@@ -1,0 +1,40 @@
+# Dependencies and build
+node_modules/
+.pnpm-store/
+.turbo/
+dist/
+out/
+release/
+build/
+coverage/
+*.tsbuildinfo
+.eslintcache
+.cache/
+
+# Electron
+*.log
+*.local
+.DS_Store
+Thumbs.db
+
+# Secrets and local data
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+*.sqlite
+*.sqlite3
+*.db
+
+# User data / app runtime
+user-data/
+app-data/
+
+# IDE
+.idea/
+*.swp
+
+# OS
+Desktop.ini
