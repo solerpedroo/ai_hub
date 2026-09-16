@@ -6,13 +6,19 @@
     "types": ["electron-vite/node", "node"],
     "baseUrl": ".",
     "paths": {
-      "@ai-hub/shared": ["../../packages/shared/src/index.ts"]
+      "@ai-hub/shared": ["../../packages/shared/src/index.ts"],
+      "@ai-hub/db": ["../../packages/db/src/index.ts"],
+      "@ai-hub/security/keytar": ["../../packages/security/src/keytar-store.ts"],
+      "@ai-hub/security": ["../../packages/security/src/index.ts"]
     }
   },
   "include": [
     "electron.vite.config.ts",
     "src/main/**/*.ts",
     "src/preload/**/*.ts",
-    "../../packages/shared/src/**/*.ts"
-  ]
+    "../../packages/shared/src/**/*.ts",
+    "../../packages/db/src/**/*.ts",
+    "../../packages/security/src/**/*.ts"
+  ],
+  "exclude": ["../../packages/**/*.test.ts"]
 }
