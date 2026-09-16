@@ -15,11 +15,14 @@ pnpm dev
 
 Outros scripts na raiz:
 
-- `pnpm typecheck` — TypeScript em `apps/desktop` e `packages/shared`
+- `pnpm typecheck` — TypeScript em `apps/desktop` e `packages/*`
 - `pnpm lint` — ESLint
+- `pnpm test` — Vitest (sem chaves reais)
 - `pnpm build` — bundle Electron (sem instalador; isso é Wave 8)
 
-A janela é frameless. Tema (claro/escuro/sistema) e idioma (pt-BR/en) ficam em Configurações. `Ctrl+K` abre um command palette só de chrome (tema).
+Após o install, `pnpm dev` recompila nativos para o Electron. `pnpm test` no pacote `db` restaura o ABI do Node se o binário estiver no ABI do Electron.
+
+A janela é frameless. Projetos e conversas ficam no SQLite local (campos sensíveis em envelope AES-GCM). Tema/idioma persistem em `settings`. Chaves de API vão para o Credential Manager. `Ctrl+K` abre um command palette de chrome (tema).
 
 ## Docs
 
