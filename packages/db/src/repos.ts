@@ -1,0 +1,365 @@
+import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
+import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
+import {
+  decryptUtf8,
+  encryptUtf8,
+  last4OfSecret,
+  maskSecret,
+  providerKeyAccount,
+  type SecretStore,
+} from "@ai-hub/security";
+import {
+  conversations,
+  messages,
+  projects,
+  providerKeys,
+  providers,
+  settings,
+  type schema,
+} from "./schema";
+
+export type HubDrizzle = BetterSQLite3Database<typeof schema>;
+
+export interface ProjectRecord {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConversationRecord {
+  id: string;
+  projectId: string | null;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type MessageRole = "user" | "assistant" | "system";
+export type MessageStatus = "complete" | "streaming" | "interrupted" | "aborted";
+
+export interface MessageRecord {
+  id: string;
+  conversationId: string;
+  parentId: string | null;
+  branchId: string;
+  role: MessageRole;
+  content: string;
+  status: MessageStatus;
+  createdAt: string;
+}
+
+export interface ProviderRecord {
+  id: string;
+  slug: string;
+  name: string;
+}
+
+export interface ProviderKeyRecord {
+  id: string;
+  providerSlug: string;
+  label: string;
+  maskedKey: string;
+  last4: string;
+  status: "active" | "invalid";
+  createdAt: string;
+}
+
+export interface AppearanceRecord {
+  theme: "light" | "dark" | "system";
+  locale: "pt-BR" | "en";
+}
+
+const APPEARANCE_KEY = "appearance";
+
+function iso(ms: number): string {
+  return new Date(ms).toISOString();
+}
+
+function asRole(value: string): MessageRole {
+  if (value === "user" || value === "assistant" || value === "system") {
+    return value;
+  }
+  throw new Error("Unknown message role");
+}
+
+function asStatus(value: string): MessageStatus {
+  if (
+    value === "complete" ||
+    value === "streaming" ||
+    value === "interrupted" ||
+    value === "aborted"
+  ) {
+    return value;
+  }
+  throw new Error("Unknown message status");
+}
+
+export class HubRepos {
+  constructor(
+    private readonly db: HubDrizzle,
+    private readonly masterKey: Buffer,
+    private readonly secrets: SecretStore,
+  ) {}
+
+  listProjects(): ProjectRecord[] {
+    return this.db
+      .select()
+      .from(projects)
+      .all()
+      .map((row) => ({
+        id: row.id,
+        name: decryptUtf8(row.nameCipher, this.masterKey),
+        createdAt: iso(row.createdAt),
+        updatedAt: iso(row.updatedAt),
+      }))
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  createProject(name: string): ProjectRecord {
+    const now = Date.now();
+    const id = randomUUID();
+    this.db
+      .insert(projects)
+      .values({
+        id,
+        nameCipher: encryptUtf8(name, this.masterKey),
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+    return { id, name, createdAt: iso(now), updatedAt: iso(now) };
+  }
+
+  removeProject(id: string): void {
+    this.db.delete(projects).where(eq(projects.id, id)).run();
+  }
+
+  listConversations(projectId: string | null): ConversationRecord[] {
+    const rows =
+      projectId === null
+        ? this.db.select().from(conversations).all().filter((row) => row.projectId === null)
+        : this.db.select().from(conversations).where(eq(conversations.projectId, projectId)).all();
+    return rows
+      .map((row) => ({
+        id: row.id,
+        projectId: row.projectId,
+        title: decryptUtf8(row.titleCipher, this.masterKey),
+        createdAt: iso(row.createdAt),
+        updatedAt: iso(row.updatedAt),
+      }))
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  createConversation(projectId: string | null, title: string): ConversationRecord {
+    const now = Date.now();
+    const id = randomUUID();
+    this.db
+      .insert(conversations)
+      .values({
+        id,
+        projectId,
+        titleCipher: encryptUtf8(title, this.masterKey),
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+    return { id, projectId, title, createdAt: iso(now), updatedAt: iso(now) };
+  }
+
+  removeConversation(id: string): void {
+    this.db.delete(conversations).where(eq(conversations.id, id)).run();
+  }
+
+  listMessages(conversationId: string): MessageRecord[] {
+    return this.db
+      .select()
+      .from(messages)
+      .where(eq(messages.conversationId, conversationId))
+      .all()
+      .map((row) => ({
+        id: row.id,
+        conversationId: row.conversationId,
+        parentId: row.parentId,
+        branchId: row.branchId,
+        role: asRole(row.role),
+        content: decryptUtf8(row.contentCipher, this.masterKey),
+        status: asStatus(row.status),
+        createdAt: iso(row.createdAt),
+      }))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  createMessage(input: {
+    conversationId: string;
+    role: MessageRole;
+    content: string;
+    parentId: string | null;
+    branchId: string | null;
+  }): MessageRecord {
+    const conversation = this.db
+      .select()
+      .from(conversations)
+      .where(eq(conversations.id, input.conversationId))
+      .get();
+    if (!conversation) {
+      throw new Error("Conversation not found");
+    }
+
+    let branchId = input.branchId;
+    if (input.parentId) {
+      const parent = this.db.select().from(messages).where(eq(messages.id, input.parentId)).get();
+      if (!parent || parent.conversationId !== input.conversationId) {
+        throw new Error("Parent message not found");
+      }
+      branchId = branchId ?? parent.branchId;
+    }
+    branchId = branchId ?? randomUUID();
+
+    const now = Date.now();
+    const id = randomUUID();
+    this.db
+      .insert(messages)
+      .values({
+        id,
+        conversationId: input.conversationId,
+        parentId: input.parentId,
+        branchId,
+        isActiveBranch: 1,
+        role: input.role,
+        contentCipher: encryptUtf8(input.content, this.masterKey),
+        status: "complete",
+        createdAt: now,
+      })
+      .run();
+    this.db
+      .update(conversations)
+      .set({ updatedAt: now })
+      .where(eq(conversations.id, input.conversationId))
+      .run();
+
+    return {
+      id,
+      conversationId: input.conversationId,
+      parentId: input.parentId,
+      branchId,
+      role: input.role,
+      content: input.content,
+      status: "complete",
+      createdAt: iso(now),
+    };
+  }
+
+  listProviders(): ProviderRecord[] {
+    return this.db.select().from(providers).all();
+  }
+
+  getAppearance(): AppearanceRecord {
+    const row = this.db.select().from(settings).where(eq(settings.key, APPEARANCE_KEY)).get();
+    if (!row) {
+      return { theme: "system", locale: "pt-BR" };
+    }
+    const parsed: unknown = JSON.parse(row.value);
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "theme" in parsed &&
+      "locale" in parsed &&
+      (parsed.theme === "light" || parsed.theme === "dark" || parsed.theme === "system") &&
+      (parsed.locale === "pt-BR" || parsed.locale === "en")
+    ) {
+      return { theme: parsed.theme, locale: parsed.locale };
+    }
+    return { theme: "system", locale: "pt-BR" };
+  }
+
+  setAppearance(appearance: AppearanceRecord): void {
+    const now = Date.now();
+    this.db
+      .insert(settings)
+      .values({
+        key: APPEARANCE_KEY,
+        value: JSON.stringify(appearance),
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: settings.key,
+        set: { value: JSON.stringify(appearance), updatedAt: now },
+      })
+      .run();
+  }
+
+  async listProviderKeys(): Promise<ProviderKeyRecord[]> {
+    const rows = this.db.select().from(providerKeys).all();
+    const catalog = this.listProviders();
+    return rows.map((row) => {
+      const provider = catalog.find((item) => item.id === row.providerId);
+      const prefix = row.last4.length > 0 ? `sk-…${row.last4}` : "sk-…";
+      return {
+        id: row.id,
+        providerSlug: provider?.slug ?? "unknown",
+        label: row.label,
+        maskedKey: prefix,
+        last4: row.last4,
+        status: row.status === "invalid" ? "invalid" : "active",
+        createdAt: iso(row.createdAt),
+      };
+    });
+  }
+
+  async saveProviderKey(input: {
+    providerSlug: string;
+    label: string;
+    secret: string;
+  }): Promise<ProviderKeyRecord> {
+    const provider = this.db
+      .select()
+      .from(providers)
+      .where(eq(providers.slug, input.providerSlug))
+      .get();
+    if (!provider) {
+      throw new Error("Unknown provider");
+    }
+    const id = randomUUID();
+    const account = providerKeyAccount(id);
+    const last4 = last4OfSecret(input.secret);
+    const now = Date.now();
+    try {
+      await this.secrets.setPassword(account, input.secret);
+      this.db
+        .insert(providerKeys)
+        .values({
+          id,
+          providerId: provider.id,
+          label: input.label,
+          keytarAccount: account,
+          last4,
+          status: "active",
+          createdAt: now,
+        })
+        .run();
+    } catch (error) {
+      await this.secrets.deletePassword(account);
+      throw error;
+    }
+    return {
+      id,
+      providerSlug: provider.slug,
+      label: input.label,
+      maskedKey: maskSecret(input.secret),
+      last4,
+      status: "active",
+      createdAt: iso(now),
+    };
+  }
+
+  async removeProviderKey(id: string): Promise<void> {
+    const row = this.db.select().from(providerKeys).where(eq(providerKeys.id, id)).get();
+    if (!row) {
+      return;
+    }
+    this.db.delete(providerKeys).where(eq(providerKeys.id, id)).run();
+    await this.secrets.deletePassword(row.keytarAccount);
+  }
+}
