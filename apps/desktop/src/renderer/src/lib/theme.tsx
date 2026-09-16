@@ -9,9 +9,13 @@ import {
   type ReactNode,
 } from "react";
 import type { ThemeMode } from "@ai-hub/shared";
-import { themeModeSchema } from "@ai-hub/shared";
-
-const THEME_STORAGE_KEY = "ai-hub.theme";
+import {
+  hydrateAppearanceSettings,
+  persistAppearanceSettings,
+  readCachedLocale,
+  readCachedTheme,
+} from "./appearance-settings";
+import i18n from "./i18n";
 
 interface ThemeContextValue {
   theme: ThemeMode;
@@ -20,18 +24,6 @@ interface ThemeContextValue {
 }
 
 const ThemeContext = createContext<ThemeContextValue | null>(null);
-
-function isThemeMode(value: string): value is ThemeMode {
-  return (themeModeSchema as readonly string[]).includes(value);
-}
-
-function readStoredTheme(): ThemeMode {
-  const raw = window.localStorage.getItem(THEME_STORAGE_KEY);
-  if (raw && isThemeMode(raw)) {
-    return raw;
-  }
-  return "system";
-}
 
 function resolveTheme(theme: ThemeMode): "light" | "dark" {
   if (theme === "system") {
@@ -45,12 +37,24 @@ function applyDomTheme(resolved: "light" | "dark"): void {
 }
 
 export function ThemeProvider({ children }: { children: ReactNode }): JSX.Element {
-  const [theme, setThemeState] = useState<ThemeMode>(readStoredTheme);
+  const [theme, setThemeState] = useState<ThemeMode>(readCachedTheme);
   const resolved = resolveTheme(theme);
 
   useEffect(() => {
     applyDomTheme(resolved);
   }, [resolved]);
+
+  useEffect(() => {
+    void hydrateAppearanceSettings()
+      .then((appearance) => {
+        setThemeState(appearance.theme);
+        void i18n.changeLanguage(appearance.locale);
+        document.documentElement.lang = appearance.locale;
+      })
+      .catch(() => {
+        // Keep the localStorage cache if the database is not ready yet.
+      });
+  }, []);
 
   useEffect(() => {
     if (theme !== "system") {
@@ -65,8 +69,8 @@ export function ThemeProvider({ children }: { children: ReactNode }): JSX.Elemen
   }, [theme]);
 
   const setTheme = useCallback((next: ThemeMode) => {
-    window.localStorage.setItem(THEME_STORAGE_KEY, next);
     setThemeState(next);
+    void persistAppearanceSettings({ theme: next, locale: readCachedLocale() });
   }, []);
 
   const value = useMemo(
