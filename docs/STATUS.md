@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave 
 
 | Field | Value |
 |---|---|
-| Wave | **W00** (not started) |
+| Wave | **W01** (pending) |
 | Marco | A — Foundation |
 | State | `pending` |
-| Last completed | — |
-| Next action | Implement Wave 0: repo, Electron shell, design system (`docs/IMPLEMENTATION_PLAN.md` § Wave 0) |
+| Last completed | **W00** |
+| Next action | Wave 1: trust boundary, DB, keytar, IPC Zod além da janela (`docs/IMPLEMENTATION_PLAN.md` § Wave 1) |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
@@ -20,17 +20,19 @@ None.
 
 ## Open residual risks
 
-None yet (no code).
+- W00 não revalidou a janela após locks de navegação/`openExternal`.
+- macOS não exercitado.
+- Tema/idioma ainda em `localStorage` até W1.
+- Dev CSP com `unsafe-eval` para HMR (aceito em ADR-W00-003).
 
 ## Notes for the next session
 
-- Greenfield repo: README + docs + agent structure only. No `apps/` yet.
-- First ADRs belong to W00 when stack/tooling is locked in code (Electron + electron-vite, pnpm, Turborepo).
-- Do not start W01 until W00 close gate passes (`docs/reviews/W00/` + ADRs).
+- W00 fechada: `docs/reviews/W00/REVIEW.md`.
+- Não implementar chat/gateway em W1. Schema nasce com hooks (branches, receipts, caps) sem features posteriores.
 
 ## Last review / ADR
 
 | Kind | Path |
 |---|---|
-| Review | — |
-| Latest ADR | — |
+| Review | `docs/reviews/W00/REVIEW.md` |
+| Latest ADR | `docs/ADR/ADR-W00-003-csp-and-window-ipc.md` |
