@@ -1,0 +1,4274 @@
+diff --git a/README.md b/README.md
+index 667cb5c..c5f4c59 100644
+--- a/README.md
++++ b/README.md
+@@ -15,11 +15,14 @@ pnpm dev
+ 
+ Outros scripts na raiz:
+ 
+-- `pnpm typecheck` — TypeScript em `apps/desktop` e `packages/shared`
++- `pnpm typecheck` — TypeScript em `apps/desktop` e `packages/*`
+ - `pnpm lint` — ESLint
++- `pnpm test` — Vitest (sem chaves reais)
+ - `pnpm build` — bundle Electron (sem instalador; isso é Wave 8)
+ 
+-A janela é frameless. Tema (claro/escuro/sistema) e idioma (pt-BR/en) ficam em Configurações. `Ctrl+K` abre um command palette só de chrome (tema).
++Após o install, `pnpm dev` recompila nativos para o Electron. `pnpm test` no pacote `db` restaura o ABI do Node se o binário estiver no ABI do Electron.
++
++A janela é frameless. Projetos e conversas ficam no SQLite local (campos sensíveis em envelope AES-GCM). Tema/idioma persistem em `settings`. Chaves de API vão para o Credential Manager. `Ctrl+K` abre um command palette de chrome (tema).
+ 
+ ## Docs
+ 
+diff --git a/apps/desktop/electron.vite.config.ts b/apps/desktop/electron.vite.config.ts
+index fa60381..f0ebee1 100644
+--- a/apps/desktop/electron.vite.config.ts
++++ b/apps/desktop/electron.vite.config.ts
+@@ -3,14 +3,22 @@ import { defineConfig, externalizeDepsPlugin } from "electron-vite";
+ import react from "@vitejs/plugin-react";
+ 
+ const shared = resolve(__dirname, "../../packages/shared/src");
++const db = resolve(__dirname, "../../packages/db/src");
++const securityIndex = resolve(__dirname, "../../packages/security/src/index.ts");
++const securityKeytar = resolve(__dirname, "../../packages/security/src/keytar-store.ts");
++
++const mainAliases = {
++  "@ai-hub/shared": shared,
++  "@ai-hub/db": db,
++  "@ai-hub/security/keytar": securityKeytar,
++  "@ai-hub/security": securityIndex,
++};
+ 
+ export default defineConfig({
+   main: {
+-    plugins: [externalizeDepsPlugin({ exclude: ["@ai-hub/shared"] })],
++    plugins: [externalizeDepsPlugin({ exclude: ["@ai-hub/shared", "@ai-hub/db", "@ai-hub/security"] })],
+     resolve: {
+-      alias: {
+-        "@ai-hub/shared": shared,
+-      },
++      alias: mainAliases,
+     },
+   },
+   preload: {
+diff --git a/apps/desktop/package.json b/apps/desktop/package.json
+index 3b97b06..6bca0ef 100644
+--- a/apps/desktop/package.json
++++ b/apps/desktop/package.json
+@@ -5,22 +5,28 @@
+   "type": "module",
+   "main": "out/main/index.js",
+   "scripts": {
+-    "dev": "electron-vite dev",
++    "dev": "electron-rebuild -f -w better-sqlite3 -w keytar && electron-vite dev",
+     "build": "electron-vite build",
+     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+-    "lint": "eslint src --max-warnings 0"
++    "lint": "eslint src --max-warnings 0",
++    "rebuild:native": "electron-rebuild -f -w better-sqlite3 -w keytar"
+   },
+   "dependencies": {
++    "@ai-hub/db": "workspace:*",
++    "@ai-hub/security": "workspace:*",
+     "@ai-hub/shared": "workspace:*",
+     "@electron-toolkit/utils": "^4.0.0",
+     "@radix-ui/react-dialog": "^1.1.15",
+     "@radix-ui/react-scroll-area": "^1.2.10",
+     "@radix-ui/react-slot": "^1.2.3",
+     "@radix-ui/react-tooltip": "^1.2.8",
++    "better-sqlite3": "^12.2.0",
+     "class-variance-authority": "^0.7.1",
+     "clsx": "^2.1.1",
+     "cmdk": "^1.1.1",
++    "drizzle-orm": "^0.44.5",
+     "i18next": "^25.4.2",
++    "keytar": "^7.9.0",
+     "lucide-react": "^0.542.0",
+     "react": "^19.1.1",
+     "react-dom": "^19.1.1",
+@@ -30,6 +36,8 @@
+   },
+   "devDependencies": {
+     "@electron-toolkit/tsconfig": "^1.0.1",
++    "@electron/rebuild": "^4.0.1",
++    "@types/better-sqlite3": "^7.6.13",
+     "@types/node": "^22.18.1",
+     "@types/react": "^19.1.12",
+     "@types/react-dom": "^19.1.9",
+diff --git a/apps/desktop/src/main/index.ts b/apps/desktop/src/main/index.ts
+index 625f653..5d7828b 100644
+--- a/apps/desktop/src/main/index.ts
++++ b/apps/desktop/src/main/index.ts
+@@ -1,11 +1,9 @@
+ import { join } from "node:path";
+-import { BrowserWindow, app, ipcMain, session, shell } from "electron";
++import { BrowserWindow, app, dialog, session, shell } from "electron";
+ import { electronApp, is, optimizer } from "@electron-toolkit/utils";
+-import {
+-  IpcChannel,
+-  emptyIpcPayloadSchema,
+-  windowIsMaximizedResultSchema,
+-} from "@ai-hub/shared";
++import { safeErrorMessage } from "@ai-hub/security";
++import { registerWindowIpc, registerWorkspaceIpc } from "./ipc";
++import { bootPersistence } from "./persistence";
+ 
+ function applyContentSecurityPolicy(): void {
+   const developmentCsp = [
+@@ -52,8 +50,7 @@ function isAllowedAppNavigation(url: string): boolean {
+     return false;
+   }
+   if (is.dev) {
+-    const local =
+-      parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
++    const local = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+     return (parsed.protocol === "http:" || parsed.protocol === "https:") && local;
+   }
+   return parsed.protocol === "file:";
+@@ -92,40 +89,6 @@ function targetWindow(event: Electron.IpcMainInvokeEvent): BrowserWindow | null
+   return BrowserWindow.fromWebContents(event.sender);
+ }
+ 
+-function registerWindowIpc(): void {
+-  const parseEmpty = (payload: unknown): void => {
+-    emptyIpcPayloadSchema.parse(payload ?? {});
+-  };
+-
+-  ipcMain.handle(IpcChannel.windowMinimize, (event, payload: unknown) => {
+-    parseEmpty(payload);
+-    targetWindow(event)?.minimize();
+-  });
+-
+-  ipcMain.handle(IpcChannel.windowMaximize, (event, payload: unknown) => {
+-    parseEmpty(payload);
+-    const window = targetWindow(event);
+-    if (!window) {
+-      return;
+-    }
+-    if (window.isMaximized()) {
+-      window.unmaximize();
+-      return;
+-    }
+-    window.maximize();
+-  });
+-
+-  ipcMain.handle(IpcChannel.windowClose, (event, payload: unknown) => {
+-    parseEmpty(payload);
+-    targetWindow(event)?.close();
+-  });
+-
+-  ipcMain.handle(IpcChannel.windowIsMaximized, (event, payload: unknown) => {
+-    parseEmpty(payload);
+-    return windowIsMaximizedResultSchema.parse(targetWindow(event)?.isMaximized() ?? false);
+-  });
+-}
+-
+ function createWindow(): void {
+   const window = new BrowserWindow({
+     width: 1280,
+@@ -158,10 +121,18 @@ function createWindow(): void {
+   }
+ }
+ 
+-app.whenReady().then(() => {
++app.whenReady().then(async () => {
+   electronApp.setAppUserModelId("com.aihub.desktop");
+   applyContentSecurityPolicy();
+-  registerWindowIpc();
++  registerWindowIpc(targetWindow);
++  try {
++    await bootPersistence();
++  } catch (error) {
++    dialog.showErrorBox("AI Hub", safeErrorMessage(error));
++    app.quit();
++    return;
++  }
++  registerWorkspaceIpc();
+ 
+   app.on("browser-window-created", (_event, window) => {
+     optimizer.watchWindowShortcuts(window);
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+new file mode 100644
+index 0000000..956947e
+--- /dev/null
++++ b/apps/desktop/src/main/ipc.ts
+@@ -0,0 +1,166 @@
++import { ipcMain } from "electron";
++import { ZodError, type ZodType } from "zod";
++import {
++  IpcChannel,
++  appearanceSettingsSchema,
++  conversationCreateInputSchema,
++  conversationDtoSchema,
++  conversationListInputSchema,
++  conversationListResultSchema,
++  emptyIpcPayloadSchema,
++  idInputSchema,
++  ipcAckResultSchema,
++  messageCreateInputSchema,
++  messageDtoSchema,
++  messageListInputSchema,
++  messageListResultSchema,
++  projectCreateInputSchema,
++  projectDtoSchema,
++  projectListResultSchema,
++  providerKeyDtoSchema,
++  providerKeyListResultSchema,
++  providerListResultSchema,
++  secretsSaveInputSchema,
++  windowIsMaximizedResultSchema,
++} from "@ai-hub/shared";
++import { safeErrorMessage } from "@ai-hub/security";
++import { getHubDatabase } from "./persistence";
++
++function registerHandler<TIn, TOut>(
++  channel: string,
++  inputSchema: ZodType<TIn>,
++  outputSchema: ZodType<TOut>,
++  handler: (input: TIn, event: Electron.IpcMainInvokeEvent) => TOut | Promise<TOut>,
++): void {
++  ipcMain.handle(channel, async (event, payload: unknown) => {
++    try {
++      const input = inputSchema.parse(payload ?? {});
++      const output = await handler(input, event);
++      return outputSchema.parse(output);
++    } catch (error) {
++      if (error instanceof ZodError) {
++        throw new Error("Invalid request");
++      }
++      throw new Error(safeErrorMessage(error));
++    }
++  });
++}
++
++export function registerWorkspaceIpc(): void {
++  registerHandler(IpcChannel.projectsList, emptyIpcPayloadSchema, projectListResultSchema, () =>
++    getHubDatabase().repos.listProjects().map((row) => projectDtoSchema.parse(row)),
++  );
++
++  registerHandler(IpcChannel.projectsCreate, projectCreateInputSchema, projectDtoSchema, (input) =>
++    projectDtoSchema.parse(getHubDatabase().repos.createProject(input.name)),
++  );
++
++  registerHandler(IpcChannel.projectsRemove, idInputSchema, ipcAckResultSchema, (input) => {
++    getHubDatabase().repos.removeProject(input.id);
++  });
++
++  registerHandler(
++    IpcChannel.conversationsList,
++    conversationListInputSchema,
++    conversationListResultSchema,
++    (input) =>
++      getHubDatabase()
++        .repos.listConversations(input.projectId)
++        .map((row) => conversationDtoSchema.parse(row)),
++  );
++
++  registerHandler(
++    IpcChannel.conversationsCreate,
++    conversationCreateInputSchema,
++    conversationDtoSchema,
++    (input) => conversationDtoSchema.parse(getHubDatabase().repos.createConversation(input.projectId, input.title)),
++  );
++
++  registerHandler(IpcChannel.conversationsRemove, idInputSchema, ipcAckResultSchema, (input) => {
++    getHubDatabase().repos.removeConversation(input.id);
++  });
++
++  registerHandler(IpcChannel.messagesList, messageListInputSchema, messageListResultSchema, (input) =>
++    getHubDatabase()
++      .repos.listMessages(input.conversationId)
++      .map((row) => messageDtoSchema.parse(row)),
++  );
++
++  registerHandler(IpcChannel.messagesCreate, messageCreateInputSchema, messageDtoSchema, (input) =>
++    messageDtoSchema.parse(
++      getHubDatabase().repos.createMessage({
++        conversationId: input.conversationId,
++        role: input.role,
++        content: input.content,
++        parentId: input.parentId,
++        branchId: input.branchId,
++      }),
++    ),
++  );
++
++  registerHandler(
++    IpcChannel.settingsGetAppearance,
++    emptyIpcPayloadSchema,
++    appearanceSettingsSchema,
++    () => appearanceSettingsSchema.parse(getHubDatabase().repos.getAppearance()),
++  );
++
++  registerHandler(
++    IpcChannel.settingsSetAppearance,
++    appearanceSettingsSchema,
++    ipcAckResultSchema,
++    (input) => {
++      getHubDatabase().repos.setAppearance(input);
++    },
++  );
++
++  registerHandler(IpcChannel.providersList, emptyIpcPayloadSchema, providerListResultSchema, () =>
++    getHubDatabase().repos.listProviders(),
++  );
++
++  registerHandler(IpcChannel.secretsList, emptyIpcPayloadSchema, providerKeyListResultSchema, () =>
++    getHubDatabase().repos.listProviderKeys(),
++  );
++
++  registerHandler(IpcChannel.secretsSave, secretsSaveInputSchema, providerKeyDtoSchema, (input) =>
++    getHubDatabase().repos.saveProviderKey(input),
++  );
++
++  registerHandler(IpcChannel.secretsRemove, idInputSchema, ipcAckResultSchema, (input) =>
++    getHubDatabase().repos.removeProviderKey(input.id),
++  );
++}
++
++export function registerWindowIpc(targetWindow: (event: Electron.IpcMainInvokeEvent) => Electron.BrowserWindow | null): void {
++  const parseEmpty = (payload: unknown): void => {
++    emptyIpcPayloadSchema.parse(payload ?? {});
++  };
++
++  ipcMain.handle(IpcChannel.windowMinimize, (event, payload: unknown) => {
++    parseEmpty(payload);
++    targetWindow(event)?.minimize();
++  });
++
++  ipcMain.handle(IpcChannel.windowMaximize, (event, payload: unknown) => {
++    parseEmpty(payload);
++    const window = targetWindow(event);
++    if (!window) {
++      return;
++    }
++    if (window.isMaximized()) {
++      window.unmaximize();
++      return;
++    }
++    window.maximize();
++  });
++
++  ipcMain.handle(IpcChannel.windowClose, (event, payload: unknown) => {
++    parseEmpty(payload);
++    targetWindow(event)?.close();
++  });
++
++  ipcMain.handle(IpcChannel.windowIsMaximized, (event, payload: unknown) => {
++    parseEmpty(payload);
++    return windowIsMaximizedResultSchema.parse(targetWindow(event)?.isMaximized() ?? false);
++  });
++}
+diff --git a/apps/desktop/src/main/persistence.ts b/apps/desktop/src/main/persistence.ts
+new file mode 100644
+index 0000000..0482d12
+--- /dev/null
++++ b/apps/desktop/src/main/persistence.ts
+@@ -0,0 +1,25 @@
++import { join } from "node:path";
++import { app } from "electron";
++import { openHubDatabase, type HubDatabase } from "@ai-hub/db";
++import { loadOrCreateMasterKey } from "@ai-hub/security";
++import { KeytarSecretStore } from "@ai-hub/security/keytar";
++
++let hub: HubDatabase | null = null;
++
++export async function bootPersistence(): Promise<HubDatabase> {
++  if (hub) {
++    return hub;
++  }
++  const store = new KeytarSecretStore();
++  const masterKey = await loadOrCreateMasterKey(store);
++  const dbPath = join(app.getPath("userData"), "ai-hub.sqlite");
++  hub = openHubDatabase({ path: dbPath, masterKey, secretStore: store });
++  return hub;
++}
++
++export function getHubDatabase(): HubDatabase {
++  if (!hub) {
++    throw new Error("Database is not ready");
++  }
++  return hub;
++}
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index 6f1a694..a20363a 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -1,19 +1,58 @@
+ import { contextBridge, ipcRenderer } from "electron";
++import type { ZodType } from "zod";
+ import {
+   IpcChannel,
+   type HubApi,
++  appearanceSettingsSchema,
++  conversationCreateInputSchema,
++  conversationListInputSchema,
++  conversationListResultSchema,
++  conversationDtoSchema,
+   emptyIpcPayloadSchema,
++  idInputSchema,
+   ipcAckResultSchema,
++  messageCreateInputSchema,
++  messageDtoSchema,
++  messageListInputSchema,
++  messageListResultSchema,
++  projectCreateInputSchema,
++  projectDtoSchema,
++  projectListResultSchema,
++  providerKeyDtoSchema,
++  providerKeyListResultSchema,
++  providerListResultSchema,
++  secretsSaveInputSchema,
+   windowIsMaximizedResultSchema,
+ } from "@ai-hub/shared";
+ 
+ const empty = emptyIpcPayloadSchema.parse({});
+ 
++async function invokeParsed<TIn, TOut>(
++  channel: string,
++  payload: TIn,
++  inputSchema: ZodType<TIn>,
++  outputSchema: ZodType<TOut>,
++): Promise<TOut> {
++  const parsed = inputSchema.parse(payload);
++  const result: unknown = await ipcRenderer.invoke(channel, parsed);
++  return outputSchema.parse(result);
++}
++
+ async function invokeAck(channel: string): Promise<void> {
+   const result: unknown = await ipcRenderer.invoke(channel, empty);
+   ipcAckResultSchema.parse(result);
+ }
+ 
++async function invokeAckWith<TIn>(
++  channel: string,
++  payload: TIn,
++  inputSchema: ZodType<TIn>,
++): Promise<void> {
++  const parsed = inputSchema.parse(payload);
++  const result: unknown = await ipcRenderer.invoke(channel, parsed);
++  ipcAckResultSchema.parse(result);
++}
++
+ const hub: HubApi = {
+   platform:
+     process.platform === "darwin" || process.platform === "linux" ? process.platform : "win32",
+@@ -26,6 +65,49 @@ const hub: HubApi = {
+       return windowIsMaximizedResultSchema.parse(result);
+     },
+   },
++  projects: {
++    list: () => invokeParsed(IpcChannel.projectsList, empty, emptyIpcPayloadSchema, projectListResultSchema),
++    create: (input) =>
++      invokeParsed(IpcChannel.projectsCreate, input, projectCreateInputSchema, projectDtoSchema),
++    remove: (input) => invokeAckWith(IpcChannel.projectsRemove, input, idInputSchema),
++  },
++  conversations: {
++    list: (input) =>
++      invokeParsed(
++        IpcChannel.conversationsList,
++        input,
++        conversationListInputSchema,
++        conversationListResultSchema,
++      ),
++    create: (input) =>
++      invokeParsed(IpcChannel.conversationsCreate, input, conversationCreateInputSchema, conversationDtoSchema),
++    remove: (input) => invokeAckWith(IpcChannel.conversationsRemove, input, idInputSchema),
++  },
++  messages: {
++    list: (input) =>
++      invokeParsed(IpcChannel.messagesList, input, messageListInputSchema, messageListResultSchema),
++    create: (input) =>
++      invokeParsed(IpcChannel.messagesCreate, input, messageCreateInputSchema, messageDtoSchema),
++  },
++  settings: {
++    getAppearance: () =>
++      invokeParsed(
++        IpcChannel.settingsGetAppearance,
++        empty,
++        emptyIpcPayloadSchema,
++        appearanceSettingsSchema,
++      ),
++    setAppearance: (input) =>
++      invokeAckWith(IpcChannel.settingsSetAppearance, input, appearanceSettingsSchema),
++  },
++  providers: {
++    list: () => invokeParsed(IpcChannel.providersList, empty, emptyIpcPayloadSchema, providerListResultSchema),
++  },
++  secrets: {
++    list: () => invokeParsed(IpcChannel.secretsList, empty, emptyIpcPayloadSchema, providerKeyListResultSchema),
++    save: (input) => invokeParsed(IpcChannel.secretsSave, input, secretsSaveInputSchema, providerKeyDtoSchema),
++    remove: (input) => invokeAckWith(IpcChannel.secretsRemove, input, idInputSchema),
++  },
+ };
+ 
+ contextBridge.exposeInMainWorld("hub", hub);
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index 6fec0f4..9bac028 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -1,4 +1,6 @@
+-import { useState, type JSX } from "react";
++import { useCallback, useEffect, useState, type JSX } from "react";
++import { useTranslation } from "react-i18next";
++import type { ConversationDto, MessageDto, ProjectDto } from "@ai-hub/shared";
+ import { TitleBar } from "@/components/layout/title-bar";
+ import { Sidebar } from "@/components/layout/sidebar";
+ import { StatusBar } from "@/components/layout/status-bar";
+@@ -8,15 +10,138 @@ import { ChromeCommandPalette } from "@/components/layout/command-palette";
+ import type { AppView } from "@/components/layout/types";
+ 
+ export function App(): JSX.Element {
++  const { t } = useTranslation();
+   const [view, setView] = useState<AppView>("home");
++  const [projects, setProjects] = useState<ProjectDto[]>([]);
++  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
++  const [conversations, setConversations] = useState<ConversationDto[]>([]);
++  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
++  const [messages, setMessages] = useState<MessageDto[]>([]);
++  const [error, setError] = useState<string | null>(null);
++
++  const fail = useCallback((): void => {
++    setError(t("workspace.error.generic"));
++  }, [t]);
++
++  const loadProjects = useCallback(async (): Promise<ProjectDto[]> => {
++    const list = await window.hub.projects.list();
++    setProjects(list);
++    return list;
++  }, []);
++
++  const loadConversations = useCallback(async (projectId: string): Promise<void> => {
++    const list = await window.hub.conversations.list({ projectId });
++    setConversations(list);
++  }, []);
++
++  const loadMessages = useCallback(async (conversationId: string): Promise<void> => {
++    const list = await window.hub.messages.list({ conversationId });
++    setMessages(list);
++  }, []);
++
++  useEffect(() => {
++    void loadProjects()
++      .then((list) => {
++        const first = list[0];
++        if (first) {
++          setSelectedProjectId(first.id);
++        }
++      })
++      .catch(fail);
++  }, [fail, loadProjects]);
++
++  useEffect(() => {
++    if (!selectedProjectId) {
++      setConversations([]);
++      setSelectedConversationId(null);
++      setMessages([]);
++      return;
++    }
++    void loadConversations(selectedProjectId)
++      .then(() => {
++        setSelectedConversationId(null);
++        setMessages([]);
++      })
++      .catch(fail);
++  }, [fail, loadConversations, selectedProjectId]);
++
++  const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
+ 
+   return (
+     <div className="flex h-full flex-col overflow-hidden">
+       <TitleBar />
+       <div className="flex min-h-0 flex-1">
+-        <Sidebar view={view} onChange={setView} />
++        <Sidebar
++          view={view}
++          onChange={setView}
++          projects={projects}
++          selectedProjectId={selectedProjectId}
++          onSelectProject={setSelectedProjectId}
++          onCreateProject={async (name) => {
++            try {
++              const created = await window.hub.projects.create({ name });
++              setError(null);
++              const list = await loadProjects();
++              const next = list.find((item) => item.id === created.id) ?? created;
++              setSelectedProjectId(next.id);
++              setView("home");
++            } catch {
++              fail();
++            }
++          }}
++        />
+         <main className="min-w-0 flex-1 bg-background">
+-          {view === "home" ? <HomeView onOpenSettings={() => setView("settings")} /> : <SettingsView />}
++          {view === "home" ? (
++            <HomeView
++              project={selectedProject}
++              conversations={conversations}
++              selectedConversationId={selectedConversationId}
++              messages={messages}
++              error={error}
++              onSelectConversation={(id) => {
++                setSelectedConversationId(id);
++                void loadMessages(id).catch(fail);
++              }}
++              onCreateConversation={async (title) => {
++                if (!selectedProjectId) {
++                  return;
++                }
++                try {
++                  const created = await window.hub.conversations.create({
++                    projectId: selectedProjectId,
++                    title,
++                  });
++                  setError(null);
++                  await loadConversations(selectedProjectId);
++                  setSelectedConversationId(created.id);
++                  setMessages([]);
++                } catch {
++                  fail();
++                }
++              }}
++              onCreateMessage={async (content) => {
++                if (!selectedConversationId) {
++                  return;
++                }
++                const parentId = messages.at(-1)?.id ?? null;
++                try {
++                  await window.hub.messages.create({
++                    conversationId: selectedConversationId,
++                    role: "user",
++                    content,
++                    parentId,
++                    branchId: null,
++                  });
++                  setError(null);
++                  await loadMessages(selectedConversationId);
++                } catch {
++                  fail();
++                }
++              }}
++            />
++          ) : (
++            <SettingsView />
++          )}
+         </main>
+       </div>
+       <StatusBar />
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index 9db06d1..4e5d476 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -1,19 +1,143 @@
+-import { type JSX } from "react";
++import { type JSX, useState } from "react";
+ import { useTranslation } from "react-i18next";
++import type { ConversationDto, MessageDto, ProjectDto } from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
++import { Input } from "@/components/ui/input";
++import { ScrollArea } from "@/components/ui/scroll-area";
+ 
+-export function HomeView({ onOpenSettings }: { onOpenSettings: () => void }): JSX.Element {
++export function HomeView({
++  project,
++  conversations,
++  selectedConversationId,
++  messages,
++  error,
++  onSelectConversation,
++  onCreateConversation,
++  onCreateMessage,
++}: {
++  project: ProjectDto | null;
++  conversations: ConversationDto[];
++  selectedConversationId: string | null;
++  messages: MessageDto[];
++  error: string | null;
++  onSelectConversation: (id: string) => void;
++  onCreateConversation: (title: string) => Promise<void>;
++  onCreateMessage: (content: string) => Promise<void>;
++}): JSX.Element {
+   const { t } = useTranslation();
++  const [title, setTitle] = useState("");
++  const [note, setNote] = useState("");
+ 
+-  return (
+-    <div className="flex h-full items-center justify-center p-8">
+-      <div className="flex max-w-md flex-col items-start gap-3">
+-        <h1 className="text-base font-semibold">{t("empty.title")}</h1>
+-        <p className="text-muted-foreground">{t("empty.body")}</p>
+-        <Button type="button" onClick={onOpenSettings}>
+-          {t("empty.action")}
+-        </Button>
++  if (!project) {
++    return (
++      <div className="flex h-full items-center justify-center p-8">
++        <div className="flex max-w-md flex-col items-start gap-3">
++          <h1 className="text-base font-semibold">{t("empty.title")}</h1>
++          <p className="text-muted-foreground">{t("empty.body")}</p>
++        </div>
+       </div>
++    );
++  }
++
++  return (
++    <div className="flex h-full min-h-0">
++      <section className="flex w-64 shrink-0 flex-col border-r">
++        <div className="border-b p-3">
++          <h1 className="truncate text-sm font-semibold">{project.name}</h1>
++          <p className="text-muted-foreground">{t("workspace.conversations")}</p>
++        </div>
++        <ScrollArea className="flex-1 p-2">
++          {conversations.length === 0 ? (
++            <p className="px-2 text-muted-foreground">{t("workspace.noConversations")}</p>
++          ) : (
++            <div className="flex flex-col gap-0.5">
++              {conversations.map((conversation) => (
++                <Button
++                  key={conversation.id}
++                  type="button"
++                  variant={selectedConversationId === conversation.id ? "secondary" : "ghost"}
++                  className="h-8 w-full justify-start truncate"
++                  onClick={() => onSelectConversation(conversation.id)}
++                >
++                  {conversation.title}
++                </Button>
++              ))}
++            </div>
++          )}
++        </ScrollArea>
++        <form
++          className="flex flex-col gap-1 border-t p-2"
++          onSubmit={(event) => {
++            event.preventDefault();
++            const next = title.trim();
++            if (!next) {
++              return;
++            }
++            void onCreateConversation(next).then(() => setTitle(""));
++          }}
++        >
++          <Input
++            value={title}
++            onChange={(event) => setTitle(event.target.value)}
++            placeholder={t("workspace.conversationPlaceholder")}
++            aria-label={t("workspace.conversationPlaceholder")}
++          />
++          <Button type="submit" size="sm" className="h-7">
++            {t("workspace.newConversation")}
++          </Button>
++        </form>
++      </section>
++      <section className="flex min-w-0 flex-1 flex-col">
++        {selectedConversationId ? (
++          <>
++            <ScrollArea className="flex-1 p-4">
++              {messages.length === 0 ? (
++                <p className="text-muted-foreground">{t("workspace.noMessages")}</p>
++              ) : (
++                <ol className="flex flex-col gap-2">
++                  {messages.map((message) => (
++                    <li key={message.id} className="rounded-md border bg-card p-2">
++                      <p className="text-[11px] uppercase text-muted-foreground">
++                        {message.role}
++                        {message.parentId ? ` · ${t("workspace.branched")}` : ""}
++                      </p>
++                      <p className="whitespace-pre-wrap">{message.content}</p>
++                    </li>
++                  ))}
++                </ol>
++              )}
++            </ScrollArea>
++            <form
++              className="flex gap-2 border-t p-2"
++              onSubmit={(event) => {
++                event.preventDefault();
++                const next = note.trim();
++                if (!next) {
++                  return;
++                }
++                void onCreateMessage(next).then(() => setNote(""));
++              }}
++            >
++              <Input
++                value={note}
++                onChange={(event) => setNote(event.target.value)}
++                placeholder={t("workspace.notePlaceholder")}
++                aria-label={t("workspace.notePlaceholder")}
++              />
++              <Button type="submit">{t("workspace.addNote")}</Button>
++            </form>
++          </>
++        ) : (
++          <div className="flex flex-1 items-center justify-center p-8 text-muted-foreground">
++            {t("workspace.pickConversation")}
++          </div>
++        )}
++        {error ? (
++          <p className="border-t px-3 py-2 text-destructive" role="alert">
++            {error}
++          </p>
++        ) : null}
++      </section>
+     </div>
+   );
+ }
+diff --git a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+index 3ae94cf..86addca 100644
+--- a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+@@ -1,6 +1,6 @@
+-import { type JSX } from "react";
++import { type FormEvent, type JSX, useEffect, useState } from "react";
+ import { useTranslation } from "react-i18next";
+-import type { AppLocale, ThemeMode } from "@ai-hub/shared";
++import type { AppLocale, ProviderDto, ProviderKeyDto, ThemeMode } from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import { persistLocale } from "@/lib/i18n";
+@@ -9,11 +9,71 @@ import { useTheme } from "@/lib/theme";
+ export function SettingsView(): JSX.Element {
+   const { t, i18n } = useTranslation();
+   const { theme, setTheme } = useTheme();
++  const [providers, setProviders] = useState<ProviderDto[]>([]);
++  const [keys, setKeys] = useState<ProviderKeyDto[]>([]);
++  const [providerSlug, setProviderSlug] = useState("openrouter");
++  const [label, setLabel] = useState("default");
++  const [secret, setSecret] = useState("");
++  const [error, setError] = useState<string | null>(null);
++
++  const reloadKeys = (): void => {
++    void window.hub.secrets
++      .list()
++      .then(setKeys)
++      .catch(() => setError(t("workspace.error.generic")));
++  };
++
++  useEffect(() => {
++    let cancelled = false;
++    void window.hub.providers
++      .list()
++      .then((list) => {
++        if (cancelled) {
++          return;
++        }
++        setProviders(list);
++        const first = list[0];
++        if (first) {
++          setProviderSlug(first.slug);
++        }
++      })
++      .catch(() => {
++        if (!cancelled) {
++          setError(t("workspace.error.generic"));
++        }
++      });
++    void window.hub.secrets
++      .list()
++      .then((list) => {
++        if (!cancelled) {
++          setKeys(list);
++        }
++      })
++      .catch(() => {
++        if (!cancelled) {
++          setError(t("workspace.error.generic"));
++        }
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, [t]);
+ 
+   const setLocale = (locale: AppLocale): void => {
+     persistLocale(locale);
+-    void i18n.changeLanguage(locale);
+-    document.documentElement.lang = locale;
++  };
++
++  const onSaveKey = (event: FormEvent): void => {
++    event.preventDefault();
++    const value = secret;
++    setSecret("");
++    void window.hub.secrets
++      .save({ providerSlug, label, secret: value })
++      .then(() => {
++        setError(null);
++        reloadKeys();
++      })
++      .catch(() => setError(t("secrets.error.save")));
+   };
+ 
+   return (
+@@ -57,7 +117,65 @@ export function SettingsView(): JSX.Element {
+         </div>
+       </section>
+       <section className="flex flex-col gap-2">
+-        <Input readOnly value={t("app.name")} aria-label={t("app.name")} />
++        <h2 className="text-[12px] font-medium">{t("secrets.title")}</h2>
++        <p className="text-muted-foreground">{t("secrets.hint")}</p>
++        <form className="flex flex-col gap-2" onSubmit={onSaveKey}>
++          <label className="flex flex-col gap-1 text-[12px]">
++            {t("secrets.provider")}
++            <select
++              className="h-8 rounded-md border border-input bg-background px-2 text-[13px]"
++              value={providerSlug}
++              onChange={(event) => setProviderSlug(event.target.value)}
++            >
++              {providers.map((provider) => (
++                <option key={provider.id} value={provider.slug}>
++                  {provider.name}
++                </option>
++              ))}
++            </select>
++          </label>
++          <label className="flex flex-col gap-1 text-[12px]">
++            {t("secrets.labelField")}
++            <Input value={label} onChange={(event) => setLabel(event.target.value)} />
++          </label>
++          <label className="flex flex-col gap-1 text-[12px]">
++            {t("secrets.secret")}
++            <Input
++              type="password"
++              autoComplete="off"
++              value={secret}
++              onChange={(event) => setSecret(event.target.value)}
++            />
++          </label>
++          <Button type="submit">{t("secrets.save")}</Button>
++        </form>
++        <ul className="flex flex-col gap-1">
++          {keys.map((key) => (
++            <li key={key.id} className="flex items-center justify-between gap-2 rounded-md border px-2 py-1">
++              <span>
++                {key.providerSlug} · {key.label} · {key.maskedKey}
++              </span>
++              <Button
++                type="button"
++                variant="outline"
++                size="sm"
++                onClick={() => {
++                  void window.hub.secrets
++                    .remove({ id: key.id })
++                    .then(() => reloadKeys())
++                    .catch(() => setError(t("workspace.error.generic")));
++                }}
++              >
++                {t("secrets.remove")}
++              </Button>
++            </li>
++          ))}
++        </ul>
++        {error ? (
++          <p className="text-destructive" role="alert">
++            {error}
++          </p>
++        ) : null}
+       </section>
+     </div>
+   );
+diff --git a/apps/desktop/src/renderer/src/components/layout/sidebar.tsx b/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
+index 040ec50..b2e9682 100644
+--- a/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
+@@ -1,18 +1,37 @@
+-import { type JSX, type ReactNode } from "react";
+-import { Home, Settings } from "lucide-react";
++import { type JSX, type ReactNode, useState } from "react";
++import { Home, Plus, Settings } from "lucide-react";
+ import { useTranslation } from "react-i18next";
++import type { ProjectDto } from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
++import { Input } from "@/components/ui/input";
+ import { ScrollArea } from "@/components/ui/scroll-area";
+ import type { AppView } from "./types";
+ 
+ export function Sidebar({
+   view,
+   onChange,
++  projects,
++  selectedProjectId,
++  onSelectProject,
++  onCreateProject,
+ }: {
+   view: AppView;
+   onChange: (view: AppView) => void;
++  projects: ProjectDto[];
++  selectedProjectId: string | null;
++  onSelectProject: (id: string) => void;
++  onCreateProject: (name: string) => Promise<void>;
+ }): JSX.Element {
+   const { t } = useTranslation();
++  const [draft, setDraft] = useState("");
++
++  const submit = (): void => {
++    const name = draft.trim();
++    if (!name) {
++      return;
++    }
++    void onCreateProject(name).then(() => setDraft(""));
++  };
+ 
+   return (
+     <aside className="flex w-52 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground">
+@@ -31,7 +50,44 @@ export function Sidebar({
+             onClick={() => onChange("settings")}
+           />
+         </nav>
++        <p className="mt-4 px-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
++          {t("workspace.projects")}
++        </p>
++        <div className="mt-1 flex flex-col gap-0.5">
++          {projects.map((project) => (
++            <Button
++              key={project.id}
++              type="button"
++              variant={selectedProjectId === project.id ? "secondary" : "ghost"}
++              className="h-8 w-full justify-start truncate"
++              onClick={() => {
++                onSelectProject(project.id);
++                onChange("home");
++              }}
++            >
++              {project.name}
++            </Button>
++          ))}
++        </div>
+       </ScrollArea>
++      <form
++        className="flex flex-col gap-1 border-t p-2"
++        onSubmit={(event) => {
++          event.preventDefault();
++          submit();
++        }}
++      >
++        <Input
++          value={draft}
++          onChange={(event) => setDraft(event.target.value)}
++          placeholder={t("workspace.projectPlaceholder")}
++          aria-label={t("workspace.projectPlaceholder")}
++        />
++        <Button type="submit" size="sm" className="h-7 gap-1">
++          <Plus className="h-3 w-3" />
++          {t("workspace.newProject")}
++        </Button>
++      </form>
+     </aside>
+   );
+ }
+diff --git a/apps/desktop/src/renderer/src/lib/appearance-settings.ts b/apps/desktop/src/renderer/src/lib/appearance-settings.ts
+new file mode 100644
+index 0000000..edacef6
+--- /dev/null
++++ b/apps/desktop/src/renderer/src/lib/appearance-settings.ts
+@@ -0,0 +1,59 @@
++import type { AppearanceSettings, AppLocale, ThemeMode } from "@ai-hub/shared";
++import { localeSchema, themeModeSchema } from "@ai-hub/shared";
++
++export const THEME_STORAGE_KEY = "ai-hub.theme";
++export const LOCALE_STORAGE_KEY = "ai-hub.locale";
++
++function isThemeMode(value: string): value is ThemeMode {
++  return (themeModeSchema as readonly string[]).includes(value);
++}
++
++function isLocale(value: string): value is AppLocale {
++  return (localeSchema as readonly string[]).includes(value);
++}
++
++export function readCachedTheme(): ThemeMode {
++  const raw = window.localStorage.getItem(THEME_STORAGE_KEY);
++  if (raw && isThemeMode(raw)) {
++    return raw;
++  }
++  return "system";
++}
++
++export function readCachedLocale(): AppLocale {
++  const raw = window.localStorage.getItem(LOCALE_STORAGE_KEY);
++  if (raw && isLocale(raw)) {
++    return raw;
++  }
++  return "pt-BR";
++}
++
++function writeCache(settings: AppearanceSettings): void {
++  window.localStorage.setItem(THEME_STORAGE_KEY, settings.theme);
++  window.localStorage.setItem(LOCALE_STORAGE_KEY, settings.locale);
++}
++
++export async function persistAppearanceSettings(settings: AppearanceSettings): Promise<void> {
++  writeCache(settings);
++  await window.hub.settings.setAppearance(settings);
++}
++
++export async function hydrateAppearanceSettings(): Promise<AppearanceSettings> {
++  const fromDb = await window.hub.settings.getAppearance();
++  const cachedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
++  const cachedLocale = window.localStorage.getItem(LOCALE_STORAGE_KEY);
++  const dbUntouched = fromDb.theme === "system" && fromDb.locale === "pt-BR";
++  const cacheHasCustom =
++    (cachedTheme !== null && cachedTheme !== "system") ||
++    (cachedLocale !== null && cachedLocale !== "pt-BR");
++  if (dbUntouched && cacheHasCustom) {
++    const migrated: AppearanceSettings = {
++      theme: cachedTheme && isThemeMode(cachedTheme) ? cachedTheme : fromDb.theme,
++      locale: cachedLocale && isLocale(cachedLocale) ? cachedLocale : fromDb.locale,
++    };
++    await persistAppearanceSettings(migrated);
++    return migrated;
++  }
++  writeCache(fromDb);
++  return fromDb;
++}
+diff --git a/apps/desktop/src/renderer/src/lib/i18n.ts b/apps/desktop/src/renderer/src/lib/i18n.ts
+index a8c65f6..73bc9b5 100644
+--- a/apps/desktop/src/renderer/src/lib/i18n.ts
++++ b/apps/desktop/src/renderer/src/lib/i18n.ts
+@@ -1,22 +1,14 @@
+ import i18n from "i18next";
+ import { initReactI18next } from "react-i18next";
+ import type { AppLocale } from "@ai-hub/shared";
+-import { localeSchema } from "@ai-hub/shared";
+ import en from "../locales/en.json";
+ import ptBR from "../locales/pt-BR.json";
+-
+-export const LOCALE_STORAGE_KEY = "ai-hub.locale";
+-
+-export function readStoredLocale(): AppLocale {
+-  const raw = window.localStorage.getItem(LOCALE_STORAGE_KEY);
+-  if (raw && (localeSchema as readonly string[]).includes(raw)) {
+-    return raw as AppLocale;
+-  }
+-  return "pt-BR";
+-}
++import { persistAppearanceSettings, readCachedLocale, readCachedTheme } from "./appearance-settings";
+ 
+ export function persistLocale(locale: AppLocale): void {
+-  window.localStorage.setItem(LOCALE_STORAGE_KEY, locale);
++  void persistAppearanceSettings({ theme: readCachedTheme(), locale });
++  void i18n.changeLanguage(locale);
++  document.documentElement.lang = locale;
+ }
+ 
+ void i18n.use(initReactI18next).init({
+@@ -24,11 +16,11 @@ void i18n.use(initReactI18next).init({
+     en: { translation: en },
+     "pt-BR": { translation: ptBR },
+   },
+-  lng: readStoredLocale(),
++  lng: readCachedLocale(),
+   fallbackLng: "en",
+   interpolation: { escapeValue: false },
+ });
+ 
+-document.documentElement.lang = readStoredLocale();
++document.documentElement.lang = readCachedLocale();
+ 
+ export default i18n;
+diff --git a/apps/desktop/src/renderer/src/lib/theme.tsx b/apps/desktop/src/renderer/src/lib/theme.tsx
+index 51e7a37..c47372b 100644
+--- a/apps/desktop/src/renderer/src/lib/theme.tsx
++++ b/apps/desktop/src/renderer/src/lib/theme.tsx
+@@ -9,9 +9,13 @@ import {
+   type ReactNode,
+ } from "react";
+ import type { ThemeMode } from "@ai-hub/shared";
+-import { themeModeSchema } from "@ai-hub/shared";
+-
+-const THEME_STORAGE_KEY = "ai-hub.theme";
++import {
++  hydrateAppearanceSettings,
++  persistAppearanceSettings,
++  readCachedLocale,
++  readCachedTheme,
++} from "./appearance-settings";
++import i18n from "./i18n";
+ 
+ interface ThemeContextValue {
+   theme: ThemeMode;
+@@ -21,18 +25,6 @@ interface ThemeContextValue {
+ 
+ const ThemeContext = createContext<ThemeContextValue | null>(null);
+ 
+-function isThemeMode(value: string): value is ThemeMode {
+-  return (themeModeSchema as readonly string[]).includes(value);
+-}
+-
+-function readStoredTheme(): ThemeMode {
+-  const raw = window.localStorage.getItem(THEME_STORAGE_KEY);
+-  if (raw && isThemeMode(raw)) {
+-    return raw;
+-  }
+-  return "system";
+-}
+-
+ function resolveTheme(theme: ThemeMode): "light" | "dark" {
+   if (theme === "system") {
+     return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+@@ -45,13 +37,25 @@ function applyDomTheme(resolved: "light" | "dark"): void {
+ }
+ 
+ export function ThemeProvider({ children }: { children: ReactNode }): JSX.Element {
+-  const [theme, setThemeState] = useState<ThemeMode>(readStoredTheme);
++  const [theme, setThemeState] = useState<ThemeMode>(readCachedTheme);
+   const resolved = resolveTheme(theme);
+ 
+   useEffect(() => {
+     applyDomTheme(resolved);
+   }, [resolved]);
+ 
++  useEffect(() => {
++    void hydrateAppearanceSettings()
++      .then((appearance) => {
++        setThemeState(appearance.theme);
++        void i18n.changeLanguage(appearance.locale);
++        document.documentElement.lang = appearance.locale;
++      })
++      .catch(() => {
++        // Keep the localStorage cache if the database is not ready yet.
++      });
++  }, []);
++
+   useEffect(() => {
+     if (theme !== "system") {
+       return;
+@@ -65,8 +69,8 @@ export function ThemeProvider({ children }: { children: ReactNode }): JSX.Elemen
+   }, [theme]);
+ 
+   const setTheme = useCallback((next: ThemeMode) => {
+-    window.localStorage.setItem(THEME_STORAGE_KEY, next);
+     setThemeState(next);
++    void persistAppearanceSettings({ theme: next, locale: readCachedLocale() });
+   }, []);
+ 
+   const value = useMemo(
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 29b435d..ff00509 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -15,10 +15,31 @@
+   "window.maximize": "Maximize",
+   "window.close": "Close",
+   "empty.title": "No projects yet",
+-  "empty.body": "Wave 1 wires persistence and keys. For now, use theme and language to validate the chrome.",
++  "empty.body": "Create a project in the sidebar. It survives an app restart.",
+   "empty.action": "Open settings",
+-  "settings.title": "Appearance",
+-  "settings.hint": "Preferences stay on this device (localStorage). Wave 1 moves them into the encrypted database.",
++  "settings.title": "Appearance and keys",
++  "settings.hint": "Theme and language live in the local database. API keys go to Credential Manager, never SQLite.",
++  "workspace.projects": "Projects",
++  "workspace.projectPlaceholder": "Project name",
++  "workspace.newProject": "New project",
++  "workspace.conversations": "Conversations",
++  "workspace.conversationPlaceholder": "Conversation title",
++  "workspace.newConversation": "New conversation",
++  "workspace.noConversations": "No conversations in this project.",
++  "workspace.noMessages": "No messages yet. Save a note to test persistence.",
++  "workspace.notePlaceholder": "Note (not sent to a model yet)",
++  "workspace.addNote": "Save note",
++  "workspace.pickConversation": "Pick or create a conversation.",
++  "workspace.branched": "branch",
++  "workspace.error.generic": "That action could not be completed. Try again.",
++  "secrets.title": "Provider keys",
++  "secrets.hint": "The full key crosses IPC only on this save, then leaves the screen. After that you only see a mask.",
++  "secrets.provider": "Provider",
++  "secrets.labelField": "Label",
++  "secrets.secret": "Key",
++  "secrets.save": "Save key",
++  "secrets.remove": "Remove",
++  "secrets.error.save": "Could not save the key. Check the value and try again.",
+   "command.placeholder": "Search commands…",
+   "command.empty": "No commands",
+   "dialog.close": "Close dialog",
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index 85c03ce..f819122 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -15,10 +15,31 @@
+   "window.maximize": "Maximizar",
+   "window.close": "Fechar",
+   "empty.title": "Nenhum projeto ainda",
+-  "empty.body": "A Wave 1 liga persistência e chaves. Por enquanto, use o tema e o idioma para validar o chrome.",
++  "empty.body": "Crie um projeto na barra lateral. Ele sobrevive ao reiniciar o app.",
+   "empty.action": "Abrir configurações",
+-  "settings.title": "Aparência",
+-  "settings.hint": "Preferências ficam neste aparelho (localStorage). A Wave 1 move isso para o banco criptografado.",
++  "settings.title": "Aparência e chaves",
++  "settings.hint": "Tema e idioma ficam no banco local. Chaves de API vão para o Credential Manager, nunca para o SQLite.",
++  "workspace.projects": "Projetos",
++  "workspace.projectPlaceholder": "Nome do projeto",
++  "workspace.newProject": "Novo projeto",
++  "workspace.conversations": "Conversas",
++  "workspace.conversationPlaceholder": "Título da conversa",
++  "workspace.newConversation": "Nova conversa",
++  "workspace.noConversations": "Nenhuma conversa neste projeto.",
++  "workspace.noMessages": "Nenhuma mensagem. Grave uma nota para testar a persistência.",
++  "workspace.notePlaceholder": "Nota (ainda sem envio a um modelo)",
++  "workspace.addNote": "Salvar nota",
++  "workspace.pickConversation": "Escolha ou crie uma conversa.",
++  "workspace.branched": "ramo",
++  "workspace.error.generic": "Não foi possível concluir a ação. Tente de novo.",
++  "secrets.title": "Chaves de provedor",
++  "secrets.hint": "A chave completa atravessa o IPC só neste save e some da tela. Depois você vê só a máscara.",
++  "secrets.provider": "Provedor",
++  "secrets.labelField": "Rótulo",
++  "secrets.secret": "Chave",
++  "secrets.save": "Guardar chave",
++  "secrets.remove": "Remover",
++  "secrets.error.save": "Não foi possível guardar a chave. Verifique o valor e tente de novo.",
+   "command.placeholder": "Buscar comando…",
+   "command.empty": "Nenhum comando",
+   "dialog.close": "Fechar diálogo",
+diff --git a/apps/desktop/tsconfig.node.json b/apps/desktop/tsconfig.node.json
+index ea712dc..f9c574b 100644
+--- a/apps/desktop/tsconfig.node.json
++++ b/apps/desktop/tsconfig.node.json
+@@ -6,13 +6,19 @@
+     "types": ["electron-vite/node", "node"],
+     "baseUrl": ".",
+     "paths": {
+-      "@ai-hub/shared": ["../../packages/shared/src/index.ts"]
++      "@ai-hub/shared": ["../../packages/shared/src/index.ts"],
++      "@ai-hub/db": ["../../packages/db/src/index.ts"],
++      "@ai-hub/security/keytar": ["../../packages/security/src/keytar-store.ts"],
++      "@ai-hub/security": ["../../packages/security/src/index.ts"]
+     }
+   },
+   "include": [
+     "electron.vite.config.ts",
+     "src/main/**/*.ts",
+     "src/preload/**/*.ts",
+-    "../../packages/shared/src/**/*.ts"
+-  ]
++    "../../packages/shared/src/**/*.ts",
++    "../../packages/db/src/**/*.ts",
++    "../../packages/security/src/**/*.ts"
++  ],
++  "exclude": ["../../packages/**/*.test.ts"]
+ }
+diff --git a/docs/ADR/ADR-W01-001-envelope-encryption-at-rest.md b/docs/ADR/ADR-W01-001-envelope-encryption-at-rest.md
+new file mode 100644
+index 0000000..882d6b2
+--- /dev/null
++++ b/docs/ADR/ADR-W01-001-envelope-encryption-at-rest.md
+@@ -0,0 +1,35 @@
++# ADR-W01-001-envelope-encryption-at-rest
++
++- **Status:** accepted
++- **Onda:** W01
++- **Data:** 2026-09-15
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++O plano exige persistência criptografada. SQLCipher no `better-sqlite3` implica build nativo customizado, frágil no Windows. FTS5 precisa de texto em claro para indexar; a Wave 6 é quem popula a busca.
++
++## Decisão
++
++Usar **envelope AES-256-GCM** (Node `crypto`) nos campos sensíveis (`name_cipher`, `title_cipher`, `content_cipher`, `instructions_cipher`, `payload_cipher`). A chave mestra (32 bytes) vive no **keytar**, nunca no SQLite. O ficheiro `.sqlite` pode ser lido, mas o conteúdo das conversas não.
++
++A tabela FTS5 `messages_fts` existe como **hook** e permanece vazia nesta onda.
++
++## Alternativas consideradas
++
++- **SQLCipher:** FTS e encriptação no ficheiro inteiro; custo de toolchain no Windows.
++- **SQLite plaintext:** viola o DoD da Wave 1.
++
++## Consequências
++
++- Repos no main desencriptam antes de montar DTOs.
++- Busca FTS real fica para W6 (talvez índice separado ou SQLCipher depois).
++- Backup do `.sqlite` sem o Credential Manager não recupera o texto.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 1)
++- `docs/reviews/W01/REVIEW.md`
++- ADR-W01-003
+diff --git a/docs/ADR/ADR-W01-002-drizzle-user-version-migrations.md b/docs/ADR/ADR-W01-002-drizzle-user-version-migrations.md
+new file mode 100644
+index 0000000..c58dcfd
+--- /dev/null
++++ b/docs/ADR/ADR-W01-002-drizzle-user-version-migrations.md
+@@ -0,0 +1,36 @@
++# ADR-W01-002-drizzle-user-version-migrations
++
++- **Status:** accepted
++- **Onda:** W01
++- **Data:** 2026-09-15
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++O plano pede Drizzle + migrations versionadas, sem `CREATE TABLE` ad hoc no fluxo da app.
++
++## Decisão
++
++- Schema Drizzle em `packages/db` alinhado ao SQL.
++- Migrations: ficheiros SQL versionados aplicados por um migrator que usa `PRAGMA user_version`.
++- Runtime: `better-sqlite3` no **main**. Native modules são dependências de `apps/desktop` e ficam externalizados no electron-vite.
++
++Não gerar pasta `meta/` do drizzle-kit nesta onda (evita snapshot ruidoso). A fonte da verdade do DDL é `packages/db/src/migrations/`.
++
++## Alternativas consideradas
++
++- **drizzle-kit generate + journal:** padrão da casa, mais ficheiros agora.
++- **CREATE TABLE no boot:** proibido pelo plano.
++
++## Consequências
++
++- Próximas ondas acrescentam `0002_*.sql` e incrementam `user_version`.
++- `better-sqlite3` é nativo: `pnpm test` recompila para o ABI do Node; `pnpm dev` recompila para o Electron (~5s). Não dá para servir os dois ABIs com um único binário hoisted.
++- Rebuild nativo (`electron-rebuild`) continua necessário no Windows antes de abrir a janela.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 1)
++- `docs/reviews/W01/REVIEW.md`
+diff --git a/docs/ADR/ADR-W01-003-keytar-and-ipc-secrets.md b/docs/ADR/ADR-W01-003-keytar-and-ipc-secrets.md
+new file mode 100644
+index 0000000..e8fc334
+--- /dev/null
++++ b/docs/ADR/ADR-W01-003-keytar-and-ipc-secrets.md
+@@ -0,0 +1,36 @@
++# ADR-W01-003-keytar-and-ipc-secrets
++
++- **Status:** accepted
++- **Onda:** W01
++- **Data:** 2026-09-15
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++API keys não podem ir para SQLite, logs ou estado React persistente. O renderer precisa de um caminho para **guardar** uma chave (vault na W5). IPC que devolve a chave completa é proibido.
++
++## Decisão
++
++- Segredos só em **keytar** (`service = ai-hub`).
++- `provider_keys` guarda metadata: label, last4, `keytar_account`, status — nunca o secret.
++- IPC `secrets:save` aceita o secret **uma vez**, grava no keytar, devolve DTO mascarado (`sk-…xxxx`). Depois disso o renderer só vê máscara.
++- IPC nunca lista secrets em claro. Logs passam por `redactSecrets`.
++- A chave mestra da DB também está no keytar (`account = db-master-key`).
++
++## Alternativas consideradas
++
++- **Prompt nativo no main sem IPC:** UX pior, sem formulário React.
++- **Não expor save até W5:** o wrapper existiria sem prova ponta-a-ponta; ainda assim o metadata e o keytar nascem agora.
++
++## Consequências
++
++- O secret atravessa o preload só no save; não fica em store Zustand.
++- W5 reutiliza o mesmo canal, não inventa outro.
++
++## Referências
++
++- `.cursorrules` §5
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 1)
++- `docs/reviews/W01/REVIEW.md`
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index 9d2275c..5d2d421 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -37,3 +37,6 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider
+ | [ADR-W00-001](./ADR-W00-001-electron-vite-monorepo.md) | W00 | Electron-vite + pnpm + Turborepo | accepted |
+ | [ADR-W00-002](./ADR-W00-002-shadcn-tailwind-i18n.md) | W00 | shadcn, Tailwind v3, i18n, tema no renderer | accepted |
+ | [ADR-W00-003](./ADR-W00-003-csp-and-window-ipc.md) | W00 | CSP, sandbox, IPC de janela com Zod | accepted |
++| [ADR-W01-001](./ADR-W01-001-envelope-encryption-at-rest.md) | W01 | Envelope AES-256-GCM em vez de SQLCipher | accepted |
++| [ADR-W01-002](./ADR-W01-002-drizzle-user-version-migrations.md) | W01 | Drizzle + migrations via `user_version` | accepted |
++| [ADR-W01-003](./ADR-W01-003-keytar-and-ipc-secrets.md) | W01 | Segredos no keytar; IPC devolve máscara | accepted |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index ab90557..8dacaec 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave
+ 
+ | Field | Value |
+ |---|---|
+-| Wave | **W01** (pending) |
++| Wave | **W01** |
+ | Marco | A — Foundation |
+-| State | `pending` |
++| State | `review` |
+ | Last completed | **W00** |
+-| Next action | Wave 1: trust boundary, DB, keytar, IPC Zod além da janela (`docs/IMPLEMENTATION_PLAN.md` § Wave 1) |
++| Next action | Gate §9: review independente → corrigir Blocker/High → persistir `docs/reviews/W01/` |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -22,17 +22,16 @@ None.
+ 
+ - W00 não revalidou a janela após locks de navegação/`openExternal`.
+ - macOS não exercitado.
+-- Tema/idioma ainda em `localStorage` até W1.
+ - Dev CSP com `unsafe-eval` para HMR (aceito em ADR-W00-003).
++- `better-sqlite3` tem um binário só: `pnpm dev` recompila para Electron; `pnpm test` no `db` restaura o ABI do Node.
+ 
+ ## Notes for the next session
+ 
+-- W00 fechada: `docs/reviews/W00/REVIEW.md`.
+-- Não implementar chat/gateway em W1. Schema nasce com hooks (branches, receipts, caps) sem features posteriores.
++- W1 em close gate. Sem chat/gateway/RAG. FTS5 existe e fica vazia.
+ 
+ ## Last review / ADR
+ 
+ | Kind | Path |
+ |---|---|
+ | Review | `docs/reviews/W00/REVIEW.md` |
+-| Latest ADR | `docs/ADR/ADR-W00-003-csp-and-window-ipc.md` |
++| Latest ADR | `docs/ADR/ADR-W01-003-keytar-and-ipc-secrets.md` |
+diff --git a/eslint.config.js b/eslint.config.js
+index a9bb2be..5564519 100644
+--- a/eslint.config.js
++++ b/eslint.config.js
+@@ -32,7 +32,11 @@ export default defineConfig(
+     },
+   },
+   {
+-    files: ["apps/desktop/src/main/**/*.ts", "apps/desktop/src/preload/**/*.ts"],
++    files: [
++      "apps/desktop/src/main/**/*.ts",
++      "apps/desktop/src/preload/**/*.ts",
++      "packages/**/*.ts",
++    ],
+     languageOptions: {
+       globals: {
+         ...globals.node,
+diff --git a/package.json b/package.json
+index 71e575b..ac5e47f 100644
+--- a/package.json
++++ b/package.json
+@@ -22,6 +22,6 @@
+     "typescript-eslint": "^8.42.0"
+   },
+   "pnpm": {
+-    "onlyBuiltDependencies": ["electron", "esbuild"]
++    "onlyBuiltDependencies": ["electron", "esbuild", "better-sqlite3", "keytar"]
+   }
+ }
+diff --git a/packages/db/package.json b/packages/db/package.json
+new file mode 100644
+index 0000000..460ea7f
+--- /dev/null
++++ b/packages/db/package.json
+@@ -0,0 +1,26 @@
++{
++  "name": "@ai-hub/db",
++  "version": "0.0.0",
++  "private": true,
++  "type": "module",
++  "exports": {
++    ".": {
++      "types": "./src/index.ts",
++      "default": "./src/index.ts"
++    }
++  },
++  "scripts": {
++    "typecheck": "tsc --noEmit -p tsconfig.json",
++    "lint": "eslint src --max-warnings 0",
++    "test": "node ../../scripts/rebuild-better-sqlite3-for-node.mjs && vitest run"
++  },
++  "dependencies": {
++    "@ai-hub/security": "workspace:*",
++    "better-sqlite3": "^12.2.0",
++    "drizzle-orm": "^0.44.5"
++  },
++  "devDependencies": {
++    "@types/better-sqlite3": "^7.6.13",
++    "vitest": "^3.2.4"
++  }
++}
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+new file mode 100644
+index 0000000..35c1b03
+--- /dev/null
++++ b/packages/db/src/index.ts
+@@ -0,0 +1,15 @@
++export { applyMigrations } from "./migrate";
++export { MIGRATIONS, MIGRATION_0001_SQL } from "./migrations";
++export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
++export {
++  HubRepos,
++  type AppearanceRecord,
++  type ConversationRecord,
++  type MessageRecord,
++  type MessageRole,
++  type MessageStatus,
++  type ProjectRecord,
++  type ProviderKeyRecord,
++  type ProviderRecord,
++} from "./repos";
++export { schema } from "./schema";
+diff --git a/packages/db/src/migrate.ts b/packages/db/src/migrate.ts
+new file mode 100644
+index 0000000..68c7c3d
+--- /dev/null
++++ b/packages/db/src/migrate.ts
+@@ -0,0 +1,14 @@
++import type Database from "better-sqlite3";
++import { MIGRATIONS } from "./migrations";
++
++export function applyMigrations(sqlite: Database.Database): void {
++  sqlite.pragma("foreign_keys = ON");
++  const current = Number(sqlite.pragma("user_version", { simple: true }));
++  for (const migration of MIGRATIONS) {
++    if (current >= migration.version) {
++      continue;
++    }
++    sqlite.exec(migration.sql);
++    sqlite.pragma(`user_version = ${migration.version}`);
++  }
++}
+diff --git a/packages/db/src/migrations.ts b/packages/db/src/migrations.ts
+new file mode 100644
+index 0000000..549663f
+--- /dev/null
++++ b/packages/db/src/migrations.ts
+@@ -0,0 +1,130 @@
++export const MIGRATION_0001_SQL = `
++PRAGMA foreign_keys = ON;
++
++CREATE TABLE projects (
++  id TEXT PRIMARY KEY,
++  name_cipher TEXT NOT NULL,
++  color TEXT,
++  instructions_cipher TEXT,
++  preferred_model TEXT,
++  created_at INTEGER NOT NULL,
++  updated_at INTEGER NOT NULL
++);
++
++CREATE TABLE conversations (
++  id TEXT PRIMARY KEY,
++  project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
++  title_cipher TEXT NOT NULL,
++  created_at INTEGER NOT NULL,
++  updated_at INTEGER NOT NULL
++);
++
++CREATE TABLE messages (
++  id TEXT PRIMARY KEY,
++  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
++  parent_id TEXT REFERENCES messages(id),
++  branch_id TEXT NOT NULL,
++  is_active_branch INTEGER NOT NULL DEFAULT 1,
++  role TEXT NOT NULL,
++  content_cipher TEXT NOT NULL,
++  status TEXT NOT NULL,
++  created_at INTEGER NOT NULL
++);
++
++CREATE INDEX messages_conversation_idx ON messages(conversation_id);
++CREATE INDEX messages_parent_idx ON messages(parent_id);
++CREATE INDEX messages_branch_idx ON messages(branch_id);
++
++CREATE TABLE message_receipts (
++  id TEXT PRIMARY KEY,
++  message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
++  provider TEXT,
++  model TEXT,
++  tokens_in INTEGER,
++  tokens_out INTEGER,
++  latency_ms INTEGER,
++  cost_usd TEXT,
++  created_at INTEGER NOT NULL
++);
++
++CREATE TABLE providers (
++  id TEXT PRIMARY KEY,
++  slug TEXT NOT NULL UNIQUE,
++  name TEXT NOT NULL
++);
++
++CREATE TABLE provider_keys (
++  id TEXT PRIMARY KEY,
++  provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
++  label TEXT NOT NULL,
++  keytar_account TEXT NOT NULL UNIQUE,
++  last4 TEXT NOT NULL,
++  status TEXT NOT NULL,
++  created_at INTEGER NOT NULL
++);
++
++CREATE TABLE settings (
++  key TEXT PRIMARY KEY,
++  value TEXT NOT NULL,
++  updated_at INTEGER NOT NULL
++);
++
++CREATE TABLE tags (
++  id TEXT PRIMARY KEY,
++  name TEXT NOT NULL UNIQUE
++);
++
++CREATE TABLE conversation_tags (
++  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
++  tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
++  PRIMARY KEY (conversation_id, tag_id)
++);
++
++CREATE TABLE spend_caps (
++  id TEXT PRIMARY KEY,
++  scope TEXT NOT NULL,
++  limit_usd TEXT NOT NULL,
++  created_at INTEGER NOT NULL
++);
++
++CREATE TABLE health_samples (
++  id TEXT PRIMARY KEY,
++  provider_slug TEXT NOT NULL,
++  ok INTEGER NOT NULL,
++  latency_ms INTEGER,
++  created_at INTEGER NOT NULL
++);
++
++CREATE TABLE import_jobs (
++  id TEXT PRIMARY KEY,
++  source TEXT NOT NULL,
++  status TEXT NOT NULL,
++  report_json TEXT,
++  created_at INTEGER NOT NULL
++);
++
++CREATE TABLE context_packets (
++  id TEXT PRIMARY KEY,
++  project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
++  payload_cipher TEXT NOT NULL,
++  token_estimate INTEGER,
++  created_at INTEGER NOT NULL
++);
++
++CREATE VIRTUAL TABLE messages_fts USING fts5(
++  message_id UNINDEXED,
++  content,
++  tokenize = 'unicode61'
++);
++
++INSERT INTO providers (id, slug, name) VALUES
++  ('11111111-1111-4111-8111-111111111111', 'openai', 'OpenAI'),
++  ('22222222-2222-4222-8222-222222222222', 'anthropic', 'Anthropic'),
++  ('33333333-3333-4333-8333-333333333333', 'google', 'Google'),
++  ('44444444-4444-4444-8444-444444444444', 'groq', 'Groq'),
++  ('55555555-5555-4555-8555-555555555555', 'openrouter', 'OpenRouter');
++`;
++
++export const MIGRATIONS: readonly { version: number; sql: string }[] = [
++  { version: 1, sql: MIGRATION_0001_SQL },
++];
+diff --git a/packages/db/src/open.ts b/packages/db/src/open.ts
+new file mode 100644
+index 0000000..d973bba
+--- /dev/null
++++ b/packages/db/src/open.ts
+@@ -0,0 +1,30 @@
++import Database from "better-sqlite3";
++import { drizzle } from "drizzle-orm/better-sqlite3";
++import type { SecretStore } from "@ai-hub/security";
++import { applyMigrations } from "./migrate";
++import { HubRepos } from "./repos";
++import { schema } from "./schema";
++
++export interface OpenHubDatabaseOptions {
++  path: string;
++  masterKey: Buffer;
++  secretStore: SecretStore;
++}
++
++export interface HubDatabase {
++  sqlite: Database.Database;
++  repos: HubRepos;
++  close: () => void;
++}
++
++export function openHubDatabase(options: OpenHubDatabaseOptions): HubDatabase {
++  const sqlite = new Database(options.path);
++  applyMigrations(sqlite);
++  const db = drizzle(sqlite, { schema });
++  const repos = new HubRepos(db, options.masterKey, options.secretStore);
++  return {
++    sqlite,
++    repos,
++    close: () => sqlite.close(),
++  };
++}
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+new file mode 100644
+index 0000000..51af0d4
+--- /dev/null
++++ b/packages/db/src/repos.test.ts
+@@ -0,0 +1,97 @@
++import { randomBytes } from "node:crypto";
++import { describe, expect, it } from "vitest";
++import { MemorySecretStore } from "@ai-hub/security";
++import { openHubDatabase } from "./open";
++
++function openTestDb() {
++  const masterKey = randomBytes(32);
++  const secrets = new MemorySecretStore();
++  return { hub: openHubDatabase({ path: ":memory:", masterKey, secretStore: secrets }), secrets };
++}
++
++function dumpAllText(sqlite: { prepare: (sql: string) => { all: () => unknown[] } }): string {
++  const tables = sqlite
++    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
++    .all() as { name: string }[];
++  const chunks: string[] = [];
++  for (const table of tables) {
++    const rows = sqlite.prepare(`SELECT * FROM "${table.name}"`).all();
++    chunks.push(JSON.stringify(rows));
++  }
++  return chunks.join("\n");
++}
++
++describe("hub database", () => {
++  it("creates project and conversation that round-trip decrypted", () => {
++    const { hub } = openTestDb();
++    const project = hub.repos.createProject("Alpha");
++    const conversation = hub.repos.createConversation(project.id, "Kickoff");
++    expect(hub.repos.listProjects().map((item) => item.name)).toEqual(["Alpha"]);
++    expect(hub.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
++    expect(conversation.projectId).toBe(project.id);
++    hub.close();
++  });
++
++  it("stores ciphertext, not plaintext names", () => {
++    const { hub } = openTestDb();
++    hub.repos.createProject("SecretProjectName");
++    const dump = dumpAllText(hub.sqlite);
++    expect(dump).not.toContain("SecretProjectName");
++    expect(dump).toContain("name_cipher");
++    hub.close();
++  });
++
++  it("accepts linear messages (null parent) and a branch (parent set)", () => {
++    const { hub } = openTestDb();
++    const project = hub.repos.createProject("Graph");
++    const conversation = hub.repos.createConversation(project.id, "Thread");
++    const root = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "user",
++      content: "hello",
++      parentId: null,
++      branchId: null,
++    });
++    const child = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "assistant",
++      content: "hi",
++      parentId: root.id,
++      branchId: null,
++    });
++    expect(root.parentId).toBeNull();
++    expect(child.parentId).toBe(root.id);
++    expect(child.branchId).toBe(root.branchId);
++    hub.close();
++  });
++
++  it("never writes API secrets into SQLite", async () => {
++    const { hub } = openTestDb();
++    const secret = "sk-testfixtureNEVERSQLITE9999";
++    const saved = await hub.repos.saveProviderKey({
++      providerSlug: "openai",
++      label: "work",
++      secret,
++    });
++    expect(saved.maskedKey).toContain("…");
++    expect(saved.maskedKey).not.toBe(secret);
++    const dump = dumpAllText(hub.sqlite);
++    expect(dump).not.toContain(secret);
++    expect(dump).toContain(saved.last4);
++    expect(dump).not.toMatch(/"secret"/i);
++    const fts = hub.sqlite
++      .prepare(`SELECT name FROM sqlite_master WHERE name = 'messages_fts'`)
++      .get() as { name: string } | undefined;
++    expect(fts?.name).toBe("messages_fts");
++    const ftsCount = hub.sqlite.prepare(`SELECT count(*) AS n FROM messages_fts`).get() as { n: number };
++    expect(ftsCount.n).toBe(0);
++    hub.close();
++  });
++
++  it("persists appearance settings as plaintext JSON", () => {
++    const { hub } = openTestDb();
++    hub.repos.setAppearance({ theme: "dark", locale: "en" });
++    expect(hub.repos.getAppearance()).toEqual({ theme: "dark", locale: "en" });
++    hub.close();
++  });
++});
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+new file mode 100644
+index 0000000..dedfeea
+--- /dev/null
++++ b/packages/db/src/repos.ts
+@@ -0,0 +1,360 @@
++import { randomUUID } from "node:crypto";
++import { eq } from "drizzle-orm";
++import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
++import {
++  decryptUtf8,
++  encryptUtf8,
++  last4OfSecret,
++  maskSecret,
++  providerKeyAccount,
++  type SecretStore,
++} from "@ai-hub/security";
++import {
++  conversations,
++  messages,
++  projects,
++  providerKeys,
++  providers,
++  settings,
++  type schema,
++} from "./schema";
++
++export type HubDrizzle = BetterSQLite3Database<typeof schema>;
++
++export interface ProjectRecord {
++  id: string;
++  name: string;
++  createdAt: string;
++  updatedAt: string;
++}
++
++export interface ConversationRecord {
++  id: string;
++  projectId: string | null;
++  title: string;
++  createdAt: string;
++  updatedAt: string;
++}
++
++export type MessageRole = "user" | "assistant" | "system";
++export type MessageStatus = "complete" | "streaming" | "interrupted" | "aborted";
++
++export interface MessageRecord {
++  id: string;
++  conversationId: string;
++  parentId: string | null;
++  branchId: string;
++  role: MessageRole;
++  content: string;
++  status: MessageStatus;
++  createdAt: string;
++}
++
++export interface ProviderRecord {
++  id: string;
++  slug: string;
++  name: string;
++}
++
++export interface ProviderKeyRecord {
++  id: string;
++  providerSlug: string;
++  label: string;
++  maskedKey: string;
++  last4: string;
++  status: "active" | "invalid";
++  createdAt: string;
++}
++
++export interface AppearanceRecord {
++  theme: "light" | "dark" | "system";
++  locale: "pt-BR" | "en";
++}
++
++const APPEARANCE_KEY = "appearance";
++
++function iso(ms: number): string {
++  return new Date(ms).toISOString();
++}
++
++function asRole(value: string): MessageRole {
++  if (value === "user" || value === "assistant" || value === "system") {
++    return value;
++  }
++  throw new Error("Unknown message role");
++}
++
++function asStatus(value: string): MessageStatus {
++  if (
++    value === "complete" ||
++    value === "streaming" ||
++    value === "interrupted" ||
++    value === "aborted"
++  ) {
++    return value;
++  }
++  throw new Error("Unknown message status");
++}
++
++export class HubRepos {
++  constructor(
++    private readonly db: HubDrizzle,
++    private readonly masterKey: Buffer,
++    private readonly secrets: SecretStore,
++  ) {}
++
++  listProjects(): ProjectRecord[] {
++    return this.db
++      .select()
++      .from(projects)
++      .all()
++      .map((row) => ({
++        id: row.id,
++        name: decryptUtf8(row.nameCipher, this.masterKey),
++        createdAt: iso(row.createdAt),
++        updatedAt: iso(row.updatedAt),
++      }))
++      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
++  }
++
++  createProject(name: string): ProjectRecord {
++    const now = Date.now();
++    const id = randomUUID();
++    this.db
++      .insert(projects)
++      .values({
++        id,
++        nameCipher: encryptUtf8(name, this.masterKey),
++        createdAt: now,
++        updatedAt: now,
++      })
++      .run();
++    return { id, name, createdAt: iso(now), updatedAt: iso(now) };
++  }
++
++  removeProject(id: string): void {
++    this.db.delete(projects).where(eq(projects.id, id)).run();
++  }
++
++  listConversations(projectId: string | null): ConversationRecord[] {
++    const rows =
++      projectId === null
++        ? this.db.select().from(conversations).all().filter((row) => row.projectId === null)
++        : this.db.select().from(conversations).where(eq(conversations.projectId, projectId)).all();
++    return rows
++      .map((row) => ({
++        id: row.id,
++        projectId: row.projectId,
++        title: decryptUtf8(row.titleCipher, this.masterKey),
++        createdAt: iso(row.createdAt),
++        updatedAt: iso(row.updatedAt),
++      }))
++      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
++  }
++
++  createConversation(projectId: string | null, title: string): ConversationRecord {
++    const now = Date.now();
++    const id = randomUUID();
++    this.db
++      .insert(conversations)
++      .values({
++        id,
++        projectId,
++        titleCipher: encryptUtf8(title, this.masterKey),
++        createdAt: now,
++        updatedAt: now,
++      })
++      .run();
++    return { id, projectId, title, createdAt: iso(now), updatedAt: iso(now) };
++  }
++
++  removeConversation(id: string): void {
++    this.db.delete(conversations).where(eq(conversations.id, id)).run();
++  }
++
++  listMessages(conversationId: string): MessageRecord[] {
++    return this.db
++      .select()
++      .from(messages)
++      .where(eq(messages.conversationId, conversationId))
++      .all()
++      .map((row) => ({
++        id: row.id,
++        conversationId: row.conversationId,
++        parentId: row.parentId,
++        branchId: row.branchId,
++        role: asRole(row.role),
++        content: decryptUtf8(row.contentCipher, this.masterKey),
++        status: asStatus(row.status),
++        createdAt: iso(row.createdAt),
++      }))
++      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
++  }
++
++  createMessage(input: {
++    conversationId: string;
++    role: MessageRole;
++    content: string;
++    parentId: string | null;
++    branchId: string | null;
++  }): MessageRecord {
++    const conversation = this.db
++      .select()
++      .from(conversations)
++      .where(eq(conversations.id, input.conversationId))
++      .get();
++    if (!conversation) {
++      throw new Error("Conversation not found");
++    }
++
++    let branchId = input.branchId;
++    if (input.parentId) {
++      const parent = this.db.select().from(messages).where(eq(messages.id, input.parentId)).get();
++      if (!parent || parent.conversationId !== input.conversationId) {
++        throw new Error("Parent message not found");
++      }
++      branchId = branchId ?? parent.branchId;
++    }
++    branchId = branchId ?? randomUUID();
++
++    const now = Date.now();
++    const id = randomUUID();
++    this.db
++      .insert(messages)
++      .values({
++        id,
++        conversationId: input.conversationId,
++        parentId: input.parentId,
++        branchId,
++        isActiveBranch: 1,
++        role: input.role,
++        contentCipher: encryptUtf8(input.content, this.masterKey),
++        status: "complete",
++        createdAt: now,
++      })
++      .run();
++    this.db
++      .update(conversations)
++      .set({ updatedAt: now })
++      .where(eq(conversations.id, input.conversationId))
++      .run();
++
++    return {
++      id,
++      conversationId: input.conversationId,
++      parentId: input.parentId,
++      branchId,
++      role: input.role,
++      content: input.content,
++      status: "complete",
++      createdAt: iso(now),
++    };
++  }
++
++  listProviders(): ProviderRecord[] {
++    return this.db.select().from(providers).all();
++  }
++
++  getAppearance(): AppearanceRecord {
++    const row = this.db.select().from(settings).where(eq(settings.key, APPEARANCE_KEY)).get();
++    if (!row) {
++      return { theme: "system", locale: "pt-BR" };
++    }
++    const parsed: unknown = JSON.parse(row.value);
++    if (
++      typeof parsed === "object" &&
++      parsed !== null &&
++      "theme" in parsed &&
++      "locale" in parsed &&
++      (parsed.theme === "light" || parsed.theme === "dark" || parsed.theme === "system") &&
++      (parsed.locale === "pt-BR" || parsed.locale === "en")
++    ) {
++      return { theme: parsed.theme, locale: parsed.locale };
++    }
++    return { theme: "system", locale: "pt-BR" };
++  }
++
++  setAppearance(appearance: AppearanceRecord): void {
++    const now = Date.now();
++    this.db
++      .insert(settings)
++      .values({
++        key: APPEARANCE_KEY,
++        value: JSON.stringify(appearance),
++        updatedAt: now,
++      })
++      .onConflictDoUpdate({
++        target: settings.key,
++        set: { value: JSON.stringify(appearance), updatedAt: now },
++      })
++      .run();
++  }
++
++  async listProviderKeys(): Promise<ProviderKeyRecord[]> {
++    const rows = this.db.select().from(providerKeys).all();
++    const catalog = this.listProviders();
++    return rows.map((row) => {
++      const provider = catalog.find((item) => item.id === row.providerId);
++      const prefix = row.last4.length > 0 ? `sk-…${row.last4}` : "sk-…";
++      return {
++        id: row.id,
++        providerSlug: provider?.slug ?? "unknown",
++        label: row.label,
++        maskedKey: prefix,
++        last4: row.last4,
++        status: row.status === "invalid" ? "invalid" : "active",
++        createdAt: iso(row.createdAt),
++      };
++    });
++  }
++
++  async saveProviderKey(input: {
++    providerSlug: string;
++    label: string;
++    secret: string;
++  }): Promise<ProviderKeyRecord> {
++    const provider = this.db
++      .select()
++      .from(providers)
++      .where(eq(providers.slug, input.providerSlug))
++      .get();
++    if (!provider) {
++      throw new Error("Unknown provider");
++    }
++    const id = randomUUID();
++    const account = providerKeyAccount(id);
++    const last4 = last4OfSecret(input.secret);
++    await this.secrets.setPassword(account, input.secret);
++    const now = Date.now();
++    this.db
++      .insert(providerKeys)
++      .values({
++        id,
++        providerId: provider.id,
++        label: input.label,
++        keytarAccount: account,
++        last4,
++        status: "active",
++        createdAt: now,
++      })
++      .run();
++    return {
++      id,
++      providerSlug: provider.slug,
++      label: input.label,
++      maskedKey: maskSecret(input.secret),
++      last4,
++      status: "active",
++      createdAt: iso(now),
++    };
++  }
++
++  async removeProviderKey(id: string): Promise<void> {
++    const row = this.db.select().from(providerKeys).where(eq(providerKeys.id, id)).get();
++    if (!row) {
++      return;
++    }
++    await this.secrets.deletePassword(row.keytarAccount);
++    this.db.delete(providerKeys).where(eq(providerKeys.id, id)).run();
++  }
++}
+diff --git a/packages/db/src/schema.ts b/packages/db/src/schema.ts
+new file mode 100644
+index 0000000..260e90d
+--- /dev/null
++++ b/packages/db/src/schema.ts
+@@ -0,0 +1,134 @@
++import { integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
++
++export const projects = sqliteTable("projects", {
++  id: text("id").primaryKey(),
++  nameCipher: text("name_cipher").notNull(),
++  color: text("color"),
++  instructionsCipher: text("instructions_cipher"),
++  preferredModel: text("preferred_model"),
++  createdAt: integer("created_at", { mode: "number" }).notNull(),
++  updatedAt: integer("updated_at", { mode: "number" }).notNull(),
++});
++
++export const conversations = sqliteTable("conversations", {
++  id: text("id").primaryKey(),
++  projectId: text("project_id"),
++  titleCipher: text("title_cipher").notNull(),
++  createdAt: integer("created_at", { mode: "number" }).notNull(),
++  updatedAt: integer("updated_at", { mode: "number" }).notNull(),
++});
++
++export const messages = sqliteTable("messages", {
++  id: text("id").primaryKey(),
++  conversationId: text("conversation_id").notNull(),
++  parentId: text("parent_id"),
++  branchId: text("branch_id").notNull(),
++  isActiveBranch: integer("is_active_branch", { mode: "number" }).notNull(),
++  role: text("role").notNull(),
++  contentCipher: text("content_cipher").notNull(),
++  status: text("status").notNull(),
++  createdAt: integer("created_at", { mode: "number" }).notNull(),
++});
++
++export const messageReceipts = sqliteTable("message_receipts", {
++  id: text("id").primaryKey(),
++  messageId: text("message_id").notNull(),
++  provider: text("provider"),
++  model: text("model"),
++  tokensIn: integer("tokens_in", { mode: "number" }),
++  tokensOut: integer("tokens_out", { mode: "number" }),
++  latencyMs: integer("latency_ms", { mode: "number" }),
++  costUsd: text("cost_usd"),
++  createdAt: integer("created_at", { mode: "number" }).notNull(),
++});
++
++export const providers = sqliteTable(
++  "providers",
++  {
++    id: text("id").primaryKey(),
++    slug: text("slug").notNull(),
++    name: text("name").notNull(),
++  },
++  (table) => [uniqueIndex("providers_slug_idx").on(table.slug)],
++);
++
++export const providerKeys = sqliteTable(
++  "provider_keys",
++  {
++    id: text("id").primaryKey(),
++    providerId: text("provider_id").notNull(),
++    label: text("label").notNull(),
++    keytarAccount: text("keytar_account").notNull(),
++    last4: text("last4").notNull(),
++    status: text("status").notNull(),
++    createdAt: integer("created_at", { mode: "number" }).notNull(),
++  },
++  (table) => [uniqueIndex("provider_keys_account_idx").on(table.keytarAccount)],
++);
++
++export const settings = sqliteTable("settings", {
++  key: text("key").primaryKey(),
++  value: text("value").notNull(),
++  updatedAt: integer("updated_at", { mode: "number" }).notNull(),
++});
++
++export const tags = sqliteTable(
++  "tags",
++  {
++    id: text("id").primaryKey(),
++    name: text("name").notNull(),
++  },
++  (table) => [uniqueIndex("tags_name_idx").on(table.name)],
++);
++
++export const conversationTags = sqliteTable("conversation_tags", {
++  conversationId: text("conversation_id").notNull(),
++  tagId: text("tag_id").notNull(),
++});
++
++export const spendCaps = sqliteTable("spend_caps", {
++  id: text("id").primaryKey(),
++  scope: text("scope").notNull(),
++  limitUsd: text("limit_usd").notNull(),
++  createdAt: integer("created_at", { mode: "number" }).notNull(),
++});
++
++export const healthSamples = sqliteTable("health_samples", {
++  id: text("id").primaryKey(),
++  providerSlug: text("provider_slug").notNull(),
++  ok: integer("ok", { mode: "number" }).notNull(),
++  latencyMs: integer("latency_ms", { mode: "number" }),
++  createdAt: integer("created_at", { mode: "number" }).notNull(),
++});
++
++export const importJobs = sqliteTable("import_jobs", {
++  id: text("id").primaryKey(),
++  source: text("source").notNull(),
++  status: text("status").notNull(),
++  reportJson: text("report_json"),
++  createdAt: integer("created_at", { mode: "number" }).notNull(),
++});
++
++export const contextPackets = sqliteTable("context_packets", {
++  id: text("id").primaryKey(),
++  projectId: text("project_id"),
++  payloadCipher: text("payload_cipher").notNull(),
++  tokenEstimate: integer("token_estimate", { mode: "number" }),
++  createdAt: integer("created_at", { mode: "number" }).notNull(),
++});
++
++export const schema = {
++  projects,
++  conversations,
++  messages,
++  messageReceipts,
++  providers,
++  providerKeys,
++  settings,
++  tags,
++  conversationTags,
++  spendCaps,
++  healthSamples,
++  importJobs,
++  contextPackets,
++};
+diff --git a/packages/db/tsconfig.json b/packages/db/tsconfig.json
+new file mode 100644
+index 0000000..60e3669
+--- /dev/null
++++ b/packages/db/tsconfig.json
+@@ -0,0 +1,9 @@
++{
++  "extends": "../../tsconfig.base.json",
++  "compilerOptions": {
++    "noEmit": true,
++    "types": ["node"]
++  },
++  "include": ["src"],
++  "exclude": ["src/**/*.test.ts"]
++}
+diff --git a/packages/db/vitest.config.ts b/packages/db/vitest.config.ts
+new file mode 100644
+index 0000000..c1433e6
+--- /dev/null
++++ b/packages/db/vitest.config.ts
+@@ -0,0 +1,8 @@
++import { defineConfig } from "vitest/config";
++
++export default defineConfig({
++  test: {
++    environment: "node",
++    include: ["src/**/*.test.ts"],
++  },
++});
+diff --git a/packages/security/package.json b/packages/security/package.json
+new file mode 100644
+index 0000000..7a83dfc
+--- /dev/null
++++ b/packages/security/package.json
+@@ -0,0 +1,27 @@
++{
++  "name": "@ai-hub/security",
++  "version": "0.0.0",
++  "private": true,
++  "type": "module",
++  "exports": {
++    ".": {
++      "types": "./src/index.ts",
++      "default": "./src/index.ts"
++    },
++    "./keytar": {
++      "types": "./src/keytar-store.ts",
++      "default": "./src/keytar-store.ts"
++    }
++  },
++  "scripts": {
++    "typecheck": "tsc --noEmit -p tsconfig.json",
++    "lint": "eslint src --max-warnings 0",
++    "test": "vitest run"
++  },
++  "dependencies": {
++    "keytar": "^7.9.0"
++  },
++  "devDependencies": {
++    "vitest": "^3.2.4"
++  }
++}
+diff --git a/packages/security/src/envelope.test.ts b/packages/security/src/envelope.test.ts
+new file mode 100644
+index 0000000..cc4e0cc
+--- /dev/null
++++ b/packages/security/src/envelope.test.ts
+@@ -0,0 +1,23 @@
++import { randomBytes } from "node:crypto";
++import { describe, expect, it } from "vitest";
++import { decryptUtf8, encryptUtf8, EnvelopeError } from "./envelope";
++
++describe("envelope AES-256-GCM", () => {
++  it("round-trips unicode text", () => {
++    const key = randomBytes(32);
++    const plain = "projeto: こんにちは — secret draft";
++    const cipher = encryptUtf8(plain, key);
++    expect(cipher.startsWith("v1.")).toBe(true);
++    expect(cipher).not.toContain(plain);
++    expect(decryptUtf8(cipher, key)).toBe(plain);
++  });
++
++  it("fails closed on the wrong key", () => {
++    const cipher = encryptUtf8("hello", randomBytes(32));
++    expect(() => decryptUtf8(cipher, randomBytes(32))).toThrow(EnvelopeError);
++  });
++
++  it("rejects truncated payloads", () => {
++    expect(() => decryptUtf8("v1.abc", randomBytes(32))).toThrow(EnvelopeError);
++  });
++});
+diff --git a/packages/security/src/envelope.ts b/packages/security/src/envelope.ts
+new file mode 100644
+index 0000000..10a9c02
+--- /dev/null
++++ b/packages/security/src/envelope.ts
+@@ -0,0 +1,54 @@
++import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
++
++const VERSION = "v1";
++const KEY_BYTES = 32;
++const IV_BYTES = 12;
++
++export class EnvelopeError extends Error {
++  constructor(message = "Unable to decrypt stored data") {
++    super(message);
++    this.name = "EnvelopeError";
++  }
++}
++
++export function assertMasterKey(key: Buffer): void {
++  if (key.length !== KEY_BYTES) {
++    throw new EnvelopeError("Master key must be 32 bytes");
++  }
++}
++
++export function encryptUtf8(plain: string, key: Buffer): string {
++  assertMasterKey(key);
++  const iv = randomBytes(IV_BYTES);
++  const cipher = createCipheriv("aes-256-gcm", key, iv);
++  const ciphertext = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
++  const tag = cipher.getAuthTag();
++  return [
++    VERSION,
++    iv.toString("base64url"),
++    tag.toString("base64url"),
++    ciphertext.toString("base64url"),
++  ].join(".");
++}
++
++export function decryptUtf8(payload: string, key: Buffer): string {
++  assertMasterKey(key);
++  const parts = payload.split(".");
++  const version = parts[0];
++  const ivB64 = parts[1];
++  const tagB64 = parts[2];
++  const dataB64 = parts[3];
++  if (parts.length !== 4 || version !== VERSION || !ivB64 || !tagB64 || !dataB64) {
++    throw new EnvelopeError();
++  }
++  try {
++    const iv = Buffer.from(ivB64, "base64url");
++    const tag = Buffer.from(tagB64, "base64url");
++    const data = Buffer.from(dataB64, "base64url");
++    const decipher = createDecipheriv("aes-256-gcm", key, iv);
++    decipher.setAuthTag(tag);
++    return Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
++  } catch {
++    throw new EnvelopeError();
++  }
++}
+diff --git a/packages/security/src/index.ts b/packages/security/src/index.ts
+new file mode 100644
+index 0000000..73b3be2
+--- /dev/null
++++ b/packages/security/src/index.ts
+@@ -0,0 +1,15 @@
++export { decryptUtf8, encryptUtf8, EnvelopeError } from "./envelope";
++export {
++  last4OfSecret,
++  maskSecret,
++  redactSecrets,
++  safeErrorMessage,
++} from "./redact";
++export {
++  DB_MASTER_KEY_ACCOUNT,
++  KEYTAR_SERVICE,
++  MemorySecretStore,
++  loadOrCreateMasterKey,
++  providerKeyAccount,
++  type SecretStore,
++} from "./secret-store";
+diff --git a/packages/security/src/keytar-store.ts b/packages/security/src/keytar-store.ts
+new file mode 100644
+index 0000000..1595824
+--- /dev/null
++++ b/packages/security/src/keytar-store.ts
+@@ -0,0 +1,18 @@
++import keytar from "keytar";
++import { KEYTAR_SERVICE, type SecretStore } from "./secret-store";
++
++export class KeytarSecretStore implements SecretStore {
++  constructor(private readonly service: string = KEYTAR_SERVICE) {}
++
++  async getPassword(account: string): Promise<string | null> {
++    return keytar.getPassword(this.service, account);
++  }
++
++  async setPassword(account: string, password: string): Promise<void> {
++    await keytar.setPassword(this.service, account, password);
++  }
++
++  async deletePassword(account: string): Promise<boolean> {
++    return keytar.deletePassword(this.service, account);
++  }
++}
+diff --git a/packages/security/src/redact.test.ts b/packages/security/src/redact.test.ts
+new file mode 100644
+index 0000000..d96be7f
+--- /dev/null
++++ b/packages/security/src/redact.test.ts
+@@ -0,0 +1,27 @@
++import { describe, expect, it } from "vitest";
++import { last4OfSecret, maskSecret, redactSecrets, safeErrorMessage } from "./redact";
++
++describe("redactSecrets", () => {
++  it("strips OpenAI-shaped keys and Bearer tokens", () => {
++    const input = "Authorization: Bearer abc.def.ghi sk-testfixtureABCDEFGH1234 leftover";
++    const redacted = redactSecrets(input);
++    expect(redacted).not.toContain("sk-testfixture");
++    expect(redacted).not.toContain("Bearer abc");
++    expect(redacted).toContain("[REDACTED]");
++  });
++});
++
++describe("maskSecret", () => {
++  it("masks with last four characters", () => {
++    expect(maskSecret("sk-abcdefghijklmnopqrstuv")).toBe("sk-…stuv");
++    expect(last4OfSecret("sk-abcdefghijklmnopqrstuv")).toBe("stuv");
++  });
++});
++
++describe("safeErrorMessage", () => {
++  it("redacts secrets inside Error messages", () => {
++    const message = safeErrorMessage(new Error("bad key sk-livefixtureXXXX9999"));
++    expect(message).not.toContain("sk-livefixture");
++    expect(message).toContain("[REDACTED]");
++  });
++});
+diff --git a/packages/security/src/redact.ts b/packages/security/src/redact.ts
+new file mode 100644
+index 0000000..08c667b
+--- /dev/null
++++ b/packages/security/src/redact.ts
+@@ -0,0 +1,32 @@
++const SECRET_PATTERNS: readonly RegExp[] = [
++  /sk-[A-Za-z0-9_-]{8,}/g,
++  /Bearer\s+[A-Za-z0-9._\-+=/]+/gi,
++  /(?:api[_-]?key|access[_-]?token|secret)[=:\s]+['"]?[^\s'"]+/gi,
++];
++
++export function redactSecrets(text: string): string {
++  let output = text;
++  for (const pattern of SECRET_PATTERNS) {
++    output = output.replace(pattern, "[REDACTED]");
++  }
++  return output;
++}
++
++export function maskSecret(secret: string): string {
++  const last = secret.length >= 4 ? secret.slice(-4) : secret;
++  if (secret.startsWith("sk-")) {
++    return `sk-…${last}`;
++  }
++  return `…${last}`;
++}
++
++export function last4OfSecret(secret: string): string {
++  return secret.length >= 4 ? secret.slice(-4) : secret;
++}
++
++export function safeErrorMessage(error: unknown): string {
++  if (error instanceof Error) {
++    return redactSecrets(error.message);
++  }
++  return redactSecrets(String(error));
++}
+diff --git a/packages/security/src/secret-store.test.ts b/packages/security/src/secret-store.test.ts
+new file mode 100644
+index 0000000..2979ec1
+--- /dev/null
++++ b/packages/security/src/secret-store.test.ts
+@@ -0,0 +1,16 @@
++import { describe, expect, it } from "vitest";
++import { MemorySecretStore, loadOrCreateMasterKey, providerKeyAccount } from "./secret-store";
++
++describe("MemorySecretStore", () => {
++  it("creates a 32-byte master key once", async () => {
++    const store = new MemorySecretStore();
++    const first = await loadOrCreateMasterKey(store);
++    const second = await loadOrCreateMasterKey(store);
++    expect(first.length).toBe(32);
++    expect(Buffer.compare(first, second)).toBe(0);
++  });
++
++  it("namespaces provider key accounts", () => {
++    expect(providerKeyAccount("abc")).toBe("provider-key:abc");
++  });
++});
+diff --git a/packages/security/src/secret-store.ts b/packages/security/src/secret-store.ts
+new file mode 100644
+index 0000000..aa6f7e9
+--- /dev/null
++++ b/packages/security/src/secret-store.ts
+@@ -0,0 +1,44 @@
++import { randomBytes } from "node:crypto";
++
++export const KEYTAR_SERVICE = "ai-hub";
++export const DB_MASTER_KEY_ACCOUNT = "db-master-key";
++
++export interface SecretStore {
++  getPassword(account: string): Promise<string | null>;
++  setPassword(account: string, password: string): Promise<void>;
++  deletePassword(account: string): Promise<boolean>;
++}
++
++export class MemorySecretStore implements SecretStore {
++  private readonly values = new Map<string, string>();
++
++  async getPassword(account: string): Promise<string | null> {
++    return this.values.get(account) ?? null;
++  }
++
++  async setPassword(account: string, password: string): Promise<void> {
++    this.values.set(account, password);
++  }
++
++  async deletePassword(account: string): Promise<boolean> {
++    return this.values.delete(account);
++  }
++}
++
++export async function loadOrCreateMasterKey(store: SecretStore): Promise<Buffer> {
++  const existing = await store.getPassword(DB_MASTER_KEY_ACCOUNT);
++  if (existing) {
++    const key = Buffer.from(existing, "base64");
++    if (key.length !== 32) {
++      throw new Error("Stored master key is not 32 bytes");
++    }
++    return key;
++  }
++  const key = randomBytes(32);
++  await store.setPassword(DB_MASTER_KEY_ACCOUNT, key.toString("base64"));
++  return key;
++}
++
++export function providerKeyAccount(keyId: string): string {
++  return `provider-key:${keyId}`;
++}
+diff --git a/packages/security/tsconfig.json b/packages/security/tsconfig.json
+new file mode 100644
+index 0000000..60e3669
+--- /dev/null
++++ b/packages/security/tsconfig.json
+@@ -0,0 +1,9 @@
++{
++  "extends": "../../tsconfig.base.json",
++  "compilerOptions": {
++    "noEmit": true,
++    "types": ["node"]
++  },
++  "include": ["src"],
++  "exclude": ["src/**/*.test.ts"]
++}
+diff --git a/packages/security/vitest.config.ts b/packages/security/vitest.config.ts
+new file mode 100644
+index 0000000..c1433e6
+--- /dev/null
++++ b/packages/security/vitest.config.ts
+@@ -0,0 +1,8 @@
++import { defineConfig } from "vitest/config";
++
++export default defineConfig({
++  test: {
++    environment: "node",
++    include: ["src/**/*.test.ts"],
++  },
++});
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index a7dbfd4..b38dc1a 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -1,4 +1,19 @@
+ import type { AppLocale, ThemeMode } from "./appearance";
++import type {
++  AppearanceSettings,
++  ConversationCreateInput,
++  ConversationDto,
++  ConversationListInput,
++  IdInput,
++  MessageCreateInput,
++  MessageDto,
++  MessageListInput,
++  ProjectCreateInput,
++  ProjectDto,
++  ProviderDto,
++  ProviderKeyDto,
++  SecretsSaveInput,
++} from "./ipc-schemas";
+ 
+ export interface HubWindowApi {
+   minimize: () => Promise<void>;
+@@ -7,9 +22,47 @@ export interface HubWindowApi {
+   isMaximized: () => Promise<boolean>;
+ }
+ 
++export interface HubProjectsApi {
++  list: () => Promise<ProjectDto[]>;
++  create: (input: ProjectCreateInput) => Promise<ProjectDto>;
++  remove: (input: IdInput) => Promise<void>;
++}
++
++export interface HubConversationsApi {
++  list: (input: ConversationListInput) => Promise<ConversationDto[]>;
++  create: (input: ConversationCreateInput) => Promise<ConversationDto>;
++  remove: (input: IdInput) => Promise<void>;
++}
++
++export interface HubMessagesApi {
++  list: (input: MessageListInput) => Promise<MessageDto[]>;
++  create: (input: MessageCreateInput) => Promise<MessageDto>;
++}
++
++export interface HubSettingsApi {
++  getAppearance: () => Promise<AppearanceSettings>;
++  setAppearance: (input: AppearanceSettings) => Promise<void>;
++}
++
++export interface HubProvidersApi {
++  list: () => Promise<ProviderDto[]>;
++}
++
++export interface HubSecretsApi {
++  list: () => Promise<ProviderKeyDto[]>;
++  save: (input: SecretsSaveInput) => Promise<ProviderKeyDto>;
++  remove: (input: IdInput) => Promise<void>;
++}
++
+ export interface HubApi {
+   platform: "win32" | "darwin" | "linux";
+   window: HubWindowApi;
++  projects: HubProjectsApi;
++  conversations: HubConversationsApi;
++  messages: HubMessagesApi;
++  settings: HubSettingsApi;
++  providers: HubProvidersApi;
++  secrets: HubSecretsApi;
+ }
+ 
+ export type { AppLocale, ThemeMode };
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 7b74b85..a4e07cc 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -1,9 +1,53 @@
+ export { type AppLocale, type ThemeMode, localeSchema, themeModeSchema } from "./appearance";
+-export { type HubApi, type HubWindowApi } from "./hub-api";
++export {
++  type HubApi,
++  type HubConversationsApi,
++  type HubMessagesApi,
++  type HubProjectsApi,
++  type HubProvidersApi,
++  type HubSecretsApi,
++  type HubSettingsApi,
++  type HubWindowApi,
++} from "./hub-api";
+ export { IpcChannel, type IpcChannelName } from "./ipc-channels";
+ export {
++  appearanceSettingsSchema,
++  conversationCreateInputSchema,
++  conversationDtoSchema,
++  conversationListInputSchema,
++  conversationListResultSchema,
+   emptyIpcPayloadSchema,
+-  type EmptyIpcPayload,
+-  windowIsMaximizedResultSchema,
++  idInputSchema,
+   ipcAckResultSchema,
++  messageCreateInputSchema,
++  messageDtoSchema,
++  messageListInputSchema,
++  messageListResultSchema,
++  messageRoleSchema,
++  messageStatusSchema,
++  projectCreateInputSchema,
++  projectDtoSchema,
++  projectListResultSchema,
++  providerDtoSchema,
++  providerKeyDtoSchema,
++  providerKeyListResultSchema,
++  providerListResultSchema,
++  secretsSaveInputSchema,
++  windowIsMaximizedResultSchema,
++  type AppearanceSettings,
++  type ConversationCreateInput,
++  type ConversationDto,
++  type ConversationListInput,
++  type EmptyIpcPayload,
++  type IdInput,
++  type MessageCreateInput,
++  type MessageDto,
++  type MessageListInput,
++  type MessageRole,
++  type MessageStatus,
++  type ProjectCreateInput,
++  type ProjectDto,
++  type ProviderDto,
++  type ProviderKeyDto,
++  type SecretsSaveInput,
+ } from "./ipc-schemas";
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index 254420d..fad166b 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -3,6 +3,20 @@ export const IpcChannel = {
+   windowMaximize: "window:maximize",
+   windowClose: "window:close",
+   windowIsMaximized: "window:isMaximized",
++  projectsList: "projects:list",
++  projectsCreate: "projects:create",
++  projectsRemove: "projects:remove",
++  conversationsList: "conversations:list",
++  conversationsCreate: "conversations:create",
++  conversationsRemove: "conversations:remove",
++  messagesList: "messages:list",
++  messagesCreate: "messages:create",
++  settingsGetAppearance: "settings:getAppearance",
++  settingsSetAppearance: "settings:setAppearance",
++  providersList: "providers:list",
++  secretsList: "secrets:list",
++  secretsSave: "secrets:save",
++  secretsRemove: "secrets:remove",
+ } as const;
+ 
+ export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index 1896572..4276e2f 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
+ import {
+   emptyIpcPayloadSchema,
+   ipcAckResultSchema,
++  messageCreateInputSchema,
++  secretsSaveInputSchema,
+   windowIsMaximizedResultSchema,
+ } from "./ipc-schemas";
+ 
+@@ -29,3 +31,29 @@ describe("ipcAckResultSchema", () => {
+     expect(ipcAckResultSchema.parse(null)).toBeNull();
+   });
+ });
++
++describe("messageCreateInputSchema", () => {
++  it("allows a null parent for a linear thread", () => {
++    const parsed = messageCreateInputSchema.parse({
++      conversationId: "11111111-1111-4111-8111-111111111111",
++      role: "user",
++      content: "hello",
++      parentId: null,
++      branchId: null,
++    });
++    expect(parsed.parentId).toBeNull();
++  });
++});
++
++describe("secretsSaveInputSchema", () => {
++  it("rejects extra keys so secrets cannot piggyback on unknown fields", () => {
++    expect(() =>
++      secretsSaveInputSchema.parse({
++        providerSlug: "openai",
++        label: "work",
++        secret: "sk-testfixtureABCDEFGH",
++        extra: true,
++      }),
++    ).toThrow();
++  });
++});
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index 59a86fc..e996957 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -1,4 +1,5 @@
+ import { z } from "zod";
++import { localeSchema, themeModeSchema } from "./appearance";
+ 
+ export const emptyIpcPayloadSchema = z.object({}).strict();
+ 
+@@ -7,3 +8,143 @@ export type EmptyIpcPayload = z.infer<typeof emptyIpcPayloadSchema>;
+ export const windowIsMaximizedResultSchema = z.boolean();
+ 
+ export const ipcAckResultSchema = z.union([z.void(), z.undefined(), z.null()]);
++
++export const isoTimestampSchema = z.string().min(1);
++
++export const projectDtoSchema = z.object({
++  id: z.string().uuid(),
++  name: z.string(),
++  createdAt: isoTimestampSchema,
++  updatedAt: isoTimestampSchema,
++});
++
++export type ProjectDto = z.infer<typeof projectDtoSchema>;
++
++export const projectListResultSchema = z.array(projectDtoSchema);
++
++export const projectCreateInputSchema = z
++  .object({
++    name: z.string().trim().min(1).max(200),
++  })
++  .strict();
++
++export type ProjectCreateInput = z.infer<typeof projectCreateInputSchema>;
++
++export const idInputSchema = z.object({ id: z.string().uuid() }).strict();
++
++export type IdInput = z.infer<typeof idInputSchema>;
++
++export const conversationDtoSchema = z.object({
++  id: z.string().uuid(),
++  projectId: z.string().uuid().nullable(),
++  title: z.string(),
++  createdAt: isoTimestampSchema,
++  updatedAt: isoTimestampSchema,
++});
++
++export type ConversationDto = z.infer<typeof conversationDtoSchema>;
++
++export const conversationListResultSchema = z.array(conversationDtoSchema);
++
++export const conversationListInputSchema = z
++  .object({
++    projectId: z.string().uuid().nullable(),
++  })
++  .strict();
++
++export type ConversationListInput = z.infer<typeof conversationListInputSchema>;
++
++export const conversationCreateInputSchema = z
++  .object({
++    projectId: z.string().uuid().nullable(),
++    title: z.string().trim().min(1).max(200),
++  })
++  .strict();
++
++export type ConversationCreateInput = z.infer<typeof conversationCreateInputSchema>;
++
++export const messageRoleSchema = z.enum(["user", "assistant", "system"]);
++
++export type MessageRole = z.infer<typeof messageRoleSchema>;
++
++export const messageStatusSchema = z.enum(["complete", "streaming", "interrupted", "aborted"]);
++
++export type MessageStatus = z.infer<typeof messageStatusSchema>;
++
++export const messageDtoSchema = z.object({
++  id: z.string().uuid(),
++  conversationId: z.string().uuid(),
++  parentId: z.string().uuid().nullable(),
++  branchId: z.string().uuid(),
++  role: messageRoleSchema,
++  content: z.string(),
++  status: messageStatusSchema,
++  createdAt: isoTimestampSchema,
++});
++
++export type MessageDto = z.infer<typeof messageDtoSchema>;
++
++export const messageListResultSchema = z.array(messageDtoSchema);
++
++export const messageListInputSchema = z
++  .object({
++    conversationId: z.string().uuid(),
++  })
++  .strict();
++
++export type MessageListInput = z.infer<typeof messageListInputSchema>;
++
++export const messageCreateInputSchema = z
++  .object({
++    conversationId: z.string().uuid(),
++    role: messageRoleSchema,
++    content: z.string().min(1).max(100_000),
++    parentId: z.string().uuid().nullable(),
++    branchId: z.string().uuid().nullable(),
++  })
++  .strict();
++
++export type MessageCreateInput = z.infer<typeof messageCreateInputSchema>;
++
++export const appearanceSettingsSchema = z
++  .object({
++    theme: z.enum(themeModeSchema),
++    locale: z.enum(localeSchema),
++  })
++  .strict();
++
++export type AppearanceSettings = z.infer<typeof appearanceSettingsSchema>;
++
++export const providerDtoSchema = z.object({
++  id: z.string().uuid(),
++  slug: z.string(),
++  name: z.string(),
++});
++
++export type ProviderDto = z.infer<typeof providerDtoSchema>;
++
++export const providerListResultSchema = z.array(providerDtoSchema);
++
++export const providerKeyDtoSchema = z.object({
++  id: z.string().uuid(),
++  providerSlug: z.string(),
++  label: z.string(),
++  maskedKey: z.string(),
++  last4: z.string(),
++  status: z.enum(["active", "invalid"]),
++  createdAt: isoTimestampSchema,
++});
++
++export type ProviderKeyDto = z.infer<typeof providerKeyDtoSchema>;
++
++export const providerKeyListResultSchema = z.array(providerKeyDtoSchema);
++
++export const secretsSaveInputSchema = z
++  .object({
++    providerSlug: z.string().min(1).max(64),
++    label: z.string().trim().min(1).max(80),
++    secret: z.string().min(8).max(4096),
++  })
++  .strict();
++
++export type SecretsSaveInput = z.infer<typeof secretsSaveInputSchema>;
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index f2854fa..7ee6e13 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -35,6 +35,12 @@ importers:
+ 
+   apps/desktop:
+     dependencies:
++      '@ai-hub/db':
++        specifier: workspace:*
++        version: link:../../packages/db
++      '@ai-hub/security':
++        specifier: workspace:*
++        version: link:../../packages/security
+       '@ai-hub/shared':
+         specifier: workspace:*
+         version: link:../../packages/shared
+@@ -53,6 +59,9 @@ importers:
+       '@radix-ui/react-tooltip':
+         specifier: ^1.2.8
+         version: 1.2.16(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
++      better-sqlite3:
++        specifier: ^12.2.0
++        version: 12.11.1
+       class-variance-authority:
+         specifier: ^0.7.1
+         version: 0.7.1
+@@ -62,9 +71,15 @@ importers:
+       cmdk:
+         specifier: ^1.1.1
+         version: 1.1.1(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
++      drizzle-orm:
++        specifier: ^0.44.5
++        version: 0.44.7(@types/better-sqlite3@7.6.13)(better-sqlite3@12.11.1)
+       i18next:
+         specifier: ^25.4.2
+         version: 25.10.10(typescript@5.9.3)
++      keytar:
++        specifier: ^7.9.0
++        version: 7.9.0
+       lucide-react:
+         specifier: ^0.542.0
+         version: 0.542.0(react@19.3.0)
+@@ -87,6 +102,12 @@ importers:
+       '@electron-toolkit/tsconfig':
+         specifier: ^1.0.1
+         version: 1.0.1(@types/node@22.20.3)
++      '@electron/rebuild':
++        specifier: ^4.0.1
++        version: 4.2.0
++      '@types/better-sqlite3':
++        specifier: ^7.6.13
++        version: 7.6.13
+       '@types/node':
+         specifier: ^22.18.1
+         version: 22.20.3
+@@ -124,6 +145,35 @@ importers:
+         specifier: ^7.1.4
+         version: 7.3.6(@types/node@22.20.3)(jiti@1.21.7)
+ 
++  packages/db:
++    dependencies:
++      '@ai-hub/security':
++        specifier: workspace:*
++        version: link:../security
++      better-sqlite3:
++        specifier: ^12.2.0
++        version: 12.11.1
++      drizzle-orm:
++        specifier: ^0.44.5
++        version: 0.44.7(@types/better-sqlite3@7.6.13)(better-sqlite3@12.11.1)
++    devDependencies:
++      '@types/better-sqlite3':
++        specifier: ^7.6.13
++        version: 7.6.13
++      vitest:
++        specifier: ^3.2.4
++        version: 3.2.7(@types/node@22.20.3)(jiti@1.21.7)
++
++  packages/security:
++    dependencies:
++      keytar:
++        specifier: ^7.9.0
++        version: 7.9.0
++    devDependencies:
++      vitest:
++        specifier: ^3.2.4
++        version: 3.2.7(@types/node@22.20.3)(jiti@1.21.7)
++
+   packages/shared:
+     dependencies:
+       zod:
+@@ -247,6 +297,11 @@ packages:
+     resolution: {integrity: sha512-Qkzpg2s9GnVV2I2BjRksUi43U5e6+zaQMcjoJy0C+C5oxaKl+fmckGDQFtRpZpZV0NQekuZZ+tGz7EA9TVnQtQ==}
+     engines: {node: '>=12'}
+ 
++  '@electron/rebuild@4.2.0':
++    resolution: {integrity: sha512-RKL/O+jGoXJMxrx/5771y1n0xTKmFuOYGO3gMmwypBM6rsH0kou0mswwdXA2JrhIkE4xyC7v9vGk0n6NPzgOxQ==}
++    engines: {node: '>=22.12.0'}
++    hasBin: true
++
+   '@esbuild/aix-ppc64@0.25.12':
+     resolution: {integrity: sha512-Hhmwd6CInZ3dwpuGTF8fJG6yoWmsToE+vYgD4nytZVxcu1ulHpUQRAB1UJ8+N1Am3Mz4+xOByoQoSZf4D+CpkA==}
+     engines: {node: '>=18'}
+@@ -632,6 +687,10 @@ packages:
+     resolution: {integrity: sha512-bV0Tgo9K4hfPCek+aMAn81RppFKv2ySDQeMoSZuvTASywNTnVJCArCZE2FWqpvIatKu7VMRLWlR1EazvVhDyhQ==}
+     engines: {node: '>=18.18'}
+ 
++  '@isaacs/fs-minipass@4.0.1':
++    resolution: {integrity: sha512-wgm9Ehl2jpeqP3zw/7mo3kRHFp5MEDhqAdwy1fTGkHAwnkGOVsgpvQhL8B5n1qlb01jV3n/bI0ZfZp5lWA1k4w==}
++    engines: {node: '>=18.0.0'}
++
+   '@jridgewell/gen-mapping@0.3.13':
+     resolution: {integrity: sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==}
+ 
+@@ -648,6 +707,10 @@ packages:
+   '@jridgewell/trace-mapping@0.3.31':
+     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
+ 
++  '@malept/cross-spawn-promise@2.0.0':
++    resolution: {integrity: sha512-1DpKU0Z5ThltBwjNySMC14g0CkbyhCaz9FkhxqNsZI6uAPJXFS8cMXlBKo26FJ8ZuW6S9GCMcR9IO5k2X5/9Fg==}
++    engines: {node: '>= 12.13.0'}
++
+   '@napi-rs/lzma-linux-x64-gnu@1.5.1':
+     resolution: {integrity: sha512-oTXEIha4SsuXdTA4Iyskj0kpdx2yVXdhd75c2v3xGrHFfVMsbhTPZU/nMPL4sWKo4pBHm3aucLaqGlF696dTyQ==}
+     engines: {node: ^22.20 || ^24.12 || >=25}
+@@ -1104,6 +1167,9 @@ packages:
+   '@types/babel__traverse@7.28.0':
+     resolution: {integrity: sha512-8PvcXf70gTDZBgt9ptxJ8elBeBjcLOAcOtoO/mPJjtji1+CdGbHgm77om1GrsPxsiE+uXIpNSK64UYaIwQXd4Q==}
+ 
++  '@types/better-sqlite3@7.6.13':
++    resolution: {integrity: sha512-NMv9ASNARoKksWtsq/SHakpYAYnhBrQgGD8zkLYk/jaK8jUGn08CfEdTRgYhMypUQAfzSP8W6gNLe0q19/t4VA==}
++
+   '@types/cacheable-request@6.0.3':
+     resolution: {integrity: sha512-IQ3EbTzGxIigb1I3qPZc1rWJnH0BmSKv5QYTalEwweFvyBDLSAe24zP0le/hyi7ecGfZVlIVAg4BZqb8WBwKqw==}
+ 
+@@ -1236,6 +1302,10 @@ packages:
+   '@vitest/utils@3.2.7':
+     resolution: {integrity: sha512-x6BDOd7dyo3PFLY3I9/HJ25X/6OurhGXk2/B9gOZNPF7XDVjeBK4k01lQE5uvDpbuheErh91qYuE1E2OEjK3Rw==}
+ 
++  abbrev@4.0.0:
++    resolution: {integrity: sha512-a1wflyaL0tHtJSmLSOVybYhy22vRih4eduhhrkcjgrWGnRfrZtovJ2FRjxuTtkkj47O/baf0R86QU5OuYpz8fA==}
++    engines: {node: ^20.17.0 || >=22.9.0}
++
+   acorn-jsx@5.3.2:
+     resolution: {integrity: sha512-rq9s+JNhf0IChjtDXxllJ7g41oZk5SlXtp0LHwyA5cejwn7vKmKp4pPri6YEePv2PU65sAsegbXtIinmDFDXgQ==}
+     peerDependencies:
+@@ -1288,15 +1358,28 @@ packages:
+     resolution: {integrity: sha512-BLrgEcRTwX2o6gGxGOCNyMvGSp35YofuYzw9h1IMTRmKqttAZZVU67bdb9Pr2vUHA8+j3i2tJfjO6C6+4myGTA==}
+     engines: {node: 18 || 20 || >=22}
+ 
++  base64-js@1.5.1:
++    resolution: {integrity: sha512-AKpaYlHn8t4SVbOHCy+b5+KKgvR4vrsD8vbvrbiQJps7fKDTkjkDry6ji0rUJjC0kzbNePLwzxq8iypo41qeWA==}
++
+   baseline-browser-mapping@2.11.24:
+     resolution: {integrity: sha512-hYrgxie335U08WqICoGqKRzV1HFXv6zdxwJE4ekCb80CM9a0SVVsN4QPwT67RraRo+9h8IATk6uxHJw7QSkdOg==}
+     engines: {node: '>=6.0.0'}
+     hasBin: true
+ 
++  better-sqlite3@12.11.1:
++    resolution: {integrity: sha512-dq9AtApgg5PGFtBzPFSBl3HZQjHok5gaQCM6zh2Yk0aSmDCs1CbnVI8/HgASQkNKsWFpseIO9beg5xxpYhbIfA==}
++    engines: {node: 20.x || 22.x || 23.x || 24.x || 25.x || 26.x}
++
+   binary-extensions@2.3.0:
+     resolution: {integrity: sha512-Ceh+7ox5qe7LJuLHoY0feh3pHuUDHAcRUeyL2VYghZwfpkNIy/+8Ocg0a3UuSoYzavmylwuLWQOf3hl0jjMMIw==}
+     engines: {node: '>=8'}
+ 
++  bindings@1.5.0:
++    resolution: {integrity: sha512-p2q/t/mhvuOj/UeLlV6566GD/guowlr0hHxClI0W9m7MWYkL1F0hLo+0Aexs9HSPCtR1SXQ0TD3MMKrXZajbiQ==}
++
++  bl@4.1.0:
++    resolution: {integrity: sha512-1W07cM9gS6DcLperZfFSj+bWLtaPGSOHWhPiGzXmvVJbRLdG82sH/Kn8EtW1VqWVA54AKf2h5k5BbnIbwF3h6w==}
++
+   boolean@3.2.0:
+     resolution: {integrity: sha512-d0II/GO9uf9lfUHH2BQsjxzRJZBdsjgsBiW4BvhWk/3qoKwQFjIDVN19PfX8F2D/r9PCMTtLWjYVCFrpeYUzsw==}
+     deprecated: Package no longer supported. Contact Support at https://www.npmjs.com/support for more info.
+@@ -1320,6 +1403,9 @@ packages:
+   buffer-crc32@0.2.13:
+     resolution: {integrity: sha512-VO9Ht/+p3SN7SKWqcrgEzjGbRSJYTx+Q1pTQC0wrWqHx0vpJraQ6GtHx8tvcg1rlK1byhU5gccxgOgj7B0TDkQ==}
+ 
++  buffer@5.7.1:
++    resolution: {integrity: sha512-EHcyIPBQ4BSGlvjB16k5KgAJ27CIsHY/2JBmCRReo48y9rQ3MaUzWX3KVlBa4U7MyX02HdVj0K7C3WaB3ju7FQ==}
++
+   cac@6.7.14:
+     resolution: {integrity: sha512-b6Ilus+c3RrdDk+JhLKUAQfzzgLEPy6wcXqS7f/xe1EETvsDP6GORG7SFuOs6cID5YkqchW/LXZbX5bc8j7ZcQ==}
+     engines: {node: '>=8'}
+@@ -1359,6 +1445,13 @@ packages:
+     resolution: {integrity: sha512-7VT13fmjotKpGipCW9JEQAusEPE+Ei8nl6/g4FBAmIm0GOOLMua9NDDo/DWp0ZAxCr3cPq5ZpBqmPAQgDda2Pw==}
+     engines: {node: '>= 8.10.0'}
+ 
++  chownr@1.1.4:
++    resolution: {integrity: sha512-jJ0bqzaylmJtVnNgzTeSOs8DPavpbYgEr/b0YL8/2GO3xJEhInFmhKMUnEJQjZumK7KXGFhUy89PrsJWlakBVg==}
++
++  chownr@3.0.0:
++    resolution: {integrity: sha512-+IxzY9BZOQd/XuYPRmrvEVjF/nqj5kgT4kEq7VofrDoM1MxoRjEWkrCC3EtLi59TVawxTAn+orJwFQcrqEN1+g==}
++    engines: {node: '>=18'}
++
+   class-variance-authority@0.7.1:
+     resolution: {integrity: sha512-Ka+9Trutv7G8M6WT6SeiRWz792K5qEqIGEGzXKhAE6xOWAY6pPH8U+9IY3oCMv6kqTmLsv7Xh/2w2RigkePMsg==}
+ 
+@@ -1421,6 +1514,10 @@ packages:
+     resolution: {integrity: sha512-h5k/5U50IJJFpzfL6nO9jaaumfjO/f2NjK/oYB2Djzm4p9L+3T9qWpZqZ2hAbLPuuYq9wrU08WQyBTL5GbPk5Q==}
+     engines: {node: '>=6'}
+ 
++  deep-extend@0.6.0:
++    resolution: {integrity: sha512-LOHxIOaPYdHlJRtCQfDIVZtfw/ufM8+rVj649RIHzcm/vGwQRXFt6OPqIFWsm2XEMrNIEtWR64sY1LEKD2vAOA==}
++    engines: {node: '>=4.0.0'}
++
+   deep-is@0.1.4:
+     resolution: {integrity: sha512-oIPzksmTg4/MriiaYGO+okXDT7ztn/w3Eptv/+gSIdMdKsJo0u4CfYNFJPy+4SKMuCqGw2wxnA+URMg3t8a/bQ==}
+ 
+@@ -1436,6 +1533,10 @@ packages:
+     resolution: {integrity: sha512-8QmQKqEASLd5nx0U1B1okLElbUuuttJ/AnYmRXbbbGDWh6uS208EjD4Xqq/I9wK7u0v6O08XhTWnt5XtEbR6Dg==}
+     engines: {node: '>= 0.4'}
+ 
++  detect-libc@2.1.2:
++    resolution: {integrity: sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==}
++    engines: {node: '>=8'}
++
+   detect-node-es@1.1.0:
+     resolution: {integrity: sha512-ypdmJU/TbBby2Dxibuv7ZLW3Bs1QEmM7nHjEANfohJLvE0XVujisn1qPJcZxg+qDucsr+bP6fLD1rPS3AhJ7EQ==}
+ 
+@@ -1448,6 +1549,98 @@ packages:
+   dlv@1.1.3:
+     resolution: {integrity: sha512-+HlytyjlPKnIG8XuRG8WvmBP8xs8P71y+SKKS6ZXWoEgLuePxtDoUEiH7WkdePWrQ5JBpE6aoVqfZfJUQkjXwA==}
+ 
++  drizzle-orm@0.44.7:
++    resolution: {integrity: sha512-quIpnYznjU9lHshEOAYLoZ9s3jweleHlZIAWR/jX9gAWNg/JhQ1wj0KGRf7/Zm+obRrYd9GjPVJg790QY9N5AQ==}
++    peerDependencies:
++      '@aws-sdk/client-rds-data': '>=3'
++      '@cloudflare/workers-types': '>=4'
++      '@electric-sql/pglite': '>=0.2.0'
++      '@libsql/client': '>=0.10.0'
++      '@libsql/client-wasm': '>=0.10.0'
++      '@neondatabase/serverless': '>=0.10.0'
++      '@op-engineering/op-sqlite': '>=2'
++      '@opentelemetry/api': ^1.4.1
++      '@planetscale/database': '>=1.13'
++      '@prisma/client': '*'
++      '@tidbcloud/serverless': '*'
++      '@types/better-sqlite3': '*'
++      '@types/pg': '*'
++      '@types/sql.js': '*'
++      '@upstash/redis': '>=1.34.7'
++      '@vercel/postgres': '>=0.8.0'
++      '@xata.io/client': '*'
++      better-sqlite3: '>=7'
++      bun-types: '*'
++      expo-sqlite: '>=14.0.0'
++      gel: '>=2'
++      knex: '*'
++      kysely: '*'
++      mysql2: '>=2'
++      pg: '>=8'
++      postgres: '>=3'
++      prisma: '*'
++      sql.js: '>=1'
++      sqlite3: '>=5'
++    peerDependenciesMeta:
++      '@aws-sdk/client-rds-data':
++        optional: true
++      '@cloudflare/workers-types':
++        optional: true
++      '@electric-sql/pglite':
++        optional: true
++      '@libsql/client':
++        optional: true
++      '@libsql/client-wasm':
++        optional: true
++      '@neondatabase/serverless':
++        optional: true
++      '@op-engineering/op-sqlite':
++        optional: true
++      '@opentelemetry/api':
++        optional: true
++      '@planetscale/database':
++        optional: true
++      '@prisma/client':
++        optional: true
++      '@tidbcloud/serverless':
++        optional: true
++      '@types/better-sqlite3':
++        optional: true
++      '@types/pg':
++        optional: true
++      '@types/sql.js':
++        optional: true
++      '@upstash/redis':
++        optional: true
++      '@vercel/postgres':
++        optional: true
++      '@xata.io/client':
++        optional: true
++      better-sqlite3:
++        optional: true
++      bun-types:
++        optional: true
++      expo-sqlite:
++        optional: true
++      gel:
++        optional: true
++      knex:
++        optional: true
++      kysely:
++        optional: true
++      mysql2:
++        optional: true
++      pg:
++        optional: true
++      postgres:
++        optional: true
++      prisma:
++        optional: true
++      sql.js:
++        optional: true
++      sqlite3:
++        optional: true
++
+   electron-to-chromium@1.5.429:
+     resolution: {integrity: sha512-/1ENIE3cx4HTIx4IfPZFaOunJmsrSVTnj6coXoRVbiJUbkeTyFkJvBeWGkdgh08OhFbxYLMT1kbkwFVSarq6Ow==}
+ 
+@@ -1562,10 +1755,17 @@ packages:
+     resolution: {integrity: sha512-kVscqXk4OCp68SZ0dkgEKVi6/8ij300KBWTJq32P/dYeWTSwK41WyTxalN1eRmA5Z9UU/LX9D7FWSmV9SAYx6g==}
+     engines: {node: '>=0.10.0'}
+ 
++  expand-template@2.0.3:
++    resolution: {integrity: sha512-XYfuKMvj4O35f/pOXLObndIRvyQ+/+6AhODh+OKWj9S9498pHHn/IMszH+gt0fBCRWMNfk1ZSp5x3AifmnI2vg==}
++    engines: {node: '>=6'}
++
+   expect-type@1.4.0:
+     resolution: {integrity: sha512-KfYbmpRm0VbLjEvVa9yGwCi9GI34xvi7A/HXYWQO65CSD2u3MczUJSuwXKFIxlGsgBQizV9q5J9NHj4VG0n+pA==}
+     engines: {node: '>=12.0.0'}
+ 
++  exponential-backoff@3.1.3:
++    resolution: {integrity: sha512-ZgEeZXj30q+I0EN+CbSSpIyPaJ5HVQD18Z1m+u1FXbAeT94mr1zw50q4q6jiiC447Nl/YTcIYSAftiGqetwXCA==}
++
+   extract-zip@2.0.1:
+     resolution: {integrity: sha512-GDhU9ntwuKyGXdZBUgTIe+vXnWj0fppUEtMDL0+idd5Sta8TGpHssn/eusA9mrPr9qNDym6SxAYZjNvCn/9RBg==}
+     engines: {node: '>= 10.17.0'}
+@@ -1603,6 +1803,9 @@ packages:
+     resolution: {integrity: sha512-XXTUwCvisa5oacNGRP9SfNtYBNAMi+RPwBFmblZEF7N7swHYQS6/Zfk7SRwx4D5j3CH211YNRco1DEMNVfZCnQ==}
+     engines: {node: '>=16.0.0'}
+ 
++  file-uri-to-path@1.0.0:
++    resolution: {integrity: sha512-0Zt+s3L7Vf1biwWZ29aARiVYLx7iMGnEUl9x33fbB/j3jR81u/O2LbqK+Bm1CDSNDKVtJ/YjwY7TUd5SkeLQLw==}
++
+   fill-range@7.1.1:
+     resolution: {integrity: sha512-YsGpe3WHLK8ZYi4tWDg2Jy3ebRz2rXowDxnld4bkQB00cc/1Zw9AWnC0i9ztDJitivtQvaI9KaLyKrc+hBW0yg==}
+     engines: {node: '>=8'}
+@@ -1621,6 +1824,9 @@ packages:
+   fraction.js@5.3.4:
+     resolution: {integrity: sha512-1X1NTtiJphryn/uLQz3whtY6jK3fTqoE3ohKs0tT+Ujr1W59oopxmoEh7Lu5p6vBaPbgoM0bzveAW4Qi5RyWDQ==}
+ 
++  fs-constants@1.0.0:
++    resolution: {integrity: sha512-y6OAwoSIf7FyjMIv94u+b5rdheZEjzR63GTyZJm5qh4Bi+2YgwLCcI/fPFZkL5PSixOt6ZNKm+w+Hfp/Bciwow==}
++
+   fs-extra@8.1.0:
+     resolution: {integrity: sha512-yhlQgA6mnOJUKOsRUFsgJdQCvkKhcz8tlZG5HBQfReYZy46OwLcY+Zia0mtdHsOo9y/hP+CxMN0TU9QxoOtG4g==}
+     engines: {node: '>=6 <7 || >=8'}
+@@ -1645,6 +1851,9 @@ packages:
+     resolution: {integrity: sha512-nBF+F1rAZVCu/p7rjzgA+Yb4lfYXrpl7a6VmJrU8wF9I1CKvP/QwPNZHnOlwbTkY6dvtFIzFMSyQXbLoTQPRpA==}
+     engines: {node: '>=8'}
+ 
++  github-from-package@0.0.0:
++    resolution: {integrity: sha512-SyHy3T1v2NUXn29OsWdxmK6RwHD+vkj3v8en8AOBZ1wBQ/hCAQ5bAQTD02kW4W9tUp/3Qh6J8r9EvntiyCmOOw==}
++
+   glob-parent@5.1.2:
+     resolution: {integrity: sha512-AOIgSQCepiJYwP3ARnGx+5VnTu2HBYdzbGP45eLw1vr3zB3vZLeyed1sC9hnbcOc9/SrMyM5RPQrkGz4aS9Zow==}
+     engines: {node: '>= 6'}
+@@ -1709,6 +1918,9 @@ packages:
+       typescript:
+         optional: true
+ 
++  ieee754@1.2.1:
++    resolution: {integrity: sha512-dcyqhDvX1C46lXZcVqCpK+FtMRQVdIMN6/Df5js2zouUsqG7I6sFxitIC+7KYK29KdXOLHdu9zL4sFnoVQnqaA==}
++
+   ignore@5.3.2:
+     resolution: {integrity: sha512-hsBTNUqQTDwkWtcdYI2i06Y/nUBEsNEDJKjWdigLvegy8kDuJAS8uRlpkkcQpyEXL0Z/pjDy5HBmMjRCJ2gq+g==}
+     engines: {node: '>= 4'}
+@@ -1725,6 +1937,12 @@ packages:
+     resolution: {integrity: sha512-JmXMZ6wuvDmLiHEml9ykzqO6lwFbof0GG4IkcGaENdCRDDmMVnny7s5HsIgHCbaq0w2MyPhDqkhTUgS2LU2PHA==}
+     engines: {node: '>=0.8.19'}
+ 
++  inherits@2.0.4:
++    resolution: {integrity: sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ==}
++
++  ini@1.3.8:
++    resolution: {integrity: sha512-JV/yugV2uzW5iMRSiZAyDtQd+nxtUnjeLt0acNdw98kKLrvuRVyB80tsREOE7yvGVgalhZ6RNXCmEHkUKBKxew==}
++
+   is-binary-path@2.1.0:
+     resolution: {integrity: sha512-ZMERYes6pDydyuGidse7OsHxtbI7WVeUEozgR/g7rd0xUimYNlvZRE/K2MgZTjWy725IfelLeVcEM97mmtRGXw==}
+     engines: {node: '>=8'}
+@@ -1748,6 +1966,10 @@ packages:
+   isexe@2.0.0:
+     resolution: {integrity: sha512-RHxMLp9lnKHGHRng9QFhRCMbYAcVpn69smSGcq3f36xjgVVWThj4qqLbTLlq7Ssj8B+fIQ1EuCEGI2lKsyQeIw==}
+ 
++  isexe@4.0.0:
++    resolution: {integrity: sha512-FFUtZMpoZ8RqHS3XeXEmHWLA4thH+ZxCv2lOiPIn1Xc7CxrqhWzNSDzD+/chS/zbYezmiwWLdQC09JdQKmthOw==}
++    engines: {node: '>=20'}
++
+   jiti@1.21.7:
+     resolution: {integrity: sha512-/imKNG4EbWNrVjoNC/1H5/9GFy+tqjGBHCaSsN+P2RnPqjsLmv6UD3Ej+Kj8nBWaRAwyk7kK5ZUc+OEatnTR3A==}
+     hasBin: true
+@@ -1787,6 +2009,9 @@ packages:
+   jsonfile@4.0.0:
+     resolution: {integrity: sha512-m6F1R3z8jjlf2imQHS2Qez5sjKWQzbuuhuJ/FKYFRZvPE3PuHcSMVZzfsLhGVOkfd20obL5SWEBew5ShlquNxg==}
+ 
++  keytar@7.9.0:
++    resolution: {integrity: sha512-VPD8mtVtm5JNtA2AErl6Chp06JBfy7diFQ7TQQhdpWOl6MrCRB+eRbvAZUsbGQS9kiMq0coJsy0W0vHpDCkWsQ==}
++
+   keyv@4.5.4:
+     resolution: {integrity: sha512-oxVHkHR/EJf2CNXnWxRLW6mg7JyCCUcG0DtEGmL2ctUo1PNTin1PUil+r/+4r5MpVgC/fn1kjsx7mjSujKqIpw==}
+ 
+@@ -1853,6 +2078,20 @@ packages:
+   minimatch@3.1.5:
+     resolution: {integrity: sha512-VgjWUsnnT6n+NUk6eZq77zeFdpW2LWDzP6zFGrCbHXiYNul5Dzqk2HHQ5uFH2DNW5Xbp8+jVzaeNt94ssEEl4w==}
+ 
++  minimist@1.2.8:
++    resolution: {integrity: sha512-2yyAR8qBkN3YuheJanUpWC5U3bb5osDywNB8RzDVlDwDHbocAJveqqj1u8+SVD7jkWT4yvsHCpWqqWqAxb0zCA==}
++
++  minipass@7.1.3:
++    resolution: {integrity: sha512-tEBHqDnIoM/1rXME1zgka9g6Q2lcoCkxHLuc7ODJ5BxbP5d4c2Z5cGgtXAku59200Cx7diuHTOYfSBD8n6mm8A==}
++    engines: {node: '>=16 || 14 >=14.17'}
++
++  minizlib@3.1.0:
++    resolution: {integrity: sha512-KZxYo1BUkWD2TVFLr0MQoM8vUUigWD3LlD83a/75BqC+4qE0Hb1Vo5v1FgcfaNXvfXzr+5EhQ6ing/CaBijTlw==}
++    engines: {node: '>= 18'}
++
++  mkdirp-classic@0.5.3:
++    resolution: {integrity: sha512-gKLcREMhtuZRwRAfqP3RFW+TK4JqApVBtOIftVgjuABpAtpxhPGaDcfvbhNvD0B8iD1oUr/txX35NjcaY6Ns/A==}
++
+   ms@2.1.3:
+     resolution: {integrity: sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==}
+ 
+@@ -1864,13 +2103,40 @@ packages:
+     engines: {node: ^10 || ^12 || ^13.7 || ^14 || >=15.0.1}
+     hasBin: true
+ 
++  napi-build-utils@2.0.0:
++    resolution: {integrity: sha512-GEbrYkbfF7MoNaoh2iGG84Mnf/WZfB0GdGEsM8wz7Expx/LlWf5U8t9nvJKXSp3qr5IsEbK04cBGhol/KwOsWA==}
++
+   natural-compare@1.4.0:
+     resolution: {integrity: sha512-OWND8ei3VtNC9h7V60qff3SVobHr996CTwgxubgyQYEpg290h9J0buyECNNJexkFm5sOajh5G116RYA1c8ZMSw==}
+ 
++  node-abi@3.96.0:
++    resolution: {integrity: sha512-rebQ/lz7i0EkoLzUVSrKRzA69zMkwLp95kKMWoMDkkM00Suxz0D7zEQPwRml5fQum24mj7bPvmlgLAmu2JCiYg==}
++    engines: {node: '>=10'}
++
++  node-abi@4.35.0:
++    resolution: {integrity: sha512-ymk4aIzxdPopw2giv8Fs1Ec6vybGkjmyxUwVqhkI4MCy2tVfXdkOGGWieWVjL0THgH+7a8lRdevyupoYj3Js/Q==}
++    engines: {node: '>=22.12.0'}
++
++  node-addon-api@4.3.0:
++    resolution: {integrity: sha512-73sE9+3UaLYYFmDsFZnqCInzPyh3MqIwZO9cw58yIqAZhONrrabrYyYe3TuIqtIiOuTXVhsGau8hcrhhwSsDIQ==}
++
++  node-api-version@0.2.1:
++    resolution: {integrity: sha512-2xP/IGGMmmSQpI1+O/k72jF/ykvZ89JeuKX3TLJAYPDVLUalrshrLHkeVcCCZqG/eEa635cr8IBYzgnDvM2O8Q==}
++
++  node-gyp@12.4.0:
++    resolution: {integrity: sha512-OMcPNvqTCFUnNaBlmdgq+lfNqY7gTiSmNRDjY3uAXRyudeKZEZxu3CLtjMQrx4zZxCX2b/mpNqTtwuCJgXhHkw==}
++    engines: {node: ^20.17.0 || >=22.9.0}
++    hasBin: true
++
+   node-releases@2.0.55:
+     resolution: {integrity: sha512-mIrE/Cw9y+9Au6dS5vDKDhQza9YvG6w+ZrS6X+ZzA7yFW/soAeaups4Qzn1bL6g5FVy8WtP79+0j82oPIbqRjQ==}
+     engines: {node: '>=18'}
+ 
++  nopt@9.0.0:
++    resolution: {integrity: sha512-Zhq3a+yFKrYwSBluL4H9XP3m3y5uvQkB/09CwDruCiRmR/UJYnn9W4R48ry0uGC70aeTPKLynBtscP9efFFcPw==}
++    engines: {node: ^20.17.0 || >=22.9.0}
++    hasBin: true
++
+   normalize-path@3.0.0:
+     resolution: {integrity: sha512-6eZs5Ls3WtCisHWp9S2GUy8dqkpGi4BVSz3GaqiE6ezub0512ESztXUwUB6C6IKbQkY2Pnb/mD4WYojCRwcwLA==}
+     engines: {node: '>=0.10.0'}
+@@ -1997,6 +2263,12 @@ packages:
+     resolution: {integrity: sha512-RRuzqDtt5Y9h3quz5hWhK+TPnsmVs6WwSU6LkJMeY4HstUEDuYTG8UJSdawMRzmzAtV+KEoG8N3Qg2qLy5vM/A==}
+     engines: {node: ^10 || ^12 || >=14}
+ 
++  prebuild-install@7.1.3:
++    resolution: {integrity: sha512-8Mf2cbV7x1cXPUILADGI3wuhfqWvtiLA1iclTDbFRZkgRQS0NqsPZphna9V+HyTEadheuPmjaJMsbzKQFOzLug==}
++    engines: {node: '>=10'}
++    deprecated: No longer maintained. Please contact the author of the relevant native addon; alternatives are available.
++    hasBin: true
++
+   prelude-ls@1.2.1:
+     resolution: {integrity: sha512-vkcDPrRZo1QZLbn5RLGPpg/WmIQ65qoWWhcGKf/b5eplkkarX0m9z8ppCat4mlOqUsWpyNuYgO3VRyrYHSzX5g==}
+     engines: {node: '>= 0.8.0'}
+@@ -2006,6 +2278,10 @@ packages:
+     engines: {node: '>=14'}
+     hasBin: true
+ 
++  proc-log@6.1.0:
++    resolution: {integrity: sha512-iG+GYldRf2BQ0UDUAd6JQ/RwzaQy6mXmsk/IzlYyal4A4SNFw54MeH4/tLkF4I5WoWG9SQwuqWzS99jaFQHBuQ==}
++    engines: {node: ^20.17.0 || >=22.9.0}
++
+   progress@2.0.3:
+     resolution: {integrity: sha512-7PiHtLll5LdnKIMw100I+8xJXR5gW2QwWYkT6iJva0bXitZKa/XMrSbdmg3r2Xnaidz9Qumd0VPaMrZlF9V9sA==}
+     engines: {node: '>=0.4.0'}
+@@ -2024,6 +2300,10 @@ packages:
+     resolution: {integrity: sha512-WuyALRjWPDGtt/wzJiadO5AXY+8hZ80hVpe6MyivgraREW751X3SbhRvG3eLKOYN+8VEvqLcf3wdnt44Z4S4SA==}
+     engines: {node: '>=10'}
+ 
++  rc@1.2.8:
++    resolution: {integrity: sha512-y3bGgqKj3QBdxLbLkomlohkvsA8gdAiUQlSBJnBhfn+BPxg4bc62d8TcBW15wavDfgexCgccckhcZvywyQYPOw==}
++    hasBin: true
++
+   react-dom@19.3.0:
+     resolution: {integrity: sha512-JDk8dgif51OjFoDE70+OT9ICyYr+69HlmihNwp1+Nsfbna3t5sIiCa9ZJktDmQ4/1b/rn26hIAR2uYXDMr5r0Q==}
+     peerDependencies:
+@@ -2083,9 +2363,17 @@ packages:
+     resolution: {integrity: sha512-E8LUcbtBWt20bbl2YoHfx4ZDBdxVTfOKtCZn9cDSJ4l6/nuoApcpIBcj47t2wZoVX8g2ZHuMHbiShgCR1T5Sog==}
+     engines: {node: '>=0.10.0'}
+ 
++  read-binary-file-arch@1.0.6:
++    resolution: {integrity: sha512-BNg9EN3DD3GsDXX7Aa8O4p92sryjkmzYYgmgTAc6CA4uGLEDzFfxOxugu21akOxpcXHiEgsYkC6nPsQvLLLmEg==}
++    hasBin: true
++
+   read-cache@1.0.2:
+     resolution: {integrity: sha512-/peqiBB/n07gQGLsWaHho3WfvUyRscw0gYTsEFMhrIe/nWLkYaf5SbKYjGYqtRV3aPwykJgF2VEMo1ac4bnsGA==}
+ 
++  readable-stream@3.6.2:
++    resolution: {integrity: sha512-9u/sniCrY3D5WdsERHzHE4G2YCXqoG5FTHUiCC4SIbr6XcLZBY05ya9EKjYek9O5xOAwjGq+1JdGBAS7Q9ScoA==}
++    engines: {node: '>= 6'}
++
+   readdirp@3.6.0:
+     resolution: {integrity: sha512-hOS089on8RduqdbhvQ5Z37A0ESjsqz6qnRcffsMU3495FuTdqSm+7bhJ29JvIOsBDEEnan5DPu9t3To9VRlMzA==}
+     engines: {node: '>=8.10.0'}
+@@ -2121,6 +2409,9 @@ packages:
+   run-parallel@1.2.0:
+     resolution: {integrity: sha512-5l4VyZR86LZ/lDxZTR6jqL8AFE2S0IFLMP26AbjsLVADxHdhB/c0GUsH+y39UfCi3dzz8OlQuPmnaJOMoDHQBA==}
+ 
++  safe-buffer@5.2.1:
++    resolution: {integrity: sha512-rp3So07KcdmmKbGvgaNxQSJr7bGVSVk5S9Eq1F+ppbRo70+YeaDxkw5Dd8NPN+GD6bjnYm2VuPuCXmpuYvmCXQ==}
++
+   scheduler@0.28.0:
+     resolution: {integrity: sha512-juorfCmIkIw8tT+p5BXSm6PJjQF/ycEYmKyzURCIt/RaZIhL+PulbQ9Yu2z1HdOJDdqDTlxA1+xKBmHXJsczAw==}
+ 
+@@ -2151,6 +2442,12 @@ packages:
+   siginfo@2.0.0:
+     resolution: {integrity: sha512-ybx0WO1/8bSBLEWXZvEd7gMW3Sn3JFlW3TvX1nREbDLRNQNaeNN8WK0meBwPdAaOI7TtRRRJn/Es1zhrrCHu7g==}
+ 
++  simple-concat@1.0.1:
++    resolution: {integrity: sha512-cSFtAPtRhljv69IK0hTVZQ+OfE9nePi/rtJmw5UjHeVyVroEqJXP1sFztKUy1qU+xvz3u/sfYJLa947b7nAN2Q==}
++
++  simple-get@4.0.1:
++    resolution: {integrity: sha512-brv7p5WgH0jmQJr1ZDDfKDOSeWWg+OVypG99A/5vYGPqJ6pxiaHLy8nxtFjBA7oMa01ebA9gfh1uMCFqOuXxvA==}
++
+   source-map-js@1.2.1:
+     resolution: {integrity: sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==}
+     engines: {node: '>=0.10.0'}
+@@ -2164,6 +2461,13 @@ packages:
+   std-env@3.10.0:
+     resolution: {integrity: sha512-5GS12FdOZNliM5mAOxFRg7Ir0pWz8MdpYm6AY6VPkGpbA7ZzmbzNcBJQ0GPvvyWgcY7QAhCgf9Uy89I03faLkg==}
+ 
++  string_decoder@1.3.0:
++    resolution: {integrity: sha512-hkRX8U1WjJFd8LsDJ2yQ/wWWxaopEsABU1XfkM8A+j0+85JAGppt16cr1Whg6KIbb4okU6Mql6BOj+uup/wKeA==}
++
++  strip-json-comments@2.0.1:
++    resolution: {integrity: sha512-4gB8na07fecVVkOI6Rs4e7T6NOTki5EmL7TUduTs6bu3EdnSycntVJ4re8kgZA+wx9IueI2Y11bfbgwtzuE0KQ==}
++    engines: {node: '>=0.10.0'}
++
+   strip-json-comments@3.1.1:
+     resolution: {integrity: sha512-6fPc+R4ihwqP6N/aIv2f1gMH8lOVtWQHoqC4yK6oSDVVocumAsfCqjkXnqiYMhmMwS/mEHLp7Vehlt3ql6lEig==}
+     engines: {node: '>=8'}
+@@ -2201,6 +2505,17 @@ packages:
+     engines: {node: '>=14.0.0'}
+     hasBin: true
+ 
++  tar-fs@2.1.5:
++    resolution: {integrity: sha512-OboTd8mmMhZDNPV+UjQcK9yKAatXu2aJ+r1w4im1Otd4M4fl2hwvdoXUxIYHFTHWK/3y3FarBP70v3vwmGlOxw==}
++
++  tar-stream@2.2.0:
++    resolution: {integrity: sha512-ujeqbceABgwMZxEJnk2HDY2DlnUZ+9oEcb1KzTVfYHio0UE6dG71n60d8D2I4qNvleWrrXpmjpt7vZeF1LnMZQ==}
++    engines: {node: '>=6'}
++
++  tar@7.5.22:
++    resolution: {integrity: sha512-MFO/QzvtAOmJbkhOaCTvbGcFN9L9b+JunIsDwaKljSOdcLMea3NJ1k9Usz/rjdfSXTq4dfzfeS7W4p4YOAAHeA==}
++    engines: {node: '>=18'}
++
+   thenify-all@1.6.0:
+     resolution: {integrity: sha512-RNxQH/qI8/t3thXJDwcstUO4zeqo64+Uy/+sNVRBx4Xn2OX+OZ9oP+iJnNFqplFra2ZUVeKCSa2oVWi3T4uVmA==}
+     engines: {node: '>=0.8'}
+@@ -2246,6 +2561,9 @@ packages:
+   tslib@2.8.1:
+     resolution: {integrity: sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==}
+ 
++  tunnel-agent@0.6.0:
++    resolution: {integrity: sha512-McnNiV1l8RYeY8tBgEpuodCC1mLUdbSN+CYBL7kJsJNInOP8UjDDEwdk6Mw60vdLLrr5NHKZhMAOSrR2NZuQ+w==}
++
+   turbo@2.10.13:
+     resolution: {integrity: sha512-69MkPbjk+G8oyC7pC2DeBk0rPdbLz51wuH5eAT0Q4BVJkzq/b1XM4kUUidsARbmDjwIELSJwd1ezITULY9kWNw==}
+     hasBin: true
+@@ -2273,6 +2591,10 @@ packages:
+   undici-types@6.21.0:
+     resolution: {integrity: sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ==}
+ 
++  undici@6.28.1:
++    resolution: {integrity: sha512-zWpdTVD54H48CIybL0rWQ3ukpb9d23wM7eH5RtfdmeP70cWHNjtfo7P4vZX+5CoDcO53J4Pu5uXp7lNfjc6DRA==}
++    engines: {node: '>=18.17'}
++
+   universalify@0.1.2:
+     resolution: {integrity: sha512-rBJeI5CXAlmy1pV+617WB9J63U6XcazHHF2f2dbJix4XzpUF0RS3Zbj0FGIOCAva5P/d/GBOYaACQ1w+0azUkg==}
+     engines: {node: '>= 4.0.0'}
+@@ -2391,6 +2713,11 @@ packages:
+     engines: {node: '>= 8'}
+     hasBin: true
+ 
++  which@6.0.1:
++    resolution: {integrity: sha512-oGLe46MIrCRqX7ytPUf66EAYvdeMIZYn3WaocqqKZAxrBpkqHfL/qvTyJ/bTk5+AqHCjXmrv3CEWgy368zhRUg==}
++    engines: {node: ^20.17.0 || >=22.9.0}
++    hasBin: true
++
+   why-is-node-running@2.3.0:
+     resolution: {integrity: sha512-hUrmaWBdVDcxvYqnyh09zunKzROWjbZTiNy8dBEjkS7ehEDQibXJ7XvlmtbwuTclUiIyN+CyXQD4Vmko8fNm8w==}
+     engines: {node: '>=8'}
+@@ -2406,6 +2733,10 @@ packages:
+   yallist@3.1.1:
+     resolution: {integrity: sha512-a4UGQaWPH59mOXUYnAG2ewncQS4i4F43Tv3JoAM+s2VDAmS9NsK8GpDMLrCHPksFT7h3K6TOoUNn2pb7RoXx4g==}
+ 
++  yallist@5.0.0:
++    resolution: {integrity: sha512-YgvUTfwqyc7UXVMrB+SImsVYSmTS8X/tSrtdNZMImM+n7+QTriRXyXim0mBrTXNeqzVF0KWGgHPeiyViFFrNDw==}
++    engines: {node: '>=18'}
++
+   yauzl@2.10.0:
+     resolution: {integrity: sha512-p4a9I6X6nu6IhoGmBqAcbJy1mlC4j27vEPZX9F4L4/vZT3Lyq1VkFHw/V/PUcB9Buo+DG3iHkT0x3Qya58zc3g==}
+ 
+@@ -2561,6 +2892,17 @@ snapshots:
+     transitivePeerDependencies:
+       - supports-color
+ 
++  '@electron/rebuild@4.2.0':
++    dependencies:
++      '@malept/cross-spawn-promise': 2.0.0
++      debug: 4.4.3
++      node-abi: 4.35.0
++      node-api-version: 0.2.1
++      node-gyp: 12.4.0
++      read-binary-file-arch: 1.0.6
++    transitivePeerDependencies:
++      - supports-color
++
+   '@esbuild/aix-ppc64@0.25.12':
+     optional: true
+ 
+@@ -2796,6 +3138,10 @@ snapshots:
+ 
+   '@humanwhocodes/retry@0.4.3': {}
+ 
++  '@isaacs/fs-minipass@4.0.1':
++    dependencies:
++      minipass: 7.1.3
++
+   '@jridgewell/gen-mapping@0.3.13':
+     dependencies:
+       '@jridgewell/sourcemap-codec': 1.6.0
+@@ -2815,6 +3161,10 @@ snapshots:
+       '@jridgewell/resolve-uri': 3.1.2
+       '@jridgewell/sourcemap-codec': 1.6.0
+ 
++  '@malept/cross-spawn-promise@2.0.0':
++    dependencies:
++      cross-spawn: 7.0.6
++
+   '@napi-rs/lzma-linux-x64-gnu@1.5.1':
+     optional: true
+ 
+@@ -3187,6 +3537,10 @@ snapshots:
+     dependencies:
+       '@babel/types': 7.29.8
+ 
++  '@types/better-sqlite3@7.6.13':
++    dependencies:
++      '@types/node': 22.20.3
++
+   '@types/cacheable-request@6.0.3':
+     dependencies:
+       '@types/http-cache-semantics': 4.2.0
+@@ -3377,6 +3731,8 @@ snapshots:
+       loupe: 3.2.1
+       tinyrainbow: 2.0.0
+ 
++  abbrev@4.0.0: {}
++
+   acorn-jsx@5.3.2(acorn@8.18.0):
+     dependencies:
+       acorn: 8.18.0
+@@ -3424,10 +3780,27 @@ snapshots:
+ 
+   balanced-match@4.0.4: {}
+ 
++  base64-js@1.5.1: {}
++
+   baseline-browser-mapping@2.11.24: {}
+ 
++  better-sqlite3@12.11.1:
++    dependencies:
++      bindings: 1.5.0
++      prebuild-install: 7.1.3
++
+   binary-extensions@2.3.0: {}
+ 
++  bindings@1.5.0:
++    dependencies:
++      file-uri-to-path: 1.0.0
++
++  bl@4.1.0:
++    dependencies:
++      buffer: 5.7.1
++      inherits: 2.0.4
++      readable-stream: 3.6.2
++
+   boolean@3.2.0:
+     optional: true
+ 
+@@ -3454,6 +3827,11 @@ snapshots:
+ 
+   buffer-crc32@0.2.13: {}
+ 
++  buffer@5.7.1:
++    dependencies:
++      base64-js: 1.5.1
++      ieee754: 1.2.1
++
+   cac@6.7.14: {}
+ 
+   cacheable-lookup@5.0.4: {}
+@@ -3501,6 +3879,10 @@ snapshots:
+     optionalDependencies:
+       fsevents: 2.3.3
+ 
++  chownr@1.1.4: {}
++
++  chownr@3.0.0: {}
++
+   class-variance-authority@0.7.1:
+     dependencies:
+       clsx: 2.1.1
+@@ -3555,6 +3937,8 @@ snapshots:
+ 
+   deep-eql@5.0.2: {}
+ 
++  deep-extend@0.6.0: {}
++
+   deep-is@0.1.4: {}
+ 
+   defer-to-connect@2.0.1: {}
+@@ -3573,6 +3957,8 @@ snapshots:
+       object-keys: 1.1.1
+     optional: true
+ 
++  detect-libc@2.1.2: {}
++
+   detect-node-es@1.1.0: {}
+ 
+   detect-node@2.1.0:
+@@ -3582,6 +3968,11 @@ snapshots:
+ 
+   dlv@1.1.3: {}
+ 
++  drizzle-orm@0.44.7(@types/better-sqlite3@7.6.13)(better-sqlite3@12.11.1):
++    optionalDependencies:
++      '@types/better-sqlite3': 7.6.13
++      better-sqlite3: 12.11.1
++
+   electron-to-chromium@1.5.429: {}
+ 
+   electron-vite@4.0.1(vite@7.3.6(@types/node@22.20.3)(jiti@1.21.7)):
+@@ -3760,8 +4151,12 @@ snapshots:
+ 
+   esutils@2.0.3: {}
+ 
++  expand-template@2.0.3: {}
++
+   expect-type@1.4.0: {}
+ 
++  exponential-backoff@3.1.3: {}
++
+   extract-zip@2.0.1:
+     dependencies:
+       debug: 4.4.3
+@@ -3802,6 +4197,8 @@ snapshots:
+     dependencies:
+       flat-cache: 4.0.1
+ 
++  file-uri-to-path@1.0.0: {}
++
+   fill-range@7.1.1:
+     dependencies:
+       to-regex-range: 5.0.1
+@@ -3820,6 +4217,8 @@ snapshots:
+ 
+   fraction.js@5.3.4: {}
+ 
++  fs-constants@1.0.0: {}
++
+   fs-extra@8.1.0:
+     dependencies:
+       graceful-fs: 4.2.11
+@@ -3839,6 +4238,8 @@ snapshots:
+     dependencies:
+       pump: 3.0.4
+ 
++  github-from-package@0.0.0: {}
++
+   glob-parent@5.1.2:
+     dependencies:
+       is-glob: 4.0.3
+@@ -3914,6 +4315,8 @@ snapshots:
+     optionalDependencies:
+       typescript: 5.9.3
+ 
++  ieee754@1.2.1: {}
++
+   ignore@5.3.2: {}
+ 
+   ignore@7.0.9: {}
+@@ -3925,6 +4328,10 @@ snapshots:
+ 
+   imurmurhash@0.1.4: {}
+ 
++  inherits@2.0.4: {}
++
++  ini@1.3.8: {}
++
+   is-binary-path@2.1.0:
+     dependencies:
+       binary-extensions: 2.3.0
+@@ -3943,6 +4350,8 @@ snapshots:
+ 
+   isexe@2.0.0: {}
+ 
++  isexe@4.0.0: {}
++
+   jiti@1.21.7: {}
+ 
+   js-tokens@4.0.0: {}
+@@ -3970,6 +4379,11 @@ snapshots:
+     optionalDependencies:
+       graceful-fs: 4.2.11
+ 
++  keytar@7.9.0:
++    dependencies:
++      node-addon-api: 4.3.0
++      prebuild-install: 7.1.3
++
+   keyv@4.5.4:
+     dependencies:
+       json-buffer: 3.0.1
+@@ -4029,6 +4443,16 @@ snapshots:
+     dependencies:
+       brace-expansion: 1.1.21
+ 
++  minimist@1.2.8: {}
++
++  minipass@7.1.3: {}
++
++  minizlib@3.1.0:
++    dependencies:
++      minipass: 7.1.3
++
++  mkdirp-classic@0.5.3: {}
++
+   ms@2.1.3: {}
+ 
+   mz@2.7.0:
+@@ -4039,10 +4463,43 @@ snapshots:
+ 
+   nanoid@3.3.19: {}
+ 
++  napi-build-utils@2.0.0: {}
++
+   natural-compare@1.4.0: {}
+ 
++  node-abi@3.96.0:
++    dependencies:
++      semver: 7.8.5
++
++  node-abi@4.35.0:
++    dependencies:
++      semver: 7.8.5
++
++  node-addon-api@4.3.0: {}
++
++  node-api-version@0.2.1:
++    dependencies:
++      semver: 7.8.5
++
++  node-gyp@12.4.0:
++    dependencies:
++      env-paths: 2.2.1
++      exponential-backoff: 3.1.3
++      graceful-fs: 4.2.11
++      nopt: 9.0.0
++      proc-log: 6.1.0
++      semver: 7.8.5
++      tar: 7.5.22
++      tinyglobby: 0.2.17
++      undici: 6.28.1
++      which: 6.0.1
++
+   node-releases@2.0.55: {}
+ 
++  nopt@9.0.0:
++    dependencies:
++      abbrev: 4.0.0
++
+   normalize-path@3.0.0: {}
+ 
+   normalize-url@6.1.0: {}
+@@ -4138,10 +4595,27 @@ snapshots:
+       picocolors: 1.1.1
+       source-map-js: 1.2.1
+ 
++  prebuild-install@7.1.3:
++    dependencies:
++      detect-libc: 2.1.2
++      expand-template: 2.0.3
++      github-from-package: 0.0.0
++      minimist: 1.2.8
++      mkdirp-classic: 0.5.3
++      napi-build-utils: 2.0.0
++      node-abi: 3.96.0
++      pump: 3.0.4
++      rc: 1.2.8
++      simple-get: 4.0.1
++      tar-fs: 2.1.5
++      tunnel-agent: 0.6.0
++
+   prelude-ls@1.2.1: {}
+ 
+   prettier@3.9.6: {}
+ 
++  proc-log@6.1.0: {}
++
+   progress@2.0.3: {}
+ 
+   pump@3.0.4:
+@@ -4155,6 +4629,13 @@ snapshots:
+ 
+   quick-lru@5.1.1: {}
+ 
++  rc@1.2.8:
++    dependencies:
++      deep-extend: 0.6.0
++      ini: 1.3.8
++      minimist: 1.2.8
++      strip-json-comments: 2.0.1
++
+   react-dom@19.3.0(react@19.3.0):
+     dependencies:
+       react: 19.3.0
+@@ -4201,8 +4682,20 @@ snapshots:
+ 
+   react@19.3.0: {}
+ 
++  read-binary-file-arch@1.0.6:
++    dependencies:
++      debug: 4.4.3
++    transitivePeerDependencies:
++      - supports-color
++
+   read-cache@1.0.2: {}
+ 
++  readable-stream@3.6.2:
++    dependencies:
++      inherits: 2.0.4
++      string_decoder: 1.3.0
++      util-deprecate: 1.0.2
++
+   readdirp@3.6.0:
+     dependencies:
+       picomatch: 2.3.2
+@@ -4270,6 +4763,8 @@ snapshots:
+     dependencies:
+       queue-microtask: 1.2.3
+ 
++  safe-buffer@5.2.1: {}
++
+   scheduler@0.28.0: {}
+ 
+   semver-compare@1.0.0:
+@@ -4292,6 +4787,14 @@ snapshots:
+ 
+   siginfo@2.0.0: {}
+ 
++  simple-concat@1.0.1: {}
++
++  simple-get@4.0.1:
++    dependencies:
++      decompress-response: 6.0.0
++      once: 1.4.0
++      simple-concat: 1.0.1
++
+   source-map-js@1.2.1: {}
+ 
+   sprintf-js@1.1.3:
+@@ -4301,6 +4804,12 @@ snapshots:
+ 
+   std-env@3.10.0: {}
+ 
++  string_decoder@1.3.0:
++    dependencies:
++      safe-buffer: 5.2.1
++
++  strip-json-comments@2.0.1: {}
++
+   strip-json-comments@3.1.1: {}
+ 
+   strip-literal@3.1.0:
+@@ -4363,6 +4872,29 @@ snapshots:
+       - tsx
+       - yaml
+ 
++  tar-fs@2.1.5:
++    dependencies:
++      chownr: 1.1.4
++      mkdirp-classic: 0.5.3
++      pump: 3.0.4
++      tar-stream: 2.2.0
++
++  tar-stream@2.2.0:
++    dependencies:
++      bl: 4.1.0
++      end-of-stream: 1.4.5
++      fs-constants: 1.0.0
++      inherits: 2.0.4
++      readable-stream: 3.6.2
++
++  tar@7.5.22:
++    dependencies:
++      '@isaacs/fs-minipass': 4.0.1
++      chownr: 3.0.0
++      minipass: 7.1.3
++      minizlib: 3.1.0
++      yallist: 5.0.0
++
+   thenify-all@1.6.0:
+     dependencies:
+       thenify: 3.3.1
+@@ -4398,6 +4930,10 @@ snapshots:
+ 
+   tslib@2.8.1: {}
+ 
++  tunnel-agent@0.6.0:
++    dependencies:
++      safe-buffer: 5.2.1
++
+   turbo@2.10.13:
+     optionalDependencies:
+       '@turbo/darwin-64': 2.10.13
+@@ -4429,6 +4965,8 @@ snapshots:
+ 
+   undici-types@6.21.0: {}
+ 
++  undici@6.28.1: {}
++
+   universalify@0.1.2: {}
+ 
+   update-browserslist-db@1.3.3(browserslist@4.29.0):
+@@ -4539,6 +5077,10 @@ snapshots:
+     dependencies:
+       isexe: 2.0.0
+ 
++  which@6.0.1:
++    dependencies:
++      isexe: 4.0.0
++
+   why-is-node-running@2.3.0:
+     dependencies:
+       siginfo: 2.0.0
+@@ -4550,6 +5092,8 @@ snapshots:
+ 
+   yallist@3.1.1: {}
+ 
++  yallist@5.0.0: {}
++
+   yauzl@2.10.0:
+     dependencies:
+       buffer-crc32: 0.2.13
+diff --git a/scripts/rebuild-better-sqlite3-for-node.mjs b/scripts/rebuild-better-sqlite3-for-node.mjs
+new file mode 100644
+index 0000000..dd7cee5
+--- /dev/null
++++ b/scripts/rebuild-better-sqlite3-for-node.mjs
+@@ -0,0 +1,43 @@
++import { execSync } from "node:child_process";
++import { createRequire } from "node:module";
++import { dirname, join } from "node:path";
++import { rmSync } from "node:fs";
++
++const require = createRequire(import.meta.url);
++
++function isNodeAbi() {
++  try {
++    const Database = require("better-sqlite3");
++    const db = new Database(":memory:");
++    db.close();
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++if (isNodeAbi()) {
++  process.exit(0);
++}
++
++const pkgDir = dirname(require.resolve("better-sqlite3/package.json"));
++rmSync(join(pkgDir, "build"), { recursive: true, force: true });
++
++const env = { ...process.env };
++for (const key of [
++  "npm_config_runtime",
++  "npm_config_target",
++  "npm_config_arch",
++  "npm_config_target_arch",
++  "npm_config_disturl",
++  "npm_config_build_from_source",
++]) {
++  delete env[key];
++}
++
++execSync("npx --yes prebuild-install || npx --yes node-gyp rebuild --release", {
++  cwd: pkgDir,
++  env,
++  stdio: "inherit",
++  shell: true,
++});
+diff --git a/tsconfig.json b/tsconfig.json
+index c9e9259..a86cc97 100644
+--- a/tsconfig.json
++++ b/tsconfig.json
+@@ -2,6 +2,8 @@
+   "files": [],
+   "references": [
+     { "path": "./packages/shared" },
++    { "path": "./packages/db" },
++    { "path": "./packages/security" },
+     { "path": "./apps/desktop/tsconfig.node.json" },
+     { "path": "./apps/desktop/tsconfig.web.json" }
+   ]
