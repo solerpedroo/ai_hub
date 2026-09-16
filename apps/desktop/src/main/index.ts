@@ -1,11 +1,9 @@
 import { join } from "node:path";
-import { BrowserWindow, app, ipcMain, session, shell } from "electron";
+import { BrowserWindow, app, dialog, session, shell } from "electron";
 import { electronApp, is, optimizer } from "@electron-toolkit/utils";
-import {
-  IpcChannel,
-  emptyIpcPayloadSchema,
-  windowIsMaximizedResultSchema,
-} from "@ai-hub/shared";
+import { safeErrorMessage } from "@ai-hub/security";
+import { registerWindowIpc, registerWorkspaceIpc } from "./ipc";
+import { bootPersistence } from "./persistence";
 
 function applyContentSecurityPolicy(): void {
   const developmentCsp = [
@@ -52,8 +50,7 @@ function isAllowedAppNavigation(url: string): boolean {
     return false;
   }
   if (is.dev) {
-    const local =
-      parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+    const local = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
     return (parsed.protocol === "http:" || parsed.protocol === "https:") && local;
   }
   return parsed.protocol === "file:";
@@ -92,40 +89,6 @@ function targetWindow(event: Electron.IpcMainInvokeEvent): BrowserWindow | null 
   return BrowserWindow.fromWebContents(event.sender);
 }
 
-function registerWindowIpc(): void {
-  const parseEmpty = (payload: unknown): void => {
-    emptyIpcPayloadSchema.parse(payload ?? {});
-  };
-
-  ipcMain.handle(IpcChannel.windowMinimize, (event, payload: unknown) => {
-    parseEmpty(payload);
-    targetWindow(event)?.minimize();
-  });
-
-  ipcMain.handle(IpcChannel.windowMaximize, (event, payload: unknown) => {
-    parseEmpty(payload);
-    const window = targetWindow(event);
-    if (!window) {
-      return;
-    }
-    if (window.isMaximized()) {
-      window.unmaximize();
-      return;
-    }
-    window.maximize();
-  });
-
-  ipcMain.handle(IpcChannel.windowClose, (event, payload: unknown) => {
-    parseEmpty(payload);
-    targetWindow(event)?.close();
-  });
-
-  ipcMain.handle(IpcChannel.windowIsMaximized, (event, payload: unknown) => {
-    parseEmpty(payload);
-    return windowIsMaximizedResultSchema.parse(targetWindow(event)?.isMaximized() ?? false);
-  });
-}
-
 function createWindow(): void {
   const window = new BrowserWindow({
     width: 1280,
@@ -158,10 +121,18 @@ function createWindow(): void {
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   electronApp.setAppUserModelId("com.aihub.desktop");
   applyContentSecurityPolicy();
-  registerWindowIpc();
+  registerWindowIpc(targetWindow);
+  try {
+    await bootPersistence();
+  } catch (error) {
+    dialog.showErrorBox("AI Hub", safeErrorMessage(error));
+    app.quit();
+    return;
+  }
+  registerWorkspaceIpc();
 
   app.on("browser-window-created", (_event, window) => {
     optimizer.watchWindowShortcuts(window);
