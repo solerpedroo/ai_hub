@@ -2,7 +2,24 @@
 
 Camada de controle entre você e o ecossistema de IAs. Desktop (Windows first), BYOK, local-first. O modelo é um plug substituível; projeto, contexto, custo e dados ficam com o usuário.
 
-**Código ainda não iniciado.** Próximo passo: Wave 0 — ver [`docs/STATUS.md`](docs/STATUS.md).
+Onda atual: [`docs/STATUS.md`](docs/STATUS.md).
+
+## Setup local (Windows)
+
+Requisitos: Node.js 22+ e [pnpm](https://pnpm.io) 10 (via Corepack: `corepack enable`).
+
+```bash
+pnpm install
+pnpm dev
+```
+
+Outros scripts na raiz:
+
+- `pnpm typecheck` — TypeScript em `apps/desktop` e `packages/shared`
+- `pnpm lint` — ESLint
+- `pnpm build` — bundle Electron (sem instalador; isso é Wave 8)
+
+A janela é frameless. Tema (claro/escuro/sistema) e idioma (pt-BR/en) ficam em Configurações. `Ctrl+K` abre um command palette só de chrome (tema).
 
 ## Docs
 
@@ -23,5 +40,3 @@ Camada de controle entre você e o ecossistema de IAs. Desktop (Windows first), 
 | `.cursor/rules/` | Regras por área |
 | `.cursor/skills/` | wave-start, wave-close, write-adr |
 | `.cursor/agents/` | wave-reviewer, trust-auditor |
-
-Setup da Wave 0 (quando existir): `pnpm install` && `pnpm dev`.
