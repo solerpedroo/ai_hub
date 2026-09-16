@@ -1,0 +1,75 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 40 10% 97%;
+    --foreground: 24 10% 10%;
+    --card: 40 10% 99%;
+    --card-foreground: 24 10% 10%;
+    --popover: 40 10% 99%;
+    --popover-foreground: 24 10% 10%;
+    --primary: 24 10% 12%;
+    --primary-foreground: 40 20% 98%;
+    --secondary: 30 8% 93%;
+    --secondary-foreground: 24 10% 12%;
+    --muted: 30 8% 93%;
+    --muted-foreground: 24 6% 40%;
+    --accent: 30 10% 91%;
+    --accent-foreground: 24 10% 12%;
+    --destructive: 0 72% 45%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 30 8% 86%;
+    --input: 30 8% 86%;
+    --ring: 24 10% 12%;
+    --sidebar: 36 10% 95%;
+    --sidebar-foreground: 24 8% 20%;
+    --radius: 0.45rem;
+  }
+
+  .dark {
+    --background: 240 6% 6%;
+    --foreground: 40 10% 96%;
+    --card: 240 5% 8%;
+    --card-foreground: 40 10% 96%;
+    --popover: 240 5% 8%;
+    --popover-foreground: 40 10% 96%;
+    --primary: 40 10% 96%;
+    --primary-foreground: 240 6% 8%;
+    --secondary: 240 4% 14%;
+    --secondary-foreground: 40 10% 96%;
+    --muted: 240 4% 14%;
+    --muted-foreground: 240 5% 64%;
+    --accent: 240 4% 16%;
+    --accent-foreground: 40 10% 96%;
+    --destructive: 0 62% 40%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 4% 16%;
+    --input: 240 4% 16%;
+    --ring: 40 10% 80%;
+    --sidebar: 240 6% 8%;
+    --sidebar-foreground: 40 8% 86%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased text-[13px] leading-5;
+    user-select: none;
+  }
+
+  button,
+  input,
+  [role="textbox"] {
+    user-select: text;
+  }
+}
