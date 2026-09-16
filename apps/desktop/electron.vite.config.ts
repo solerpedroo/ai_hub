@@ -3,14 +3,22 @@ import { defineConfig, externalizeDepsPlugin } from "electron-vite";
 import react from "@vitejs/plugin-react";
 
 const shared = resolve(__dirname, "../../packages/shared/src");
+const db = resolve(__dirname, "../../packages/db/src");
+const securityIndex = resolve(__dirname, "../../packages/security/src/index.ts");
+const securityKeytar = resolve(__dirname, "../../packages/security/src/keytar-store.ts");
+
+const mainAliases = {
+  "@ai-hub/shared": shared,
+  "@ai-hub/db": db,
+  "@ai-hub/security/keytar": securityKeytar,
+  "@ai-hub/security": securityIndex,
+};
 
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin({ exclude: ["@ai-hub/shared"] })],
+    plugins: [externalizeDepsPlugin({ exclude: ["@ai-hub/shared", "@ai-hub/db", "@ai-hub/security"] })],
     resolve: {
-      alias: {
-        "@ai-hub/shared": shared,
-      },
+      alias: mainAliases,
     },
   },
   preload: {
