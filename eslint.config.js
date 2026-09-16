@@ -32,7 +32,11 @@ export default defineConfig(
     },
   },
   {
-    files: ["apps/desktop/src/main/**/*.ts", "apps/desktop/src/preload/**/*.ts"],
+    files: [
+      "apps/desktop/src/main/**/*.ts",
+      "apps/desktop/src/preload/**/*.ts",
+      "packages/**/*.ts",
+    ],
     languageOptions: {
       globals: {
         ...globals.node,
