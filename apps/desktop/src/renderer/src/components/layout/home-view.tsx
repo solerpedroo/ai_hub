@@ -1,6 +1,16 @@
 import { type JSX, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { activePath, openaiCatalogModels, type BranchLabels, type ConversationDto, type MessageDto, type ProjectDto, type ProviderKeyDto } from "@ai-hub/shared";
+import {
+  activePath,
+  catalogModelsForProvider,
+  findCatalogModel,
+  type BranchLabels,
+  type CatalogModel,
+  type ConversationDto,
+  type MessageDto,
+  type ProjectDto,
+  type ProviderKeyDto,
+} from "@ai-hub/shared";
 import { ChatComposer } from "@/components/chat/chat-composer";
 import { ConversationTree } from "@/components/chat/conversation-tree";
 import { MessageBubble } from "@/components/chat/message-bubble";
@@ -17,6 +27,9 @@ export function HomeView({
   providerKeys,
   selectedKeyId,
   selectedModel,
+  temperature,
+  maxTokens,
+  extraSystem,
   streaming,
   sending,
   branchLabels,
@@ -25,6 +38,9 @@ export function HomeView({
   onCreateConversation,
   onSelectKey,
   onSelectModel,
+  onSelectTemperature,
+  onSelectMaxTokens,
+  onSelectExtraSystem,
   onSend,
   onAbort,
   onRegenerate,
@@ -42,6 +58,9 @@ export function HomeView({
   providerKeys: ProviderKeyDto[];
   selectedKeyId: string | null;
   selectedModel: string;
+  temperature: number;
+  maxTokens: number | null;
+  extraSystem: string;
   streaming: boolean;
   sending: boolean;
   branchLabels: BranchLabels;
@@ -50,6 +69,9 @@ export function HomeView({
   onCreateConversation: (title: string) => Promise<void>;
   onSelectKey: (id: string) => void;
   onSelectModel: (id: string) => void;
+  onSelectTemperature: (value: number) => void;
+  onSelectMaxTokens: (value: number | null) => void;
+  onSelectExtraSystem: (value: string) => void;
   onSend: (content: string) => Promise<void>;
   onAbort: () => Promise<void>;
   onRegenerate: (messageId: string) => Promise<void>;
@@ -64,9 +86,12 @@ export function HomeView({
   const [draft, setDraft] = useState("");
   const [editing, setEditing] = useState(false);
   const [treeOpen, setTreeOpen] = useState(false);
-  const openaiKeys = providerKeys.filter((key) => key.providerSlug === "openai");
-  const models = openaiCatalogModels();
-  const hasKey = selectedKeyId !== null && openaiKeys.some((key) => key.id === selectedKeyId);
+  const selectedKey = providerKeys.find((key) => key.id === selectedKeyId) ?? providerKeys[0] ?? null;
+  const providerSlug = selectedKey?.providerSlug ?? null;
+  const models = providerSlug ? catalogModelsForProvider(providerSlug) : [];
+  const selectedCatalog: CatalogModel | null =
+    providerSlug && selectedModel ? findCatalogModel(selectedModel, providerSlug) : null;
+  const hasKey = selectedKeyId !== null && providerKeys.some((key) => key.id === selectedKeyId);
   const busy = streaming || sending;
   const path = activePath(messages);
   const activeIds = new Set(path.map((item) => item.id));
@@ -146,7 +171,7 @@ export function HomeView({
         {selectedConversationId ? (
           <>
             <header className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
-              {openaiKeys.length === 0 ? (
+              {providerKeys.length === 0 ? (
                 <p className="text-muted-foreground">{t("workspace.noKey")}</p>
               ) : (
                 <>
@@ -154,31 +179,94 @@ export function HomeView({
                     <span className="text-muted-foreground">{t("workspace.key")}</span>
                     <select
                       className="h-8 rounded-md border bg-background px-2 text-sm"
-                      value={selectedKeyId ?? openaiKeys[0]?.id}
+                      value={selectedKeyId ?? providerKeys[0]?.id}
                       onChange={(event) => onSelectKey(event.target.value)}
                       aria-label={t("workspace.key")}
+                      data-testid="workspace-key"
                     >
-                      {openaiKeys.map((key) => (
+                      {providerKeys.map((key) => (
                         <option key={key.id} value={key.id}>
-                          {key.label} ({key.maskedKey})
+                          {key.providerSlug} · {key.label} ({key.maskedKey})
                         </option>
                       ))}
                     </select>
                   </label>
                   <label className="flex items-center gap-1">
                     <span className="text-muted-foreground">{t("workspace.model")}</span>
-                    <select
-                      className="h-8 rounded-md border bg-background px-2 text-sm"
-                      value={selectedModel}
-                      onChange={(event) => onSelectModel(event.target.value)}
-                      aria-label={t("workspace.model")}
-                    >
-                      {models.map((model) => (
-                        <option key={model.id} value={model.id}>
-                          {model.label}
-                        </option>
-                      ))}
-                    </select>
+                    {providerSlug === "custom" ? (
+                      <Input
+                        className="h-8 w-52"
+                        value={selectedModel}
+                        onChange={(event) => onSelectModel(event.target.value)}
+                        aria-label={t("workspace.customModel")}
+                        data-testid="workspace-custom-model"
+                      />
+                    ) : (
+                      <select
+                        className="h-8 max-w-72 rounded-md border bg-background px-2 text-sm"
+                        value={selectedModel}
+                        onChange={(event) => onSelectModel(event.target.value)}
+                        aria-label={t("workspace.model")}
+                        data-testid="workspace-model"
+                      >
+                        {models.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.label}
+                            {model.vision ? ` · ${t("workspace.model.vision")}` : ""}
+                            {model.tools ? ` · ${t("workspace.model.tools")}` : ""}
+                            {` · ${model.contextWindow / 1000}k`}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                  </label>
+                  {selectedCatalog ? (
+                    <span className="text-[11px] text-muted-foreground">
+                      {t("workspace.model.price", {
+                        input: selectedCatalog.inputUsdPerMillion,
+                        output: selectedCatalog.outputUsdPerMillion,
+                      })}
+                    </span>
+                  ) : null}
+                  <label className="flex items-center gap-1">
+                    <span className="text-muted-foreground">{t("workspace.temperature")}</span>
+                    <Input
+                      className="h-8 w-16"
+                      type="number"
+                      min={0}
+                      max={2}
+                      step={0.1}
+                      value={temperature}
+                      onChange={(event) => {
+                        const value = Number(event.target.value);
+                        if (Number.isFinite(value)) {
+                          onSelectTemperature(Math.min(2, Math.max(0, value)));
+                        }
+                      }}
+                      aria-label={t("workspace.temperature")}
+                    />
+                  </label>
+                  <label className="flex items-center gap-1">
+                    <span className="text-muted-foreground">{t("workspace.maxTokens")}</span>
+                    <Input
+                      className="h-8 w-20"
+                      type="number"
+                      min={1}
+                      placeholder={t("workspace.maxTokensDefault")}
+                      value={maxTokens ?? ""}
+                      onChange={(event) => {
+                        const raw = event.target.value.trim();
+                        if (raw.length === 0) {
+                          onSelectMaxTokens(null);
+                          return;
+                        }
+                        const value = Number(raw);
+                        if (Number.isFinite(value) && value >= 1) {
+                          onSelectMaxTokens(Math.floor(value));
+                        }
+                      }}
+                      aria-label={t("workspace.maxTokens")}
+                    />
                   </label>
                 </>
               )}
@@ -255,6 +343,15 @@ export function HomeView({
                 </ol>
               )}
             </ScrollArea>
+            <label className="flex flex-col gap-1 border-t px-3 py-2 text-[12px]">
+              <span className="text-muted-foreground">{t("workspace.extraSystem")}</span>
+              <textarea
+                className="min-h-[2.5rem] resize-y rounded-md border bg-background px-2 py-1 text-[13px]"
+                value={extraSystem}
+                onChange={(event) => onSelectExtraSystem(event.target.value)}
+                aria-label={t("workspace.extraSystem")}
+              />
+            </label>
             <ChatComposer
               key={selectedConversationId}
               value={draft}
