@@ -1,13 +1,9 @@
 import { type JSX, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type {
-  ConversationDto,
-  MessageDto,
-  ProjectDto,
-  ProviderAgnosticPacket,
-  ProviderKeyDto,
-} from "@ai-hub/shared";
+import type { ConversationDto, MessageDto, ProjectDto, ProviderKeyDto } from "@ai-hub/shared";
 import { openaiCatalogModels } from "@ai-hub/shared";
+import { ChatComposer } from "@/components/chat/chat-composer";
+import { MessageBubble } from "@/components/chat/message-bubble";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -21,15 +17,17 @@ export function HomeView({
   providerKeys,
   selectedKeyId,
   selectedModel,
-  packet,
   streaming,
+  sending,
   onSelectConversation,
   onCreateConversation,
-  onCreateMessage,
   onSelectKey,
   onSelectModel,
-  onSendToModel,
+  onSend,
   onAbort,
+  onRegenerate,
+  onContinue,
+  onEditUser,
 }: {
   project: ProjectDto | null;
   conversations: ConversationDto[];
@@ -39,21 +37,25 @@ export function HomeView({
   providerKeys: ProviderKeyDto[];
   selectedKeyId: string | null;
   selectedModel: string;
-  packet: ProviderAgnosticPacket | null;
   streaming: boolean;
+  sending: boolean;
   onSelectConversation: (id: string) => void;
   onCreateConversation: (title: string) => Promise<void>;
-  onCreateMessage: (content: string) => Promise<void>;
   onSelectKey: (id: string) => void;
   onSelectModel: (id: string) => void;
-  onSendToModel: () => Promise<void>;
+  onSend: (content: string) => Promise<void>;
   onAbort: () => Promise<void>;
+  onRegenerate: () => Promise<void>;
+  onContinue: () => Promise<void>;
+  onEditUser: (id: string, content: string) => Promise<void>;
 }): JSX.Element {
   const { t } = useTranslation();
   const [title, setTitle] = useState("");
-  const [note, setNote] = useState("");
+  const [draft, setDraft] = useState("");
   const openaiKeys = providerKeys.filter((key) => key.providerSlug === "openai");
   const models = openaiCatalogModels();
+  const hasKey = selectedKeyId !== null && openaiKeys.some((key) => key.id === selectedKeyId);
+  const busy = streaming || sending;
 
   if (!project) {
     return (
@@ -89,6 +91,7 @@ export function HomeView({
                   type="button"
                   variant={selectedConversationId === conversation.id ? "secondary" : "ghost"}
                   className="h-8 w-full justify-start truncate"
+                  aria-current={selectedConversationId === conversation.id ? "true" : undefined}
                   onClick={() => onSelectConversation(conversation.id)}
                 >
                   {conversation.title}
@@ -122,70 +125,18 @@ export function HomeView({
       <section className="flex min-w-0 flex-1 flex-col">
         {selectedConversationId ? (
           <>
-            <ScrollArea className="flex-1 p-4">
-              {messages.length === 0 ? (
-                <p className="text-muted-foreground">{t("workspace.noMessages")}</p>
-              ) : (
-                <ol className="flex flex-col gap-2">
-                  {messages.map((message) => (
-                    <li key={message.id} className="rounded-md border bg-card p-2">
-                      <p className="text-[11px] uppercase text-muted-foreground">
-                        {message.role}
-                        {message.status !== "complete" ? ` · ${t(`workspace.status.${message.status}`)}` : ""}
-                        {message.parentId ? ` · ${t("workspace.branched")}` : ""}
-                      </p>
-                      <p className="whitespace-pre-wrap">{message.content}</p>
-                      {message.receipt ? (
-                        <p className="mt-1 text-[11px] text-muted-foreground">
-                          {t("workspace.receipt", {
-                            model: message.receipt.model ?? "—",
-                            tokensIn: message.receipt.tokensIn ?? "—",
-                            tokensOut: message.receipt.tokensOut ?? "—",
-                            cost: message.receipt.costUsd ?? "—",
-                            latency: message.receipt.latencyMs ?? "—",
-                          })}
-                          {message.receipt.errorCode
-                            ? ` · ${t("workspace.receipt.error", { code: message.receipt.errorCode })}`
-                            : ""}
-                        </p>
-                      ) : null}
-                    </li>
-                  ))}
-                </ol>
-              )}
-            </ScrollArea>
-            <form
-              className="flex gap-2 border-t p-2"
-              onSubmit={(event) => {
-                event.preventDefault();
-                const next = note.trim();
-                if (!next) {
-                  return;
-                }
-                void onCreateMessage(next).then(() => setNote(""));
-              }}
-            >
-              <Input
-                value={note}
-                onChange={(event) => setNote(event.target.value)}
-                placeholder={t("workspace.notePlaceholder")}
-                aria-label={t("workspace.notePlaceholder")}
-              />
-              <Button type="submit">{t("workspace.addNote")}</Button>
-            </form>
-            <div className="flex flex-col gap-2 border-t p-2">
-              <p className="text-[11px] font-medium uppercase text-muted-foreground">{t("workspace.debug.title")}</p>
+            <header className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
               {openaiKeys.length === 0 ? (
-                <p className="text-muted-foreground">{t("workspace.debug.noKey")}</p>
+                <p className="text-muted-foreground">{t("workspace.noKey")}</p>
               ) : (
-                <div className="flex flex-wrap items-center gap-2">
+                <>
                   <label className="flex items-center gap-1">
-                    <span className="text-muted-foreground">{t("workspace.debug.key")}</span>
+                    <span className="text-muted-foreground">{t("workspace.key")}</span>
                     <select
                       className="h-8 rounded-md border bg-background px-2 text-sm"
                       value={selectedKeyId ?? openaiKeys[0]?.id}
                       onChange={(event) => onSelectKey(event.target.value)}
-                      aria-label={t("workspace.debug.key")}
+                      aria-label={t("workspace.key")}
                     >
                       {openaiKeys.map((key) => (
                         <option key={key.id} value={key.id}>
@@ -195,12 +146,12 @@ export function HomeView({
                     </select>
                   </label>
                   <label className="flex items-center gap-1">
-                    <span className="text-muted-foreground">{t("workspace.debug.model")}</span>
+                    <span className="text-muted-foreground">{t("workspace.model")}</span>
                     <select
                       className="h-8 rounded-md border bg-background px-2 text-sm"
                       value={selectedModel}
                       onChange={(event) => onSelectModel(event.target.value)}
-                      aria-label={t("workspace.debug.model")}
+                      aria-label={t("workspace.model")}
                     >
                       {models.map((model) => (
                         <option key={model.id} value={model.id}>
@@ -209,39 +160,52 @@ export function HomeView({
                       ))}
                     </select>
                   </label>
-                  <Button
-                    type="button"
-                    size="sm"
-                    className="h-8"
-                    disabled={streaming}
-                    onClick={() => {
-                      void onSendToModel();
-                    }}
-                  >
-                    {t("workspace.debug.send")}
-                  </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    className="h-8"
-                    disabled={!streaming}
-                    onClick={() => {
-                      void onAbort();
-                    }}
-                  >
-                    {t("workspace.debug.abort")}
-                  </Button>
-                </div>
+                </>
               )}
-              {packet ? (
-                <pre className="max-h-32 overflow-auto rounded-md border bg-muted/40 p-2 font-mono text-[11px]">
-                  {t("workspace.debug.packet")}
-                  {"\n"}
-                  {JSON.stringify(packet, null, 2)}
-                </pre>
-              ) : null}
-            </div>
+            </header>
+            <ScrollArea className="flex-1 p-4">
+              {messages.length === 0 ? (
+                <p className="text-muted-foreground">{t("workspace.noMessages")}</p>
+              ) : (
+                <ol className="flex flex-col gap-2" aria-live="polite">
+                  {messages.map((message, index) => (
+                    <MessageBubble
+                      key={message.id}
+                      message={message}
+                      isLast={index === messages.length - 1}
+                      busy={busy}
+                      onRegenerate={() => {
+                        void onRegenerate();
+                      }}
+                      onContinue={() => {
+                        void onContinue();
+                      }}
+                      onEdit={async (content) => {
+                        await onEditUser(message.id, content);
+                      }}
+                    />
+                  ))}
+                </ol>
+              )}
+            </ScrollArea>
+            <ChatComposer
+              key={selectedConversationId}
+              value={draft}
+              onChange={setDraft}
+              streaming={streaming}
+              sending={sending}
+              disabled={!hasKey}
+              onSend={() => {
+                const next = draft.trim();
+                if (!next) {
+                  return;
+                }
+                void onSend(next).then(() => setDraft(""));
+              }}
+              onAbort={() => {
+                void onAbort();
+              }}
+            />
           </>
         ) : (
           <div className="flex flex-1 items-center justify-center p-8 text-muted-foreground">
