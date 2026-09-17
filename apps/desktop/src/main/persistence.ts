@@ -19,6 +19,9 @@ async function seedE2eWorkspace(database: HubDatabase): Promise<void> {
     projectId: project.id,
     conversationId: conversation.id,
     model: "gpt-4o-mini",
+    temperature: 1,
+    maxTokens: null,
+    extraSystem: "",
   });
 }
 
