@@ -115,7 +115,7 @@ describe("hub database", () => {
       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
       applyMigrations(second.sqlite);
-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(3);
+      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(4);
       second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -439,6 +439,65 @@ describe("hub database", () => {
     expect(hub.repos.listHealthSamples("openrouter")).toHaveLength(1);
     const dump = dumpAllText(hub.sqlite);
     expect(dump).not.toMatch(/sk-/);
+    hub.close();
+  });
+
+  it("stores three projects with instructions and finds an old message without filling FTS", () => {
+    const { hub } = openTestDb();
+    const alpha = hub.repos.createProject("Alpha", {
+      color: "#2563eb",
+      instructions: "Stay terse.",
+      preferredModel: "gpt-4o-mini",
+      preferredProvider: "openai",
+    });
+    hub.repos.createProject("Beta", { color: "#16a34a" });
+    hub.repos.createProject("Gamma");
+    expect(hub.repos.listProjects()).toHaveLength(3);
+    expect(alpha.instructions).toBe("Stay terse.");
+    expect(alpha.preferredProvider).toBe("openai");
+
+    const inbox = hub.repos.createConversation(null, "Loose note");
+    expect(inbox.projectId).toBeNull();
+    expect(hub.repos.listConversations(null).map((item) => item.title)).toEqual(["Loose note"]);
+
+    const conversation = hub.repos.createConversation(alpha.id, "Kickoff");
+    hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "user",
+      content: "remember the ancient needle phrase",
+      parentId: null,
+      branchId: null,
+    });
+    const tagged = hub.repos.setConversationTags(conversation.id, ["research", "mvp"]);
+    expect(tagged.tags).toEqual(["mvp", "research"]);
+
+    hub.repos.removeProject(alpha.id);
+    expect(hub.repos.getConversation(conversation.id)?.projectId).toBeNull();
+
+    const hits = hub.repos.searchWorkspace("ancient needle");
+    expect(hits.some((hit) => hit.snippet.includes("ancient needle"))).toBe(true);
+    const dump = dumpAllText(hub.sqlite);
+    expect(dump).not.toContain("ancient needle phrase");
+    const ftsCount = hub.sqlite.prepare(`SELECT count(*) AS n FROM messages_fts`).get() as { n: number };
+    expect(ftsCount.n).toBe(0);
+    hub.close();
+  });
+
+  it("redacts pasted secrets in search snippets", () => {
+    const { hub } = openTestDb();
+    const project = hub.repos.createProject("Vault");
+    const conversation = hub.repos.createConversation(project.id, "Keys");
+    hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "user",
+      content: "my key is sk-testfixtureABCDEFGH never store it",
+      parentId: null,
+      branchId: null,
+    });
+    const hits = hub.repos.searchWorkspace("never store");
+    expect(hits.length).toBeGreaterThan(0);
+    expect(JSON.stringify(hits)).not.toContain("sk-testfixtureABCDEFGH");
+    expect(hits[0]?.snippet).toContain("[REDACTED]");
     hub.close();
   });
 });
