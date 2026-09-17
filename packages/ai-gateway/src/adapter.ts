@@ -15,11 +15,13 @@ export interface ChatStreamRequest {
   model: string;
   packet: ProviderAgnosticPacket;
   signal: AbortSignal;
+  temperature?: number;
+  maxTokens?: number | null;
 }
 
 export type ChatStreamEvent =
   | { type: "delta"; text: string }
-  | { type: "usage"; tokensIn: number; tokensOut: number };
+  | { type: "usage"; tokensIn: number; tokensOut: number; costUsd?: string };
 
 export interface ProviderAdapter {
   readonly id: string;
