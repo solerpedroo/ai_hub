@@ -49,6 +49,7 @@ export function ChatComposer({
         ref={areaRef}
         id="chat-composer"
         data-testid="chat-composer"
+        aria-busy={busy}
         value={value}
         disabled={disabled || sending}
         rows={3}
