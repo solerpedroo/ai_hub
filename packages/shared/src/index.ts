@@ -55,6 +55,8 @@ export {
   providerKeyListResultSchema,
   providerListResultSchema,
   secretsSaveInputSchema,
+  secretsTestInputSchema,
+  secretsTestResultSchema,
   windowIsMaximizedResultSchema,
   workspaceSessionSchema,
   type AppearanceSettings,
@@ -83,11 +85,14 @@ export {
   type ProviderDto,
   type ProviderKeyDto,
   type SecretsSaveInput,
+  type SecretsTestInput,
+  type SecretsTestResult,
   type WorkspaceSession,
 } from "./ipc-schemas";
 export {
   chatAbortInputSchema,
   chatSendInputSchema,
+  catalogModelsForProvider,
   estimateCostUsd,
   findCatalogModel,
   gatewayErrorCodeSchema,
