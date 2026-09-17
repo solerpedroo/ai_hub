@@ -93,7 +93,19 @@ export interface AppearanceRecord {
   locale: "pt-BR" | "en";
 }
 
+export interface WorkspaceSessionRecord {
+  projectId: string | null;
+  conversationId: string | null;
+  model: string;
+}
+
 const APPEARANCE_KEY = "appearance";
+const SESSION_KEY = "workspace-session";
+const DEFAULT_SESSION: WorkspaceSessionRecord = {
+  projectId: null,
+  conversationId: null,
+  model: "gpt-4o-mini",
+};
 
 function iso(ms: number): string {
   return new Date(ms).toISOString();
@@ -358,6 +370,22 @@ export class HubRepos {
     return this.toMessage(updated, this.getReceipt(id));
   }
 
+  deleteMessagesFrom(id: string): void {
+    const target = this.db.select().from(messages).where(eq(messages.id, id)).get();
+    if (!target) {
+      throw new Error("Message not found");
+    }
+    const rows = this.listMessages(target.conversationId);
+    const index = rows.findIndex((row) => row.id === id);
+    if (index < 0) {
+      throw new Error("Message not found");
+    }
+    const doomed = rows.slice(index).reverse();
+    for (const row of doomed) {
+      this.db.delete(messages).where(eq(messages.id, row.id)).run();
+    }
+  }
+
   createReceipt(input: {
     messageId: string;
     provider: string | null;
@@ -499,6 +527,51 @@ export class HubRepos {
       .onConflictDoUpdate({
         target: settings.key,
         set: { value: JSON.stringify(appearance), updatedAt: now },
+      })
+      .run();
+  }
+
+  getWorkspaceSession(): WorkspaceSessionRecord {
+    const row = this.db.select().from(settings).where(eq(settings.key, SESSION_KEY)).get();
+    if (!row) {
+      return { ...DEFAULT_SESSION };
+    }
+    const parsed: unknown = JSON.parse(row.value);
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "projectId" in parsed &&
+      "conversationId" in parsed &&
+      "model" in parsed
+    ) {
+      const projectId = parsed.projectId;
+      const conversationId = parsed.conversationId;
+      const model = parsed.model;
+      const projectOk = projectId === null || typeof projectId === "string";
+      const conversationOk = conversationId === null || typeof conversationId === "string";
+      if (projectOk && conversationOk && typeof model === "string" && model.length > 0) {
+        return {
+          projectId,
+          conversationId,
+          model,
+        };
+      }
+    }
+    return { ...DEFAULT_SESSION };
+  }
+
+  setWorkspaceSession(session: WorkspaceSessionRecord): void {
+    const now = Date.now();
+    this.db
+      .insert(settings)
+      .values({
+        key: SESSION_KEY,
+        value: JSON.stringify(session),
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: settings.key,
+        set: { value: JSON.stringify(session), updatedAt: now },
       })
       .run();
   }
