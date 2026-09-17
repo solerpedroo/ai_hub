@@ -1,0 +1,2876 @@
+﻿diff --git a/apps/desktop/electron.vite.config.ts b/apps/desktop/electron.vite.config.ts
+index f0ebee1..3de534a 100644
+--- a/apps/desktop/electron.vite.config.ts
++++ b/apps/desktop/electron.vite.config.ts
+@@ -4,19 +4,25 @@ import react from "@vitejs/plugin-react";
+ 
+ const shared = resolve(__dirname, "../../packages/shared/src");
+ const db = resolve(__dirname, "../../packages/db/src");
++const gateway = resolve(__dirname, "../../packages/ai-gateway/src");
+ const securityIndex = resolve(__dirname, "../../packages/security/src/index.ts");
+ const securityKeytar = resolve(__dirname, "../../packages/security/src/keytar-store.ts");
+ 
+ const mainAliases = {
+   "@ai-hub/shared": shared,
+   "@ai-hub/db": db,
++  "@ai-hub/ai-gateway": gateway,
+   "@ai-hub/security/keytar": securityKeytar,
+   "@ai-hub/security": securityIndex,
+ };
+ 
+ export default defineConfig({
+   main: {
+-    plugins: [externalizeDepsPlugin({ exclude: ["@ai-hub/shared", "@ai-hub/db", "@ai-hub/security"] })],
++    plugins: [
++      externalizeDepsPlugin({
++        exclude: ["@ai-hub/shared", "@ai-hub/db", "@ai-hub/security", "@ai-hub/ai-gateway"],
++      }),
++    ],
+     resolve: {
+       alias: mainAliases,
+     },
+diff --git a/apps/desktop/package.json b/apps/desktop/package.json
+index 6bca0ef..55ed87e 100644
+--- a/apps/desktop/package.json
++++ b/apps/desktop/package.json
+@@ -13,6 +13,7 @@
+   },
+   "dependencies": {
+     "@ai-hub/db": "workspace:*",
++    "@ai-hub/ai-gateway": "workspace:*",
+     "@ai-hub/security": "workspace:*",
+     "@ai-hub/shared": "workspace:*",
+     "@electron-toolkit/utils": "^4.0.0",
+diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts
+new file mode 100644
+index 0000000..fd38290
+--- /dev/null
++++ b/apps/desktop/src/main/chat-session.ts
+@@ -0,0 +1,208 @@
++import { randomUUID } from "node:crypto";
++import type { WebContents } from "electron";
++import {
++  composeReceipt,
++  compilePacket,
++  consumeCrashSafeStream,
++  createOpenAIAdapter,
++  estimateTokensFromChars,
++  GatewayError,
++  gatewayErrorCode,
++} from "@ai-hub/ai-gateway";
++import { redactSecrets } from "@ai-hub/security";
++import {
++  chatEventSchema,
++  findCatalogModel,
++  IpcChannel,
++  type ChatEvent,
++  type ChatSendInput,
++  type ChatSendResult,
++  type GatewayErrorCode,
++} from "@ai-hub/shared";
++import { getHubDatabase } from "./persistence";
++import { toMessageDto } from "./message-dto";
++
++interface ActiveRun {
++  runId: string;
++  conversationId: string;
++  messageId: string;
++  abort: AbortController;
++  sender: WebContents;
++  packetEstimate: number;
++  startedAt: number;
++  model: string;
++  provider: string;
++}
++
++const runs = new Map<string, ActiveRun>();
++const runByConversation = new Map<string, string>();
++const openai = createOpenAIAdapter();
++
++function emit(sender: WebContents, event: ChatEvent): void {
++  if (sender.isDestroyed()) {
++    return;
++  }
++  sender.send(IpcChannel.chatEvent, chatEventSchema.parse(event));
++}
++
++function writeReceipt(
++  messageId: string,
++  run: ActiveRun,
++  tokensIn: number | null,
++  tokensOut: number | null,
++  outputChars: number,
++  errorCode: GatewayErrorCode | null,
++): void {
++  const composed = composeReceipt({
++    provider: run.provider,
++    model: run.model,
++    tokensIn,
++    tokensOut,
++    estimatedIn: run.packetEstimate,
++    estimatedOut: estimateTokensFromChars(outputChars),
++    latencyMs: Math.max(0, Date.now() - run.startedAt),
++    errorCode,
++  });
++  getHubDatabase().repos.createReceipt({
++    messageId,
++    provider: composed.provider,
++    model: composed.model,
++    tokensIn: composed.tokensIn,
++    tokensOut: composed.tokensOut,
++    latencyMs: composed.latencyMs,
++    costUsd: composed.costUsd,
++    errorCode: composed.errorCode,
++  });
++}
++
++export function abortChat(runId: string): void {
++  runs.get(runId)?.abort.abort();
++}
++
++export async function sendChat(input: ChatSendInput, sender: WebContents): Promise<ChatSendResult> {
++  const repos = getHubDatabase().repos;
++  if (runByConversation.has(input.conversationId)) {
++    throw new Error("A stream is already running in this conversation");
++  }
++
++  const conversation = repos.getConversation(input.conversationId);
++  if (!conversation) {
++    throw new Error("Conversation not found");
++  }
++
++  if (!findCatalogModel(input.model, "openai")) {
++    throw new Error("Unknown model");
++  }
++
++  const key = await repos.getProviderSecret(input.providerKeyId);
++  if (!key) {
++    throw new GatewayError("auth", "Provider key is missing");
++  }
++  if (key.providerSlug !== "openai") {
++    throw new Error("Only OpenAI is available in this wave");
++  }
++
++  const history = repos.listMessages(input.conversationId);
++  if (history.some((item) => item.status === "streaming")) {
++    throw new Error("A stream is already running in this conversation");
++  }
++
++  const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
++  const packet = compilePacket({
++    projectInstructions: project?.instructions ?? null,
++    extraSystem: null,
++    messages: history.map((item) => ({
++      id: item.id,
++      role: item.role,
++      content: item.content,
++      status: item.status,
++    })),
++  });
++  if (packet.messages.length === 0) {
++    throw new Error("Add a user message before sending");
++  }
++
++  console.info("[hub:packet]", redactSecrets(JSON.stringify(packet)));
++
++  const last = history[history.length - 1];
++  const assistant = repos.createMessage({
++    conversationId: input.conversationId,
++    role: "assistant",
++    content: "",
++    parentId: last?.id ?? null,
++    branchId: last?.branchId ?? null,
++    status: "streaming",
++  });
++
++  const runId = randomUUID();
++  const run: ActiveRun = {
++    runId,
++    conversationId: input.conversationId,
++    messageId: assistant.id,
++    abort: new AbortController(),
++    sender,
++    packetEstimate: packet.tokenEstimate,
++    startedAt: Date.now(),
++    model: input.model,
++    provider: "openai",
++  };
++  runs.set(runId, run);
++  runByConversation.set(input.conversationId, runId);
++
++  const secret = key.secret;
++  void (async () => {
++    try {
++      const result = await consumeCrashSafeStream({
++        stream: openai.chatStream({
++          secret,
++          model: input.model,
++          packet,
++          signal: run.abort.signal,
++        }),
++        onDelta: (text) => {
++          emit(run.sender, {
++            type: "chunk",
++            runId,
++            messageId: assistant.id,
++            text,
++          });
++        },
++        onFlush: (content) => {
++          repos.updateMessage(assistant.id, content, "streaming");
++        },
++      });
++      repos.updateMessage(assistant.id, result.content, "complete");
++      writeReceipt(assistant.id, run, result.tokensIn, result.tokensOut, result.content.length, null);
++      const stored = repos.getMessage(assistant.id);
++      if (!stored) {
++        throw new Error("Message not found");
++      }
++      emit(run.sender, {
++        type: "done",
++        runId,
++        message: toMessageDto(stored),
++        packet,
++      });
++    } catch (error) {
++      const code = gatewayErrorCode(error);
++      const status = code === "aborted" ? "aborted" : "interrupted";
++      const current = repos.getMessage(assistant.id);
++      const content = current?.content ?? "";
++      repos.updateMessage(assistant.id, content, status);
++      if (!repos.getReceipt(assistant.id)) {
++        writeReceipt(assistant.id, run, null, null, content.length, code);
++      }
++      emit(run.sender, {
++        type: "error",
++        runId,
++        messageId: assistant.id,
++        code,
++      });
++    } finally {
++      runs.delete(runId);
++      runByConversation.delete(input.conversationId);
++    }
++  })();
++
++  return { runId, messageId: assistant.id, packet };
++}
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index b97f7e0..2fc917b 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -3,6 +3,9 @@ import { ZodError, type ZodType } from "zod";
+ import {
+   IpcChannel,
+   appearanceSettingsSchema,
++  chatAbortInputSchema,
++  chatSendInputSchema,
++  chatSendResultSchema,
+   conversationCreateInputSchema,
+   conversationDtoSchema,
+   conversationListInputSchema,
+@@ -24,6 +27,8 @@ import {
+   windowIsMaximizedResultSchema,
+ } from "@ai-hub/shared";
+ import { safeErrorMessage } from "@ai-hub/security";
++import { abortChat, sendChat } from "./chat-session";
++import { toMessageDto } from "./message-dto";
+ import { getHubDatabase } from "./persistence";
+ 
+ function registerHandler<TIn, TOut>(
+@@ -83,11 +88,11 @@ export function registerWorkspaceIpc(): void {
+   registerHandler(IpcChannel.messagesList, messageListInputSchema, messageListResultSchema, (input) =>
+     getHubDatabase()
+       .repos.listMessages(input.conversationId)
+-      .map((row) => messageDtoSchema.parse(row)),
++      .map((row) => toMessageDto(row)),
+   );
+ 
+   registerHandler(IpcChannel.messagesCreate, messageCreateInputSchema, messageDtoSchema, (input) =>
+-    messageDtoSchema.parse(
++    toMessageDto(
+       getHubDatabase().repos.createMessage({
+         conversationId: input.conversationId,
+         role: input.role,
+@@ -129,6 +134,14 @@ export function registerWorkspaceIpc(): void {
+   registerHandler(IpcChannel.secretsRemove, idInputSchema, ipcAckResultSchema, (input) =>
+     getHubDatabase().repos.removeProviderKey(input.id),
+   );
++
++  registerHandler(IpcChannel.chatSend, chatSendInputSchema, chatSendResultSchema, (input, event) =>
++    sendChat(input, event.sender),
++  );
++
++  registerHandler(IpcChannel.chatAbort, chatAbortInputSchema, ipcAckResultSchema, (input) => {
++    abortChat(input.runId);
++  });
+ }
+ 
+ export function registerWindowIpc(
+diff --git a/apps/desktop/src/main/message-dto.ts b/apps/desktop/src/main/message-dto.ts
+new file mode 100644
+index 0000000..1bb14c9
+--- /dev/null
++++ b/apps/desktop/src/main/message-dto.ts
+@@ -0,0 +1,35 @@
++import type { MessageRecord } from "@ai-hub/db";
++import {
++  gatewayErrorCodeSchema,
++  messageDtoSchema,
++  receiptDtoSchema,
++  type MessageDto,
++} from "@ai-hub/shared";
++
++export function toMessageDto(row: MessageRecord): MessageDto {
++  const receipt = row.receipt
++    ? receiptDtoSchema.parse({
++        id: row.receipt.id,
++        messageId: row.receipt.messageId,
++        provider: row.receipt.provider,
++        model: row.receipt.model,
++        tokensIn: row.receipt.tokensIn,
++        tokensOut: row.receipt.tokensOut,
++        latencyMs: row.receipt.latencyMs,
++        costUsd: row.receipt.costUsd,
++        errorCode: row.receipt.errorCode ? gatewayErrorCodeSchema.parse(row.receipt.errorCode) : null,
++        createdAt: row.receipt.createdAt,
++      })
++    : null;
++  return messageDtoSchema.parse({
++    id: row.id,
++    conversationId: row.conversationId,
++    parentId: row.parentId,
++    branchId: row.branchId,
++    role: row.role,
++    content: row.content,
++    status: row.status,
++    createdAt: row.createdAt,
++    receipt,
++  });
++}
+diff --git a/apps/desktop/src/main/persistence.ts b/apps/desktop/src/main/persistence.ts
+index 0482d12..17f2856 100644
+--- a/apps/desktop/src/main/persistence.ts
++++ b/apps/desktop/src/main/persistence.ts
+@@ -14,6 +14,7 @@ export async function bootPersistence(): Promise<HubDatabase> {
+   const masterKey = await loadOrCreateMasterKey(store);
+   const dbPath = join(app.getPath("userData"), "ai-hub.sqlite");
+   hub = openHubDatabase({ path: dbPath, masterKey, secretStore: store });
++  hub.repos.interruptOrphanStreams();
+   return hub;
+ }
+ 
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index 6502c9d..c5e65ec 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -4,6 +4,10 @@ import {
+   IpcChannel,
+   type HubApi,
+   appearanceSettingsSchema,
++  chatAbortInputSchema,
++  chatEventSchema,
++  chatSendInputSchema,
++  chatSendResultSchema,
+   conversationCreateInputSchema,
+   conversationListInputSchema,
+   conversationListResultSchema,
+@@ -131,6 +135,23 @@ const hub: HubApi = {
+     save: (input) => invokeParsed(IpcChannel.secretsSave, input, secretsSaveInputSchema, providerKeyDtoSchema),
+     remove: (input) => invokeAckWith(IpcChannel.secretsRemove, input, idInputSchema),
+   },
++  chat: {
++    send: (input) => invokeParsed(IpcChannel.chatSend, input, chatSendInputSchema, chatSendResultSchema),
++    abort: (input) => invokeAckWith(IpcChannel.chatAbort, input, chatAbortInputSchema),
++    onEvent: (listener) => {
++      const wrapped = (_event: unknown, payload: unknown): void => {
++        try {
++          listener(chatEventSchema.parse(payload));
++        } catch (error) {
++          rethrowIpcError(error);
++        }
++      };
++      ipcRenderer.on(IpcChannel.chatEvent, wrapped);
++      return () => {
++        ipcRenderer.removeListener(IpcChannel.chatEvent, wrapped);
++      };
++    },
++  },
+ };
+ 
+ contextBridge.exposeInMainWorld("hub", hub);
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index c6b6914..08280bb 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -1,6 +1,12 @@
+ import { useCallback, useEffect, useState, type JSX } from "react";
+ import { useTranslation } from "react-i18next";
+-import type { ConversationDto, MessageDto, ProjectDto } from "@ai-hub/shared";
++import type {
++  ConversationDto,
++  MessageDto,
++  ProjectDto,
++  ProviderAgnosticPacket,
++  ProviderKeyDto,
++} from "@ai-hub/shared";
+ import { TitleBar } from "@/components/layout/title-bar";
+ import { Sidebar } from "@/components/layout/sidebar";
+ import { StatusBar } from "@/components/layout/status-bar";
+@@ -17,6 +23,11 @@ export function App(): JSX.Element {
+   const [conversations, setConversations] = useState<ConversationDto[]>([]);
+   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
+   const [messages, setMessages] = useState<MessageDto[]>([]);
++  const [providerKeys, setProviderKeys] = useState<ProviderKeyDto[]>([]);
++  const [selectedKeyId, setSelectedKeyId] = useState<string | null>(null);
++  const [selectedModel, setSelectedModel] = useState("gpt-4o-mini");
++  const [packet, setPacket] = useState<ProviderAgnosticPacket | null>(null);
++  const [runId, setRunId] = useState<string | null>(null);
+   const [error, setError] = useState<string | null>(null);
+ 
+   const fail = useCallback((): void => {
+@@ -39,6 +50,13 @@ export function App(): JSX.Element {
+     setMessages(list);
+   }, []);
+ 
++  const loadKeys = useCallback(async (): Promise<void> => {
++    const list = await window.hub.secrets.list();
++    setProviderKeys(list);
++    const openai = list.find((item) => item.providerSlug === "openai");
++    setSelectedKeyId((current) => current ?? openai?.id ?? null);
++  }, []);
++
+   useEffect(() => {
+     void loadProjects()
+       .then((list) => {
+@@ -50,6 +68,13 @@ export function App(): JSX.Element {
+       .catch(fail);
+   }, [fail, loadProjects]);
+ 
++  useEffect(() => {
++    if (view !== "home") {
++      return;
++    }
++    void loadKeys().catch(fail);
++  }, [fail, loadKeys, view]);
++
+   useEffect(() => {
+     if (!selectedProjectId) {
+       setConversations([]);
+@@ -61,10 +86,44 @@ export function App(): JSX.Element {
+       .then(() => {
+         setSelectedConversationId(null);
+         setMessages([]);
++        setPacket(null);
++        setRunId(null);
+       })
+       .catch(fail);
+   }, [fail, loadConversations, selectedProjectId]);
+ 
++  useEffect(() => {
++    const off = window.hub.chat.onEvent((event) => {
++      if (event.type === "chunk") {
++        setMessages((current) =>
++          current.map((message) =>
++            message.id === event.messageId
++              ? { ...message, content: message.content + event.text, status: "streaming" }
++              : message,
++          ),
++        );
++        return;
++      }
++      if (event.type === "done") {
++        setMessages((current) =>
++          current.map((message) => (message.id === event.message.id ? event.message : message)),
++        );
++        setPacket(event.packet);
++        setRunId(null);
++        return;
++      }
++      setRunId(null);
++      setError(t("workspace.error.chat", { code: event.code }));
++      setSelectedConversationId((conversationId) => {
++        if (conversationId) {
++          void loadMessages(conversationId).catch(fail);
++        }
++        return conversationId;
++      });
++    });
++    return off;
++  }, [fail, loadMessages, t]);
++
+   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
+ 
+   return (
+@@ -98,8 +157,15 @@ export function App(): JSX.Element {
+               selectedConversationId={selectedConversationId}
+               messages={messages}
+               error={error}
++              providerKeys={providerKeys}
++              selectedKeyId={selectedKeyId}
++              selectedModel={selectedModel}
++              packet={packet}
++              streaming={runId !== null}
+               onSelectConversation={(id) => {
+                 setSelectedConversationId(id);
++                setPacket(null);
++                setRunId(null);
+                 void loadMessages(id).catch(fail);
+               }}
+               onCreateConversation={async (title) => {
+@@ -115,6 +181,8 @@ export function App(): JSX.Element {
+                   await loadConversations(selectedProjectId);
+                   setSelectedConversationId(created.id);
+                   setMessages([]);
++                  setPacket(null);
++                  setRunId(null);
+                 } catch {
+                   fail();
+                 }
+@@ -138,6 +206,55 @@ export function App(): JSX.Element {
+                   fail();
+                 }
+               }}
++              onSelectKey={setSelectedKeyId}
++              onSelectModel={setSelectedModel}
++              onSendToModel={async () => {
++                if (!selectedConversationId || !selectedKeyId) {
++                  return;
++                }
++                try {
++                  const result = await window.hub.chat.send({
++                    conversationId: selectedConversationId,
++                    providerKeyId: selectedKeyId,
++                    model: selectedModel,
++                  });
++                  setError(null);
++                  setPacket(result.packet);
++                  setRunId(result.runId);
++                  setMessages((current) => {
++                    if (current.some((item) => item.id === result.messageId)) {
++                      return current;
++                    }
++                    const last = current[current.length - 1];
++                    return [
++                      ...current,
++                      {
++                        id: result.messageId,
++                        conversationId: selectedConversationId,
++                        parentId: last?.id ?? null,
++                        branchId: last?.branchId ?? result.messageId,
++                        role: "assistant",
++                        content: "",
++                        status: "streaming",
++                        createdAt: new Date().toISOString(),
++                        receipt: null,
++                      },
++                    ];
++                  });
++                } catch {
++                  fail();
++                }
++              }}
++              onAbort={async () => {
++                if (!runId) {
++                  return;
++                }
++                try {
++                  await window.hub.chat.abort({ runId });
++                } catch {
++                  fail();
++                }
++              }}
+             />
+           ) : (
+             <SettingsView />
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index 8c48e5f..7c525ab 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -1,6 +1,13 @@
+ import { type JSX, useState } from "react";
+ import { useTranslation } from "react-i18next";
+-import type { ConversationDto, MessageDto, ProjectDto } from "@ai-hub/shared";
++import type {
++  ConversationDto,
++  MessageDto,
++  ProjectDto,
++  ProviderAgnosticPacket,
++  ProviderKeyDto,
++} from "@ai-hub/shared";
++import { openaiCatalogModels } from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import { ScrollArea } from "@/components/ui/scroll-area";
+@@ -11,22 +18,42 @@ export function HomeView({
+   selectedConversationId,
+   messages,
+   error,
++  providerKeys,
++  selectedKeyId,
++  selectedModel,
++  packet,
++  streaming,
+   onSelectConversation,
+   onCreateConversation,
+   onCreateMessage,
++  onSelectKey,
++  onSelectModel,
++  onSendToModel,
++  onAbort,
+ }: {
+   project: ProjectDto | null;
+   conversations: ConversationDto[];
+   selectedConversationId: string | null;
+   messages: MessageDto[];
+   error: string | null;
++  providerKeys: ProviderKeyDto[];
++  selectedKeyId: string | null;
++  selectedModel: string;
++  packet: ProviderAgnosticPacket | null;
++  streaming: boolean;
+   onSelectConversation: (id: string) => void;
+   onCreateConversation: (title: string) => Promise<void>;
+   onCreateMessage: (content: string) => Promise<void>;
++  onSelectKey: (id: string) => void;
++  onSelectModel: (id: string) => void;
++  onSendToModel: () => Promise<void>;
++  onAbort: () => Promise<void>;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const [title, setTitle] = useState("");
+   const [note, setNote] = useState("");
++  const openaiKeys = providerKeys.filter((key) => key.providerSlug === "openai");
++  const models = openaiCatalogModels();
+ 
+   if (!project) {
+     return (
+@@ -104,9 +131,24 @@ export function HomeView({
+                     <li key={message.id} className="rounded-md border bg-card p-2">
+                       <p className="text-[11px] uppercase text-muted-foreground">
+                         {message.role}
++                        {message.status !== "complete" ? ` ┬À ${t(`workspace.status.${message.status}`)}` : ""}
+                         {message.parentId ? ` ┬À ${t("workspace.branched")}` : ""}
+                       </p>
+                       <p className="whitespace-pre-wrap">{message.content}</p>
++                      {message.receipt ? (
++                        <p className="mt-1 text-[11px] text-muted-foreground">
++                          {t("workspace.receipt", {
++                            model: message.receipt.model ?? "ÔÇö",
++                            tokensIn: message.receipt.tokensIn ?? "ÔÇö",
++                            tokensOut: message.receipt.tokensOut ?? "ÔÇö",
++                            cost: message.receipt.costUsd ?? "ÔÇö",
++                            latency: message.receipt.latencyMs ?? "ÔÇö",
++                          })}
++                          {message.receipt.errorCode
++                            ? ` ┬À ${t("workspace.receipt.error", { code: message.receipt.errorCode })}`
++                            : ""}
++                        </p>
++                      ) : null}
+                     </li>
+                   ))}
+                 </ol>
+@@ -131,6 +173,75 @@ export function HomeView({
+               />
+               <Button type="submit">{t("workspace.addNote")}</Button>
+             </form>
++            <div className="flex flex-col gap-2 border-t p-2">
++              <p className="text-[11px] font-medium uppercase text-muted-foreground">{t("workspace.debug.title")}</p>
++              {openaiKeys.length === 0 ? (
++                <p className="text-muted-foreground">{t("workspace.debug.noKey")}</p>
++              ) : (
++                <div className="flex flex-wrap items-center gap-2">
++                  <label className="flex items-center gap-1">
++                    <span className="text-muted-foreground">{t("workspace.debug.key")}</span>
++                    <select
++                      className="h-8 rounded-md border bg-background px-2 text-sm"
++                      value={selectedKeyId ?? openaiKeys[0]?.id}
++                      onChange={(event) => onSelectKey(event.target.value)}
++                      aria-label={t("workspace.debug.key")}
++                    >
++                      {openaiKeys.map((key) => (
++                        <option key={key.id} value={key.id}>
++                          {key.label} ({key.maskedKey})
++                        </option>
++                      ))}
++                    </select>
++                  </label>
++                  <label className="flex items-center gap-1">
++                    <span className="text-muted-foreground">{t("workspace.debug.model")}</span>
++                    <select
++                      className="h-8 rounded-md border bg-background px-2 text-sm"
++                      value={selectedModel}
++                      onChange={(event) => onSelectModel(event.target.value)}
++                      aria-label={t("workspace.debug.model")}
++                    >
++                      {models.map((model) => (
++                        <option key={model.id} value={model.id}>
++                          {model.label}
++                        </option>
++                      ))}
++                    </select>
++                  </label>
++                  <Button
++                    type="button"
++                    size="sm"
++                    className="h-8"
++                    disabled={streaming}
++                    onClick={() => {
++                      void onSendToModel();
++                    }}
++                  >
++                    {t("workspace.debug.send")}
++                  </Button>
++                  <Button
++                    type="button"
++                    size="sm"
++                    variant="outline"
++                    className="h-8"
++                    disabled={!streaming}
++                    onClick={() => {
++                      void onAbort();
++                    }}
++                  >
++                    {t("workspace.debug.abort")}
++                  </Button>
++                </div>
++              )}
++              {packet ? (
++                <pre className="max-h-32 overflow-auto rounded-md border bg-muted/40 p-2 font-mono text-[11px]">
++                  {t("workspace.debug.packet")}
++                  {"\n"}
++                  {JSON.stringify(packet, null, 2)}
++                </pre>
++              ) : null}
++            </div>
+           </>
+         ) : (
+           <div className="flex flex-1 items-center justify-center p-8 text-muted-foreground">
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index ff00509..9ddb280 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -26,12 +26,26 @@
+   "workspace.conversationPlaceholder": "Conversation title",
+   "workspace.newConversation": "New conversation",
+   "workspace.noConversations": "No conversations in this project.",
+-  "workspace.noMessages": "No messages yet. Save a note to test persistence.",
+-  "workspace.notePlaceholder": "Note (not sent to a model yet)",
++  "workspace.noMessages": "No messages yet. Save a user note, then send it through the OpenAI debug strip.",
++  "workspace.notePlaceholder": "User message (saved locally, then sent on demand)",
+   "workspace.addNote": "Save note",
+   "workspace.pickConversation": "Pick or create a conversation.",
+   "workspace.branched": "branch",
+   "workspace.error.generic": "That action could not be completed. Try again.",
++  "workspace.error.chat": "The model request failed ({{code}}).",
++  "workspace.debug.title": "Gateway debug",
++  "workspace.debug.send": "Send to OpenAI",
++  "workspace.debug.abort": "Stop",
++  "workspace.debug.model": "Model",
++  "workspace.debug.key": "Key",
++  "workspace.debug.packet": "Packet v0",
++  "workspace.debug.noKey": "Save an OpenAI key in Settings first.",
++  "workspace.status.streaming": "streaming",
++  "workspace.status.interrupted": "interrupted",
++  "workspace.status.aborted": "aborted",
++  "workspace.status.complete": "complete",
++  "workspace.receipt": "Receipt: {{model}} ┬À in {{tokensIn}} / out {{tokensOut}} ┬À {{cost}} ┬À {{latency}}ms",
++  "workspace.receipt.error": "error {{code}}",
+   "secrets.title": "Provider keys",
+   "secrets.hint": "The full key crosses IPC only on this save, then leaves the screen. After that you only see a mask.",
+   "secrets.provider": "Provider",
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index f819122..8206445 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -26,12 +26,26 @@
+   "workspace.conversationPlaceholder": "T├¡tulo da conversa",
+   "workspace.newConversation": "Nova conversa",
+   "workspace.noConversations": "Nenhuma conversa neste projeto.",
+-  "workspace.noMessages": "Nenhuma mensagem. Grave uma nota para testar a persist├¬ncia.",
+-  "workspace.notePlaceholder": "Nota (ainda sem envio a um modelo)",
++  "workspace.noMessages": "Nenhuma mensagem. Grave uma nota de usu├írio e envie pelo debug da OpenAI.",
++  "workspace.notePlaceholder": "Mensagem do usu├írio (salva localmente; envio sob demanda)",
+   "workspace.addNote": "Salvar nota",
+   "workspace.pickConversation": "Escolha ou crie uma conversa.",
+   "workspace.branched": "ramo",
+   "workspace.error.generic": "N├úo foi poss├¡vel concluir a a├º├úo. Tente de novo.",
++  "workspace.error.chat": "A chamada ao modelo falhou ({{code}}).",
++  "workspace.debug.title": "Debug do gateway",
++  "workspace.debug.send": "Enviar ├á OpenAI",
++  "workspace.debug.abort": "Parar",
++  "workspace.debug.model": "Modelo",
++  "workspace.debug.key": "Chave",
++  "workspace.debug.packet": "Packet v0",
++  "workspace.debug.noKey": "Guarde uma chave OpenAI em Configura├º├Áes primeiro.",
++  "workspace.status.streaming": "em stream",
++  "workspace.status.interrupted": "interrompida",
++  "workspace.status.aborted": "abortada",
++  "workspace.status.complete": "completa",
++  "workspace.receipt": "Receipt: {{model}} ┬À in {{tokensIn}} / out {{tokensOut}} ┬À {{cost}} ┬À {{latency}}ms",
++  "workspace.receipt.error": "erro {{code}}",
+   "secrets.title": "Chaves de provedor",
+   "secrets.hint": "A chave completa atravessa o IPC s├│ neste save e some da tela. Depois voc├¬ v├¬ s├│ a m├íscara.",
+   "secrets.provider": "Provedor",
+diff --git a/apps/desktop/tsconfig.node.json b/apps/desktop/tsconfig.node.json
+index f9c574b..281c901 100644
+--- a/apps/desktop/tsconfig.node.json
++++ b/apps/desktop/tsconfig.node.json
+@@ -8,6 +8,7 @@
+     "paths": {
+       "@ai-hub/shared": ["../../packages/shared/src/index.ts"],
+       "@ai-hub/db": ["../../packages/db/src/index.ts"],
++      "@ai-hub/ai-gateway": ["../../packages/ai-gateway/src/index.ts"],
+       "@ai-hub/security/keytar": ["../../packages/security/src/keytar-store.ts"],
+       "@ai-hub/security": ["../../packages/security/src/index.ts"]
+     }
+@@ -17,7 +18,9 @@
+     "src/main/**/*.ts",
+     "src/preload/**/*.ts",
+     "../../packages/shared/src/**/*.ts",
++    "../../packages/shared/src/**/*.json",
+     "../../packages/db/src/**/*.ts",
++    "../../packages/ai-gateway/src/**/*.ts",
+     "../../packages/security/src/**/*.ts"
+   ],
+   "exclude": ["../../packages/**/*.test.ts"]
+diff --git a/apps/desktop/tsconfig.web.json b/apps/desktop/tsconfig.web.json
+index 8ba5ad4..44849c0 100644
+--- a/apps/desktop/tsconfig.web.json
++++ b/apps/desktop/tsconfig.web.json
+@@ -17,6 +17,7 @@
+     "src/renderer/**/*.tsx",
+     "src/renderer/**/*.json",
+     "src/preload/index.d.ts",
+-    "../../packages/shared/src/**/*.ts"
++    "../../packages/shared/src/**/*.ts",
++    "../../packages/shared/src/**/*.json"
+   ]
+ }
+diff --git a/docs/ADR/ADR-W02-001-provider-adapter-fetch.md b/docs/ADR/ADR-W02-001-provider-adapter-fetch.md
+new file mode 100644
+index 0000000..5d16749
+--- /dev/null
++++ b/docs/ADR/ADR-W02-001-provider-adapter-fetch.md
+@@ -0,0 +1,33 @@
++# ADR-W02-001-provider-adapter-fetch
++
++- **Status:** accepted
++- **Onda:** W02
++- **Data:** 2026-09-16
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++O plano pede um `ProviderAdapter` unificado e um adapter OpenAI com stream + abort. A tabela de arquitetura menciona ÔÇ£AI SDK no main ou camada equivalenteÔÇØ. Puxar o AI SDK agora traria um runtime extra s├│ para um provider.
++
++## Decis├úo
++
++Adapters vivem em `packages/ai-gateway` e falam HTTP com `fetch` + SSE. A interface ├® `listModels`, `chatStream`, `testConnection`, `capabilities`. O adapter OpenAI ├® o ├║nico desta onda. N├úo h├í fallback silencioso para outro modelo ou URL.
++
++A chave sai do keytar **s├│ no main**. O pacote gateway recebe o secret como argumento de chamada, nunca persiste, nunca devolve.
++
++## Alternativas consideradas
++
++- **Vercel AI SDK:** streaming maduro; mais superf├¡cie e vers├úo a gerir para um adapter.
++- **SDK oficial `openai`:** ├║til, mas os testes de fixture ficam mais pesados que um `fetch` injet├ível.
++
++## Consequ├¬ncias
++
++- Fixtures de stream s├úo strings SSE, sem rede no CI.
++- OpenRouter e nativos extras entram no mesmo contrato na W5, n├úo como URL escondida.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 2)
++- `docs/reviews/W02/REVIEW.md`
+diff --git a/docs/ADR/ADR-W02-002-compiler-packet-v0.md b/docs/ADR/ADR-W02-002-compiler-packet-v0.md
+new file mode 100644
+index 0000000..1740874
+--- /dev/null
++++ b/docs/ADR/ADR-W02-002-compiler-packet-v0.md
+@@ -0,0 +1,38 @@
++# ADR-W02-002-compiler-packet-v0
++
++- **Status:** accepted
++- **Onda:** W02
++- **Data:** 2026-09-16
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++D1 pede um pacote independente de provider. A Wave 2 entrega o compiler **v0**: system + hist├│rico + instru├º├Áes do projeto. Sem arquivos, mem├│rias, skills ou compacta├º├úo.
++
++## Decis├úo
++
++`compile(input) ÔåÆ ProviderAgnosticPacket` vers├úo `1`:
++
++- `system`: instru├º├Áes do projeto (se houver) + system extra
++- `messages`: pares `user`/`assistant` do hist├│rico (sem API keys)
++- `tokenEstimate`: `ceil(chars / 4)`
++- `excluded`: lista de omiss├Áes (nesta onda: mensagens `streaming`)
++
++Trocar de modelo nesta onda **n├úo** existe na UI; o packet j├í ├® a entrada do adapter. Preview vai ├á UI de debug e para o log com redaction.
++
++## Alternativas consideradas
++
++- **Concatenar o recap no texto do user:** viola o compiler.
++- **Packet completo da W10 agora:** fora de onda.
++
++## Consequ├¬ncias
++
++- W6/W10 evoluem o JSON (`version: 2+`) sem quebrar o v0.
++- O packet nunca cont├®m secrets (ADR-W01-003).
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 2, D1)
++- `docs/reviews/W02/REVIEW.md`
+diff --git a/docs/ADR/ADR-W02-003-crash-safe-stream.md b/docs/ADR/ADR-W02-003-crash-safe-stream.md
+new file mode 100644
+index 0000000..65b6479
+--- /dev/null
++++ b/docs/ADR/ADR-W02-003-crash-safe-stream.md
+@@ -0,0 +1,37 @@
++# ADR-W02-003-crash-safe-stream
++
++- **Status:** accepted
++- **Onda:** W02
++- **Data:** 2026-09-16
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++D10 exige que crash ou abort n├úo apague o parcial. O schema W1 j├í tem `streaming | interrupted | complete | aborted`.
++
++## Decis├úo
++
++- A assistant message nasce com `status = streaming` e conte├║do vazio.
++- Flush criptografado a cada 48 caracteres **ou** 200 ms.
++- Abort do utilizador ÔåÆ `aborted` + receipt com tokens parciais.
++- Erro de rede/provider ÔåÆ `interrupted` + receipt com `error_code`.
++- No boot, qualquer linha ainda `streaming` passa a `interrupted` (processo morreu).
++
++IPC: `chat:send` / `chat:abort` + evento `chat:event` (chunk/done/error), Zod nos dois sentidos. Continuar um stream interrompido no mesmo request id fica para W3 (regenerar a partir daqui = novo send).
++
++## Alternativas consideradas
++
++- **S├│ persistir no `done`:** perde o DoD de crash.
++- **Flush a cada token:** I/O demais no main.
++
++## Consequ├¬ncias
++
++- Reabrir o app mostra o parcial `interrupted`.
++- W3 usa os mesmos estados na bolha.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 2, D10)
++- `docs/reviews/W02/REVIEW.md`
+diff --git a/docs/ADR/ADR-W02-004-gateway-errors-and-receipts.md b/docs/ADR/ADR-W02-004-gateway-errors-and-receipts.md
+new file mode 100644
+index 0000000..1e53807
+--- /dev/null
++++ b/docs/ADR/ADR-W02-004-gateway-errors-and-receipts.md
+@@ -0,0 +1,35 @@
++# ADR-W02-004-gateway-errors-and-receipts
++
++- **Status:** accepted
++- **Onda:** W02
++- **Data:** 2026-09-16
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++O plano pede taxonomia de erro e um receipt em toda tentativa, inclusive falha. Pre├ºos reais do provider s├│ existem ├ás vezes.
++
++## Decis├úo
++
++C├│digos: `timeout | rate_limit | auth | context_overflow | quota | network | aborted | unknown`. O adapter mapeia HTTP/SDK para estes c├│digos; nunca engole; nunca troca de modelo.
++
++Receipt: `provider`, `model`, `tokens_in/out`, `latency_ms`, `cost_usd`, `error_code` opcional. Preferir `usage` da API; sen├úo estimar pelos chars. Custo vem do cat├ílogo JSON versionado em `packages/shared` (`model-catalog.json`). Sem secrets no receipt.
++
++Migration `0002` acrescenta `error_code` em `message_receipts`.
++
++## Alternativas consideradas
++
++- **Erro s├│ na UI, sem receipt:** quebra D12.
++- **Pre├ºo hardcoded no adapter:** o cat├ílogo tem de viver em `shared` para a W7.
++
++## Consequ├¬ncias
++
++- Caps (W7) leem a mesma tabela.
++- UI de receipt polida ├® W7; W2 mostra o motor na UI de debug.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 2, D12)
++- `docs/reviews/W02/REVIEW.md`
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index 6754162..051ad97 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -41,3 +41,7 @@ N├úo escrever ADR de detalhe cosm├®tica. Se mexe em seguran├ºa, custo, provider
+ | [ADR-W01-002](./ADR-W01-002-drizzle-user-version-migrations.md) | W01 | Drizzle + migrations via `user_version` | accepted |
+ | [ADR-W01-003](./ADR-W01-003-keytar-and-ipc-secrets.md) | W01 | Segredos no keytar; IPC devolve m├íscara | accepted |
+ | [ADR-W01-004](./ADR-W01-004-message-graph-parent-branch.md) | W01 | Grafo de mensagens: `parent_id` + `branch_id` | accepted |
++| [ADR-W02-001](./ADR-W02-001-provider-adapter-fetch.md) | W02 | Adapter via `fetch` + SSE, sem AI SDK | accepted |
++| [ADR-W02-002](./ADR-W02-002-compiler-packet-v0.md) | W02 | Compiler v0 e packet JSON vers├úo 1 | accepted |
++| [ADR-W02-003](./ADR-W02-003-crash-safe-stream.md) | W02 | Flush incremental e `interrupted` no boot | accepted |
++| [ADR-W02-004](./ADR-W02-004-gateway-errors-and-receipts.md) | W02 | Taxonomia de erro e receipts com cat├ílogo | accepted |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 106f5b4..d81a85b 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave
+ |---|---|
+ | Wave | **W02** |
+ | Marco | A ÔÇö Foundation |
+-| State | `pending` |
++| State | `review` |
+ | Last completed | **W01** |
+-| Next action | Come├ºar Wave 2 ÔÇö AI Gateway, streaming crash-safe, receipts, Compiler v0 |
++| Next action | Gate ┬º9 W02 ÔÇö freeze, review, persist `docs/reviews/W02/` |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -28,12 +28,11 @@ None.
+ 
+ ## Notes for the next session
+ 
+-- W01 fechada: `docs/reviews/W01/REVIEW.md`.
+-- Sem chat/gateway ainda. Schema com hooks (branches, receipts, caps, import, packets).
++- W02: sem chat core (W3), sem OpenRouter first-class (W5), sem UI polida de receipts (W7). UI de debug do stream ├® o DoD.
+ 
+ ## Last review / ADR
+ 
+ | Kind | Path |
+ |---|---|
+ | Review | `docs/reviews/W01/REVIEW.md` |
+-| Latest ADR | `docs/ADR/ADR-W01-004-message-graph-parent-branch.md` |
++| Latest ADR | `docs/ADR/ADR-W02-004-gateway-errors-and-receipts.md` |
+diff --git a/packages/ai-gateway/package.json b/packages/ai-gateway/package.json
+new file mode 100644
+index 0000000..88406e4
+--- /dev/null
++++ b/packages/ai-gateway/package.json
+@@ -0,0 +1,23 @@
++{
++  "name": "@ai-hub/ai-gateway",
++  "version": "0.0.0",
++  "private": true,
++  "type": "module",
++  "exports": {
++    ".": {
++      "types": "./src/index.ts",
++      "default": "./src/index.ts"
++    }
++  },
++  "scripts": {
++    "typecheck": "tsc --noEmit -p tsconfig.json",
++    "lint": "eslint src --max-warnings 0",
++    "test": "vitest run"
++  },
++  "dependencies": {
++    "@ai-hub/shared": "workspace:*"
++  },
++  "devDependencies": {
++    "vitest": "^3.2.4"
++  }
++}
+diff --git a/packages/ai-gateway/src/adapter.ts b/packages/ai-gateway/src/adapter.ts
+new file mode 100644
+index 0000000..1971a0a
+--- /dev/null
++++ b/packages/ai-gateway/src/adapter.ts
+@@ -0,0 +1,30 @@
++import type { ProviderAgnosticPacket } from "@ai-hub/shared";
++
++export interface ModelRef {
++  id: string;
++  label: string;
++}
++
++export interface ProviderCapabilities {
++  streaming: boolean;
++  tools: boolean;
++}
++
++export interface ChatStreamRequest {
++  secret: string;
++  model: string;
++  packet: ProviderAgnosticPacket;
++  signal: AbortSignal;
++}
++
++export type ChatStreamEvent =
++  | { type: "delta"; text: string }
++  | { type: "usage"; tokensIn: number; tokensOut: number };
++
++export interface ProviderAdapter {
++  readonly id: string;
++  listModels: () => ModelRef[];
++  capabilities: () => ProviderCapabilities;
++  testConnection: (secret: string, signal: AbortSignal) => Promise<void>;
++  chatStream: (request: ChatStreamRequest) => AsyncIterable<ChatStreamEvent>;
++}
+diff --git a/packages/ai-gateway/src/compiler.test.ts b/packages/ai-gateway/src/compiler.test.ts
+new file mode 100644
+index 0000000..48e00a6
+--- /dev/null
++++ b/packages/ai-gateway/src/compiler.test.ts
+@@ -0,0 +1,58 @@
++import { describe, expect, it } from "vitest";
++import { compilePacket } from "./compiler";
++
++describe("compilePacket", () => {
++  it("joins project instructions and skips streaming messages", () => {
++    const packet = compilePacket({
++      projectInstructions: "Stay in Portuguese.",
++      extraSystem: "Be brief.",
++      messages: [
++        {
++          id: "11111111-1111-4111-8111-111111111111",
++          role: "user",
++          content: "hello",
++          status: "complete",
++        },
++        {
++          id: "22222222-2222-4222-8222-222222222222",
++          role: "assistant",
++          content: "partial",
++          status: "streaming",
++        },
++        {
++          id: "33333333-3333-4333-8333-333333333333",
++          role: "assistant",
++          content: "hi",
++          status: "interrupted",
++        },
++      ],
++    });
++    expect(packet.version).toBe(1);
++    expect(packet.system).toBe("Stay in Portuguese.\n\nBe brief.");
++    expect(packet.messages).toEqual([
++      { role: "user", content: "hello" },
++      { role: "assistant", content: "hi" },
++    ]);
++    expect(packet.excluded).toEqual(["22222222-2222-4222-8222-222222222222"]);
++    expect(packet.tokenEstimate).toBe(
++      Math.ceil((packet.system.length + "hello".length + "hi".length) / 4),
++    );
++  });
++
++  it("never puts an apiKey field on the packet", () => {
++    const packet = compilePacket({
++      projectInstructions: null,
++      extraSystem: null,
++      messages: [
++        {
++          id: "11111111-1111-4111-8111-111111111111",
++          role: "user",
++          content: "summarize this",
++          status: "complete",
++        },
++      ],
++    });
++    expect(packet).not.toHaveProperty("apiKey");
++    expect(JSON.stringify(packet)).not.toMatch(/sk-/);
++  });
++});
+diff --git a/packages/ai-gateway/src/compiler.ts b/packages/ai-gateway/src/compiler.ts
+new file mode 100644
+index 0000000..c5a7675
+--- /dev/null
++++ b/packages/ai-gateway/src/compiler.ts
+@@ -0,0 +1,60 @@
++import type { MessageStatus, ProviderAgnosticPacket } from "@ai-hub/shared";
++import { packetV0Schema } from "@ai-hub/shared";
++
++export interface CompilerMessage {
++  id: string;
++  role: "user" | "assistant" | "system";
++  content: string;
++  status: MessageStatus;
++}
++
++export interface CompileInput {
++  projectInstructions: string | null;
++  extraSystem: string | null;
++  messages: CompilerMessage[];
++}
++
++function tokenEstimateFromChars(chars: number): number {
++  return Math.ceil(chars / 4);
++}
++
++export function compilePacket(input: CompileInput): ProviderAgnosticPacket {
++  const systemParts: string[] = [];
++  if (input.projectInstructions && input.projectInstructions.trim().length > 0) {
++    systemParts.push(input.projectInstructions.trim());
++  }
++  if (input.extraSystem && input.extraSystem.trim().length > 0) {
++    systemParts.push(input.extraSystem.trim());
++  }
++
++  const excluded: string[] = [];
++  const packetMessages: { role: "user" | "assistant"; content: string }[] = [];
++
++  for (const message of input.messages) {
++    if (message.status === "streaming") {
++      excluded.push(message.id);
++      continue;
++    }
++    if (message.role === "system") {
++      if (message.content.trim().length > 0) {
++        systemParts.push(message.content.trim());
++      }
++      continue;
++    }
++    packetMessages.push({ role: message.role, content: message.content });
++  }
++
++  const system = systemParts.join("\n\n");
++  let chars = system.length;
++  for (const message of packetMessages) {
++    chars += message.content.length;
++  }
++
++  return packetV0Schema.parse({
++    version: 1,
++    system,
++    messages: packetMessages,
++    tokenEstimate: tokenEstimateFromChars(chars),
++    excluded,
++  });
++}
+diff --git a/packages/ai-gateway/src/crash-safe.test.ts b/packages/ai-gateway/src/crash-safe.test.ts
+new file mode 100644
+index 0000000..2a88407
+--- /dev/null
++++ b/packages/ai-gateway/src/crash-safe.test.ts
+@@ -0,0 +1,53 @@
++import { describe, expect, it } from "vitest";
++import { consumeCrashSafeStream, STREAM_FLUSH_CHARS } from "./crash-safe";
++import type { ChatStreamEvent } from "./adapter";
++import { GatewayError } from "./errors";
++
++async function* eventsOf(items: ChatStreamEvent[]): AsyncIterable<ChatStreamEvent> {
++  for (const item of items) {
++    yield item;
++  }
++}
++
++describe("consumeCrashSafeStream", () => {
++  it("flushes when pending characters reach the batch size", async () => {
++    const flushes: string[] = [];
++    const deltas: string[] = [];
++    const chunk = "x".repeat(STREAM_FLUSH_CHARS);
++    const result = await consumeCrashSafeStream({
++      stream: eventsOf([
++        { type: "delta", text: chunk },
++        { type: "usage", tokensIn: 9, tokensOut: 3 },
++      ]),
++      onDelta: (text) => {
++        deltas.push(text);
++      },
++      onFlush: (content) => {
++        flushes.push(content);
++      },
++      now: () => 0,
++    });
++    expect(deltas).toEqual([chunk]);
++    expect(flushes[0]).toBe(chunk);
++    expect(result).toEqual({ content: chunk, tokensIn: 9, tokensOut: 3 });
++  });
++
++  it("flushes the partial before rethrowing an abort", async () => {
++    const flushes: string[] = [];
++    async function* failing(): AsyncIterable<ChatStreamEvent> {
++      yield { type: "delta", text: "Hel" };
++      throw new GatewayError("aborted", "Request aborted");
++    }
++    await expect(
++      consumeCrashSafeStream({
++        stream: failing(),
++        onDelta: () => undefined,
++        onFlush: (content) => {
++          flushes.push(content);
++        },
++        now: () => 0,
++      }),
++    ).rejects.toMatchObject({ code: "aborted" });
++    expect(flushes).toEqual(["Hel"]);
++  });
++});
+diff --git a/packages/ai-gateway/src/crash-safe.ts b/packages/ai-gateway/src/crash-safe.ts
+new file mode 100644
+index 0000000..1be1cfc
+--- /dev/null
++++ b/packages/ai-gateway/src/crash-safe.ts
+@@ -0,0 +1,62 @@
++import type { ChatStreamEvent } from "./adapter";
++
++export const STREAM_FLUSH_CHARS = 48;
++export const STREAM_FLUSH_MS = 200;
++
++export interface CrashSafeStreamResult {
++  content: string;
++  tokensIn: number | null;
++  tokensOut: number | null;
++}
++
++export async function consumeCrashSafeStream(input: {
++  stream: AsyncIterable<ChatStreamEvent>;
++  onDelta: (text: string) => void;
++  onFlush: (content: string) => void;
++  now?: () => number;
++}): Promise<CrashSafeStreamResult> {
++  const now = input.now ?? Date.now;
++  let content = "";
++  let lastFlushed = "";
++  let lastFlushAt = now();
++  let tokensIn: number | null = null;
++  let tokensOut: number | null = null;
++
++  const flush = (force: boolean): void => {
++    if (content === lastFlushed) {
++      return;
++    }
++    const pending = content.length - lastFlushed.length;
++    const elapsed = now() - lastFlushAt;
++    if (!force && pending < STREAM_FLUSH_CHARS && elapsed < STREAM_FLUSH_MS) {
++      return;
++    }
++    input.onFlush(content);
++    lastFlushed = content;
++    lastFlushAt = now();
++  };
++
++  const timer = setInterval(() => {
++    flush(false);
++  }, STREAM_FLUSH_MS);
++
++  try {
++    for await (const event of input.stream) {
++      if (event.type === "delta") {
++        content += event.text;
++        input.onDelta(event.text);
++        flush(false);
++      } else {
++        tokensIn = event.tokensIn;
++        tokensOut = event.tokensOut;
++      }
++    }
++    flush(true);
++    return { content, tokensIn, tokensOut };
++  } catch (error) {
++    flush(true);
++    throw error;
++  } finally {
++    clearInterval(timer);
++  }
++}
+diff --git a/packages/ai-gateway/src/errors.ts b/packages/ai-gateway/src/errors.ts
+new file mode 100644
+index 0000000..616d6f8
+--- /dev/null
++++ b/packages/ai-gateway/src/errors.ts
+@@ -0,0 +1,26 @@
++import type { GatewayErrorCode } from "@ai-hub/shared";
++
++export class GatewayError extends Error {
++  readonly code: GatewayErrorCode;
++
++  constructor(code: GatewayErrorCode, message: string, options?: { cause?: unknown }) {
++    if (options) {
++      super(message, options);
++    } else {
++      super(message);
++    }
++    this.name = "GatewayError";
++    this.code = code;
++  }
++}
++
++export function isGatewayError(error: unknown): error is GatewayError {
++  return error instanceof GatewayError;
++}
++
++export function gatewayErrorCode(error: unknown): GatewayErrorCode {
++  if (error instanceof GatewayError) {
++    return error.code;
++  }
++  return "unknown";
++}
+diff --git a/packages/ai-gateway/src/index.ts b/packages/ai-gateway/src/index.ts
+new file mode 100644
+index 0000000..9fdf496
+--- /dev/null
++++ b/packages/ai-gateway/src/index.ts
+@@ -0,0 +1,22 @@
++export type {
++  ChatStreamEvent,
++  ChatStreamRequest,
++  ModelRef,
++  ProviderAdapter,
++  ProviderCapabilities,
++} from "./adapter";
++export { compilePacket, type CompileInput, type CompilerMessage } from "./compiler";
++export {
++  consumeCrashSafeStream,
++  STREAM_FLUSH_CHARS,
++  STREAM_FLUSH_MS,
++  type CrashSafeStreamResult,
++} from "./crash-safe";
++export { GatewayError, gatewayErrorCode, isGatewayError } from "./errors";
++export { createOpenAIAdapter, type OpenAIAdapterOptions } from "./openai-adapter";
++export {
++  composeReceipt,
++  estimateTokensFromChars,
++  type ComposedReceipt,
++  type ComposeReceiptInput,
++} from "./receipts";
+diff --git a/packages/ai-gateway/src/openai-adapter.test.ts b/packages/ai-gateway/src/openai-adapter.test.ts
+new file mode 100644
+index 0000000..43ed91b
+--- /dev/null
++++ b/packages/ai-gateway/src/openai-adapter.test.ts
+@@ -0,0 +1,167 @@
++import { describe, expect, it } from "vitest";
++import { createOpenAIAdapter } from "./openai-adapter";
++import { GatewayError } from "./errors";
++import type { ProviderAgnosticPacket } from "@ai-hub/shared";
++
++const packet: ProviderAgnosticPacket = {
++  version: 1,
++  system: "",
++  messages: [{ role: "user", content: "hi" }],
++  tokenEstimate: 1,
++  excluded: [],
++};
++
++function sseBody(chunks: string[]): ReadableStream<Uint8Array> {
++  const encoder = new TextEncoder();
++  return new ReadableStream({
++    start(controller) {
++      for (const chunk of chunks) {
++        controller.enqueue(encoder.encode(chunk));
++      }
++      controller.close();
++    },
++  });
++}
++
++describe("createOpenAIAdapter", () => {
++  it("lists catalog models and streaming capability", () => {
++    const adapter = createOpenAIAdapter({
++      fetch: async () => {
++        throw new Error("network should not be called");
++      },
++    });
++    expect(adapter.id).toBe("openai");
++    expect(adapter.capabilities()).toEqual({ streaming: true, tools: false });
++    expect(adapter.listModels().some((model) => model.id === "gpt-4o-mini")).toBe(true);
++  });
++
++  it("streams deltas from an SSE fixture and records usage", async () => {
++    const adapter = createOpenAIAdapter({
++      fetch: async () =>
++        new Response(
++          sseBody([
++            `data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n`,
++            `data: {"choices":[{"delta":{"content":"lo"}}]}\n\n`,
++            `data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":2}}\n\n`,
++            `data: [DONE]\n\n`,
++          ]),
++          { status: 200, headers: { "Content-Type": "text/event-stream" } },
++        ),
++    });
++    const texts: string[] = [];
++    let usage: { tokensIn: number; tokensOut: number } | null = null;
++    for await (const event of adapter.chatStream({
++      secret: "sk-testfixtureABCDEFGH",
++      model: "gpt-4o-mini",
++      packet,
++      signal: new AbortController().signal,
++    })) {
++      if (event.type === "delta") {
++        texts.push(event.text);
++      } else {
++        usage = { tokensIn: event.tokensIn, tokensOut: event.tokensOut };
++      }
++    }
++    expect(texts.join("")).toBe("Hello");
++    expect(usage).toEqual({ tokensIn: 11, tokensOut: 2 });
++  });
++
++  it("maps 401 to auth and never throws the secret", async () => {
++    const secret = "sk-testfixtureABCDEFGH";
++    const adapter = createOpenAIAdapter({
++      fetch: async () =>
++        new Response(JSON.stringify({ error: { message: "Incorrect API key", code: "invalid_api_key" } }), {
++          status: 401,
++          headers: { "Content-Type": "application/json" },
++        }),
++    });
++    try {
++      await adapter.chatStream({
++        secret,
++        model: "gpt-4o-mini",
++        packet,
++        signal: new AbortController().signal,
++      }).next();
++      throw new Error("expected failure");
++    } catch (error) {
++      expect(error).toBeInstanceOf(GatewayError);
++      expect((error as GatewayError).code).toBe("auth");
++      expect(String(error)).not.toContain(secret);
++    }
++  });
++
++  it("maps insufficient_quota", async () => {
++    const adapter = createOpenAIAdapter({
++      fetch: async () =>
++        new Response(JSON.stringify({ error: { code: "insufficient_quota", message: "quota" } }), {
++          status: 429,
++        }),
++    });
++    try {
++      await adapter.chatStream({
++        secret: "sk-testfixtureABCDEFGH",
++        model: "gpt-4o-mini",
++        packet,
++        signal: new AbortController().signal,
++      }).next();
++      throw new Error("expected failure");
++    } catch (error) {
++      expect((error as GatewayError).code).toBe("quota");
++    }
++  });
++
++  it("maps a fetch failure to network", async () => {
++    const adapter = createOpenAIAdapter({
++      fetch: async () => {
++        throw new TypeError("fetch failed");
++      },
++    });
++    try {
++      await adapter.chatStream({
++        secret: "sk-testfixtureABCDEFGH",
++        model: "gpt-4o-mini",
++        packet,
++        signal: new AbortController().signal,
++      }).next();
++      throw new Error("expected failure");
++    } catch (error) {
++      expect((error as GatewayError).code).toBe("network");
++    }
++  });
++
++  it("testConnection resolves on HTTP 200", async () => {
++    const adapter = createOpenAIAdapter({
++      fetch: async () => new Response("{}", { status: 200 }),
++    });
++    await expect(
++      adapter.testConnection("sk-testfixtureABCDEFGH", new AbortController().signal),
++    ).resolves.toBeUndefined();
++  });
++
++  it("maps user abort before fetch to aborted", async () => {
++    const controller = new AbortController();
++    controller.abort();
++    const adapter = createOpenAIAdapter({
++      fetch: async (_url, init) => {
++        const signal = init?.signal;
++        if (signal?.aborted) {
++          throw new DOMException("Aborted", "AbortError");
++        }
++        throw new Error("should have aborted");
++      },
++    });
++    try {
++      await adapter
++        .chatStream({
++          secret: "sk-testfixtureABCDEFGH",
++          model: "gpt-4o-mini",
++          packet,
++          signal: controller.signal,
++        })
++        .next();
++      throw new Error("expected failure");
++    } catch (error) {
++      expect((error as GatewayError).code).toBe("aborted");
++    }
++  });
++});
+diff --git a/packages/ai-gateway/src/openai-adapter.ts b/packages/ai-gateway/src/openai-adapter.ts
+new file mode 100644
+index 0000000..fa286b4
+--- /dev/null
++++ b/packages/ai-gateway/src/openai-adapter.ts
+@@ -0,0 +1,183 @@
++import { openaiCatalogModels, type ProviderAgnosticPacket } from "@ai-hub/shared";
++import type {
++  ChatStreamEvent,
++  ChatStreamRequest,
++  ModelRef,
++  ProviderAdapter,
++  ProviderCapabilities,
++} from "./adapter";
++import { GatewayError } from "./errors";
++import { iterateSseData } from "./sse";
++
++export interface OpenAIAdapterOptions {
++  fetch?: typeof fetch;
++  baseUrl?: string;
++  timeoutMs?: number;
++}
++
++interface OpenAIStreamChunk {
++  choices?: Array<{ delta?: { content?: unknown } }>;
++  usage?: { prompt_tokens?: unknown; completion_tokens?: unknown };
++}
++
++function asObject(value: unknown): Record<string, unknown> | null {
++  if (typeof value === "object" && value !== null) {
++    return value as Record<string, unknown>;
++  }
++  return null;
++}
++
++function readString(value: unknown): string | null {
++  return typeof value === "string" ? value : null;
++}
++
++function readNumber(value: unknown): number | null {
++  return typeof value === "number" && Number.isFinite(value) ? value : null;
++}
++
++function packetMessages(packet: ProviderAgnosticPacket): Array<{ role: string; content: string }> {
++  const messages: Array<{ role: string; content: string }> = [];
++  if (packet.system.length > 0) {
++    messages.push({ role: "system", content: packet.system });
++  }
++  for (const message of packet.messages) {
++    messages.push({ role: message.role, content: message.content });
++  }
++  return messages;
++}
++
++function mapStatus(status: number, body: unknown): GatewayError {
++  const record = asObject(body);
++  const error = record ? asObject(record.error) : null;
++  const message = (error ? readString(error.message) : null) ?? `OpenAI HTTP ${status}`;
++  const code = error ? readString(error.code) ?? readString(error.type) : null;
++  if (status === 401 || status === 403 || code === "invalid_api_key") {
++    return new GatewayError("auth", message);
++  }
++  if (status === 402 || code === "insufficient_quota") {
++    return new GatewayError("quota", message);
++  }
++  if (code === "context_length_exceeded" || /context length|maximum context/i.test(message)) {
++    return new GatewayError("context_overflow", message);
++  }
++  if (status === 429) {
++    return new GatewayError("rate_limit", message);
++  }
++  if (status >= 500) {
++    return new GatewayError("network", message);
++  }
++  return new GatewayError("unknown", message);
++}
++
++async function readJson(response: Response): Promise<unknown> {
++  try {
++    return await response.json();
++  } catch {
++    return null;
++  }
++}
++
++function classifyTransport(error: unknown, userSignal: AbortSignal, timeout: AbortSignal): never {
++  if (error instanceof GatewayError) {
++    throw error;
++  }
++  if (userSignal.aborted) {
++    throw new GatewayError("aborted", "Request aborted");
++  }
++  if (timeout.aborted) {
++    throw new GatewayError("timeout", "Request timed out");
++  }
++  const message = error instanceof Error ? error.message : "Network error";
++  throw new GatewayError("network", message);
++}
++
++export function createOpenAIAdapter(options: OpenAIAdapterOptions = {}): ProviderAdapter {
++  const fetchFn = options.fetch ?? fetch;
++  const baseUrl = (options.baseUrl ?? "https://api.openai.com/v1").replace(/\/$/, "");
++  const timeoutMs = options.timeoutMs ?? 60_000;
++
++  const request = async (
++    path: string,
++    secret: string,
++    body: Record<string, unknown>,
++    signal: AbortSignal,
++  ): Promise<Response> => {
++    const timeout = AbortSignal.timeout(timeoutMs);
++    const combined = AbortSignal.any([signal, timeout]);
++    try {
++      return await fetchFn(`${baseUrl}${path}`, {
++        method: "POST",
++        headers: {
++          Authorization: `Bearer ${secret}`,
++          "Content-Type": "application/json",
++        },
++        body: JSON.stringify(body),
++        signal: combined,
++      });
++    } catch (error) {
++      classifyTransport(error, signal, timeout);
++    }
++  };
++
++  return {
++    id: "openai",
++    listModels(): ModelRef[] {
++      return openaiCatalogModels().map((model) => ({ id: model.id, label: model.label }));
++    },
++    capabilities(): ProviderCapabilities {
++      return { streaming: true, tools: false };
++    },
++    async testConnection(secret: string, signal: AbortSignal): Promise<void> {
++      const response = await request(
++        "/chat/completions",
++        secret,
++        {
++          model: "gpt-4o-mini",
++          messages: [{ role: "user", content: "ping" }],
++          max_tokens: 1,
++        },
++        signal,
++      );
++      if (!response.ok) {
++        throw mapStatus(response.status, await readJson(response));
++      }
++    },
++    async *chatStream(input: ChatStreamRequest): AsyncIterable<ChatStreamEvent> {
++      const response = await request(
++        "/chat/completions",
++        input.secret,
++        {
++          model: input.model,
++          stream: true,
++          stream_options: { include_usage: true },
++          messages: packetMessages(input.packet),
++        },
++        input.signal,
++      );
++      if (!response.ok) {
++        throw mapStatus(response.status, await readJson(response));
++      }
++      if (!response.body) {
++        throw new GatewayError("network", "OpenAI response had no body");
++      }
++      for await (const data of iterateSseData(response.body, input.signal)) {
++        let parsed: unknown;
++        try {
++          parsed = JSON.parse(data) as unknown;
++        } catch {
++          continue;
++        }
++        const chunk = parsed as OpenAIStreamChunk;
++        const delta = chunk.choices?.[0]?.delta?.content;
++        if (typeof delta === "string" && delta.length > 0) {
++          yield { type: "delta", text: delta };
++        }
++        const prompt = readNumber(chunk.usage?.prompt_tokens);
++        const completion = readNumber(chunk.usage?.completion_tokens);
++        if (prompt !== null || completion !== null) {
++          yield { type: "usage", tokensIn: prompt ?? 0, tokensOut: completion ?? 0 };
++        }
++      }
++    },
++  };
++}
+diff --git a/packages/ai-gateway/src/receipts.test.ts b/packages/ai-gateway/src/receipts.test.ts
+new file mode 100644
+index 0000000..2a03a08
+--- /dev/null
++++ b/packages/ai-gateway/src/receipts.test.ts
+@@ -0,0 +1,37 @@
++import { describe, expect, it } from "vitest";
++import { composeReceipt } from "./receipts";
++
++describe("composeReceipt", () => {
++  it("uses catalog prices when usage is present", () => {
++    const receipt = composeReceipt({
++      provider: "openai",
++      model: "gpt-4o-mini",
++      tokensIn: 1_000_000,
++      tokensOut: 0,
++      estimatedIn: 1,
++      estimatedOut: 1,
++      latencyMs: 40,
++      errorCode: null,
++    });
++    expect(receipt.costUsd).toBe("0.150000");
++    expect(receipt.tokensIn).toBe(1_000_000);
++    expect(receipt.errorCode).toBeNull();
++  });
++
++  it("falls back to estimated tokens and still writes an error code", () => {
++    const receipt = composeReceipt({
++      provider: "openai",
++      model: "gpt-4o-mini",
++      tokensIn: null,
++      tokensOut: null,
++      estimatedIn: 8,
++      estimatedOut: 4,
++      latencyMs: 12,
++      errorCode: "network",
++    });
++    expect(receipt.tokensIn).toBe(8);
++    expect(receipt.tokensOut).toBe(4);
++    expect(receipt.errorCode).toBe("network");
++    expect(receipt.costUsd).not.toBeNull();
++  });
++});
+diff --git a/packages/ai-gateway/src/receipts.ts b/packages/ai-gateway/src/receipts.ts
+new file mode 100644
+index 0000000..c72417a
+--- /dev/null
++++ b/packages/ai-gateway/src/receipts.ts
+@@ -0,0 +1,45 @@
++import {
++  estimateCostUsd,
++  findCatalogModel,
++  type GatewayErrorCode,
++} from "@ai-hub/shared";
++
++export interface ComposeReceiptInput {
++  provider: string;
++  model: string;
++  tokensIn: number | null;
++  tokensOut: number | null;
++  estimatedIn: number;
++  estimatedOut: number;
++  latencyMs: number;
++  errorCode: GatewayErrorCode | null;
++}
++
++export interface ComposedReceipt {
++  provider: string;
++  model: string;
++  tokensIn: number;
++  tokensOut: number;
++  latencyMs: number;
++  costUsd: string | null;
++  errorCode: GatewayErrorCode | null;
++}
++
++export function composeReceipt(input: ComposeReceiptInput): ComposedReceipt {
++  const tokensIn = input.tokensIn ?? input.estimatedIn;
++  const tokensOut = input.tokensOut ?? input.estimatedOut;
++  const catalog = findCatalogModel(input.model, input.provider);
++  return {
++    provider: input.provider,
++    model: input.model,
++    tokensIn,
++    tokensOut,
++    latencyMs: input.latencyMs,
++    costUsd: catalog ? estimateCostUsd(catalog, tokensIn, tokensOut) : null,
++    errorCode: input.errorCode,
++  };
++}
++
++export function estimateTokensFromChars(chars: number): number {
++  return Math.ceil(chars / 4);
++}
+diff --git a/packages/ai-gateway/src/sse.ts b/packages/ai-gateway/src/sse.ts
+new file mode 100644
+index 0000000..8b31a17
+--- /dev/null
++++ b/packages/ai-gateway/src/sse.ts
+@@ -0,0 +1,41 @@
++import { GatewayError } from "./errors";
++
++export async function* iterateSseData(
++  body: ReadableStream<Uint8Array>,
++  signal: AbortSignal,
++): AsyncGenerator<string> {
++  const reader = body.getReader();
++  const decoder = new TextDecoder();
++  let buffer = "";
++  try {
++    while (true) {
++      if (signal.aborted) {
++        throw new GatewayError("aborted", "Request aborted");
++      }
++      const read = await reader.read();
++      if (read.done) {
++        break;
++      }
++      buffer += decoder.decode(read.value, { stream: true }).replace(/\r\n/g, "\n");
++      let separator = buffer.indexOf("\n\n");
++      while (separator >= 0) {
++        const rawEvent = buffer.slice(0, separator);
++        buffer = buffer.slice(separator + 2);
++        const data = rawEvent
++          .split("\n")
++          .filter((line) => line.startsWith("data:"))
++          .map((line) => line.slice(5).trimStart())
++          .join("\n");
++        if (data === "[DONE]") {
++          return;
++        }
++        if (data.length > 0) {
++          yield data;
++        }
++        separator = buffer.indexOf("\n\n");
++      }
++    }
++  } finally {
++    reader.releaseLock();
++  }
++}
+diff --git a/packages/ai-gateway/tsconfig.json b/packages/ai-gateway/tsconfig.json
+new file mode 100644
+index 0000000..60e3669
+--- /dev/null
++++ b/packages/ai-gateway/tsconfig.json
+@@ -0,0 +1,9 @@
++{
++  "extends": "../../tsconfig.base.json",
++  "compilerOptions": {
++    "noEmit": true,
++    "types": ["node"]
++  },
++  "include": ["src"],
++  "exclude": ["src/**/*.test.ts"]
++}
+diff --git a/packages/ai-gateway/vitest.config.ts b/packages/ai-gateway/vitest.config.ts
+new file mode 100644
+index 0000000..c1433e6
+--- /dev/null
++++ b/packages/ai-gateway/vitest.config.ts
+@@ -0,0 +1,8 @@
++import { defineConfig } from "vitest/config";
++
++export default defineConfig({
++  test: {
++    environment: "node",
++    include: ["src/**/*.test.ts"],
++  },
++});
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index 35c1b03..49d27ce 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -1,5 +1,5 @@
+ export { applyMigrations } from "./migrate";
+-export { MIGRATIONS, MIGRATION_0001_SQL } from "./migrations";
++export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL } from "./migrations";
+ export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
+ export {
+   HubRepos,
+@@ -11,5 +11,7 @@ export {
+   type ProjectRecord,
+   type ProviderKeyRecord,
+   type ProviderRecord,
++  type ProviderSecretRecord,
++  type ReceiptRecord,
+ } from "./repos";
+ export { schema } from "./schema";
+diff --git a/packages/db/src/migrations.ts b/packages/db/src/migrations.ts
+index 549663f..a83a142 100644
+--- a/packages/db/src/migrations.ts
++++ b/packages/db/src/migrations.ts
+@@ -125,6 +125,11 @@ INSERT INTO providers (id, slug, name) VALUES
+   ('55555555-5555-4555-8555-555555555555', 'openrouter', 'OpenRouter');
+ `;
+ 
++export const MIGRATION_0002_SQL = `
++ALTER TABLE message_receipts ADD COLUMN error_code TEXT;
++`;
++
+ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 1, sql: MIGRATION_0001_SQL },
++  { version: 2, sql: MIGRATION_0002_SQL },
+ ];
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index a0fdea7..01d02bb 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -115,10 +115,81 @@ describe("hub database", () => {
+       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
+       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
+       applyMigrations(second.sqlite);
+-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(1);
++      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(2);
+       second.close();
+     } finally {
+       rmSync(dir, { recursive: true, force: true });
+     }
+   });
++
++  it("flushes streaming content and marks orphans interrupted with a receipt", () => {
++    const { hub } = openTestDb();
++    const project = hub.repos.createProject("Stream");
++    const conversation = hub.repos.createConversation(project.id, "Thread");
++    const user = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "user",
++      content: "hello",
++      parentId: null,
++      branchId: null,
++    });
++    const assistant = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "assistant",
++      content: "",
++      parentId: user.id,
++      branchId: null,
++      status: "streaming",
++    });
++    hub.repos.updateMessage(assistant.id, "Hel", "streaming");
++    expect(hub.repos.interruptOrphanStreams()).toBe(1);
++    const stored = hub.repos.getMessage(assistant.id);
++    expect(stored?.content).toBe("Hel");
++    expect(stored?.status).toBe("interrupted");
++    expect(stored?.receipt?.errorCode).toBe("unknown");
++    hub.close();
++  });
++
++  it("stores a receipt without the API secret", async () => {
++    const { hub } = openTestDb();
++    const secret = "sk-testfixtureNEVERSQLITE9999";
++    await hub.repos.saveProviderKey({ providerSlug: "openai", label: "work", secret });
++    const project = hub.repos.createProject("Receipts");
++    const conversation = hub.repos.createConversation(project.id, "Thread");
++    const message = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "assistant",
++      content: "hi",
++      parentId: null,
++      branchId: null,
++    });
++    hub.repos.createReceipt({
++      messageId: message.id,
++      provider: "openai",
++      model: "gpt-4o-mini",
++      tokensIn: 8,
++      tokensOut: 2,
++      latencyMs: 40,
++      costUsd: "0.000001",
++      errorCode: null,
++    });
++    const dump = dumpAllText(hub.sqlite);
++    expect(dump).not.toContain(secret);
++    expect(hub.repos.getReceipt(message.id)?.model).toBe("gpt-4o-mini");
++    hub.close();
++  });
++
++  it("reads a provider secret from the store, not sqlite", async () => {
++    const { hub } = openTestDb();
++    const secret = "sk-testfixtureNEVERSQLITE9999";
++    const saved = await hub.repos.saveProviderKey({
++      providerSlug: "openai",
++      label: "work",
++      secret,
++    });
++    const loaded = await hub.repos.getProviderSecret(saved.id);
++    expect(loaded?.secret).toBe(secret);
++    expect(dumpAllText(hub.sqlite)).not.toContain(secret);
++    hub.close();
++  });
+ });
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index a4bcf62..07bb659 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -11,6 +11,7 @@ import {
+ } from "@ai-hub/security";
+ import {
+   conversations,
++  messageReceipts,
+   messages,
+   projects,
+   providerKeys,
+@@ -24,6 +25,7 @@ export type HubDrizzle = BetterSQLite3Database<typeof schema>;
+ export interface ProjectRecord {
+   id: string;
+   name: string;
++  instructions: string | null;
+   createdAt: string;
+   updatedAt: string;
+ }
+@@ -39,6 +41,19 @@ export interface ConversationRecord {
+ export type MessageRole = "user" | "assistant" | "system";
+ export type MessageStatus = "complete" | "streaming" | "interrupted" | "aborted";
+ 
++export interface ReceiptRecord {
++  id: string;
++  messageId: string;
++  provider: string | null;
++  model: string | null;
++  tokensIn: number | null;
++  tokensOut: number | null;
++  latencyMs: number | null;
++  costUsd: string | null;
++  errorCode: string | null;
++  createdAt: string;
++}
++
+ export interface MessageRecord {
+   id: string;
+   conversationId: string;
+@@ -48,6 +63,7 @@ export interface MessageRecord {
+   content: string;
+   status: MessageStatus;
+   createdAt: string;
++  receipt: ReceiptRecord | null;
+ }
+ 
+ export interface ProviderRecord {
+@@ -66,6 +82,12 @@ export interface ProviderKeyRecord {
+   createdAt: string;
+ }
+ 
++export interface ProviderSecretRecord {
++  id: string;
++  providerSlug: string;
++  secret: string;
++}
++
+ export interface AppearanceRecord {
+   theme: "light" | "dark" | "system";
+   locale: "pt-BR" | "en";
+@@ -103,20 +125,92 @@ export class HubRepos {
+     private readonly secrets: SecretStore,
+   ) {}
+ 
++  private toReceipt(row: typeof messageReceipts.$inferSelect): ReceiptRecord {
++    return {
++      id: row.id,
++      messageId: row.messageId,
++      provider: row.provider,
++      model: row.model,
++      tokensIn: row.tokensIn,
++      tokensOut: row.tokensOut,
++      latencyMs: row.latencyMs,
++      costUsd: row.costUsd,
++      errorCode: row.errorCode,
++      createdAt: iso(row.createdAt),
++    };
++  }
++
++  private toProject(row: typeof projects.$inferSelect): ProjectRecord {
++    return {
++      id: row.id,
++      name: decryptUtf8(row.nameCipher, this.masterKey),
++      instructions: row.instructionsCipher
++        ? decryptUtf8(row.instructionsCipher, this.masterKey)
++        : null,
++      createdAt: iso(row.createdAt),
++      updatedAt: iso(row.updatedAt),
++    };
++  }
++
++  private toConversation(row: typeof conversations.$inferSelect): ConversationRecord {
++    return {
++      id: row.id,
++      projectId: row.projectId,
++      title: decryptUtf8(row.titleCipher, this.masterKey),
++      createdAt: iso(row.createdAt),
++      updatedAt: iso(row.updatedAt),
++    };
++  }
++
++  private toMessage(
++    row: typeof messages.$inferSelect,
++    receipt: ReceiptRecord | null,
++  ): MessageRecord {
++    return {
++      id: row.id,
++      conversationId: row.conversationId,
++      parentId: row.parentId,
++      branchId: row.branchId,
++      role: asRole(row.role),
++      content: decryptUtf8(row.contentCipher, this.masterKey),
++      status: asStatus(row.status),
++      createdAt: iso(row.createdAt),
++      receipt,
++    };
++  }
++
++  getReceipt(messageId: string): ReceiptRecord | null {
++    const row = this.db
++      .select()
++      .from(messageReceipts)
++      .where(eq(messageReceipts.messageId, messageId))
++      .all()
++      .sort((a, b) => b.createdAt - a.createdAt)[0];
++    return row ? this.toReceipt(row) : null;
++  }
++
++  getMessage(id: string): MessageRecord | null {
++    const row = this.db.select().from(messages).where(eq(messages.id, id)).get();
++    if (!row) {
++      return null;
++    }
++    return this.toMessage(row, this.getReceipt(id));
++  }
++
+   listProjects(): ProjectRecord[] {
+     return this.db
+       .select()
+       .from(projects)
+       .all()
+-      .map((row) => ({
+-        id: row.id,
+-        name: decryptUtf8(row.nameCipher, this.masterKey),
+-        createdAt: iso(row.createdAt),
+-        updatedAt: iso(row.updatedAt),
+-      }))
++      .map((row) => this.toProject(row))
+       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+   }
+ 
++  getProject(id: string): ProjectRecord | null {
++    const row = this.db.select().from(projects).where(eq(projects.id, id)).get();
++    return row ? this.toProject(row) : null;
++  }
++
+   createProject(name: string): ProjectRecord {
+     const now = Date.now();
+     const id = randomUUID();
+@@ -129,7 +223,7 @@ export class HubRepos {
+         updatedAt: now,
+       })
+       .run();
+-    return { id, name, createdAt: iso(now), updatedAt: iso(now) };
++    return { id, name, instructions: null, createdAt: iso(now), updatedAt: iso(now) };
+   }
+ 
+   removeProject(id: string): void {
+@@ -142,16 +236,15 @@ export class HubRepos {
+         ? this.db.select().from(conversations).all().filter((row) => row.projectId === null)
+         : this.db.select().from(conversations).where(eq(conversations.projectId, projectId)).all();
+     return rows
+-      .map((row) => ({
+-        id: row.id,
+-        projectId: row.projectId,
+-        title: decryptUtf8(row.titleCipher, this.masterKey),
+-        createdAt: iso(row.createdAt),
+-        updatedAt: iso(row.updatedAt),
+-      }))
++      .map((row) => this.toConversation(row))
+       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+   }
+ 
++  getConversation(id: string): ConversationRecord | null {
++    const row = this.db.select().from(conversations).where(eq(conversations.id, id)).get();
++    return row ? this.toConversation(row) : null;
++  }
++
+   createConversation(projectId: string | null, title: string): ConversationRecord {
+     const now = Date.now();
+     const id = randomUUID();
+@@ -178,16 +271,7 @@ export class HubRepos {
+       .from(messages)
+       .where(eq(messages.conversationId, conversationId))
+       .all()
+-      .map((row) => ({
+-        id: row.id,
+-        conversationId: row.conversationId,
+-        parentId: row.parentId,
+-        branchId: row.branchId,
+-        role: asRole(row.role),
+-        content: decryptUtf8(row.contentCipher, this.masterKey),
+-        status: asStatus(row.status),
+-        createdAt: iso(row.createdAt),
+-      }))
++      .map((row) => this.toMessage(row, this.getReceipt(row.id)))
+       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+   }
+ 
+@@ -197,6 +281,7 @@ export class HubRepos {
+     content: string;
+     parentId: string | null;
+     branchId: string | null;
++    status?: MessageStatus;
+   }): MessageRecord {
+     const conversation = this.db
+       .select()
+@@ -219,6 +304,7 @@ export class HubRepos {
+ 
+     const now = Date.now();
+     const id = randomUUID();
++    const status = input.status ?? "complete";
+     this.db
+       .insert(messages)
+       .values({
+@@ -229,7 +315,7 @@ export class HubRepos {
+         isActiveBranch: 1,
+         role: input.role,
+         contentCipher: encryptUtf8(input.content, this.masterKey),
+-        status: "complete",
++        status,
+         createdAt: now,
+       })
+       .run();
+@@ -246,11 +332,103 @@ export class HubRepos {
+       branchId,
+       role: input.role,
+       content: input.content,
+-      status: "complete",
++      status,
++      createdAt: iso(now),
++      receipt: null,
++    };
++  }
++
++  updateMessage(id: string, content: string, status: MessageStatus): MessageRecord {
++    const row = this.db.select().from(messages).where(eq(messages.id, id)).get();
++    if (!row) {
++      throw new Error("Message not found");
++    }
++    this.db
++      .update(messages)
++      .set({
++        contentCipher: encryptUtf8(content, this.masterKey),
++        status,
++      })
++      .where(eq(messages.id, id))
++      .run();
++    const updated = this.db.select().from(messages).where(eq(messages.id, id)).get();
++    if (!updated) {
++      throw new Error("Message not found");
++    }
++    return this.toMessage(updated, this.getReceipt(id));
++  }
++
++  createReceipt(input: {
++    messageId: string;
++    provider: string | null;
++    model: string | null;
++    tokensIn: number | null;
++    tokensOut: number | null;
++    latencyMs: number | null;
++    costUsd: string | null;
++    errorCode: string | null;
++  }): ReceiptRecord {
++    const message = this.db.select().from(messages).where(eq(messages.id, input.messageId)).get();
++    if (!message) {
++      throw new Error("Message not found");
++    }
++    const now = Date.now();
++    const id = randomUUID();
++    this.db
++      .insert(messageReceipts)
++      .values({
++        id,
++        messageId: input.messageId,
++        provider: input.provider,
++        model: input.model,
++        tokensIn: input.tokensIn,
++        tokensOut: input.tokensOut,
++        latencyMs: input.latencyMs,
++        costUsd: input.costUsd,
++        errorCode: input.errorCode,
++        createdAt: now,
++      })
++      .run();
++    return {
++      id,
++      messageId: input.messageId,
++      provider: input.provider,
++      model: input.model,
++      tokensIn: input.tokensIn,
++      tokensOut: input.tokensOut,
++      latencyMs: input.latencyMs,
++      costUsd: input.costUsd,
++      errorCode: input.errorCode,
+       createdAt: iso(now),
+     };
+   }
+ 
++  interruptOrphanStreams(): number {
++    const rows = this.db.select().from(messages).where(eq(messages.status, "streaming")).all();
++    const now = Date.now();
++    for (const row of rows) {
++      this.db.update(messages).set({ status: "interrupted" }).where(eq(messages.id, row.id)).run();
++      if (!this.getReceipt(row.id)) {
++        this.db
++          .insert(messageReceipts)
++          .values({
++            id: randomUUID(),
++            messageId: row.id,
++            provider: null,
++            model: null,
++            tokensIn: null,
++            tokensOut: null,
++            latencyMs: null,
++            costUsd: null,
++            errorCode: "unknown",
++            createdAt: now,
++          })
++          .run();
++      }
++    }
++    return rows.length;
++  }
++
+   listProviders(): ProviderRecord[] {
+     return this.db.select().from(providers).all();
+   }
+@@ -308,6 +486,19 @@ export class HubRepos {
+     });
+   }
+ 
++  async getProviderSecret(id: string): Promise<ProviderSecretRecord | null> {
++    const row = this.db.select().from(providerKeys).where(eq(providerKeys.id, id)).get();
++    if (!row) {
++      return null;
++    }
++    const provider = this.db.select().from(providers).where(eq(providers.id, row.providerId)).get();
++    const secret = await this.secrets.getPassword(row.keytarAccount);
++    if (!secret || !provider) {
++      return null;
++    }
++    return { id: row.id, providerSlug: provider.slug, secret };
++  }
++
+   async saveProviderKey(input: {
+     providerSlug: string;
+     label: string;
+diff --git a/packages/db/src/schema.ts b/packages/db/src/schema.ts
+index 260e90d..9fa66bb 100644
+--- a/packages/db/src/schema.ts
++++ b/packages/db/src/schema.ts
+@@ -39,6 +39,7 @@ export const messageReceipts = sqliteTable("message_receipts", {
+   tokensOut: integer("tokens_out", { mode: "number" }),
+   latencyMs: integer("latency_ms", { mode: "number" }),
+   costUsd: text("cost_usd"),
++  errorCode: text("error_code"),
+   createdAt: integer("created_at", { mode: "number" }).notNull(),
+ });
+ 
+diff --git a/packages/shared/src/gateway.test.ts b/packages/shared/src/gateway.test.ts
+new file mode 100644
+index 0000000..5232a7c
+--- /dev/null
++++ b/packages/shared/src/gateway.test.ts
+@@ -0,0 +1,86 @@
++import { describe, expect, it } from "vitest";
++import {
++  chatEventSchema,
++  chatSendInputSchema,
++  estimateCostUsd,
++  findCatalogModel,
++  packetV0Schema,
++  receiptDtoSchema,
++} from "./index";
++
++describe("packet v0", () => {
++  it("accepts a version-1 packet without extra keys", () => {
++    const packet = packetV0Schema.parse({
++      version: 1,
++      system: "Be brief.",
++      messages: [{ role: "user", content: "hi" }],
++      tokenEstimate: 3,
++      excluded: [],
++    });
++    expect(packet.version).toBe(1);
++  });
++
++  it("rejects a packet with extra keys", () => {
++    expect(() =>
++      packetV0Schema.parse({
++        version: 1,
++        system: "",
++        messages: [],
++        tokenEstimate: 0,
++        excluded: [],
++        apiKey: "sk-testfixtureABCDEFGH",
++      }),
++    ).toThrow();
++  });
++});
++
++describe("model catalog", () => {
++  it("prices gpt-4o-mini from the local catalog", () => {
++    const model = findCatalogModel("gpt-4o-mini", "openai");
++    expect(model).not.toBeNull();
++    if (!model) {
++      return;
++    }
++    expect(estimateCostUsd(model, 1_000_000, 1_000_000)).toBe("0.750000");
++  });
++});
++
++describe("chat contracts", () => {
++  it("rejects extra keys on chat send", () => {
++    expect(() =>
++      chatSendInputSchema.parse({
++        conversationId: "11111111-1111-4111-8111-111111111111",
++        providerKeyId: "22222222-2222-4222-8222-222222222222",
++        model: "gpt-4o-mini",
++        secret: "sk-testfixtureABCDEFGH",
++      }),
++    ).toThrow();
++  });
++
++  it("parses a chunk event", () => {
++    const event = chatEventSchema.parse({
++      type: "chunk",
++      runId: "11111111-1111-4111-8111-111111111111",
++      messageId: "22222222-2222-4222-8222-222222222222",
++      text: "Hi",
++    });
++    expect(event.type).toBe("chunk");
++  });
++
++  it("parses a receipt without a secret field", () => {
++    const receipt = receiptDtoSchema.parse({
++      id: "11111111-1111-4111-8111-111111111111",
++      messageId: "22222222-2222-4222-8222-222222222222",
++      provider: "openai",
++      model: "gpt-4o-mini",
++      tokensIn: 10,
++      tokensOut: 4,
++      latencyMs: 120,
++      costUsd: "0.000001",
++      errorCode: null,
++      createdAt: "2026-09-16T00:00:00.000Z",
++    });
++    expect(receipt.provider).toBe("openai");
++    expect("secret" in receipt).toBe(false);
++  });
++});
+diff --git a/packages/shared/src/gateway.ts b/packages/shared/src/gateway.ts
+new file mode 100644
+index 0000000..6be5858
+--- /dev/null
++++ b/packages/shared/src/gateway.ts
+@@ -0,0 +1,81 @@
++import { z } from "zod";
++
++export {
++  estimateCostUsd,
++  findCatalogModel,
++  MODEL_CATALOG,
++  openaiCatalogModels,
++  type CatalogModel,
++  type ModelCatalog,
++} from "./model-catalog";
++
++export const gatewayErrorCodeSchema = z.enum([
++  "timeout",
++  "rate_limit",
++  "auth",
++  "context_overflow",
++  "quota",
++  "network",
++  "aborted",
++  "unknown",
++]);
++
++export type GatewayErrorCode = z.infer<typeof gatewayErrorCodeSchema>;
++
++export const packetMessageSchema = z.object({
++  role: z.enum(["user", "assistant"]),
++  content: z.string(),
++});
++
++export type PacketMessage = z.infer<typeof packetMessageSchema>;
++
++export const packetV0Schema = z
++  .object({
++    version: z.literal(1),
++    system: z.string(),
++    messages: z.array(packetMessageSchema),
++    tokenEstimate: z.number().int().nonnegative(),
++    excluded: z.array(z.string()),
++  })
++  .strict();
++
++export type ProviderAgnosticPacket = z.infer<typeof packetV0Schema>;
++
++export const receiptDtoSchema = z.object({
++  id: z.string().uuid(),
++  messageId: z.string().uuid(),
++  provider: z.string().nullable(),
++  model: z.string().nullable(),
++  tokensIn: z.number().int().nullable(),
++  tokensOut: z.number().int().nullable(),
++  latencyMs: z.number().int().nullable(),
++  costUsd: z.string().nullable(),
++  errorCode: gatewayErrorCodeSchema.nullable(),
++  createdAt: z.string().min(1),
++});
++
++export type ReceiptDto = z.infer<typeof receiptDtoSchema>;
++
++export const chatSendInputSchema = z
++  .object({
++    conversationId: z.string().uuid(),
++    providerKeyId: z.string().uuid(),
++    model: z.string().min(1).max(128),
++  })
++  .strict();
++
++export type ChatSendInput = z.infer<typeof chatSendInputSchema>;
++
++export const chatSendResultSchema = z
++  .object({
++    runId: z.string().uuid(),
++    messageId: z.string().uuid(),
++    packet: packetV0Schema,
++  })
++  .strict();
++
++export type ChatSendResult = z.infer<typeof chatSendResultSchema>;
++
++export const chatAbortInputSchema = z.object({ runId: z.string().uuid() }).strict();
++
++export type ChatAbortInput = z.infer<typeof chatAbortInputSchema>;
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index b38dc1a..a99ef87 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -1,6 +1,8 @@
+ import type { AppLocale, ThemeMode } from "./appearance";
++import type { ChatAbortInput, ChatSendInput, ChatSendResult } from "./gateway";
+ import type {
+   AppearanceSettings,
++  ChatEvent,
+   ConversationCreateInput,
+   ConversationDto,
+   ConversationListInput,
+@@ -54,6 +56,12 @@ export interface HubSecretsApi {
+   remove: (input: IdInput) => Promise<void>;
+ }
+ 
++export interface HubChatApi {
++  send: (input: ChatSendInput) => Promise<ChatSendResult>;
++  abort: (input: ChatAbortInput) => Promise<void>;
++  onEvent: (listener: (event: ChatEvent) => void) => () => void;
++}
++
+ export interface HubApi {
+   platform: "win32" | "darwin" | "linux";
+   window: HubWindowApi;
+@@ -63,6 +71,7 @@ export interface HubApi {
+   settings: HubSettingsApi;
+   providers: HubProvidersApi;
+   secrets: HubSecretsApi;
++  chat: HubChatApi;
+ }
+ 
+ export type { AppLocale, ThemeMode };
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 06f2ca4..bab0a34 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -1,6 +1,7 @@
+ export { type AppLocale, type ThemeMode, localeSchema, themeModeSchema } from "./appearance";
+ export {
+   type HubApi,
++  type HubChatApi,
+   type HubConversationsApi,
+   type HubMessagesApi,
+   type HubProjectsApi,
+@@ -12,6 +13,7 @@ export {
+ export { IpcChannel, type IpcChannelName } from "./ipc-channels";
+ export {
+   appearanceSettingsSchema,
++  chatEventSchema,
+   conversationCreateInputSchema,
+   conversationDtoSchema,
+   conversationListInputSchema,
+@@ -36,6 +38,7 @@ export {
+   secretsSaveInputSchema,
+   windowIsMaximizedResultSchema,
+   type AppearanceSettings,
++  type ChatEvent,
+   type ConversationCreateInput,
+   type ConversationDto,
+   type ConversationListInput,
+@@ -52,3 +55,24 @@ export {
+   type ProviderKeyDto,
+   type SecretsSaveInput,
+ } from "./ipc-schemas";
++export {
++  chatAbortInputSchema,
++  chatSendInputSchema,
++  chatSendResultSchema,
++  estimateCostUsd,
++  findCatalogModel,
++  gatewayErrorCodeSchema,
++  MODEL_CATALOG,
++  openaiCatalogModels,
++  packetV0Schema,
++  receiptDtoSchema,
++  type CatalogModel,
++  type ChatAbortInput,
++  type ChatSendInput,
++  type ChatSendResult,
++  type GatewayErrorCode,
++  type ModelCatalog,
++  type PacketMessage,
++  type ProviderAgnosticPacket,
++  type ReceiptDto,
++} from "./gateway";
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index fad166b..ea0ab20 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -17,6 +17,9 @@ export const IpcChannel = {
+   secretsList: "secrets:list",
+   secretsSave: "secrets:save",
+   secretsRemove: "secrets:remove",
++  chatSend: "chat:send",
++  chatAbort: "chat:abort",
++  chatEvent: "chat:event",
+ } as const;
+ 
+ export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index cf35636..1105253 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -1,5 +1,6 @@
+ import { z } from "zod";
+ import { localeSchema, themeModeSchema } from "./appearance";
++import { gatewayErrorCodeSchema, packetV0Schema, receiptDtoSchema } from "./gateway";
+ 
+ export const emptyIpcPayloadSchema = z.object({}).strict();
+ 
+@@ -80,6 +81,7 @@ export const messageDtoSchema = z.object({
+   content: z.string(),
+   status: messageStatusSchema,
+   createdAt: isoTimestampSchema,
++  receipt: receiptDtoSchema.nullable(),
+ });
+ 
+ export type MessageDto = z.infer<typeof messageDtoSchema>;
+@@ -154,3 +156,26 @@ export const secretsSaveInputSchema = z
+   .strict();
+ 
+ export type SecretsSaveInput = z.infer<typeof secretsSaveInputSchema>;
++
++export const chatEventSchema = z.discriminatedUnion("type", [
++  z.object({
++    type: z.literal("chunk"),
++    runId: z.string().uuid(),
++    messageId: z.string().uuid(),
++    text: z.string(),
++  }),
++  z.object({
++    type: z.literal("done"),
++    runId: z.string().uuid(),
++    message: messageDtoSchema,
++    packet: packetV0Schema,
++  }),
++  z.object({
++    type: z.literal("error"),
++    runId: z.string().uuid(),
++    messageId: z.string().uuid(),
++    code: gatewayErrorCodeSchema,
++  }),
++]);
++
++export type ChatEvent = z.infer<typeof chatEventSchema>;
+diff --git a/packages/shared/src/model-catalog.json b/packages/shared/src/model-catalog.json
+new file mode 100644
+index 0000000..4817e6f
+--- /dev/null
++++ b/packages/shared/src/model-catalog.json
+@@ -0,0 +1,21 @@
++{
++  "version": 1,
++  "models": [
++    {
++      "id": "gpt-4o-mini",
++      "provider": "openai",
++      "label": "GPT-4o mini",
++      "contextWindow": 128000,
++      "inputUsdPerMillion": 0.15,
++      "outputUsdPerMillion": 0.6
++    },
++    {
++      "id": "gpt-4o",
++      "provider": "openai",
++      "label": "GPT-4o",
++      "contextWindow": 128000,
++      "inputUsdPerMillion": 2.5,
++      "outputUsdPerMillion": 10
++    }
++  ]
++}
+diff --git a/packages/shared/src/model-catalog.ts b/packages/shared/src/model-catalog.ts
+new file mode 100644
+index 0000000..83a8f3d
+--- /dev/null
++++ b/packages/shared/src/model-catalog.ts
+@@ -0,0 +1,38 @@
++import catalogJson from "./model-catalog.json";
++
++export interface CatalogModel {
++  id: string;
++  provider: string;
++  label: string;
++  contextWindow: number;
++  inputUsdPerMillion: number;
++  outputUsdPerMillion: number;
++}
++
++export interface ModelCatalog {
++  version: number;
++  models: CatalogModel[];
++}
++
++export const MODEL_CATALOG: ModelCatalog = catalogJson;
++
++export function findCatalogModel(modelId: string, provider: string): CatalogModel | null {
++  return (
++    MODEL_CATALOG.models.find((model) => model.id === modelId && model.provider === provider) ?? null
++  );
++}
++
++export function estimateCostUsd(
++  model: CatalogModel,
++  tokensIn: number,
++  tokensOut: number,
++): string {
++  const cost =
++    (tokensIn / 1_000_000) * model.inputUsdPerMillion +
++    (tokensOut / 1_000_000) * model.outputUsdPerMillion;
++  return cost.toFixed(6);
++}
++
++export function openaiCatalogModels(): CatalogModel[] {
++  return MODEL_CATALOG.models.filter((model) => model.provider === "openai");
++}
+diff --git a/packages/shared/tsconfig.json b/packages/shared/tsconfig.json
+index 4bcb66c..8a5cc63 100644
+--- a/packages/shared/tsconfig.json
++++ b/packages/shared/tsconfig.json
+@@ -3,6 +3,6 @@
+   "compilerOptions": {
+     "noEmit": true
+   },
+-  "include": ["src"],
++  "include": ["src", "src/**/*.json"],
+   "exclude": ["src/**/*.test.ts"]
+ }
