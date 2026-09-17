@@ -75,3 +75,16 @@ test("regenerate keeps the previous answer as a sibling", async () => {
     await app.close();
   }
 });
+
+test("settings lists OpenRouter as a first-class provider", async () => {
+  const app = await launchHub();
+  try {
+    const window = await app.firstWindow();
+    await window.getByTestId("nav-settings").click();
+    await expect(window.getByTestId("secrets-provider")).toBeVisible();
+    await expect(window.getByTestId("secrets-provider")).toContainText("OpenRouter");
+    await expect(window.getByTestId("secrets-test")).toBeVisible();
+  } finally {
+    await app.close();
+  }
+});
