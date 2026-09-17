@@ -7,6 +7,10 @@ import {
   messageDtoSchema,
   messageUpdateInputSchema,
   providerKeyDtoSchema,
+  projectCreateInputSchema,
+  projectDtoSchema,
+  searchHitSchema,
+  searchInputSchema,
   secretsSaveInputSchema,
   secretsTestResultSchema,
   windowIsMaximizedResultSchema,
@@ -97,6 +101,7 @@ describe("conversationExportDocumentSchema", () => {
           id: "11111111-1111-4111-8111-111111111111",
           projectId: null,
           title: "Chat",
+          tags: [],
           createdAt: "2026-09-17T00:00:00.000Z",
           updatedAt: "2026-09-17T00:00:00.000Z",
         },
@@ -215,5 +220,42 @@ describe("providerKeyDtoSchema", () => {
     expect(() =>
       providerKeyDtoSchema.parse({ ...base, maskedKey: "sk-abcdefghijklmnopqrstuv" }),
     ).toThrow();
+  });
+});
+
+describe("project and search contracts", () => {
+  it("accepts a full project DTO and rejects credentials in color", () => {
+    const parsed = projectDtoSchema.parse({
+      id: "11111111-1111-4111-8111-111111111111",
+      name: "Alpha",
+      color: "#2563eb",
+      instructions: "Stay terse.",
+      preferredModel: "gpt-4o-mini",
+      preferredProvider: "openai",
+      createdAt: "2026-09-17T00:00:00.000Z",
+      updatedAt: "2026-09-17T00:00:00.000Z",
+    });
+    expect(parsed.instructions).toBe("Stay terse.");
+    expect(() =>
+      projectCreateInputSchema.parse({ name: "Alpha", color: "not-a-color" }),
+    ).toThrow();
+  });
+
+  it("caps search query length", () => {
+    expect(() => searchInputSchema.parse({ query: "a".repeat(201) })).toThrow();
+    expect(searchInputSchema.parse({ query: "  needle  " }).query).toBe("needle");
+  });
+
+  it("rejects extra keys and overlong snippets on search hits", () => {
+    const hit = {
+      conversationId: "11111111-1111-4111-8111-111111111111",
+      projectId: null,
+      conversationTitle: "Kickoff",
+      messageId: null,
+      snippet: "needle",
+    };
+    expect(searchHitSchema.parse(hit).snippet).toBe("needle");
+    expect(() => searchHitSchema.parse({ ...hit, apiKey: "sk-testfixtureABCDEFGH" })).toThrow();
+    expect(() => searchHitSchema.parse({ ...hit, snippet: "x".repeat(401) })).toThrow();
   });
 });
