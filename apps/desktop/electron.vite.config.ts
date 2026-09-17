@@ -4,19 +4,25 @@ import react from "@vitejs/plugin-react";
 
 const shared = resolve(__dirname, "../../packages/shared/src");
 const db = resolve(__dirname, "../../packages/db/src");
+const gateway = resolve(__dirname, "../../packages/ai-gateway/src");
 const securityIndex = resolve(__dirname, "../../packages/security/src/index.ts");
 const securityKeytar = resolve(__dirname, "../../packages/security/src/keytar-store.ts");
 
 const mainAliases = {
   "@ai-hub/shared": shared,
   "@ai-hub/db": db,
+  "@ai-hub/ai-gateway": gateway,
   "@ai-hub/security/keytar": securityKeytar,
   "@ai-hub/security": securityIndex,
 };
 
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin({ exclude: ["@ai-hub/shared", "@ai-hub/db", "@ai-hub/security"] })],
+    plugins: [
+      externalizeDepsPlugin({
+        exclude: ["@ai-hub/shared", "@ai-hub/db", "@ai-hub/security", "@ai-hub/ai-gateway"],
+      }),
+    ],
     resolve: {
       alias: mainAliases,
     },
