@@ -1,0 +1,2572 @@
+diff --git a/apps/desktop/e2e/send.spec.ts b/apps/desktop/e2e/send.spec.ts
+index f55b80d..b1c83f7 100644
+--- a/apps/desktop/e2e/send.spec.ts
++++ b/apps/desktop/e2e/send.spec.ts
+@@ -52,3 +52,26 @@ test("stop aborts the mock stream without treating it as a request failure", asy
+     await app.close();
+   }
+ });
++
++test("regenerate keeps the previous answer as a sibling", async () => {
++  const app = await launchHub();
++  try {
++    const window = await app.firstWindow();
++    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
++    await window.getByTestId("chat-composer").fill("Hello");
++    await window.getByTestId("chat-send").click();
++    await expect(window.getByTestId("message-assistant")).toHaveAttribute("data-status", "complete", {
++      timeout: 30_000,
++    });
++    await window.getByTestId("message-regenerate").click();
++    await expect(window.getByTestId("sibling-count")).toHaveText("2 / 2", { timeout: 30_000 });
++    await expect(window.getByTestId("message-assistant")).toHaveAttribute("data-status", "complete", {
++      timeout: 30_000,
++    });
++    await window.getByTestId("tree-toggle").click();
++    await expect(window.getByTestId("conversation-tree")).toBeVisible();
++    await expect(window.getByTestId("tree-node")).toHaveCount(3);
++  } finally {
++    await app.close();
++  }
++});
+diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts
+index ce28634..dd576a0 100644
+--- a/apps/desktop/src/main/chat-session.ts
++++ b/apps/desktop/src/main/chat-session.ts
+@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
+ import type { WebContents } from "electron";
+ import {
+   composeReceipt,
++  compileActivePath,
+   compilePacket,
+   consumeCrashSafeStream,
+   createMockOpenAIAdapter,
+@@ -12,8 +13,11 @@ import {
+   gatewayErrorCode,
+   type ProviderAdapter,
+ } from "@ai-hub/ai-gateway";
++import type { MessageRecord } from "@ai-hub/db";
+ import { redactSecrets } from "@ai-hub/security";
+ import {
++  activePath,
++  ancestorsOf,
+   chatEventSchema,
+   findCatalogModel,
+   IpcChannel,
+@@ -113,36 +117,106 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+     throw new Error("Only OpenAI is available in this wave");
+   }
+ 
+-  let history = repos.listMessages(input.conversationId);
+-  if (history.some((item) => item.status === "streaming")) {
++  const existing = repos.listMessages(input.conversationId);
++  if (existing.some((item) => item.status === "streaming")) {
+     throw new Error("A stream is already running in this conversation");
+   }
+ 
+-  let userMessageId: string | null = null;
+-  if (input.content !== null) {
+-    const last = history[history.length - 1];
+-    const user = repos.createMessage({
+-      conversationId: input.conversationId,
+-      role: "user",
+-      content: input.content,
+-      parentId: last?.id ?? null,
+-      branchId: last?.branchId ?? null,
+-    });
+-    userMessageId = user.id;
+-    history = [...history, user];
++  let userMessage: MessageRecord | null = null;
++  let compileRows: MessageRecord[] = [];
++  let assistantParentId: string | null = null;
++  let assistantBranchId: string | null = null;
++
++  switch (input.mode) {
++    case "send": {
++      const leaf = activePath(existing).at(-1);
++      userMessage = repos.createMessage({
++        conversationId: input.conversationId,
++        role: "user",
++        content: input.content,
++        parentId: leaf?.id ?? null,
++        branchId: leaf?.branchId ?? null,
++      });
++      compileRows = repos.listActivePath(input.conversationId);
++      assistantParentId = userMessage.id;
++      assistantBranchId = userMessage.branchId;
++      break;
++    }
++    case "continue": {
++      compileRows = repos.listActivePath(input.conversationId);
++      const leaf = compileRows.at(-1);
++      if (!leaf) {
++        throw new Error("Add a user message before sending");
++      }
++      assistantParentId = leaf.id;
++      assistantBranchId = leaf.branchId;
++      break;
++    }
++    case "regenerate": {
++      const target = repos.getMessage(input.messageId);
++      if (!target || target.conversationId !== input.conversationId || target.role !== "assistant") {
++        throw new Error("Assistant message not found");
++      }
++      if (target.status === "streaming") {
++        throw new Error("A stream is already running in this conversation");
++      }
++      const path = activePath(existing);
++      const index = path.findIndex((item) => item.id === target.id);
++      compileRows =
++        index >= 0 ? path.slice(0, index) : ancestorsOf(existing, target.id).slice(1).reverse();
++      assistantParentId = target.parentId;
++      assistantBranchId = randomUUID();
++      break;
++    }
++    case "edit": {
++      const target = repos.getMessage(input.messageId);
++      if (!target || target.conversationId !== input.conversationId || target.role !== "user") {
++        throw new Error("User message not found");
++      }
++      userMessage = repos.createMessage({
++        conversationId: input.conversationId,
++        role: "user",
++        content: input.content,
++        parentId: target.parentId,
++        branchId: randomUUID(),
++      });
++      compileRows = repos.listActivePath(input.conversationId);
++      assistantParentId = userMessage.id;
++      assistantBranchId = userMessage.branchId;
++      break;
++    }
++    default: {
++      const _never: never = input;
++      throw new Error(`Unknown send mode: ${String(_never)}`);
++    }
+   }
+ 
+   const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
+-  const packet = compilePacket({
+-    projectInstructions: project?.instructions ?? null,
+-    extraSystem: null,
+-    messages: history.map((item) => ({
+-      id: item.id,
+-      role: item.role,
+-      content: item.content,
+-      status: item.status,
+-    })),
+-  });
++  const packet =
++    input.mode === "regenerate"
++      ? compilePacket({
++          projectInstructions: project?.instructions ?? null,
++          extraSystem: null,
++          messages: compileRows.map((item) => ({
++            id: item.id,
++            role: item.role,
++            content: item.content,
++            status: item.status,
++          })),
++        })
++      : compileActivePath({
++          projectInstructions: project?.instructions ?? null,
++          extraSystem: null,
++          messages: compileRows.map((item) => ({
++            id: item.id,
++            parentId: item.parentId,
++            isActiveBranch: item.isActiveBranch,
++            createdAt: item.createdAt,
++            role: item.role,
++            content: item.content,
++            status: item.status,
++          })),
++        });
+   if (packet.messages.length === 0) {
+     throw new Error("Add a user message before sending");
+   }
+@@ -150,13 +224,12 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+   console.info("[hub:packet]", redactSecrets(JSON.stringify(packet)));
+   const publicPacket = inspectablePacket(packet);
+ 
+-  const last = history[history.length - 1];
+   const assistant = repos.createMessage({
+     conversationId: input.conversationId,
+     role: "assistant",
+     content: "",
+-    parentId: last?.id ?? null,
+-    branchId: last?.branchId ?? null,
++    parentId: assistantParentId,
++    branchId: assistantBranchId,
+     status: "streaming",
+   });
+   repos.createReceipt({
+@@ -169,6 +242,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+     costUsd: null,
+     errorCode: null,
+   });
++  const assistantStored = repos.getMessage(assistant.id) ?? assistant;
+ 
+   const runId = randomUUID();
+   const run: ActiveRun = {
+@@ -251,7 +325,9 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+   return {
+     runId,
+     messageId: assistant.id,
+-    userMessageId,
++    userMessageId: userMessage?.id ?? null,
+     packet: publicPacket,
++    userMessage: userMessage ? toMessageDto(userMessage) : null,
++    assistant: toMessageDto(assistantStored),
+   };
+ }
+diff --git a/apps/desktop/src/main/conversation-export.ts b/apps/desktop/src/main/conversation-export.ts
+new file mode 100644
+index 0000000..ff12f64
+--- /dev/null
++++ b/apps/desktop/src/main/conversation-export.ts
+@@ -0,0 +1,89 @@
++import { writeFile } from "node:fs/promises";
++import { BrowserWindow, dialog, type WebContents } from "electron";
++import { redactSecrets } from "@ai-hub/security";
++import {
++  selectExportMessages,
++  branchLabelsSchema,
++  conversationDtoSchema,
++  conversationExportDocumentSchema,
++  conversationExportResultSchema,
++  type ConversationExportDocument,
++  type ConversationExportInput,
++  type ConversationExportResult,
++  type MessageDto,
++} from "@ai-hub/shared";
++import { toMessageDto } from "./message-dto";
++import { getHubDatabase } from "./persistence";
++
++function filePart(title: string): string {
++  const cleaned = Array.from(title)
++    .map((ch) => {
++      const code = ch.codePointAt(0) ?? 0;
++      if (code < 32 || '<>:"/\\|?*'.includes(ch)) {
++        return "_";
++      }
++      return ch;
++    })
++    .join("")
++    .trim();
++  return (cleaned.length > 0 ? cleaned : "conversation").slice(0, 60);
++}
++
++export function buildConversationExportDocument(input: {
++  mode: "active" | "tree";
++  exportedAt: string;
++  conversation: {
++    id: string;
++    projectId: string | null;
++    title: string;
++    createdAt: string;
++    updatedAt: string;
++  };
++  messages: MessageDto[];
++  branchLabels: Record<string, string>;
++}): ConversationExportDocument {
++  const selected = selectExportMessages(input.mode, input.messages);
++  return conversationExportDocumentSchema.parse({
++    version: 1,
++    mode: input.mode,
++    exportedAt: input.exportedAt,
++    conversation: conversationDtoSchema.parse(input.conversation),
++    branchLabels: branchLabelsSchema.parse(input.branchLabels),
++    messages: selected,
++  });
++}
++
++export async function exportConversation(
++  input: ConversationExportInput,
++  sender: WebContents,
++): Promise<ConversationExportResult> {
++  const repos = getHubDatabase().repos;
++  const conversation = repos.getConversation(input.conversationId);
++  if (!conversation) {
++    throw new Error("Conversation not found");
++  }
++
++  const document = buildConversationExportDocument({
++    mode: input.mode,
++    exportedAt: new Date().toISOString(),
++    conversation,
++    messages: repos.listMessages(input.conversationId).map((row) => toMessageDto(row)),
++    branchLabels: repos.getBranchLabels(input.conversationId),
++  });
++  const payload = redactSecrets(JSON.stringify(document, null, 2));
++
++  const window = BrowserWindow.fromWebContents(sender);
++  const options = {
++    defaultPath: `${filePart(conversation.title)}-${input.mode}.json`,
++    filters: [{ name: "JSON", extensions: ["json"] }],
++  };
++  const choice = window
++    ? await dialog.showSaveDialog(window, options)
++    : await dialog.showSaveDialog(options);
++  if (choice.canceled || !choice.filePath) {
++    return conversationExportResultSchema.parse({ status: "cancelled" });
++  }
++
++  await writeFile(choice.filePath, payload, "utf8");
++  return conversationExportResultSchema.parse({ status: "saved", path: choice.filePath });
++}
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index 8730eb5..b2e4352 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -3,11 +3,16 @@ import { ZodError, type ZodType } from "zod";
+ import {
+   IpcChannel,
+   appearanceSettingsSchema,
++  branchLabelSetInputSchema,
++  branchLabelsGetInputSchema,
++  branchLabelsSchema,
+   chatAbortInputSchema,
+   chatSendInputSchema,
+   chatSendResultSchema,
+   conversationCreateInputSchema,
+   conversationDtoSchema,
++  conversationExportInputSchema,
++  conversationExportResultSchema,
+   conversationListInputSchema,
+   conversationListResultSchema,
+   emptyIpcPayloadSchema,
+@@ -30,6 +35,7 @@ import {
+ } from "@ai-hub/shared";
+ import { safeErrorMessage } from "@ai-hub/security";
+ import { abortChat, sendChat } from "./chat-session";
++import { exportConversation } from "./conversation-export";
+ import { toMessageDto } from "./message-dto";
+ import { getHubDatabase } from "./persistence";
+ 
+@@ -87,6 +93,34 @@ export function registerWorkspaceIpc(): void {
+     getHubDatabase().repos.removeConversation(input.id);
+   });
+ 
++  registerHandler(
++    IpcChannel.conversationsExport,
++    conversationExportInputSchema,
++    conversationExportResultSchema,
++    (input, event) => exportConversation(input, event.sender),
++  );
++
++  registerHandler(
++    IpcChannel.conversationsGetBranchLabels,
++    branchLabelsGetInputSchema,
++    branchLabelsSchema,
++    (input) => {
++      const parsed = branchLabelsSchema.safeParse(
++        getHubDatabase().repos.getBranchLabels(input.conversationId),
++      );
++      return parsed.success ? parsed.data : {};
++    },
++  );
++
++  registerHandler(
++    IpcChannel.conversationsSetBranchLabel,
++    branchLabelSetInputSchema,
++    ipcAckResultSchema,
++    (input) => {
++      getHubDatabase().repos.setBranchLabel(input.conversationId, input.branchId, input.label);
++    },
++  );
++
+   registerHandler(IpcChannel.messagesList, messageListInputSchema, messageListResultSchema, (input) =>
+     getHubDatabase()
+       .repos.listMessages(input.conversationId)
+@@ -113,8 +147,8 @@ export function registerWorkspaceIpc(): void {
+     return toMessageDto(getHubDatabase().repos.updateMessage(input.id, input.content, existing.status));
+   });
+ 
+-  registerHandler(IpcChannel.messagesDeleteFrom, idInputSchema, ipcAckResultSchema, (input) => {
+-    getHubDatabase().repos.deleteMessagesFrom(input.id);
++  registerHandler(IpcChannel.messagesActivate, idInputSchema, ipcAckResultSchema, (input) => {
++    getHubDatabase().repos.activatePathThrough(input.id);
+   });
+ 
+   registerHandler(
+diff --git a/apps/desktop/src/main/message-dto.ts b/apps/desktop/src/main/message-dto.ts
+index 1bb14c9..a20bea8 100644
+--- a/apps/desktop/src/main/message-dto.ts
++++ b/apps/desktop/src/main/message-dto.ts
+@@ -26,6 +26,7 @@ export function toMessageDto(row: MessageRecord): MessageDto {
+     conversationId: row.conversationId,
+     parentId: row.parentId,
+     branchId: row.branchId,
++    isActiveBranch: row.isActiveBranch,
+     role: row.role,
+     content: row.content,
+     status: row.status,
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index 7af6877..2140521 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -4,6 +4,9 @@ import {
+   IpcChannel,
+   type HubApi,
+   appearanceSettingsSchema,
++  branchLabelSetInputSchema,
++  branchLabelsGetInputSchema,
++  branchLabelsSchema,
+   chatAbortInputSchema,
+   chatEventSchema,
+   chatSendInputSchema,
+@@ -12,6 +15,8 @@ import {
+   conversationListInputSchema,
+   conversationListResultSchema,
+   conversationDtoSchema,
++  conversationExportInputSchema,
++  conversationExportResultSchema,
+   emptyIpcPayloadSchema,
+   idInputSchema,
+   ipcAckResultSchema,
+@@ -111,6 +116,22 @@ const hub: HubApi = {
+     create: (input) =>
+       invokeParsed(IpcChannel.conversationsCreate, input, conversationCreateInputSchema, conversationDtoSchema),
+     remove: (input) => invokeAckWith(IpcChannel.conversationsRemove, input, idInputSchema),
++    export: (input) =>
++      invokeParsed(
++        IpcChannel.conversationsExport,
++        input,
++        conversationExportInputSchema,
++        conversationExportResultSchema,
++      ),
++    getBranchLabels: (input) =>
++      invokeParsed(
++        IpcChannel.conversationsGetBranchLabels,
++        input,
++        branchLabelsGetInputSchema,
++        branchLabelsSchema,
++      ),
++    setBranchLabel: (input) =>
++      invokeAckWith(IpcChannel.conversationsSetBranchLabel, input, branchLabelSetInputSchema),
+   },
+   messages: {
+     list: (input) =>
+@@ -119,7 +140,7 @@ const hub: HubApi = {
+       invokeParsed(IpcChannel.messagesCreate, input, messageCreateInputSchema, messageDtoSchema),
+     update: (input) =>
+       invokeParsed(IpcChannel.messagesUpdate, input, messageUpdateInputSchema, messageDtoSchema),
+-    deleteFrom: (input) => invokeAckWith(IpcChannel.messagesDeleteFrom, input, idInputSchema),
++    activate: (input) => invokeAckWith(IpcChannel.messagesActivate, input, idInputSchema),
+   },
+   settings: {
+     getAppearance: () =>
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index 1eb7c14..2e24f02 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -1,7 +1,15 @@
+ import { useCallback, useEffect, useState, type JSX } from "react";
+ import { useTranslation } from "react-i18next";
+-import type { ConversationDto, MessageDto, ProjectDto, ProviderKeyDto } from "@ai-hub/shared";
+-import { findCatalogModel } from "@ai-hub/shared";
++import type {
++  BranchLabels,
++  ChatSendInput,
++  ChatSendResult,
++  ConversationDto,
++  MessageDto,
++  ProjectDto,
++  ProviderKeyDto,
++} from "@ai-hub/shared";
++import { findCatalogModel, upsertActivated } from "@ai-hub/shared";
+ import { TitleBar } from "@/components/layout/title-bar";
+ import { Sidebar } from "@/components/layout/sidebar";
+ import { StatusBar } from "@/components/layout/status-bar";
+@@ -10,23 +18,12 @@ import { SettingsView } from "@/components/layout/settings-view";
+ import { ChromeCommandPalette } from "@/components/layout/command-palette";
+ import type { AppView } from "@/components/layout/types";
+ 
+-function placeholderAssistant(
+-  conversationId: string,
+-  messageId: string,
+-  parentId: string | null,
+-  branchId: string,
+-): MessageDto {
+-  return {
+-    id: messageId,
+-    conversationId,
+-    parentId,
+-    branchId,
+-    role: "assistant",
+-    content: "",
+-    status: "streaming",
+-    createdAt: new Date().toISOString(),
+-    receipt: null,
+-  };
++function applySendResult(current: MessageDto[], result: ChatSendResult): MessageDto[] {
++  let next = current;
++  if (result.userMessage) {
++    next = upsertActivated(next, result.userMessage);
++  }
++  return upsertActivated(next, result.assistant);
+ }
+ 
+ export function App(): JSX.Element {
+@@ -42,8 +39,11 @@ export function App(): JSX.Element {
+   const [selectedModel, setSelectedModel] = useState("gpt-4o-mini");
+   const [run, setRun] = useState<{ runId: string; conversationId: string } | null>(null);
+   const [sending, setSending] = useState(false);
++  const [activating, setActivating] = useState(false);
+   const [sessionReady, setSessionReady] = useState(false);
+   const [error, setError] = useState<string | null>(null);
++  const [branchLabels, setBranchLabels] = useState<BranchLabels>({});
++  const [exportNotice, setExportNotice] = useState<string | null>(null);
+ 
+   const fail = useCallback((): void => {
+     setError(t("workspace.error.generic"));
+@@ -64,6 +64,8 @@ export function App(): JSX.Element {
+   const loadMessages = useCallback(async (conversationId: string): Promise<MessageDto[]> => {
+     const list = await window.hub.messages.list({ conversationId });
+     setMessages(list);
++    const labels = await window.hub.conversations.getBranchLabels({ conversationId });
++    setBranchLabels(labels);
+     return list;
+   }, []);
+ 
+@@ -170,53 +172,16 @@ export function App(): JSX.Element {
+     return off;
+   }, [fail, loadMessages, t]);
+ 
+-  const sendToModel = async (content: string | null): Promise<void> => {
++  const sendToModel = async (input: ChatSendInput): Promise<void> => {
+     if (!selectedConversationId || !selectedKeyId) {
+       return;
+     }
+     setSending(true);
+     try {
+-      const result = await window.hub.chat.send({
+-        conversationId: selectedConversationId,
+-        providerKeyId: selectedKeyId,
+-        model: selectedModel,
+-        content,
+-      });
++      const result = await window.hub.chat.send(input);
+       setError(null);
+       setRun({ runId: result.runId, conversationId: selectedConversationId });
+-      setMessages((current) => {
+-        let next = current;
+-        if (result.userMessageId && content && !next.some((item) => item.id === result.userMessageId)) {
+-          const last = next[next.length - 1];
+-          next = [
+-            ...next,
+-            {
+-              id: result.userMessageId,
+-              conversationId: selectedConversationId,
+-              parentId: last?.id ?? null,
+-              branchId: last?.branchId ?? result.userMessageId,
+-              role: "user",
+-              content,
+-              status: "complete",
+-              createdAt: new Date().toISOString(),
+-              receipt: null,
+-            },
+-          ];
+-        }
+-        if (next.some((item) => item.id === result.messageId)) {
+-          return next;
+-        }
+-        const last = next[next.length - 1];
+-        return [
+-          ...next,
+-          placeholderAssistant(
+-            selectedConversationId,
+-            result.messageId,
+-            last?.id ?? null,
+-            last?.branchId ?? result.messageId,
+-          ),
+-        ];
+-      });
++      setMessages((current) => applySendResult(current, result));
+     } catch {
+       fail();
+     } finally {
+@@ -251,6 +216,7 @@ export function App(): JSX.Element {
+             setSelectedProjectId(id);
+             setSelectedConversationId(null);
+             setMessages([]);
++            setBranchLabels({});
+             void loadConversations(id).catch(fail);
+           }}
+           onCreateProject={async (name) => {
+@@ -262,6 +228,7 @@ export function App(): JSX.Element {
+               setSelectedProjectId(next.id);
+               setSelectedConversationId(null);
+               setMessages([]);
++              setBranchLabels({});
+               abortIfLeaving(null);
+               await loadConversations(next.id);
+               setView("home");
+@@ -282,7 +249,9 @@ export function App(): JSX.Element {
+               selectedKeyId={selectedKeyId}
+               selectedModel={selectedModel}
+               streaming={run?.conversationId === selectedConversationId}
+-              sending={sending}
++              sending={sending || activating}
++              branchLabels={branchLabels}
++              exportNotice={exportNotice}
+               onSelectConversation={(id) => {
+                 abortIfLeaving(id);
+                 setSelectedConversationId(id);
+@@ -301,6 +270,7 @@ export function App(): JSX.Element {
+                   await loadConversations(selectedProjectId);
+                   setSelectedConversationId(created.id);
+                   setMessages([]);
++                  setBranchLabels({});
+                   abortIfLeaving(created.id);
+                 } catch {
+                   fail();
+@@ -308,7 +278,18 @@ export function App(): JSX.Element {
+               }}
+               onSelectKey={setSelectedKeyId}
+               onSelectModel={setSelectedModel}
+-              onSend={(content) => sendToModel(content)}
++              onSend={(content) => {
++                if (!selectedConversationId || !selectedKeyId) {
++                  return Promise.resolve();
++                }
++                return sendToModel({
++                  mode: "send",
++                  conversationId: selectedConversationId,
++                  providerKeyId: selectedKeyId,
++                  model: selectedModel,
++                  content,
++                });
++              }}
+               onAbort={async () => {
+                 if (!run || run.conversationId !== selectedConversationId) {
+                   return;
+@@ -319,46 +300,92 @@ export function App(): JSX.Element {
+                   fail();
+                 }
+               }}
+-              onRegenerate={async () => {
+-                const last = messages[messages.length - 1];
+-                if (!last || last.role !== "assistant") {
++              onRegenerate={async (messageId) => {
++                if (!selectedConversationId || !selectedKeyId) {
++                  return;
++                }
++                await sendToModel({
++                  mode: "regenerate",
++                  conversationId: selectedConversationId,
++                  providerKeyId: selectedKeyId,
++                  model: selectedModel,
++                  messageId,
++                });
++              }}
++              onContinue={() => {
++                if (!selectedConversationId || !selectedKeyId) {
++                  return Promise.resolve();
++                }
++                return sendToModel({
++                  mode: "continue",
++                  conversationId: selectedConversationId,
++                  providerKeyId: selectedKeyId,
++                  model: selectedModel,
++                });
++              }}
++              onEditUser={async (id, content) => {
++                if (!selectedConversationId || !selectedKeyId) {
+                   return;
+                 }
++                await sendToModel({
++                  mode: "edit",
++                  conversationId: selectedConversationId,
++                  providerKeyId: selectedKeyId,
++                  model: selectedModel,
++                  messageId: id,
++                  content,
++                });
++              }}
++              onActivate={async (id) => {
++                setActivating(true);
+                 try {
+-                  await window.hub.messages.deleteFrom({ id: last.id });
+-                  const index = messages.findIndex((item) => item.id === last.id);
+-                  setMessages(index < 0 ? messages : messages.slice(0, index));
+-                  await sendToModel(null);
+-                } catch {
+-                  fail();
++                  await window.hub.messages.activate({ id });
+                   if (selectedConversationId) {
+-                    void loadMessages(selectedConversationId).catch(fail);
++                    await loadMessages(selectedConversationId);
+                   }
++                } catch {
++                  fail();
++                } finally {
++                  setActivating(false);
+                 }
+               }}
+-              onContinue={() => sendToModel(null)}
+-              onEditUser={async (id, content) => {
+-                const target = messages.find((item) => item.id === id);
+-                if (!target) {
++              onRenameBranch={async (branchId, label) => {
++                if (!selectedConversationId) {
+                   return;
+                 }
+                 try {
+-                  const updated = await window.hub.messages.update({ id, content });
+-                  const laterFirst = messages.find((item) => item.createdAt > target.createdAt);
+-                  if (laterFirst) {
+-                    await window.hub.messages.deleteFrom({ id: laterFirst.id });
+-                  }
+-                  setMessages(
+-                    messages
+-                      .filter((item) => item.createdAt <= target.createdAt)
+-                      .map((item) => (item.id === updated.id ? updated : item)),
++                  await window.hub.conversations.setBranchLabel({
++                    conversationId: selectedConversationId,
++                    branchId,
++                    label,
++                  });
++                  setBranchLabels(
++                    await window.hub.conversations.getBranchLabels({
++                      conversationId: selectedConversationId,
++                    }),
+                   );
+-                  await sendToModel(null);
+                 } catch {
+                   fail();
+-                  if (selectedConversationId) {
+-                    void loadMessages(selectedConversationId).catch(fail);
++                }
++              }}
++              onExport={async (mode) => {
++                if (!selectedConversationId) {
++                  return;
++                }
++                try {
++                  const result = await window.hub.conversations.export({
++                    conversationId: selectedConversationId,
++                    mode,
++                  });
++                  if (result.status === "saved") {
++                    const parts = result.path.split(/[/\\]/);
++                    const name = parts[parts.length - 1] ?? result.path;
++                    setExportNotice(t("workspace.export.saved", { path: name }));
++                  } else {
++                    setExportNotice(null);
+                   }
++                } catch {
++                  fail();
+                 }
+               }}
+             />
+diff --git a/apps/desktop/src/renderer/src/components/chat/conversation-tree.tsx b/apps/desktop/src/renderer/src/components/chat/conversation-tree.tsx
+new file mode 100644
+index 0000000..d42dcad
+--- /dev/null
++++ b/apps/desktop/src/renderer/src/components/chat/conversation-tree.tsx
+@@ -0,0 +1,149 @@
++import { type JSX, useEffect, useState } from "react";
++import { useTranslation } from "react-i18next";
++import { childrenOf, type BranchLabels, type MessageDto } from "@ai-hub/shared";
++import { Button } from "@/components/ui/button";
++import { Input } from "@/components/ui/input";
++import { ScrollArea } from "@/components/ui/scroll-area";
++
++function preview(content: string, fallback: string): string {
++  const compact = content.replace(/\s+/g, " ").trim();
++  if (compact.length === 0) {
++    return fallback;
++  }
++  return compact.length <= 42 ? compact : `${compact.slice(0, 42)}…`;
++}
++
++function TreeBranch({
++  messages,
++  parentId,
++  activeIds,
++  labels,
++  busy,
++  onJump,
++}: {
++  messages: MessageDto[];
++  parentId: string | null;
++  activeIds: Set<string>;
++  labels: BranchLabels;
++  busy: boolean;
++  onJump: (id: string) => void;
++}): JSX.Element | null {
++  const { t } = useTranslation();
++  const nodes = childrenOf(messages, parentId);
++  if (nodes.length === 0) {
++    return null;
++  }
++  return (
++    <ul className="flex flex-col gap-0.5 border-l border-border/80 pl-2">
++      {nodes.map((node) => {
++        const forks = childrenOf(messages, node.id).length;
++        const current = activeIds.has(node.id);
++        const name = labels[node.branchId];
++        return (
++          <li key={node.id}>
++            <Button
++              type="button"
++              variant={current ? "secondary" : "ghost"}
++              size="sm"
++              className="h-auto w-full justify-start whitespace-normal py-1 text-left font-normal"
++              data-testid="tree-node"
++              aria-current={current ? "true" : undefined}
++              disabled={busy}
++              onClick={() => onJump(node.id)}
++            >
++              <span className="min-w-0 flex-1 truncate">
++                {name ? `${name} · ` : ""}
++                {preview(node.content, t("workspace.placeholder"))}
++              </span>
++              {forks > 1 ? (
++                <span className="shrink-0 text-[10px] text-muted-foreground">
++                  {t("workspace.tree.forks", { count: forks })}
++                </span>
++              ) : null}
++            </Button>
++            <TreeBranch
++              messages={messages}
++              parentId={node.id}
++              activeIds={activeIds}
++              labels={labels}
++              busy={busy}
++              onJump={onJump}
++            />
++          </li>
++        );
++      })}
++    </ul>
++  );
++}
++
++export function ConversationTree({
++  messages,
++  activeIds,
++  labels,
++  activeBranchId,
++  busy,
++  onJump,
++  onRename,
++}: {
++  messages: MessageDto[];
++  activeIds: Set<string>;
++  labels: BranchLabels;
++  activeBranchId: string | null;
++  busy: boolean;
++  onJump: (id: string) => void;
++  onRename: (branchId: string, label: string) => Promise<void>;
++}): JSX.Element {
++  const { t } = useTranslation();
++  const [draft, setDraft] = useState(activeBranchId ? (labels[activeBranchId] ?? "") : "");
++
++  useEffect(() => {
++    setDraft(activeBranchId ? (labels[activeBranchId] ?? "") : "");
++  }, [activeBranchId, labels]);
++
++  return (
++    <aside className="flex w-56 shrink-0 flex-col border-l" data-testid="conversation-tree">
++      <div className="border-b px-3 py-2">
++        <h2 className="text-sm font-semibold">{t("workspace.tree.title")}</h2>
++        <p className="text-[11px] text-muted-foreground">{t("workspace.tree.hint")}</p>
++      </div>
++      <ScrollArea className="flex-1 p-2">
++        {messages.length === 0 ? (
++          <p className="px-1 text-muted-foreground">{t("workspace.tree.empty")}</p>
++        ) : (
++          <TreeBranch
++            messages={messages}
++            parentId={null}
++            activeIds={activeIds}
++            labels={labels}
++            busy={busy}
++            onJump={onJump}
++          />
++        )}
++      </ScrollArea>
++      {activeBranchId ? (
++        <form
++          className="flex flex-col gap-1 border-t p-2"
++          onSubmit={(event) => {
++            event.preventDefault();
++            void onRename(activeBranchId, draft.trim());
++          }}
++        >
++          <label className="text-[11px] text-muted-foreground" htmlFor="branch-name">
++            {t("workspace.tree.rename")}
++          </label>
++          <Input
++            id="branch-name"
++            value={draft}
++            onChange={(event) => setDraft(event.target.value)}
++            maxLength={80}
++            disabled={busy}
++            aria-label={t("workspace.tree.rename")}
++          />
++          <Button type="submit" size="sm" disabled={busy}>
++            {t("workspace.tree.saveName")}
++          </Button>
++        </form>
++      ) : null}
++    </aside>
++  );
++}
+diff --git a/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx b/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx
+index 7018a51..ac55c7f 100644
+--- a/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx
++++ b/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx
+@@ -1,25 +1,31 @@
+ import { type JSX, useState } from "react";
+ import { useTranslation } from "react-i18next";
+-import type { MessageDto } from "@ai-hub/shared";
++import { siblingsOf, type MessageDto } from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
+ import { CopyResponseButton, MessageMarkdown } from "@/components/chat/message-markdown";
+ 
+ export function MessageBubble({
+   message,
++  messages,
+   isLast,
+   busy,
++  hasKey,
+   onRegenerate,
+   onContinue,
+   onEdit,
+   onEditingChange,
++  onActivateSibling,
+ }: {
+   message: MessageDto;
++  messages: MessageDto[];
+   isLast: boolean;
+   busy: boolean;
++  hasKey: boolean;
+   onRegenerate: () => void;
+   onContinue: () => void;
+   onEdit: (content: string) => Promise<void>;
+   onEditingChange?: (editing: boolean) => void;
++  onActivateSibling: (id: string) => void;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const [editing, setEditing] = useState(false);
+@@ -28,11 +34,15 @@ export function MessageBubble({
+     message.status === "complete" ? null : t(`workspace.status.${message.status}`);
+   const canContinue =
+     isLast &&
++    hasKey &&
+     message.role === "assistant" &&
+     (message.status === "interrupted" || message.status === "aborted");
+   const canRegenerate =
+-    isLast && message.role === "assistant" && message.status !== "streaming";
+-  const canEdit = message.role === "user" && message.status === "complete" && !busy;
++    hasKey && message.role === "assistant" && message.status !== "streaming" && !busy;
++  const canEdit = hasKey && message.role === "user" && message.status === "complete" && !busy;
++  const siblings = siblingsOf(messages, message.id);
++  const siblingIndex = siblings.findIndex((item) => item.id === message.id);
++  const showSiblings = siblings.length > 1 && siblingIndex >= 0;
+ 
+   return (
+     <li
+@@ -45,9 +55,51 @@ export function MessageBubble({
+           {t(`workspace.role.${message.role}`)}
+           {statusLabel ? ` · ${statusLabel}` : ""}
+         </p>
+-        {message.role === "assistant" && message.content.length > 0 ? (
+-          <CopyResponseButton text={message.content} />
+-        ) : null}
++        <div className="flex items-center gap-1">
++          {showSiblings ? (
++            <div className="flex items-center gap-0.5" data-testid="sibling-nav">
++              <Button
++                type="button"
++                size="sm"
++                variant="outline"
++                disabled={busy || siblingIndex <= 0}
++                aria-label={t("workspace.sibling.prev")}
++                onClick={() => {
++                  const previous = siblings[siblingIndex - 1];
++                  if (previous) {
++                    onActivateSibling(previous.id);
++                  }
++                }}
++              >
++                ←
++              </Button>
++              <span className="px-1 text-[11px] text-muted-foreground" data-testid="sibling-count">
++                {t("workspace.sibling.count", {
++                  current: siblingIndex + 1,
++                  total: siblings.length,
++                })}
++              </span>
++              <Button
++                type="button"
++                size="sm"
++                variant="outline"
++                disabled={busy || siblingIndex >= siblings.length - 1}
++                aria-label={t("workspace.sibling.next")}
++                onClick={() => {
++                  const next = siblings[siblingIndex + 1];
++                  if (next) {
++                    onActivateSibling(next.id);
++                  }
++                }}
++              >
++                →
++              </Button>
++            </div>
++          ) : null}
++          {message.role === "assistant" && message.content.length > 0 ? (
++            <CopyResponseButton text={message.content} />
++          ) : null}
++        </div>
+       </div>
+       {editing ? (
+         <form
+@@ -125,7 +177,14 @@ export function MessageBubble({
+             </Button>
+           ) : null}
+           {canRegenerate ? (
+-            <Button type="button" size="sm" variant="outline" onClick={onRegenerate} disabled={busy}>
++            <Button
++              type="button"
++              size="sm"
++              variant="outline"
++              data-testid="message-regenerate"
++              onClick={onRegenerate}
++              disabled={busy}
++            >
+               {t("workspace.regenerate")}
+             </Button>
+           ) : null}
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index b60f156..a6518b7 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -1,8 +1,8 @@
+ import { type JSX, useEffect, useState } from "react";
+ import { useTranslation } from "react-i18next";
+-import type { ConversationDto, MessageDto, ProjectDto, ProviderKeyDto } from "@ai-hub/shared";
+-import { openaiCatalogModels } from "@ai-hub/shared";
++import { activePath, openaiCatalogModels, type BranchLabels, type ConversationDto, type MessageDto, type ProjectDto, type ProviderKeyDto } from "@ai-hub/shared";
+ import { ChatComposer } from "@/components/chat/chat-composer";
++import { ConversationTree } from "@/components/chat/conversation-tree";
+ import { MessageBubble } from "@/components/chat/message-bubble";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+@@ -19,6 +19,8 @@ export function HomeView({
+   selectedModel,
+   streaming,
+   sending,
++  branchLabels,
++  exportNotice,
+   onSelectConversation,
+   onCreateConversation,
+   onSelectKey,
+@@ -28,6 +30,9 @@ export function HomeView({
+   onRegenerate,
+   onContinue,
+   onEditUser,
++  onActivate,
++  onRenameBranch,
++  onExport,
+ }: {
+   project: ProjectDto | null;
+   conversations: ConversationDto[];
+@@ -39,27 +44,37 @@ export function HomeView({
+   selectedModel: string;
+   streaming: boolean;
+   sending: boolean;
++  branchLabels: BranchLabels;
++  exportNotice: string | null;
+   onSelectConversation: (id: string) => void;
+   onCreateConversation: (title: string) => Promise<void>;
+   onSelectKey: (id: string) => void;
+   onSelectModel: (id: string) => void;
+   onSend: (content: string) => Promise<void>;
+   onAbort: () => Promise<void>;
+-  onRegenerate: () => Promise<void>;
++  onRegenerate: (messageId: string) => Promise<void>;
+   onContinue: () => Promise<void>;
+   onEditUser: (id: string, content: string) => Promise<void>;
++  onActivate: (id: string) => Promise<void>;
++  onRenameBranch: (branchId: string, label: string) => Promise<void>;
++  onExport: (mode: "active" | "tree") => Promise<void>;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const [title, setTitle] = useState("");
+   const [draft, setDraft] = useState("");
+   const [editing, setEditing] = useState(false);
++  const [treeOpen, setTreeOpen] = useState(false);
+   const openaiKeys = providerKeys.filter((key) => key.providerSlug === "openai");
+   const models = openaiCatalogModels();
+   const hasKey = selectedKeyId !== null && openaiKeys.some((key) => key.id === selectedKeyId);
+   const busy = streaming || sending;
++  const path = activePath(messages);
++  const activeIds = new Set(path.map((item) => item.id));
++  const leaf = path[path.length - 1] ?? null;
+ 
+   useEffect(() => {
+     setEditing(false);
++    setTreeOpen(false);
+   }, [selectedConversationId]);
+ 
+   if (!project) {
+@@ -167,20 +182,63 @@ export function HomeView({
+                   </label>
+                 </>
+               )}
++              <div className="ml-auto flex flex-wrap items-center gap-1">
++                <Button
++                  type="button"
++                  size="sm"
++                  variant="outline"
++                  data-testid="tree-toggle"
++                  aria-pressed={treeOpen}
++                  onClick={() => setTreeOpen((open) => !open)}
++                >
++                  {treeOpen ? t("workspace.tree.hide") : t("workspace.tree.show")}
++                </Button>
++                <Button
++                  type="button"
++                  size="sm"
++                  variant="outline"
++                  disabled={!selectedConversationId || busy}
++                  onClick={() => {
++                    void onExport("active");
++                  }}
++                >
++                  {t("workspace.export.active")}
++                </Button>
++                <Button
++                  type="button"
++                  size="sm"
++                  variant="outline"
++                  disabled={!selectedConversationId || busy}
++                  onClick={() => {
++                    void onExport("tree");
++                  }}
++                >
++                  {t("workspace.export.tree")}
++                </Button>
++              </div>
+             </header>
++            {exportNotice ? (
++              <p className="border-b px-3 py-1 text-[11px] text-muted-foreground" role="status">
++                {exportNotice}
++              </p>
++            ) : null}
++            <div className="flex min-h-0 flex-1">
++            <div className="flex min-w-0 flex-1 flex-col">
+             <ScrollArea className="flex-1 p-4">
+-              {messages.length === 0 ? (
++              {path.length === 0 ? (
+                 <p className="text-muted-foreground">{t("workspace.noMessages")}</p>
+               ) : (
+                 <ol className="flex flex-col gap-2" aria-live="polite">
+-                  {messages.map((message, index) => (
++                  {path.map((message, index) => (
+                     <MessageBubble
+                       key={message.id}
+                       message={message}
+-                      isLast={index === messages.length - 1}
++                      messages={messages}
++                      isLast={index === path.length - 1}
+                       busy={busy}
++                      hasKey={hasKey}
+                       onRegenerate={() => {
+-                        void onRegenerate();
++                        void onRegenerate(message.id);
+                       }}
+                       onContinue={() => {
+                         void onContinue();
+@@ -189,6 +247,9 @@ export function HomeView({
+                         await onEditUser(message.id, content);
+                       }}
+                       onEditingChange={setEditing}
++                      onActivateSibling={(id) => {
++                        void onActivate(id);
++                      }}
+                     />
+                   ))}
+                 </ol>
+@@ -212,6 +273,21 @@ export function HomeView({
+                 void onAbort();
+               }}
+             />
++            </div>
++            {treeOpen ? (
++              <ConversationTree
++                messages={messages}
++                activeIds={activeIds}
++                labels={branchLabels}
++                activeBranchId={leaf?.branchId ?? null}
++                busy={busy}
++                onJump={(id) => {
++                  void onActivate(id);
++                }}
++                onRename={onRenameBranch}
++              />
++            ) : null}
++            </div>
+           </>
+         ) : (
+           <div className="flex flex-1 items-center justify-center p-8 text-muted-foreground">
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 89bbaef..3bde3cb 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -55,6 +55,20 @@
+   "workspace.status.complete": "complete",
+   "workspace.receipt": "Receipt: {{model}} · in {{tokensIn}} / out {{tokensOut}} · {{cost}} · {{latency}}ms",
+   "workspace.receipt.error": "error {{code}}",
++  "workspace.sibling.prev": "Previous alternative",
++  "workspace.sibling.next": "Next alternative",
++  "workspace.sibling.count": "{{current}} / {{total}}",
++  "workspace.tree.title": "Tree",
++  "workspace.tree.hint": "Jump to a node. The other branch stays.",
++  "workspace.tree.show": "Tree",
++  "workspace.tree.hide": "Hide tree",
++  "workspace.tree.empty": "No nodes yet.",
++  "workspace.tree.forks": "{{count}} children",
++  "workspace.tree.rename": "Branch name",
++  "workspace.tree.saveName": "Save name",
++  "workspace.export.active": "Export branch",
++  "workspace.export.tree": "Export tree JSON",
++  "workspace.export.saved": "Saved to {{path}}",
+   "secrets.title": "Provider keys",
+   "secrets.hint": "The full key crosses IPC only on this save, then leaves the screen. After that you only see a mask.",
+   "secrets.provider": "Provider",
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index f4a9693..5ec3c41 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -55,6 +55,20 @@
+   "workspace.status.complete": "completa",
+   "workspace.receipt": "Recibo: {{model}} · entrada {{tokensIn}} / saída {{tokensOut}} · {{cost}} · {{latency}}ms",
+   "workspace.receipt.error": "erro {{code}}",
++  "workspace.sibling.prev": "Alternativa anterior",
++  "workspace.sibling.next": "Próxima alternativa",
++  "workspace.sibling.count": "{{current}} / {{total}}",
++  "workspace.tree.title": "Árvore",
++  "workspace.tree.hint": "Salte para um nó. O outro ramo fica.",
++  "workspace.tree.show": "Árvore",
++  "workspace.tree.hide": "Ocultar árvore",
++  "workspace.tree.empty": "Nenhum nó ainda.",
++  "workspace.tree.forks": "{{count}} filhos",
++  "workspace.tree.rename": "Nome do ramo",
++  "workspace.tree.saveName": "Guardar nome",
++  "workspace.export.active": "Exportar ramo",
++  "workspace.export.tree": "Exportar árvore JSON",
++  "workspace.export.saved": "Guardado em {{path}}",
+   "secrets.title": "Chaves de provedor",
+   "secrets.hint": "A chave completa atravessa o IPC só neste save e some da tela. Depois você vê só a máscara.",
+   "secrets.provider": "Provedor",
+diff --git a/docs/ADR/ADR-W03-002-linear-edit-and-regenerate.md b/docs/ADR/ADR-W03-002-linear-edit-and-regenerate.md
+index 5992357..af0d208 100644
+--- a/docs/ADR/ADR-W03-002-linear-edit-and-regenerate.md
++++ b/docs/ADR/ADR-W03-002-linear-edit-and-regenerate.md
+@@ -1,11 +1,11 @@
+ # ADR-W03-002-linear-edit-and-regenerate
+ 
+-- **Status:** accepted
++- **Status:** superseded by ADR-W04-002
+ - **Onda:** W03
+ - **Data:** 2026-09-16
+ - **Deciders:** agent / Pedro
+ - **Supersedes:** —
+-- **Superseded by:** —
++- **Superseded by:** ADR-W04-002-sibling-fork-not-delete
+ 
+ ## Contexto
+ 
+diff --git a/docs/ADR/ADR-W04-001-active-path-is-active-branch.md b/docs/ADR/ADR-W04-001-active-path-is-active-branch.md
+new file mode 100644
+index 0000000..9e60f72
+--- /dev/null
++++ b/docs/ADR/ADR-W04-001-active-path-is-active-branch.md
+@@ -0,0 +1,39 @@
++# ADR-W04-001-active-path-is-active-branch
++
++- **Status:** accepted
++- **Onda:** W04
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++O schema W1 já tem `parent_id`, `branch_id` e `is_active_branch` (ADR-W01-004), mas a UI e o compiler ainda tratavam a conversa como lista. A W4 precisa de uma regra única para “qual fio está na tela” e para persistir isso após restart, sem uma tabela extra de ramos.
++
++## Decisão
++
++O caminho ativo é a caminhada **raiz → folha**: em cada grupo de irmãos (`parent_id` igual, ou todos os nós com `parent_id` nulo), no máximo um nó tem `is_active_branch = 1`. Se nenhum estiver marcado (legado), escolhe-se o mais antigo por `created_at`.
++
++- Inserir um irmão (regenerar / editar / novo send) ativa o nó novo e desativa os outros irmãos **naquele pai**. Descendentes de irmãos inativos mantêm os próprios flags para quando o utilizador voltar.
++- `messages:activate` ativa o nó alvo **e os ancestrais**, para um salto na árvore não deixar o path incoerente.
++- A sessão em `settings` **não** ganha `branchId`: os flags no grafo já sobrevivem ao restart (ADR-W03-003 permanece só `{ projectId, conversationId, model }`).
++- `listMessages` continua a devolver **todas** as mensagens; o filtro de path é no compiler, no export `active` e na UI.
++
++## Alternativas consideradas
++
++- **Guardar `branchId` na sessão:** redundante e divergiria dos flags se o utilizador mudasse de ramo noutro sítio.
++- **Tabela `message_branches`:** rejeitada em ADR-W01-004.
++- **Filtrar no SQL (`WHERE is_active_branch = 1`):** quebraria o painel Árvore e a navegação de irmãos.
++
++## Consequências
++
++- Conversas lineares W1–W3 (todas com `is_active_branch = 1`) continuam corretas: cada pai tem um filho.
++- Ondas futuras (caps, council) devem enviar e contabilizar só o path ativo, a menos que o utilizador exporte a árvore.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 4, D4)
++- `docs/ADR/ADR-W01-004-message-graph-parent-branch.md`
++- `docs/ADR/ADR-W03-003-session-restore-settings.md`
++- `docs/reviews/W04/REVIEW.md`
+diff --git a/docs/ADR/ADR-W04-002-sibling-fork-not-delete.md b/docs/ADR/ADR-W04-002-sibling-fork-not-delete.md
+new file mode 100644
+index 0000000..574cdd4
+--- /dev/null
++++ b/docs/ADR/ADR-W04-002-sibling-fork-not-delete.md
+@@ -0,0 +1,40 @@
++# ADR-W04-002-sibling-fork-not-delete
++
++- **Status:** accepted
++- **Onda:** W04
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** ADR-W03-002
++- **Superseded by:** —
++
++## Contexto
++
++A W3 regenerava e editava com `deleteMessagesFrom` (wipe linear). D4 exige que o caminho antigo sobreviva. Continue/regenerate continuam a ser **novo send** (ADR-W02-003), não retoma do mesmo `runId`.
++
++## Decisão
++
++`chat:send` passa a união discriminada por `mode`:
++
++- `send` — cria user no leaf do path ativo (mesmo `branch_id`) e um assistant filho.
++- `continue` — não cria user; assistant filho do leaf (parcial `interrupted`/`aborted` permanece).
++- `regenerate` — cria **irmão** da assistant alvo (`parent_id` partilhado, `branch_id` novo). Não apaga nada. O packet omite a alvo e os seus descendentes.
++- `edit` — cria **irmão** da user alvo (conteúdo novo, `branch_id` novo) e um assistant filho. A user antiga e o subgrafo ficam.
++
++`messages:deleteFrom` permanece no IPC por compatibilidade, mas o renderer **não** o usa para regenerar nem editar. Continuar a ser novo send.
++
++## Alternativas consideradas
++
++- **Mutar a user in-place e só ramificar o assistant:** perderia o prompt original daquele nó.
++- **Manter o schema de `content: string | null` da W3:** ambíguo entre continue e regenerate.
++
++## Consequências
++
++- Comparar duas respostas no mesmo ponto é navegar irmãos, não desfazer.
++- Caps (W7) e receipts aplicam-se a cada novo send, inclusive regenerate/edit.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 4, D4, D10)
++- `docs/ADR/ADR-W02-003-crash-safe-stream.md`
++- `docs/ADR/ADR-W03-002-linear-edit-and-regenerate.md`
++- `docs/reviews/W04/REVIEW.md`
+diff --git a/docs/ADR/ADR-W04-003-compiler-active-path.md b/docs/ADR/ADR-W04-003-compiler-active-path.md
+new file mode 100644
+index 0000000..879149c
+--- /dev/null
++++ b/docs/ADR/ADR-W04-003-compiler-active-path.md
+@@ -0,0 +1,39 @@
++# ADR-W04-003-compiler-active-path
++
++- **Status:** accepted
++- **Onda:** W04
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++O compiler v0 (ADR-W02-002) recebe uma lista e ignora só `streaming`. Se a main passar `listMessages` completo, irmãos inativos e ramos mortos entram no packet — custo, privacidade e respostas misturadas.
++
++## Decisão
++
++O packet v0 é compilado **apenas** com o path ativo (raiz → folha), na ordem desse path. `compilePacket` não conhece o grafo; `compileActivePath` filtra com o algoritmo da ADR-W04-001 e depois chama `compilePacket`.
++
++Exceções:
++
++- Regenerar: o path passado ao compiler termina no **pai** da assistant alvo (a resposta antiga não é reenviada).
++- `streaming` continua excluído do packet (já na W2).
++
++O composer envia sempre no leaf do path ativo (`send` / `continue`).
++
++## Alternativas consideradas
++
++- **Filtrar dentro de `compilePacket` por `isActiveBranch` sem caminhar:** um irmão inativo com flag 1 legado ou um filho ativo de um pai inativo poluiria o packet.
++- **Deixar o renderer montar o histórico:** o renderer não deve decidir o que o provider vê.
++
++## Consequências
++
++- Trocar de modelo no mesmo ramo (W6) usa o mesmo path. @-mentions e RAG (ondas posteriores) injetam no packet **depois** deste recorte.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 4, Wave 2 compiler)
++- `docs/ADR/ADR-W02-002-compiler-packet-v0.md`
++- `docs/ADR/ADR-W04-001-active-path-is-active-branch.md`
++- `docs/reviews/W04/REVIEW.md`
+diff --git a/docs/ADR/ADR-W04-004-export-json-main-process.md b/docs/ADR/ADR-W04-004-export-json-main-process.md
+new file mode 100644
+index 0000000..2fe2a42
+--- /dev/null
++++ b/docs/ADR/ADR-W04-004-export-json-main-process.md
+@@ -0,0 +1,36 @@
++# ADR-W04-004-export-json-main-process
++
++- **Status:** accepted
++- **Onda:** W04
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++D4 pede export do ramo ativo e uma opção avançada de exportar a árvore JSON. O renderer já vê o conteúdo da conversa, mas `fs` e o diálogo nativo pertencem ao main. Nomes de ramo são opcionais e não cabem no schema de mensagens (ADR-W01-004).
++
++## Decisão
++
++- Export é IPC `conversations:export` `{ conversationId, mode: "active" | "tree" }`. O main monta um documento JSON versão 1 (conversa, labels, mensagens DTO), aplica redaction, abre `dialog.showSaveDialog` e grava o ficheiro.
++- Resultado: `{ status: "saved", path }` ou `{ status: "cancelled" }`. O renderer não recebe um blob para escrever em disco.
++- Nomes de ramo: chave `settings` `branch-labels:{conversationId}` → `{ [branchId]: string }`. Não são cifrados (são rótulos curtos, não o corpo da mensagem).
++- O documento **não** inclui chaves, receipts com secret, nem campos extra. Mensagens já vão em plaintext no DTO (o renderer já as tem).
++
++## Alternativas consideradas
++
++- **Devolver JSON ao renderer e `download`:** exigiria `fs` no renderer ou um save não nativo.
++- **Tabela `branches`:** viola ADR-W01-004.
++- **Cifrar labels:** custo sem ganho; o título da conversa já é cifrado, o rótulo é metadata de UI.
++
++## Consequências
++
++- Import (W9) pode reutilizar a versão 1 do documento; se o formato mudar, nova ADR.
++- Diálogo nativo não corre em e2e a menos que um teste o invoque; o contrato é coberto por Zod + unit tests do documento.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 4, D4)
++- `docs/ADR/ADR-W01-001-envelope-encryption-at-rest.md`
++- `docs/reviews/W04/REVIEW.md`
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index 04ce9a2..57c5ef4 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -46,7 +46,11 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider
+ | [ADR-W02-003](./ADR-W02-003-crash-safe-stream.md) | W02 | Flush incremental e `interrupted` no boot | accepted |
+ | [ADR-W02-004](./ADR-W02-004-gateway-errors-and-receipts.md) | W02 | Taxonomia de erro e receipts com catálogo | accepted |
+ | [ADR-W03-001](./ADR-W03-001-react-markdown-gfm.md) | W03 | Markdown no renderer com GFM e highlight | accepted |
+-| [ADR-W03-002](./ADR-W03-002-linear-edit-and-regenerate.md) | W03 | Edit/regenerate lineares até a W4 | accepted |
++| [ADR-W03-002](./ADR-W03-002-linear-edit-and-regenerate.md) | W03 | Edit/regenerate lineares até a W4 | superseded by ADR-W04-002 |
+ | [ADR-W03-003](./ADR-W03-003-session-restore-settings.md) | W03 | Restore da sessão em `settings` | accepted |
+ | [ADR-W03-004](./ADR-W03-004-e2e-mock-adapter.md) | W03 | Playwright com adapter mock, sem rede | accepted |
+ | [ADR-W03-005](./ADR-W03-005-sandboxed-cjs-preload.md) | W03 | Preload CJS sandboxed + HTML sem crossorigin | accepted |
++| [ADR-W04-001](./ADR-W04-001-active-path-is-active-branch.md) | W04 | Path ativo via `is_active_branch` | accepted |
++| [ADR-W04-002](./ADR-W04-002-sibling-fork-not-delete.md) | W04 | Regenerar/editar criam irmãos, sem wipe | accepted |
++| [ADR-W04-003](./ADR-W04-003-compiler-active-path.md) | W04 | Compiler só no path ativo | accepted |
++| [ADR-W04-004](./ADR-W04-004-export-json-main-process.md) | W04 | Export JSON no main + labels em settings | accepted |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 56ff2b3..3ab9f33 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave
+ 
+ | Field | Value |
+ |---|---|
+-| Wave | **W04** |
++| Wave | **W05** |
+ | Marco | B — MVP |
+ | State | `pending` |
+-| Last completed | **W03** |
+-| Next action | Wave 4 — Conversation branching (D4) |
++| Last completed | **W04** |
++| Next action | Wave 5 — Providers + OpenRouter + vault |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -20,23 +20,25 @@ None.
+ 
+ ## Open residual risks
+ 
+-- W00–W03 não revalidaram a janela Electron com chave real após o último gate (e2e W3 usa mock).
++- W00–W04 não revalidaram a janela Electron com chave real após o último gate (e2e usa mock).
+ - macOS não exercitado.
+ - Dev CSP com `unsafe-eval` para HMR (ADR-W00-003).
+ - `better-sqlite3` tem um binário só: `pnpm dev` recompila para Electron; `pnpm test` no `db` restaura o ABI do Node.
+ - FTS5 existe e fica vazia; W6 não pode popular plaintext sem nova decisão (ADR-W01-001).
+-- Redaction regex não cobre todos os formatos de chave colados na conversa.
+-- Caps (W7) ainda não hard-stopam `chat:send`.
+-- Zustand ainda não foi introduzido; W0–W3 usam `useState` (barulho vs stack travada).
++- Redaction regex não cobre todos os formatos de chave colados na conversa (export e logs).
++- Caps (W7) ainda não hard-stopam `chat:send` (incluindo regenerate/edit).
++- Zustand ainda não foi introduzido; W0–W4 usam `useState` (barulho vs stack travada).
+ - `AI_HUB_E2E=1` só liga mock se o app **não** está empacotado; unpackaged + env ainda é o caminho CI.
++- `messages.update` IPC ainda muta user in-place (UI W4 já não usa).
++- Labels de ramo em plaintext no SQLite (ADR-W04-004).
+ 
+ ## Notes for the next session
+ 
+-- W04: regenerar/editar criam irmãos; **não** usar `deleteMessagesFrom` como wipe do ramo antigo. Compiler no path ativo. Continue/regenerate continuam a ser novo send.
++- W05: OpenRouter first-class; adapters Anthropic/Gemini/Groq/custom; key nunca em SQLite nem no renderer. Caps continuam W7.
+ 
+ ## Last review / ADR
+ 
+ | Kind | Path |
+ |---|---|
+-| Review | `docs/reviews/W03/REVIEW.md` |
+-| Latest ADR | `docs/ADR/ADR-W03-005-sandboxed-cjs-preload.md` |
++| Review | `docs/reviews/W04/REVIEW.md` |
++| Latest ADR | `docs/ADR/ADR-W04-004-export-json-main-process.md` |
+diff --git a/packages/ai-gateway/src/compiler.test.ts b/packages/ai-gateway/src/compiler.test.ts
+index 48e00a6..66960f2 100644
+--- a/packages/ai-gateway/src/compiler.test.ts
++++ b/packages/ai-gateway/src/compiler.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it } from "vitest";
+-import { compilePacket } from "./compiler";
++import { compileActivePath, compilePacket } from "./compiler";
+ 
+ describe("compilePacket", () => {
+   it("joins project instructions and skips streaming messages", () => {
+@@ -55,4 +55,45 @@ describe("compilePacket", () => {
+     expect(packet).not.toHaveProperty("apiKey");
+     expect(JSON.stringify(packet)).not.toMatch(/sk-/);
+   });
++
++  it("compiles only the active path when siblings exist", () => {
++    const packet = compileActivePath({
++      projectInstructions: null,
++      extraSystem: null,
++      messages: [
++        {
++          id: "11111111-1111-4111-8111-111111111111",
++          parentId: null,
++          isActiveBranch: true,
++          createdAt: "2026-09-17T00:00:00.000Z",
++          role: "user",
++          content: "prompt",
++          status: "complete",
++        },
++        {
++          id: "22222222-2222-4222-8222-222222222222",
++          parentId: "11111111-1111-4111-8111-111111111111",
++          isActiveBranch: false,
++          createdAt: "2026-09-17T00:00:01.000Z",
++          role: "assistant",
++          content: "old",
++          status: "complete",
++        },
++        {
++          id: "33333333-3333-4333-8333-333333333333",
++          parentId: "11111111-1111-4111-8111-111111111111",
++          isActiveBranch: true,
++          createdAt: "2026-09-17T00:00:02.000Z",
++          role: "assistant",
++          content: "new",
++          status: "complete",
++        },
++      ],
++    });
++    expect(packet.messages).toEqual([
++      { role: "user", content: "prompt" },
++      { role: "assistant", content: "new" },
++    ]);
++    expect(packet.messages.some((item) => item.content === "old")).toBe(false);
++  });
+ });
+diff --git a/packages/ai-gateway/src/compiler.ts b/packages/ai-gateway/src/compiler.ts
+index c5a7675..711f07f 100644
+--- a/packages/ai-gateway/src/compiler.ts
++++ b/packages/ai-gateway/src/compiler.ts
+@@ -1,5 +1,5 @@
+ import type { MessageStatus, ProviderAgnosticPacket } from "@ai-hub/shared";
+-import { packetV0Schema } from "@ai-hub/shared";
++import { activePath, packetV0Schema, type MessageGraphNode } from "@ai-hub/shared";
+ 
+ export interface CompilerMessage {
+   id: string;
+@@ -58,3 +58,17 @@ export function compilePacket(input: CompileInput): ProviderAgnosticPacket {
+     excluded,
+   });
+ }
++
++export interface CompilerGraphMessage extends CompilerMessage, MessageGraphNode {}
++
++export function compileActivePath(input: {
++  projectInstructions: string | null;
++  extraSystem: string | null;
++  messages: CompilerGraphMessage[];
++}): ProviderAgnosticPacket {
++  return compilePacket({
++    projectInstructions: input.projectInstructions,
++    extraSystem: input.extraSystem,
++    messages: activePath(input.messages),
++  });
++}
+diff --git a/packages/ai-gateway/src/index.ts b/packages/ai-gateway/src/index.ts
+index 5c866e3..f6bbf46 100644
+--- a/packages/ai-gateway/src/index.ts
++++ b/packages/ai-gateway/src/index.ts
+@@ -5,7 +5,7 @@ export type {
+   ProviderAdapter,
+   ProviderCapabilities,
+ } from "./adapter";
+-export { compilePacket, type CompileInput, type CompilerMessage } from "./compiler";
++export { compileActivePath, compilePacket, type CompileInput, type CompilerGraphMessage, type CompilerMessage } from "./compiler";
+ export {
+   consumeCrashSafeStream,
+   STREAM_FLUSH_CHARS,
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index 853f2da..03a1cb7 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -1,4 +1,4 @@
+-import { randomBytes } from "node:crypto";
++import { randomBytes, randomUUID } from "node:crypto";
+ import { mkdtempSync, rmSync } from "node:fs";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
+@@ -234,6 +234,37 @@ describe("hub database", () => {
+     hub.close();
+   });
+ 
++  it("does not delete a later sibling when removing a subtree", () => {
++    const { hub } = openTestDb();
++    const project = hub.repos.createProject("GraphDelete");
++    const conversation = hub.repos.createConversation(project.id, "Thread");
++    const user = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "user",
++      content: "prompt",
++      parentId: null,
++      branchId: null,
++    });
++    const first = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "assistant",
++      content: "one",
++      parentId: user.id,
++      branchId: null,
++    });
++    const second = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "assistant",
++      content: "two",
++      parentId: user.id,
++      branchId: randomUUID(),
++    });
++    hub.repos.deleteMessagesFrom(first.id);
++    const remaining = hub.repos.listMessages(conversation.id);
++    expect(remaining.map((item) => item.id).sort()).toEqual([user.id, second.id].sort());
++    hub.close();
++  });
++
+   it("round-trips workspace session without a provider key id", () => {
+     const { hub } = openTestDb();
+     const project = hub.repos.createProject("Session");
+@@ -264,4 +295,103 @@ describe("hub database", () => {
+     expect(dumpAllText(hub.sqlite)).not.toContain(secret);
+     hub.close();
+   });
++
++  it("keeps three branches, switches the active sibling, and survives reopen", () => {
++    const dir = mkdtempSync(join(tmpdir(), "ai-hub-branch-"));
++    const path = join(dir, "ai-hub.sqlite");
++    const masterKey = randomBytes(32);
++    const secrets = new MemorySecretStore();
++    try {
++      const first = openHubDatabase({ path, masterKey, secretStore: secrets });
++      const project = first.repos.createProject("Graph");
++      const conversation = first.repos.createConversation(project.id, "Thread");
++      const user = first.repos.createMessage({
++        conversationId: conversation.id,
++        role: "user",
++        content: "prompt",
++        parentId: null,
++        branchId: null,
++      });
++      const a1 = first.repos.createMessage({
++        conversationId: conversation.id,
++        role: "assistant",
++        content: "one",
++        parentId: user.id,
++        branchId: null,
++      });
++      const a2 = first.repos.createMessage({
++        conversationId: conversation.id,
++        role: "assistant",
++        content: "two",
++        parentId: user.id,
++        branchId: randomUUID(),
++      });
++      const a3 = first.repos.createMessage({
++        conversationId: conversation.id,
++        role: "assistant",
++        content: "three",
++        parentId: user.id,
++        branchId: randomUUID(),
++      });
++      expect(first.repos.getMessage(a1.id)?.isActiveBranch).toBe(false);
++      expect(first.repos.getMessage(a2.id)?.isActiveBranch).toBe(false);
++      expect(first.repos.getMessage(a3.id)?.isActiveBranch).toBe(true);
++      expect(first.repos.listActivePath(conversation.id).map((item) => item.id)).toEqual([
++        user.id,
++        a3.id,
++      ]);
++      first.repos.activatePathThrough(a1.id);
++      expect(first.repos.listActivePath(conversation.id).map((item) => item.id)).toEqual([
++        user.id,
++        a1.id,
++      ]);
++      expect(first.repos.listMessages(conversation.id)).toHaveLength(4);
++      first.repos.setBranchLabel(conversation.id, a2.branchId, "alt-b");
++      first.close();
++
++      const second = openHubDatabase({ path, masterKey, secretStore: secrets });
++      expect(second.repos.listActivePath(conversation.id).map((item) => item.id)).toEqual([
++        user.id,
++        a1.id,
++      ]);
++      expect(second.repos.getMessage(a2.id)?.content).toBe("two");
++      expect(second.repos.getMessage(a2.id)?.isActiveBranch).toBe(false);
++      expect(second.repos.getBranchLabels(conversation.id)[a2.branchId]).toBe("alt-b");
++      second.close();
++    } finally {
++      rmSync(dir, { recursive: true, force: true });
++    }
++  });
++
++  it("forks a user sibling without deleting the original prompt", () => {
++    const { hub } = openTestDb();
++    const project = hub.repos.createProject("Edit");
++    const conversation = hub.repos.createConversation(project.id, "Thread");
++    const user = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "user",
++      content: "original",
++      parentId: null,
++      branchId: null,
++    });
++    const assistant = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "assistant",
++      content: "reply",
++      parentId: user.id,
++      branchId: null,
++    });
++    const edited = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "user",
++      content: "edited",
++      parentId: null,
++      branchId: randomUUID(),
++    });
++    expect(hub.repos.getMessage(user.id)?.isActiveBranch).toBe(false);
++    expect(edited.isActiveBranch).toBe(true);
++    expect(hub.repos.getMessage(assistant.id)?.content).toBe("reply");
++    expect(hub.repos.listActivePath(conversation.id).map((item) => item.id)).toEqual([edited.id]);
++    hub.close();
++  });
+ });
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 7c00fcb..4a3c600 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -1,5 +1,5 @@
+ import { randomUUID } from "node:crypto";
+-import { eq } from "drizzle-orm";
++import { and, eq, isNull, ne } from "drizzle-orm";
+ import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
+ import {
+   decryptUtf8,
+@@ -59,6 +59,7 @@ export interface MessageRecord {
+   conversationId: string;
+   parentId: string | null;
+   branchId: string;
++  isActiveBranch: boolean;
+   role: MessageRole;
+   content: string;
+   status: MessageStatus;
+@@ -101,6 +102,7 @@ export interface WorkspaceSessionRecord {
+ 
+ const APPEARANCE_KEY = "appearance";
+ const SESSION_KEY = "workspace-session";
++const BRANCH_LABELS_PREFIX = "branch-labels:";
+ const DEFAULT_SESSION: WorkspaceSessionRecord = {
+   projectId: null,
+   conversationId: null,
+@@ -183,6 +185,7 @@ export class HubRepos {
+       conversationId: row.conversationId,
+       parentId: row.parentId,
+       branchId: row.branchId,
++      isActiveBranch: row.isActiveBranch === 1,
+       role: asRole(row.role),
+       content: decryptUtf8(row.contentCipher, this.masterKey),
+       status: asStatus(row.status),
+@@ -336,18 +339,143 @@ export class HubRepos {
+       .set({ updatedAt: now })
+       .where(eq(conversations.id, input.conversationId))
+       .run();
++    this.activateAmongSiblings(id);
++    const stored = this.getMessage(id);
++    if (!stored) {
++      throw new Error("Message not found");
++    }
++    return stored;
++  }
+ 
+-    return {
+-      id,
+-      conversationId: input.conversationId,
+-      parentId: input.parentId,
+-      branchId,
+-      role: input.role,
+-      content: input.content,
+-      status,
+-      createdAt: iso(now),
+-      receipt: null,
+-    };
++  private activateAmongSiblings(messageId: string): void {
++    const row = this.db.select().from(messages).where(eq(messages.id, messageId)).get();
++    if (!row) {
++      throw new Error("Message not found");
++    }
++    const siblingFilter =
++      row.parentId === null
++        ? and(
++            eq(messages.conversationId, row.conversationId),
++            isNull(messages.parentId),
++            ne(messages.id, messageId),
++          )
++        : and(
++            eq(messages.conversationId, row.conversationId),
++            eq(messages.parentId, row.parentId),
++            ne(messages.id, messageId),
++          );
++    if (siblingFilter) {
++      this.db.update(messages).set({ isActiveBranch: 0 }).where(siblingFilter).run();
++    }
++    this.db.update(messages).set({ isActiveBranch: 1 }).where(eq(messages.id, messageId)).run();
++  }
++
++  activatePathThrough(id: string): MessageRecord {
++    const target = this.getMessage(id);
++    if (!target) {
++      throw new Error("Message not found");
++    }
++    const chain: string[] = [];
++    const seen = new Set<string>();
++    let current: typeof messages.$inferSelect | undefined = this.db
++      .select()
++      .from(messages)
++      .where(eq(messages.id, id))
++      .get();
++    while (current && !seen.has(current.id)) {
++      seen.add(current.id);
++      chain.push(current.id);
++      current = current.parentId
++        ? this.db.select().from(messages).where(eq(messages.id, current.parentId)).get()
++        : undefined;
++    }
++    for (const nodeId of chain) {
++      this.activateAmongSiblings(nodeId);
++    }
++    const stored = this.getMessage(id);
++    if (!stored) {
++      throw new Error("Message not found");
++    }
++    return stored;
++  }
++
++  listActivePath(conversationId: string): MessageRecord[] {
++    const all = this.listMessages(conversationId);
++    const path: MessageRecord[] = [];
++    const seen = new Set<string>();
++    let parentId: string | null = null;
++    for (;;) {
++      const children = all
++        .filter((item) => item.parentId === parentId)
++        .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
++      if (children.length === 0) {
++        return path;
++      }
++      const next = children.find((item) => item.isActiveBranch) ?? children[0];
++      if (!next || seen.has(next.id)) {
++        return path;
++      }
++      seen.add(next.id);
++      path.push(next);
++      parentId = next.id;
++    }
++  }
++
++  getBranchLabels(conversationId: string): Record<string, string> {
++    const row = this.db
++      .select()
++      .from(settings)
++      .where(eq(settings.key, `${BRANCH_LABELS_PREFIX}${conversationId}`))
++      .get();
++    if (!row) {
++      return {};
++    }
++    const parsed: unknown = JSON.parse(row.value);
++    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
++      return {};
++    }
++    const labels: Record<string, string> = {};
++    for (const [key, value] of Object.entries(parsed)) {
++      if (typeof value === "string") {
++        const trimmed = value.trim();
++        if (trimmed.length > 0 && trimmed.length <= 80) {
++          labels[key] = trimmed;
++        }
++      }
++    }
++    return labels;
++  }
++
++  setBranchLabel(conversationId: string, branchId: string, label: string): void {
++    const conversation = this.db
++      .select()
++      .from(conversations)
++      .where(eq(conversations.id, conversationId))
++      .get();
++    if (!conversation) {
++      throw new Error("Conversation not found");
++    }
++    const next = { ...this.getBranchLabels(conversationId) };
++    const trimmed = label.trim();
++    if (trimmed.length === 0) {
++      delete next[branchId];
++    } else {
++      next[branchId] = trimmed.slice(0, 80);
++    }
++    const now = Date.now();
++    const key = `${BRANCH_LABELS_PREFIX}${conversationId}`;
++    this.db
++      .insert(settings)
++      .values({
++        key,
++        value: JSON.stringify(next),
++        updatedAt: now,
++      })
++      .onConflictDoUpdate({
++        target: settings.key,
++        set: { value: JSON.stringify(next), updatedAt: now },
++      })
++      .run();
+   }
+ 
+   updateMessage(id: string, content: string, status: MessageStatus): MessageRecord {
+@@ -376,13 +504,16 @@ export class HubRepos {
+       throw new Error("Message not found");
+     }
+     const rows = this.listMessages(target.conversationId);
+-    const index = rows.findIndex((row) => row.id === id);
+-    if (index < 0) {
+-      throw new Error("Message not found");
+-    }
+-    const doomed = rows.slice(index).reverse();
+-    for (const row of doomed) {
+-      this.db.delete(messages).where(eq(messages.id, row.id)).run();
++    const doomed: string[] = [];
++    const walk = (nodeId: string): void => {
++      for (const child of rows.filter((row) => row.parentId === nodeId)) {
++        walk(child.id);
++      }
++      doomed.push(nodeId);
++    };
++    walk(id);
++    for (const nodeId of doomed) {
++      this.db.delete(messages).where(eq(messages.id, nodeId)).run();
+     }
+   }
+ 
+diff --git a/packages/security/src/envelope.test.ts b/packages/security/src/envelope.test.ts
+index cc4e0cc..4018461 100644
+--- a/packages/security/src/envelope.test.ts
++++ b/packages/security/src/envelope.test.ts
+@@ -17,6 +17,11 @@ describe("envelope AES-256-GCM", () => {
+     expect(() => decryptUtf8(cipher, randomBytes(32))).toThrow(EnvelopeError);
+   });
+ 
++  it("round-trips an empty string used for streaming placeholders", () => {
++    const key = randomBytes(32);
++    expect(decryptUtf8(encryptUtf8("", key), key)).toBe("");
++  });
++
+   it("rejects truncated payloads", () => {
+     expect(() => decryptUtf8("v1.abc", randomBytes(32))).toThrow(EnvelopeError);
+   });
+diff --git a/packages/security/src/envelope.ts b/packages/security/src/envelope.ts
+index 10a9c02..735ba93 100644
+--- a/packages/security/src/envelope.ts
++++ b/packages/security/src/envelope.ts
+@@ -38,7 +38,7 @@ export function decryptUtf8(payload: string, key: Buffer): string {
+   const ivB64 = parts[1];
+   const tagB64 = parts[2];
+   const dataB64 = parts[3];
+-  if (parts.length !== 4 || version !== VERSION || !ivB64 || !tagB64 || !dataB64) {
++  if (parts.length !== 4 || version !== VERSION || !ivB64 || !tagB64 || dataB64 === undefined) {
+     throw new EnvelopeError();
+   }
+   try {
+diff --git a/packages/shared/src/gateway.test.ts b/packages/shared/src/gateway.test.ts
+index 58af4f5..c6f7905 100644
+--- a/packages/shared/src/gateway.test.ts
++++ b/packages/shared/src/gateway.test.ts
+@@ -49,6 +49,7 @@ describe("chat contracts", () => {
+   it("rejects extra keys on chat send", () => {
+     expect(() =>
+       chatSendInputSchema.parse({
++        mode: "send",
+         conversationId: "11111111-1111-4111-8111-111111111111",
+         providerKeyId: "22222222-2222-4222-8222-222222222222",
+         model: "gpt-4o-mini",
+@@ -58,14 +59,37 @@ describe("chat contracts", () => {
+     ).toThrow();
+   });
+ 
+-  it("accepts a continue send with null content", () => {
++  it("accepts a continue send without content", () => {
+     const parsed = chatSendInputSchema.parse({
++      mode: "continue",
+       conversationId: "11111111-1111-4111-8111-111111111111",
+       providerKeyId: "22222222-2222-4222-8222-222222222222",
+       model: "gpt-4o-mini",
+-      content: null,
+     });
+-    expect(parsed.content).toBeNull();
++    expect(parsed.mode).toBe("continue");
++  });
++
++  it("requires messageId for regenerate", () => {
++    expect(() =>
++      chatSendInputSchema.parse({
++        mode: "regenerate",
++        conversationId: "11111111-1111-4111-8111-111111111111",
++        providerKeyId: "22222222-2222-4222-8222-222222222222",
++        model: "gpt-4o-mini",
++      }),
++    ).toThrow();
++  });
++
++  it("accepts an edit send with content and messageId", () => {
++    const parsed = chatSendInputSchema.parse({
++      mode: "edit",
++      conversationId: "11111111-1111-4111-8111-111111111111",
++      providerKeyId: "22222222-2222-4222-8222-222222222222",
++      model: "gpt-4o-mini",
++      messageId: "33333333-3333-4333-8333-333333333333",
++      content: "rewritten",
++    });
++    expect(parsed.mode).toBe("edit");
+   });
+ 
+   it("parses a chunk event", () => {
+diff --git a/packages/shared/src/gateway.ts b/packages/shared/src/gateway.ts
+index 21ebbca..f7d468d 100644
+--- a/packages/shared/src/gateway.ts
++++ b/packages/shared/src/gateway.ts
+@@ -56,27 +56,36 @@ export const receiptDtoSchema = z.object({
+ 
+ export type ReceiptDto = z.infer<typeof receiptDtoSchema>;
+ 
+-export const chatSendInputSchema = z
+-  .object({
+-    conversationId: z.string().uuid(),
+-    providerKeyId: z.string().uuid(),
+-    model: z.string().min(1).max(128),
+-    content: z.string().min(1).max(100_000).nullable(),
+-  })
+-  .strict();
+-
+-export type ChatSendInput = z.infer<typeof chatSendInputSchema>;
++const chatSendBaseSchema = z.object({
++  conversationId: z.string().uuid(),
++  providerKeyId: z.string().uuid(),
++  model: z.string().min(1).max(128),
++});
+ 
+-export const chatSendResultSchema = z
+-  .object({
+-    runId: z.string().uuid(),
+-    messageId: z.string().uuid(),
+-    userMessageId: z.string().uuid().nullable(),
+-    packet: packetV0Schema,
+-  })
+-  .strict();
++export const chatSendInputSchema = z.discriminatedUnion("mode", [
++  chatSendBaseSchema
++    .extend({
++      mode: z.literal("send"),
++      content: z.string().min(1).max(100_000),
++    })
++    .strict(),
++  chatSendBaseSchema.extend({ mode: z.literal("continue") }).strict(),
++  chatSendBaseSchema
++    .extend({
++      mode: z.literal("regenerate"),
++      messageId: z.string().uuid(),
++    })
++    .strict(),
++  chatSendBaseSchema
++    .extend({
++      mode: z.literal("edit"),
++      messageId: z.string().uuid(),
++      content: z.string().min(1).max(100_000),
++    })
++    .strict(),
++]);
+ 
+-export type ChatSendResult = z.infer<typeof chatSendResultSchema>;
++export type ChatSendInput = z.infer<typeof chatSendInputSchema>;
+ 
+ export const chatAbortInputSchema = z.object({ runId: z.string().uuid() }).strict();
+ 
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index 71db02e..d360764 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -1,10 +1,16 @@
+ import type { AppLocale, ThemeMode } from "./appearance";
+-import type { ChatAbortInput, ChatSendInput, ChatSendResult } from "./gateway";
++import type { ChatAbortInput, ChatSendInput } from "./gateway";
+ import type {
+   AppearanceSettings,
++  BranchLabelSetInput,
++  BranchLabels,
++  BranchLabelsGetInput,
+   ChatEvent,
++  ChatSendResult,
+   ConversationCreateInput,
+   ConversationDto,
++  ConversationExportInput,
++  ConversationExportResult,
+   ConversationListInput,
+   IdInput,
+   MessageCreateInput,
+@@ -36,13 +42,16 @@ export interface HubConversationsApi {
+   list: (input: ConversationListInput) => Promise<ConversationDto[]>;
+   create: (input: ConversationCreateInput) => Promise<ConversationDto>;
+   remove: (input: IdInput) => Promise<void>;
++  export: (input: ConversationExportInput) => Promise<ConversationExportResult>;
++  getBranchLabels: (input: BranchLabelsGetInput) => Promise<BranchLabels>;
++  setBranchLabel: (input: BranchLabelSetInput) => Promise<void>;
+ }
+ 
+ export interface HubMessagesApi {
+   list: (input: MessageListInput) => Promise<MessageDto[]>;
+   create: (input: MessageCreateInput) => Promise<MessageDto>;
+   update: (input: MessageUpdateInput) => Promise<MessageDto>;
+-  deleteFrom: (input: IdInput) => Promise<void>;
++  activate: (input: IdInput) => Promise<void>;
+ }
+ 
+ export interface HubSettingsApi {
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 5cff5a6..58b84ee 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -11,11 +11,29 @@ export {
+   type HubWindowApi,
+ } from "./hub-api";
+ export { IpcChannel, type IpcChannelName } from "./ipc-channels";
++export {
++  activePath,
++  ancestorsOf,
++  childrenOf,
++  compareGraphNodes,
++  siblingsOf,
++  upsertActivated,
++  selectExportMessages,
++  type MessageGraphNode,
++} from "./message-graph";
+ export {
+   appearanceSettingsSchema,
++  branchLabelSetInputSchema,
++  branchLabelsGetInputSchema,
++  branchLabelsSchema,
+   chatEventSchema,
++  chatSendResultSchema,
+   conversationCreateInputSchema,
+   conversationDtoSchema,
++  conversationExportDocumentSchema,
++  conversationExportInputSchema,
++  conversationExportModeSchema,
++  conversationExportResultSchema,
+   conversationListInputSchema,
+   conversationListResultSchema,
+   emptyIpcPayloadSchema,
+@@ -40,9 +58,17 @@ export {
+   windowIsMaximizedResultSchema,
+   workspaceSessionSchema,
+   type AppearanceSettings,
++  type BranchLabelSetInput,
++  type BranchLabels,
++  type BranchLabelsGetInput,
+   type ChatEvent,
++  type ChatSendResult,
+   type ConversationCreateInput,
+   type ConversationDto,
++  type ConversationExportDocument,
++  type ConversationExportInput,
++  type ConversationExportMode,
++  type ConversationExportResult,
+   type ConversationListInput,
+   type EmptyIpcPayload,
+   type IdInput,
+@@ -62,7 +88,6 @@ export {
+ export {
+   chatAbortInputSchema,
+   chatSendInputSchema,
+-  chatSendResultSchema,
+   estimateCostUsd,
+   findCatalogModel,
+   gatewayErrorCodeSchema,
+@@ -73,7 +98,6 @@ export {
+   type CatalogModel,
+   type ChatAbortInput,
+   type ChatSendInput,
+-  type ChatSendResult,
+   type GatewayErrorCode,
+   type ModelCatalog,
+   type PacketMessage,
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index 6eddebc..0653e7e 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -9,10 +9,13 @@ export const IpcChannel = {
+   conversationsList: "conversations:list",
+   conversationsCreate: "conversations:create",
+   conversationsRemove: "conversations:remove",
++  conversationsExport: "conversations:export",
++  conversationsGetBranchLabels: "conversations:getBranchLabels",
++  conversationsSetBranchLabel: "conversations:setBranchLabel",
+   messagesList: "messages:list",
+   messagesCreate: "messages:create",
+   messagesUpdate: "messages:update",
+-  messagesDeleteFrom: "messages:deleteFrom",
++  messagesActivate: "messages:activate",
+   settingsGetAppearance: "settings:getAppearance",
+   settingsSetAppearance: "settings:setAppearance",
+   settingsGetSession: "settings:getSession",
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index 1d87cda..6416517 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -1,8 +1,10 @@
+ import { describe, expect, it } from "vitest";
+ import {
++  conversationExportDocumentSchema,
+   emptyIpcPayloadSchema,
+   ipcAckResultSchema,
+   messageCreateInputSchema,
++  messageDtoSchema,
+   messageUpdateInputSchema,
+   providerKeyDtoSchema,
+   secretsSaveInputSchema,
+@@ -83,6 +85,46 @@ describe("workspaceSessionSchema", () => {
+   });
+ });
+ 
++describe("conversationExportDocumentSchema", () => {
++  it("rejects extra keys so secrets cannot piggyback on an export", () => {
++    expect(() =>
++      conversationExportDocumentSchema.parse({
++        version: 1,
++        mode: "active",
++        exportedAt: "2026-09-17T00:00:00.000Z",
++        conversation: {
++          id: "11111111-1111-4111-8111-111111111111",
++          projectId: null,
++          title: "Chat",
++          createdAt: "2026-09-17T00:00:00.000Z",
++          updatedAt: "2026-09-17T00:00:00.000Z",
++        },
++        branchLabels: {},
++        messages: [],
++        apiKey: "sk-testfixtureABCDEFGH",
++      }),
++    ).toThrow();
++  });
++});
++
++describe("messageDtoSchema", () => {
++  it("requires isActiveBranch", () => {
++    expect(() =>
++      messageDtoSchema.parse({
++        id: "11111111-1111-4111-8111-111111111111",
++        conversationId: "22222222-2222-4222-8222-222222222222",
++        parentId: null,
++        branchId: "33333333-3333-4333-8333-333333333333",
++        role: "user",
++        content: "hi",
++        status: "complete",
++        createdAt: "2026-09-17T00:00:00.000Z",
++        receipt: null,
++      }),
++    ).toThrow();
++  });
++});
++
+ describe("secretsSaveInputSchema", () => {
+   it("rejects extra keys so secrets cannot piggyback on unknown fields", () => {
+     expect(() =>
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index d301700..a51312b 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -77,6 +77,7 @@ export const messageDtoSchema = z.object({
+   conversationId: z.string().uuid(),
+   parentId: z.string().uuid().nullable(),
+   branchId: z.string().uuid(),
++  isActiveBranch: z.boolean(),
+   role: messageRoleSchema,
+   content: z.string(),
+   status: messageStatusSchema,
+@@ -198,3 +199,71 @@ export const chatEventSchema = z.discriminatedUnion("type", [
+ ]);
+ 
+ export type ChatEvent = z.infer<typeof chatEventSchema>;
++
++export const chatSendResultSchema = z
++  .object({
++    runId: z.string().uuid(),
++    messageId: z.string().uuid(),
++    userMessageId: z.string().uuid().nullable(),
++    packet: packetV0Schema,
++    userMessage: messageDtoSchema.nullable(),
++    assistant: messageDtoSchema,
++  })
++  .strict();
++
++export type ChatSendResult = z.infer<typeof chatSendResultSchema>;
++
++export const branchLabelsSchema = z.record(z.string().uuid(), z.string().trim().min(1).max(80));
++
++export type BranchLabels = z.infer<typeof branchLabelsSchema>;
++
++export const branchLabelsGetInputSchema = z
++  .object({
++    conversationId: z.string().uuid(),
++  })
++  .strict();
++
++export type BranchLabelsGetInput = z.infer<typeof branchLabelsGetInputSchema>;
++
++export const branchLabelSetInputSchema = z
++  .object({
++    conversationId: z.string().uuid(),
++    branchId: z.string().uuid(),
++    label: z.string().max(80),
++  })
++  .strict();
++
++export type BranchLabelSetInput = z.infer<typeof branchLabelSetInputSchema>;
++
++export const conversationExportModeSchema = z.enum(["active", "tree"]);
++
++export type ConversationExportMode = z.infer<typeof conversationExportModeSchema>;
++
++export const conversationExportInputSchema = z
++  .object({
++    conversationId: z.string().uuid(),
++    mode: conversationExportModeSchema,
++  })
++  .strict();
++
++export type ConversationExportInput = z.infer<typeof conversationExportInputSchema>;
++
++export const conversationExportResultSchema = z.discriminatedUnion("status", [
++  z.object({ status: z.literal("saved"), path: z.string().min(1) }).strict(),
++  z.object({ status: z.literal("cancelled") }).strict(),
++]);
++
++export type ConversationExportResult = z.infer<typeof conversationExportResultSchema>;
++
++export const conversationExportDocumentSchema = z
++  .object({
++    version: z.literal(1),
++    mode: conversationExportModeSchema,
++    exportedAt: isoTimestampSchema,
++    conversation: conversationDtoSchema,
++    branchLabels: branchLabelsSchema,
++    messages: z.array(messageDtoSchema),
++  })
++  .strict();
++
++export type ConversationExportDocument = z.infer<typeof conversationExportDocumentSchema>;
+diff --git a/packages/shared/src/message-graph.test.ts b/packages/shared/src/message-graph.test.ts
+new file mode 100644
+index 0000000..1c9b659
+--- /dev/null
++++ b/packages/shared/src/message-graph.test.ts
+@@ -0,0 +1,58 @@
++import { describe, expect, it } from "vitest";
++import {
++  activePath,
++  ancestorsOf,
++  childrenOf,
++  siblingsOf,
++  selectExportMessages,
++  upsertActivated,
++  type MessageGraphNode,
++} from "./message-graph";
++
++function node(
++  id: string,
++  parentId: string | null,
++  isActiveBranch: boolean,
++  createdAt: string,
++): MessageGraphNode {
++  return { id, parentId, isActiveBranch, createdAt };
++}
++
++describe("message graph", () => {
++  it("walks the active path across three assistant siblings", () => {
++    const user = node("u", null, true, "2026-09-17T00:00:00.000Z");
++    const a1 = node("a1", "u", false, "2026-09-17T00:00:01.000Z");
++    const a2 = node("a2", "u", false, "2026-09-17T00:00:02.000Z");
++    const a3 = node("a3", "u", true, "2026-09-17T00:00:03.000Z");
++    const messages = [user, a1, a2, a3];
++    expect(activePath(messages).map((item) => item.id)).toEqual(["u", "a3"]);
++    expect(siblingsOf(messages, "a2").map((item) => item.id)).toEqual(["a1", "a2", "a3"]);
++    expect(childrenOf(messages, "u")).toHaveLength(3);
++  });
++
++  it("keeps the inactive sibling after switching back", () => {
++    const user = node("u", null, true, "2026-09-17T00:00:00.000Z");
++    const a1 = node("a1", "u", false, "2026-09-17T00:00:01.000Z");
++    const a2 = node("a2", "u", true, "2026-09-17T00:00:02.000Z");
++    const switched = upsertActivated([user, a1, a2], a1);
++    expect(activePath(switched).map((item) => item.id)).toEqual(["u", "a1"]);
++    expect(switched.find((item) => item.id === "a2")?.isActiveBranch).toBe(false);
++    expect(switched).toHaveLength(3);
++  });
++
++  it("returns ancestors from the node up to the root", () => {
++    const root = node("u", null, true, "2026-09-17T00:00:00.000Z");
++    const mid = node("a", "u", true, "2026-09-17T00:00:01.000Z");
++    const leaf = node("u2", "a", true, "2026-09-17T00:00:02.000Z");
++    expect(ancestorsOf([root, mid, leaf], "u2").map((item) => item.id)).toEqual(["u2", "a", "u"]);
++  });
++
++  it("exports only the active path or the full tree", () => {
++    const user = node("u", null, true, "2026-09-17T00:00:00.000Z");
++    const a1 = node("a1", "u", false, "2026-09-17T00:00:01.000Z");
++    const a2 = node("a2", "u", true, "2026-09-17T00:00:02.000Z");
++    const messages = [user, a1, a2];
++    expect(selectExportMessages("active", messages).map((item) => item.id)).toEqual(["u", "a2"]);
++    expect(selectExportMessages("tree", messages).map((item) => item.id)).toEqual(["u", "a1", "a2"]);
++  });
++});
+diff --git a/packages/shared/src/message-graph.ts b/packages/shared/src/message-graph.ts
+new file mode 100644
+index 0000000..aa996fa
+--- /dev/null
++++ b/packages/shared/src/message-graph.ts
+@@ -0,0 +1,91 @@
++export interface MessageGraphNode {
++  id: string;
++  parentId: string | null;
++  isActiveBranch: boolean;
++  createdAt: string;
++}
++
++export function compareGraphNodes(a: MessageGraphNode, b: MessageGraphNode): number {
++  const byTime = a.createdAt.localeCompare(b.createdAt);
++  if (byTime !== 0) {
++    return byTime;
++  }
++  return a.id.localeCompare(b.id);
++}
++
++export function childrenOf<T extends MessageGraphNode>(
++  messages: readonly T[],
++  parentId: string | null,
++): T[] {
++  return messages
++    .filter((item) => item.parentId === parentId)
++    .slice()
++    .sort(compareGraphNodes);
++}
++
++export function siblingsOf<T extends MessageGraphNode>(messages: readonly T[], messageId: string): T[] {
++  const target = messages.find((item) => item.id === messageId);
++  if (!target) {
++    return [];
++  }
++  return childrenOf(messages, target.parentId);
++}
++
++export function ancestorsOf<T extends MessageGraphNode>(messages: readonly T[], messageId: string): T[] {
++  const byId = new Map(messages.map((item) => [item.id, item]));
++  const chain: T[] = [];
++  const seen = new Set<string>();
++  let current = byId.get(messageId);
++  while (current && !seen.has(current.id)) {
++    seen.add(current.id);
++    chain.push(current);
++    current = current.parentId ? byId.get(current.parentId) : undefined;
++  }
++  return chain;
++}
++
++export function activePath<T extends MessageGraphNode>(messages: readonly T[]): T[] {
++  const path: T[] = [];
++  const seen = new Set<string>();
++  let parentId: string | null = null;
++  for (;;) {
++    const children: T[] = childrenOf(messages, parentId);
++    if (children.length === 0) {
++      return path;
++    }
++    const active = children.find((item: T) => item.isActiveBranch);
++    const next: T | undefined = active ?? children[0];
++    if (!next || seen.has(next.id)) {
++      return path;
++    }
++    seen.add(next.id);
++    path.push(next);
++    parentId = next.id;
++  }
++}
++
++export function upsertActivated<T extends MessageGraphNode>(messages: readonly T[], activated: T): T[] {
++  const exists = messages.some((item) => item.id === activated.id);
++  const merged = exists
++    ? messages.map((item) => (item.id === activated.id ? activated : item))
++    : [...messages, activated];
++  return merged.map((item) => {
++    if (item.id === activated.id) {
++      return { ...item, isActiveBranch: true };
++    }
++    if (item.parentId === activated.parentId) {
++      return { ...item, isActiveBranch: false };
++    }
++    return item;
++  });
++}
++
++export function selectExportMessages<T extends MessageGraphNode>(
++  mode: "active" | "tree",
++  messages: readonly T[],
++): T[] {
++  if (mode === "active") {
++    return activePath(messages);
++  }
++  return messages.slice().sort(compareGraphNodes);
++}
