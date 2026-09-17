@@ -3,12 +3,9 @@ import { app } from "electron";
 import { openHubDatabase, type HubDatabase } from "@ai-hub/db";
 import { loadOrCreateMasterKey, MemorySecretStore } from "@ai-hub/security";
 import { KeytarSecretStore } from "@ai-hub/security/keytar";
+import { isE2eMode } from "./e2e-mode";
 
 let hub: HubDatabase | null = null;
-
-function isE2e(): boolean {
-  return process.env.AI_HUB_E2E === "1";
-}
 
 async function seedE2eWorkspace(database: HubDatabase): Promise<void> {
   const project = database.repos.createProject("E2E");
@@ -29,11 +26,11 @@ export async function bootPersistence(): Promise<HubDatabase> {
   if (hub) {
     return hub;
   }
-  const store = isE2e() ? new MemorySecretStore() : new KeytarSecretStore();
+  const store = isE2eMode() ? new MemorySecretStore() : new KeytarSecretStore();
   const masterKey = await loadOrCreateMasterKey(store);
   const dbPath = join(app.getPath("userData"), "ai-hub.sqlite");
   hub = openHubDatabase({ path: dbPath, masterKey, secretStore: store });
-  if (isE2e()) {
+  if (isE2eMode()) {
     await seedE2eWorkspace(hub);
   }
   hub.repos.interruptOrphanStreams();
