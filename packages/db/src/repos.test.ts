@@ -115,7 +115,7 @@ describe("hub database", () => {
       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
       applyMigrations(second.sqlite);
-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(2);
+      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(3);
       second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -273,11 +273,17 @@ describe("hub database", () => {
       projectId: project.id,
       conversationId: conversation.id,
       model: "gpt-4o",
+      temperature: 0.4,
+      maxTokens: 256,
+      extraSystem: "Be terse.",
     });
     expect(hub.repos.getWorkspaceSession()).toEqual({
       projectId: project.id,
       conversationId: conversation.id,
       model: "gpt-4o",
+      temperature: 0.4,
+      maxTokens: 256,
+      extraSystem: "Be terse.",
     });
     hub.close();
   });
@@ -392,6 +398,47 @@ describe("hub database", () => {
     expect(edited.isActiveBranch).toBe(true);
     expect(hub.repos.getMessage(assistant.id)?.content).toBe("reply");
     expect(hub.repos.listActivePath(conversation.id).map((item) => item.id)).toEqual([edited.id]);
+    hub.close();
+  });
+
+  it("seeds custom and OpenRouter providers and stores custom URL without the secret", async () => {
+    const { hub } = openTestDb();
+    const slugs = hub.repos.listProviders().map((item) => item.slug);
+    expect(slugs).toEqual(expect.arrayContaining(["openai", "openrouter", "anthropic", "google", "groq", "custom"]));
+    const secret = "sk-customfixtureNEVERSQLITE9999";
+    const saved = await hub.repos.saveProviderKey({
+      providerSlug: "custom",
+      label: "local",
+      secret,
+      baseUrl: "http://127.0.0.1:8080/v1",
+    });
+    expect(saved.endpointUrl).toBe("http://127.0.0.1:8080/v1");
+    expect(saved.maskedKey).not.toBe(secret);
+    const dump = dumpAllText(hub.sqlite);
+    expect(dump).not.toContain(secret);
+    expect(dump).toContain("http://127.0.0.1:8080/v1");
+    await expect(
+      hub.repos.saveProviderKey({
+        providerSlug: "custom",
+        label: "bad",
+        secret: "sk-customfixtureNEVERSQLITE9999",
+        baseUrl: "https://user:embedded-secret@127.0.0.1/v1",
+      }),
+    ).rejects.toThrow("Invalid custom base URL");
+    hub.close();
+  });
+
+  it("records a health sample without storing secrets", () => {
+    const { hub } = openTestDb();
+    const sample = hub.repos.recordHealthSample({
+      providerSlug: "openrouter",
+      ok: true,
+      latencyMs: 42,
+    });
+    expect(sample.ok).toBe(true);
+    expect(hub.repos.listHealthSamples("openrouter")).toHaveLength(1);
+    const dump = dumpAllText(hub.sqlite);
+    expect(dump).not.toMatch(/sk-/);
     hub.close();
   });
 });
