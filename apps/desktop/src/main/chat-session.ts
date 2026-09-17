@@ -11,6 +11,8 @@ import {
   GatewayStreamError,
   gatewayErrorCode,
   resolveAdapter,
+  type CompilerGraphMessage,
+  type CompilerMessage,
   type ProviderAdapter,
 } from "@ai-hub/ai-gateway";
 import type { MessageRecord } from "@ai-hub/db";
@@ -105,6 +107,58 @@ function writeReceipt(
 
 export function abortChat(runId: string): void {
   runs.get(runId)?.abort.abort();
+}
+
+function compilerMessages(rows: MessageRecord[]): CompilerMessage[] {
+  return rows.map((item) => ({
+    id: item.id,
+    role: item.role,
+    content: item.content,
+    status: item.status,
+  }));
+}
+
+function compilerGraphMessages(rows: MessageRecord[]): CompilerGraphMessage[] {
+  return rows.map((item) => ({
+    id: item.id,
+    parentId: item.parentId,
+    isActiveBranch: item.isActiveBranch,
+    createdAt: item.createdAt,
+    role: item.role,
+    content: item.content,
+    status: item.status,
+  }));
+}
+
+function compileOutgoing(
+  input: ChatSendInput,
+  projectInstructions: string | null,
+  compileRows: MessageRecord[],
+  providerSlug: string,
+): ProviderAgnosticPacket {
+  const extraSystem =
+    input.extraSystem !== undefined && input.extraSystem.trim().length > 0 ? input.extraSystem.trim() : null;
+  const catalog = findCatalogModel(input.model, providerSlug);
+  const maxTokenBudget =
+    input.compactHistory === true ? (catalog?.contextWindow ?? 128_000) : undefined;
+  if (input.mode === "regenerate") {
+    const compiled = {
+      projectInstructions,
+      extraSystem,
+      messages: compilerMessages(compileRows),
+    };
+    return compilePacket(
+      maxTokenBudget !== undefined ? { ...compiled, maxTokenBudget } : compiled,
+    );
+  }
+  const compiled = {
+    projectInstructions,
+    extraSystem,
+    messages: compilerGraphMessages(compileRows),
+  };
+  return compileActivePath(
+    maxTokenBudget !== undefined ? { ...compiled, maxTokenBudget } : compiled,
+  );
 }
 
 export async function sendChat(input: ChatSendInput, sender: WebContents): Promise<ChatSendResult> {
@@ -206,34 +260,8 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     }
   }
 
-  const extraSystem =
-    input.extraSystem !== undefined && input.extraSystem.trim().length > 0 ? input.extraSystem.trim() : null;
   const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
-  const packet =
-    input.mode === "regenerate"
-      ? compilePacket({
-          projectInstructions: project?.instructions ?? null,
-          extraSystem,
-          messages: compileRows.map((item) => ({
-            id: item.id,
-            role: item.role,
-            content: item.content,
-            status: item.status,
-          })),
-        })
-      : compileActivePath({
-          projectInstructions: project?.instructions ?? null,
-          extraSystem,
-          messages: compileRows.map((item) => ({
-            id: item.id,
-            parentId: item.parentId,
-            isActiveBranch: item.isActiveBranch,
-            createdAt: item.createdAt,
-            role: item.role,
-            content: item.content,
-            status: item.status,
-          })),
-        });
+  const packet = compileOutgoing(input, project?.instructions ?? null, compileRows, key.providerSlug);
   if (packet.messages.length === 0) {
     throw new Error("Add a user message before sending");
   }
