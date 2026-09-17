@@ -108,6 +108,25 @@ export const messageCreateInputSchema = z
 
 export type MessageCreateInput = z.infer<typeof messageCreateInputSchema>;
 
+export const messageUpdateInputSchema = z
+  .object({
+    id: z.string().uuid(),
+    content: z.string().min(1).max(100_000),
+  })
+  .strict();
+
+export type MessageUpdateInput = z.infer<typeof messageUpdateInputSchema>;
+
+export const workspaceSessionSchema = z
+  .object({
+    projectId: z.string().uuid().nullable(),
+    conversationId: z.string().uuid().nullable(),
+    model: z.string().min(1).max(128),
+  })
+  .strict();
+
+export type WorkspaceSession = z.infer<typeof workspaceSessionSchema>;
+
 export const appearanceSettingsSchema = z
   .object({
     theme: z.enum(themeModeSchema),
