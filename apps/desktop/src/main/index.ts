@@ -1,9 +1,15 @@
 import { join } from "node:path";
+import { existsSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { BrowserWindow, app, dialog, session, shell } from "electron";
 import { electronApp, is, optimizer } from "@electron-toolkit/utils";
 import { safeErrorMessage } from "@ai-hub/security";
 import { registerWindowIpc, registerWorkspaceIpc } from "./ipc";
 import { bootPersistence } from "./persistence";
+
+if (process.env.AI_HUB_E2E === "1") {
+  app.setPath("userData", mkdtempSync(join(tmpdir(), "ai-hub-e2e-")));
+}
 
 function applyContentSecurityPolicy(): void {
   const developmentCsp = [
@@ -89,6 +95,19 @@ function targetWindow(event: Electron.IpcMainInvokeEvent): BrowserWindow | null 
   return BrowserWindow.fromWebContents(event.sender);
 }
 
+function preloadScript(): string {
+  const cjs = join(__dirname, "../preload/index.cjs");
+  const mjs = join(__dirname, "../preload/index.mjs");
+  const js = join(__dirname, "../preload/index.js");
+  if (existsSync(cjs)) {
+    return cjs;
+  }
+  if (existsSync(mjs)) {
+    return mjs;
+  }
+  return js;
+}
+
 function createWindow(): void {
   const window = new BrowserWindow({
     width: 1280,
@@ -100,7 +119,7 @@ function createWindow(): void {
     autoHideMenuBar: true,
     backgroundColor: "#0c0c0e",
     webPreferences: {
-      preload: join(__dirname, "../preload/index.mjs"),
+      preload: preloadScript(),
       sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
@@ -110,11 +129,15 @@ function createWindow(): void {
 
   attachNavigationLocks(window);
 
+  window.webContents.on("preload-error", (_event, preloadPath, error) => {
+    console.error("[hub:preload]", preloadPath, safeErrorMessage(error));
+  });
+
   window.on("ready-to-show", () => {
     window.show();
   });
 
-  if (is.dev && process.env["ELECTRON_RENDERER_URL"]) {
+  if ((is.dev && process.env.AI_HUB_E2E !== "1") && process.env["ELECTRON_RENDERER_URL"]) {
     void window.loadURL(process.env["ELECTRON_RENDERER_URL"]);
   } else {
     void window.loadFile(join(__dirname, "../renderer/index.html"));
