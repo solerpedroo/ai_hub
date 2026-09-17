@@ -1,5 +1,5 @@
 import { redactSecrets } from "@ai-hub/security";
-import { openaiCatalogModels, type ProviderAgnosticPacket } from "@ai-hub/shared";
+import { catalogModelsForProvider, type ProviderAgnosticPacket } from "@ai-hub/shared";
 import type {
   ChatStreamEvent,
   ChatStreamRequest,
@@ -10,15 +10,18 @@ import type {
 import { GatewayError } from "./errors";
 import { iterateSseData } from "./sse";
 
-export interface OpenAIAdapterOptions {
+export interface OpenAICompatibleAdapterOptions {
+  id?: string;
   fetch?: typeof fetch;
   baseUrl?: string;
   timeoutMs?: number;
+  extraHeaders?: Record<string, string>;
+  testModel?: string;
 }
 
 interface OpenAIStreamChunk {
   choices?: Array<{ delta?: { content?: unknown } }>;
-  usage?: { prompt_tokens?: unknown; completion_tokens?: unknown };
+  usage?: { prompt_tokens?: unknown; completion_tokens?: unknown; cost?: unknown };
 }
 
 function asObject(value: unknown): Record<string, unknown> | null {
@@ -50,7 +53,7 @@ function packetMessages(packet: ProviderAgnosticPacket): Array<{ role: string; c
 function mapStatus(status: number, body: unknown): GatewayError {
   const record = asObject(body);
   const error = record ? asObject(record.error) : null;
-  const raw = (error ? readString(error.message) : null) ?? `OpenAI HTTP ${status}`;
+  const raw = (error ? readString(error.message) : null) ?? `OpenAI-compatible HTTP ${status}`;
   const message = redactSecrets(raw);
   const code = error ? readString(error.code) ?? readString(error.type) : null;
   if (status === 401 || status === 403 || code === "invalid_api_key") {
@@ -93,10 +96,13 @@ function classifyTransport(error: unknown, userSignal: AbortSignal, timeout: Abo
   throw new GatewayError("network", message);
 }
 
-export function createOpenAIAdapter(options: OpenAIAdapterOptions = {}): ProviderAdapter {
+export function createOpenAICompatibleAdapter(
+  options: OpenAICompatibleAdapterOptions & { id: string; baseUrl: string; testModel: string },
+): ProviderAdapter {
   const fetchFn = options.fetch ?? fetch;
-  const baseUrl = (options.baseUrl ?? "https://api.openai.com/v1").replace(/\/$/, "");
+  const baseUrl = options.baseUrl.replace(/\/$/, "");
   const timeoutMs = options.timeoutMs ?? 60_000;
+  const extraHeaders = options.extraHeaders ?? {};
 
   const request = async (
     path: string,
@@ -112,6 +118,7 @@ export function createOpenAIAdapter(options: OpenAIAdapterOptions = {}): Provide
         headers: {
           Authorization: `Bearer ${secret}`,
           "Content-Type": "application/json",
+          ...extraHeaders,
         },
         body: JSON.stringify(body),
         signal: combined,
@@ -122,20 +129,49 @@ export function createOpenAIAdapter(options: OpenAIAdapterOptions = {}): Provide
     }
   };
 
+  const requestGet = async (
+    path: string,
+    secret: string,
+    signal: AbortSignal,
+  ): Promise<{ response: Response; timeout: AbortSignal }> => {
+    const timeout = AbortSignal.timeout(timeoutMs);
+    const combined = AbortSignal.any([signal, timeout]);
+    try {
+      const response = await fetchFn(`${baseUrl}${path}`, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${secret}`,
+          ...extraHeaders,
+        },
+        signal: combined,
+      });
+      return { response, timeout };
+    } catch (error) {
+      classifyTransport(error, signal, timeout);
+    }
+  };
+
   return {
-    id: "openai",
+    id: options.id,
     listModels(): ModelRef[] {
-      return openaiCatalogModels().map((model) => ({ id: model.id, label: model.label }));
+      return catalogModelsForProvider(options.id).map((model) => ({ id: model.id, label: model.label }));
     },
     capabilities(): ProviderCapabilities {
       return { streaming: true, tools: false };
     },
     async testConnection(secret: string, signal: AbortSignal): Promise<void> {
+      if (options.id === "custom") {
+        const { response } = await requestGet("/models", secret, signal);
+        if (!response.ok) {
+          throw mapStatus(response.status, await readJson(response));
+        }
+        return;
+      }
       const { response } = await request(
         "/chat/completions",
         secret,
         {
-          model: "gpt-4o-mini",
+          model: options.testModel,
           messages: [{ role: "user", content: "ping" }],
           max_tokens: 1,
         },
@@ -146,22 +182,25 @@ export function createOpenAIAdapter(options: OpenAIAdapterOptions = {}): Provide
       }
     },
     async *chatStream(input: ChatStreamRequest): AsyncIterable<ChatStreamEvent> {
-      const { response, timeout } = await request(
-        "/chat/completions",
-        input.secret,
-        {
-          model: input.model,
-          stream: true,
-          stream_options: { include_usage: true },
-          messages: packetMessages(input.packet),
-        },
-        input.signal,
-      );
+      const body: Record<string, unknown> = {
+        model: input.model,
+        stream: true,
+        stream_options: { include_usage: true },
+        messages: packetMessages(input.packet),
+        temperature: input.temperature ?? 1,
+      };
+      if (input.maxTokens !== undefined && input.maxTokens !== null) {
+        body.max_tokens = input.maxTokens;
+      }
+      if (options.id === "openrouter") {
+        body.usage = { include: true };
+      }
+      const { response, timeout } = await request("/chat/completions", input.secret, body, input.signal);
       if (!response.ok) {
         throw mapStatus(response.status, await readJson(response));
       }
       if (!response.body) {
-        throw new GatewayError("network", "OpenAI response had no body");
+        throw new GatewayError("network", "OpenAI-compatible response had no body");
       }
       for await (const data of iterateSseData(response.body, input.signal, timeout)) {
         let parsed: unknown;
@@ -177,10 +216,52 @@ export function createOpenAIAdapter(options: OpenAIAdapterOptions = {}): Provide
         }
         const prompt = readNumber(chunk.usage?.prompt_tokens);
         const completion = readNumber(chunk.usage?.completion_tokens);
-        if (prompt !== null || completion !== null) {
-          yield { type: "usage", tokensIn: prompt ?? 0, tokensOut: completion ?? 0 };
+        const cost = readNumber(chunk.usage?.cost);
+        if (prompt !== null || completion !== null || cost !== null) {
+          const usage: ChatStreamEvent = {
+            type: "usage",
+            tokensIn: prompt ?? 0,
+            tokensOut: completion ?? 0,
+          };
+          if (cost !== null) {
+            usage.costUsd = cost.toFixed(6);
+          }
+          yield usage;
         }
       }
     },
   };
 }
+
+export function mergeOpenAICompatibleOptions(
+  defaults: { id: string; baseUrl: string; testModel: string; extraHeaders?: Record<string, string> },
+  options: OpenAICompatibleAdapterOptions,
+): OpenAICompatibleAdapterOptions & { id: string; baseUrl: string; testModel: string } {
+  const extraHeaders = { ...defaults.extraHeaders, ...options.extraHeaders };
+  const merged: OpenAICompatibleAdapterOptions & { id: string; baseUrl: string; testModel: string } = {
+    id: options.id ?? defaults.id,
+    baseUrl: options.baseUrl ?? defaults.baseUrl,
+    testModel: options.testModel ?? defaults.testModel,
+  };
+  if (options.fetch !== undefined) {
+    merged.fetch = options.fetch;
+  }
+  if (options.timeoutMs !== undefined) {
+    merged.timeoutMs = options.timeoutMs;
+  }
+  if (Object.keys(extraHeaders).length > 0) {
+    merged.extraHeaders = extraHeaders;
+  }
+  return merged;
+}
+
+export function createOpenAIAdapter(options: OpenAICompatibleAdapterOptions = {}): ProviderAdapter {
+  return createOpenAICompatibleAdapter(
+    mergeOpenAICompatibleOptions(
+      { id: "openai", baseUrl: "https://api.openai.com/v1", testModel: "gpt-4o-mini" },
+      options,
+    ),
+  );
+}
+
+export type OpenAIAdapterOptions = OpenAICompatibleAdapterOptions;
