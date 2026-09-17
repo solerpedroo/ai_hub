@@ -17,6 +17,7 @@ import {
   messageDtoSchema,
   messageListInputSchema,
   messageListResultSchema,
+  messageUpdateInputSchema,
   projectCreateInputSchema,
   projectDtoSchema,
   projectListResultSchema,
@@ -25,6 +26,7 @@ import {
   providerListResultSchema,
   secretsSaveInputSchema,
   windowIsMaximizedResultSchema,
+  workspaceSessionSchema,
 } from "@ai-hub/shared";
 import { safeErrorMessage } from "@ai-hub/security";
 import { abortChat, sendChat } from "./chat-session";
@@ -103,6 +105,18 @@ export function registerWorkspaceIpc(): void {
     ),
   );
 
+  registerHandler(IpcChannel.messagesUpdate, messageUpdateInputSchema, messageDtoSchema, (input) => {
+    const existing = getHubDatabase().repos.getMessage(input.id);
+    if (!existing || existing.role !== "user") {
+      throw new Error("User message not found");
+    }
+    return toMessageDto(getHubDatabase().repos.updateMessage(input.id, input.content, existing.status));
+  });
+
+  registerHandler(IpcChannel.messagesDeleteFrom, idInputSchema, ipcAckResultSchema, (input) => {
+    getHubDatabase().repos.deleteMessagesFrom(input.id);
+  });
+
   registerHandler(
     IpcChannel.settingsGetAppearance,
     emptyIpcPayloadSchema,
@@ -116,6 +130,28 @@ export function registerWorkspaceIpc(): void {
     ipcAckResultSchema,
     (input) => {
       getHubDatabase().repos.setAppearance(input);
+    },
+  );
+
+  registerHandler(
+    IpcChannel.settingsGetSession,
+    emptyIpcPayloadSchema,
+    workspaceSessionSchema,
+    () => {
+      const parsed = workspaceSessionSchema.safeParse(getHubDatabase().repos.getWorkspaceSession());
+      if (!parsed.success) {
+        return { projectId: null, conversationId: null, model: "gpt-4o-mini" };
+      }
+      return parsed.data;
+    },
+  );
+
+  registerHandler(
+    IpcChannel.settingsSetSession,
+    workspaceSessionSchema,
+    ipcAckResultSchema,
+    (input) => {
+      getHubDatabase().repos.setWorkspaceSession(input);
     },
   );
 
