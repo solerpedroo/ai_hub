@@ -11,6 +11,7 @@ export function MessageBubble({
   onRegenerate,
   onContinue,
   onEdit,
+  onEditingChange,
 }: {
   message: MessageDto;
   isLast: boolean;
@@ -18,6 +19,7 @@ export function MessageBubble({
   onRegenerate: () => void;
   onContinue: () => void;
   onEdit: (content: string) => Promise<void>;
+  onEditingChange?: (editing: boolean) => void;
 }): JSX.Element {
   const { t } = useTranslation();
   const [editing, setEditing] = useState(false);
@@ -28,13 +30,15 @@ export function MessageBubble({
     isLast &&
     message.role === "assistant" &&
     (message.status === "interrupted" || message.status === "aborted");
-  const canRegenerate = isLast && message.role === "assistant" && message.status === "complete";
+  const canRegenerate =
+    isLast && message.role === "assistant" && message.status !== "streaming";
   const canEdit = message.role === "user" && message.status === "complete" && !busy;
 
   return (
     <li
       className="rounded-md border bg-card p-2"
       data-testid={message.role === "assistant" ? "message-assistant" : "message-user"}
+      data-status={message.status}
     >
       <div className="mb-1 flex items-center justify-between gap-2">
         <p className="text-[11px] uppercase text-muted-foreground">
@@ -54,7 +58,10 @@ export function MessageBubble({
             if (!next) {
               return;
             }
-            void onEdit(next).then(() => setEditing(false));
+            void onEdit(next).then(() => {
+              setEditing(false);
+              onEditingChange?.(false);
+            });
           }}
         >
           <textarea
@@ -75,6 +82,7 @@ export function MessageBubble({
               onClick={() => {
                 setDraft(message.content);
                 setEditing(false);
+                onEditingChange?.(false);
               }}
             >
               {t("workspace.cancelEdit")}
@@ -82,7 +90,7 @@ export function MessageBubble({
           </div>
         </form>
       ) : message.role === "assistant" ? (
-        <MessageMarkdown content={message.content.length > 0 ? message.content : "…"} />
+        <MessageMarkdown content={message.content.length > 0 ? message.content : t("workspace.placeholder")} />
       ) : (
         <p className="whitespace-pre-wrap">{message.content}</p>
       )}
@@ -110,6 +118,7 @@ export function MessageBubble({
               onClick={() => {
                 setDraft(message.content);
                 setEditing(true);
+                onEditingChange?.(true);
               }}
             >
               {t("workspace.edit")}
