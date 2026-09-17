@@ -26,6 +26,7 @@ export function toMessageDto(row: MessageRecord): MessageDto {
     conversationId: row.conversationId,
     parentId: row.parentId,
     branchId: row.branchId,
+    isActiveBranch: row.isActiveBranch,
     role: row.role,
     content: row.content,
     status: row.status,
