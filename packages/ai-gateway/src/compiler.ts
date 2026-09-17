@@ -12,10 +12,25 @@ export interface CompileInput {
   projectInstructions: string | null;
   extraSystem: string | null;
   messages: CompilerMessage[];
+  maxTokenBudget?: number;
 }
+
+type PacketRow = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+};
 
 function tokenEstimateFromChars(chars: number): number {
   return Math.ceil(chars / 4);
+}
+
+function estimateTokens(system: string, rows: PacketRow[]): number {
+  let chars = system.length;
+  for (const row of rows) {
+    chars += row.content.length;
+  }
+  return tokenEstimateFromChars(chars);
 }
 
 export function compilePacket(input: CompileInput): ProviderAgnosticPacket {
@@ -28,7 +43,7 @@ export function compilePacket(input: CompileInput): ProviderAgnosticPacket {
   }
 
   const excluded: string[] = [];
-  const packetMessages: { role: "user" | "assistant"; content: string }[] = [];
+  const kept: PacketRow[] = [];
 
   for (const message of input.messages) {
     if (message.status === "streaming") {
@@ -41,20 +56,25 @@ export function compilePacket(input: CompileInput): ProviderAgnosticPacket {
       }
       continue;
     }
-    packetMessages.push({ role: message.role, content: message.content });
+    kept.push({ id: message.id, role: message.role, content: message.content });
   }
 
   const system = systemParts.join("\n\n");
-  let chars = system.length;
-  for (const message of packetMessages) {
-    chars += message.content.length;
+  const budget = input.maxTokenBudget;
+  if (budget !== undefined) {
+    while (kept.length > 1 && estimateTokens(system, kept) > budget) {
+      const dropped = kept.shift();
+      if (dropped) {
+        excluded.push(dropped.id);
+      }
+    }
   }
 
   return packetV0Schema.parse({
     version: 1,
     system,
-    messages: packetMessages,
-    tokenEstimate: tokenEstimateFromChars(chars),
+    messages: kept.map((row) => ({ role: row.role, content: row.content })),
+    tokenEstimate: estimateTokens(system, kept),
     excluded,
   });
 }
@@ -65,10 +85,15 @@ export function compileActivePath(input: {
   projectInstructions: string | null;
   extraSystem: string | null;
   messages: CompilerGraphMessage[];
+  maxTokenBudget?: number;
 }): ProviderAgnosticPacket {
-  return compilePacket({
+  const compiled: CompileInput = {
     projectInstructions: input.projectInstructions,
     extraSystem: input.extraSystem,
     messages: activePath(input.messages),
-  });
+  };
+  if (input.maxTokenBudget !== undefined) {
+    compiled.maxTokenBudget = input.maxTokenBudget;
+  }
+  return compilePacket(compiled);
 }
