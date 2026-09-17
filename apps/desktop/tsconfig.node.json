@@ -8,6 +8,7 @@
     "paths": {
       "@ai-hub/shared": ["../../packages/shared/src/index.ts"],
       "@ai-hub/db": ["../../packages/db/src/index.ts"],
+      "@ai-hub/ai-gateway": ["../../packages/ai-gateway/src/index.ts"],
       "@ai-hub/security/keytar": ["../../packages/security/src/keytar-store.ts"],
       "@ai-hub/security": ["../../packages/security/src/index.ts"]
     }
@@ -17,7 +18,9 @@
     "src/main/**/*.ts",
     "src/preload/**/*.ts",
     "../../packages/shared/src/**/*.ts",
+    "../../packages/shared/src/**/*.json",
     "../../packages/db/src/**/*.ts",
+    "../../packages/ai-gateway/src/**/*.ts",
     "../../packages/security/src/**/*.ts"
   ],
   "exclude": ["../../packages/**/*.test.ts"]
