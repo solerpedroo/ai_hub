@@ -1,0 +1,589 @@
+﻿diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index f819122..8dcc9ed 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -26,12 +26,26 @@
+   "workspace.conversationPlaceholder": "T├¡tulo da conversa",
+   "workspace.newConversation": "Nova conversa",
+   "workspace.noConversations": "Nenhuma conversa neste projeto.",
+-  "workspace.noMessages": "Nenhuma mensagem. Grave uma nota para testar a persist├¬ncia.",
+-  "workspace.notePlaceholder": "Nota (ainda sem envio a um modelo)",
++  "workspace.noMessages": "Nenhuma mensagem. Grave uma nota de usu├írio e envie pelo debug da OpenAI.",
++  "workspace.notePlaceholder": "Mensagem do usu├írio (salva localmente; envio sob demanda)",
+   "workspace.addNote": "Salvar nota",
+   "workspace.pickConversation": "Escolha ou crie uma conversa.",
+   "workspace.branched": "ramo",
+   "workspace.error.generic": "N├úo foi poss├¡vel concluir a a├º├úo. Tente de novo.",
++  "workspace.error.chat": "A chamada ao modelo falhou ({{code}}).",
++  "workspace.debug.title": "Debug do gateway",
++  "workspace.debug.send": "Enviar ├á OpenAI",
++  "workspace.debug.abort": "Parar",
++  "workspace.debug.model": "Modelo",
++  "workspace.debug.key": "Chave",
++  "workspace.debug.packet": "Packet v0",
++  "workspace.debug.noKey": "Guarde uma chave OpenAI em Configura├º├Áes primeiro.",
++  "workspace.status.streaming": "em stream",
++  "workspace.status.interrupted": "interrompida",
++  "workspace.status.aborted": "abortada",
++  "workspace.status.complete": "completa",
++  "workspace.receipt": "Recibo: {{model}} ┬À entrada {{tokensIn}} / sa├¡da {{tokensOut}} ┬À {{cost}} ┬À {{latency}}ms",
++  "workspace.receipt.error": "erro {{code}}",
+   "secrets.title": "Chaves de provedor",
+   "secrets.hint": "A chave completa atravessa o IPC s├│ neste save e some da tela. Depois voc├¬ v├¬ s├│ a m├íscara.",
+   "secrets.provider": "Provedor",
+diff --git a/packages/ai-gateway/src/sse.test.ts b/packages/ai-gateway/src/sse.test.ts
+new file mode 100644
+index 0000000..3f65adc
+--- /dev/null
++++ b/packages/ai-gateway/src/sse.test.ts
+@@ -0,0 +1,39 @@
++import { describe, expect, it } from "vitest";
++import { iterateSseData } from "./sse";
++
++function hangingAfter(first: string): ReadableStream<Uint8Array> {
++  const encoder = new TextEncoder();
++  return new ReadableStream({
++    start(controller) {
++      controller.enqueue(encoder.encode(first));
++    },
++  });
++}
++
++describe("iterateSseData", () => {
++  it("maps user abort while waiting for the next chunk to aborted", async () => {
++    const user = new AbortController();
++    const timeout = new AbortController();
++    const iter = iterateSseData(
++      hangingAfter(`data: {"ok":true}\n\n`),
++      user.signal,
++      timeout.signal,
++    );
++    await expect(iter.next()).resolves.toMatchObject({ value: '{"ok":true}' });
++    user.abort();
++    await expect(iter.next()).rejects.toMatchObject({ code: "aborted" });
++  });
++
++  it("maps timeout while waiting for the next chunk", async () => {
++    const user = new AbortController();
++    const timeout = new AbortController();
++    const iter = iterateSseData(
++      hangingAfter(`data: {"ok":true}\n\n`),
++      user.signal,
++      timeout.signal,
++    );
++    await expect(iter.next()).resolves.toMatchObject({ value: '{"ok":true}' });
++    timeout.abort();
++    await expect(iter.next()).rejects.toMatchObject({ code: "timeout" });
++  });
++});
+diff --git a/packages/db/src/migrations.ts b/packages/db/src/migrations.ts
+index 549663f..973213e 100644
+--- a/packages/db/src/migrations.ts
++++ b/packages/db/src/migrations.ts
+@@ -125,6 +125,12 @@ INSERT INTO providers (id, slug, name) VALUES
+   ('55555555-5555-4555-8555-555555555555', 'openrouter', 'OpenRouter');
+ `;
+ 
++export const MIGRATION_0002_SQL = `
++ALTER TABLE message_receipts ADD COLUMN error_code TEXT;
++CREATE UNIQUE INDEX IF NOT EXISTS message_receipts_message_idx ON message_receipts(message_id);
++`;
++
+ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 1, sql: MIGRATION_0001_SQL },
++  { version: 2, sql: MIGRATION_0002_SQL },
+ ];
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index a0fdea7..66bd8c4 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -115,10 +115,93 @@ describe("hub database", () => {
+       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
+       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
+       applyMigrations(second.sqlite);
+-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(1);
++      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(2);
+       second.close();
+     } finally {
+       rmSync(dir, { recursive: true, force: true });
+     }
+   });
++
++  it("flushes streaming content and marks orphans interrupted with a receipt", () => {
++    const { hub } = openTestDb();
++    const project = hub.repos.createProject("Stream");
++    const conversation = hub.repos.createConversation(project.id, "Thread");
++    const user = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "user",
++      content: "hello",
++      parentId: null,
++      branchId: null,
++    });
++    const assistant = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "assistant",
++      content: "",
++      parentId: user.id,
++      branchId: null,
++      status: "streaming",
++    });
++    hub.repos.updateMessage(assistant.id, "Hel", "streaming");
++    hub.repos.createReceipt({
++      messageId: assistant.id,
++      provider: "openai",
++      model: "gpt-4o-mini",
++      tokensIn: null,
++      tokensOut: null,
++      latencyMs: null,
++      costUsd: null,
++      errorCode: null,
++    });
++    expect(hub.repos.interruptOrphanStreams()).toBe(1);
++    const stored = hub.repos.getMessage(assistant.id);
++    expect(stored?.content).toBe("Hel");
++    expect(stored?.status).toBe("interrupted");
++    expect(stored?.receipt?.errorCode).toBe("unknown");
++    expect(stored?.receipt?.provider).toBe("openai");
++    expect(stored?.receipt?.model).toBe("gpt-4o-mini");
++    hub.close();
++  });
++
++  it("stores a receipt without the API secret", async () => {
++    const { hub } = openTestDb();
++    const secret = "sk-testfixtureNEVERSQLITE9999";
++    await hub.repos.saveProviderKey({ providerSlug: "openai", label: "work", secret });
++    const project = hub.repos.createProject("Receipts");
++    const conversation = hub.repos.createConversation(project.id, "Thread");
++    const message = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "assistant",
++      content: "hi",
++      parentId: null,
++      branchId: null,
++    });
++    hub.repos.createReceipt({
++      messageId: message.id,
++      provider: "openai",
++      model: "gpt-4o-mini",
++      tokensIn: 8,
++      tokensOut: 2,
++      latencyMs: 40,
++      costUsd: "0.000001",
++      errorCode: null,
++    });
++    const dump = dumpAllText(hub.sqlite);
++    expect(dump).not.toContain(secret);
++    expect(hub.repos.getReceipt(message.id)?.model).toBe("gpt-4o-mini");
++    hub.close();
++  });
++
++  it("reads a provider secret from the store, not sqlite", async () => {
++    const { hub } = openTestDb();
++    const secret = "sk-testfixtureNEVERSQLITE9999";
++    const saved = await hub.repos.saveProviderKey({
++      providerSlug: "openai",
++      label: "work",
++      secret,
++    });
++    const loaded = await hub.repos.getProviderSecret(saved.id);
++    expect(loaded?.secret).toBe(secret);
++    expect(dumpAllText(hub.sqlite)).not.toContain(secret);
++    hub.close();
++  });
+ });
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index a4bcf62..726069e 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -11,6 +11,7 @@ import {
+ } from "@ai-hub/security";
+ import {
+   conversations,
++  messageReceipts,
+   messages,
+   projects,
+   providerKeys,
+@@ -24,6 +25,7 @@ export type HubDrizzle = BetterSQLite3Database<typeof schema>;
+ export interface ProjectRecord {
+   id: string;
+   name: string;
++  instructions: string | null;
+   createdAt: string;
+   updatedAt: string;
+ }
+@@ -39,6 +41,19 @@ export interface ConversationRecord {
+ export type MessageRole = "user" | "assistant" | "system";
+ export type MessageStatus = "complete" | "streaming" | "interrupted" | "aborted";
+ 
++export interface ReceiptRecord {
++  id: string;
++  messageId: string;
++  provider: string | null;
++  model: string | null;
++  tokensIn: number | null;
++  tokensOut: number | null;
++  latencyMs: number | null;
++  costUsd: string | null;
++  errorCode: string | null;
++  createdAt: string;
++}
++
+ export interface MessageRecord {
+   id: string;
+   conversationId: string;
+@@ -48,6 +63,7 @@ export interface MessageRecord {
+   content: string;
+   status: MessageStatus;
+   createdAt: string;
++  receipt: ReceiptRecord | null;
+ }
+ 
+ export interface ProviderRecord {
+@@ -66,6 +82,12 @@ export interface ProviderKeyRecord {
+   createdAt: string;
+ }
+ 
++export interface ProviderSecretRecord {
++  id: string;
++  providerSlug: string;
++  secret: string;
++}
++
+ export interface AppearanceRecord {
+   theme: "light" | "dark" | "system";
+   locale: "pt-BR" | "en";
+@@ -103,20 +125,92 @@ export class HubRepos {
+     private readonly secrets: SecretStore,
+   ) {}
+ 
++  private toReceipt(row: typeof messageReceipts.$inferSelect): ReceiptRecord {
++    return {
++      id: row.id,
++      messageId: row.messageId,
++      provider: row.provider,
++      model: row.model,
++      tokensIn: row.tokensIn,
++      tokensOut: row.tokensOut,
++      latencyMs: row.latencyMs,
++      costUsd: row.costUsd,
++      errorCode: row.errorCode,
++      createdAt: iso(row.createdAt),
++    };
++  }
++
++  private toProject(row: typeof projects.$inferSelect): ProjectRecord {
++    return {
++      id: row.id,
++      name: decryptUtf8(row.nameCipher, this.masterKey),
++      instructions: row.instructionsCipher
++        ? decryptUtf8(row.instructionsCipher, this.masterKey)
++        : null,
++      createdAt: iso(row.createdAt),
++      updatedAt: iso(row.updatedAt),
++    };
++  }
++
++  private toConversation(row: typeof conversations.$inferSelect): ConversationRecord {
++    return {
++      id: row.id,
++      projectId: row.projectId,
++      title: decryptUtf8(row.titleCipher, this.masterKey),
++      createdAt: iso(row.createdAt),
++      updatedAt: iso(row.updatedAt),
++    };
++  }
++
++  private toMessage(
++    row: typeof messages.$inferSelect,
++    receipt: ReceiptRecord | null,
++  ): MessageRecord {
++    return {
++      id: row.id,
++      conversationId: row.conversationId,
++      parentId: row.parentId,
++      branchId: row.branchId,
++      role: asRole(row.role),
++      content: decryptUtf8(row.contentCipher, this.masterKey),
++      status: asStatus(row.status),
++      createdAt: iso(row.createdAt),
++      receipt,
++    };
++  }
++
++  getReceipt(messageId: string): ReceiptRecord | null {
++    const row = this.db
++      .select()
++      .from(messageReceipts)
++      .where(eq(messageReceipts.messageId, messageId))
++      .all()
++      .sort((a, b) => b.createdAt - a.createdAt)[0];
++    return row ? this.toReceipt(row) : null;
++  }
++
++  getMessage(id: string): MessageRecord | null {
++    const row = this.db.select().from(messages).where(eq(messages.id, id)).get();
++    if (!row) {
++      return null;
++    }
++    return this.toMessage(row, this.getReceipt(id));
++  }
++
+   listProjects(): ProjectRecord[] {
+     return this.db
+       .select()
+       .from(projects)
+       .all()
+-      .map((row) => ({
+-        id: row.id,
+-        name: decryptUtf8(row.nameCipher, this.masterKey),
+-        createdAt: iso(row.createdAt),
+-        updatedAt: iso(row.updatedAt),
+-      }))
++      .map((row) => this.toProject(row))
+       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+   }
+ 
++  getProject(id: string): ProjectRecord | null {
++    const row = this.db.select().from(projects).where(eq(projects.id, id)).get();
++    return row ? this.toProject(row) : null;
++  }
++
+   createProject(name: string): ProjectRecord {
+     const now = Date.now();
+     const id = randomUUID();
+@@ -129,7 +223,7 @@ export class HubRepos {
+         updatedAt: now,
+       })
+       .run();
+-    return { id, name, createdAt: iso(now), updatedAt: iso(now) };
++    return { id, name, instructions: null, createdAt: iso(now), updatedAt: iso(now) };
+   }
+ 
+   removeProject(id: string): void {
+@@ -142,16 +236,15 @@ export class HubRepos {
+         ? this.db.select().from(conversations).all().filter((row) => row.projectId === null)
+         : this.db.select().from(conversations).where(eq(conversations.projectId, projectId)).all();
+     return rows
+-      .map((row) => ({
+-        id: row.id,
+-        projectId: row.projectId,
+-        title: decryptUtf8(row.titleCipher, this.masterKey),
+-        createdAt: iso(row.createdAt),
+-        updatedAt: iso(row.updatedAt),
+-      }))
++      .map((row) => this.toConversation(row))
+       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+   }
+ 
++  getConversation(id: string): ConversationRecord | null {
++    const row = this.db.select().from(conversations).where(eq(conversations.id, id)).get();
++    return row ? this.toConversation(row) : null;
++  }
++
+   createConversation(projectId: string | null, title: string): ConversationRecord {
+     const now = Date.now();
+     const id = randomUUID();
+@@ -178,16 +271,7 @@ export class HubRepos {
+       .from(messages)
+       .where(eq(messages.conversationId, conversationId))
+       .all()
+-      .map((row) => ({
+-        id: row.id,
+-        conversationId: row.conversationId,
+-        parentId: row.parentId,
+-        branchId: row.branchId,
+-        role: asRole(row.role),
+-        content: decryptUtf8(row.contentCipher, this.masterKey),
+-        status: asStatus(row.status),
+-        createdAt: iso(row.createdAt),
+-      }))
++      .map((row) => this.toMessage(row, this.getReceipt(row.id)))
+       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+   }
+ 
+@@ -197,6 +281,7 @@ export class HubRepos {
+     content: string;
+     parentId: string | null;
+     branchId: string | null;
++    status?: MessageStatus;
+   }): MessageRecord {
+     const conversation = this.db
+       .select()
+@@ -219,6 +304,7 @@ export class HubRepos {
+ 
+     const now = Date.now();
+     const id = randomUUID();
++    const status = input.status ?? "complete";
+     this.db
+       .insert(messages)
+       .values({
+@@ -229,7 +315,7 @@ export class HubRepos {
+         isActiveBranch: 1,
+         role: input.role,
+         contentCipher: encryptUtf8(input.content, this.masterKey),
+-        status: "complete",
++        status,
+         createdAt: now,
+       })
+       .run();
+@@ -246,11 +332,138 @@ export class HubRepos {
+       branchId,
+       role: input.role,
+       content: input.content,
+-      status: "complete",
++      status,
+       createdAt: iso(now),
++      receipt: null,
+     };
+   }
+ 
++  updateMessage(id: string, content: string, status: MessageStatus): MessageRecord {
++    const row = this.db.select().from(messages).where(eq(messages.id, id)).get();
++    if (!row) {
++      throw new Error("Message not found");
++    }
++    this.db
++      .update(messages)
++      .set({
++        contentCipher: encryptUtf8(content, this.masterKey),
++        status,
++      })
++      .where(eq(messages.id, id))
++      .run();
++    const updated = this.db.select().from(messages).where(eq(messages.id, id)).get();
++    if (!updated) {
++      throw new Error("Message not found");
++    }
++    return this.toMessage(updated, this.getReceipt(id));
++  }
++
++  createReceipt(input: {
++    messageId: string;
++    provider: string | null;
++    model: string | null;
++    tokensIn: number | null;
++    tokensOut: number | null;
++    latencyMs: number | null;
++    costUsd: string | null;
++    errorCode: string | null;
++  }): ReceiptRecord {
++    const message = this.db.select().from(messages).where(eq(messages.id, input.messageId)).get();
++    if (!message) {
++      throw new Error("Message not found");
++    }
++    const existing = this.getReceipt(input.messageId);
++    if (existing) {
++      this.db
++        .update(messageReceipts)
++        .set({
++          provider: input.provider,
++          model: input.model,
++          tokensIn: input.tokensIn,
++          tokensOut: input.tokensOut,
++          latencyMs: input.latencyMs,
++          costUsd: input.costUsd,
++          errorCode: input.errorCode,
++        })
++        .where(eq(messageReceipts.id, existing.id))
++        .run();
++      return {
++        ...existing,
++        provider: input.provider,
++        model: input.model,
++        tokensIn: input.tokensIn,
++        tokensOut: input.tokensOut,
++        latencyMs: input.latencyMs,
++        costUsd: input.costUsd,
++        errorCode: input.errorCode,
++      };
++    }
++    const now = Date.now();
++    const id = randomUUID();
++    this.db
++      .insert(messageReceipts)
++      .values({
++        id,
++        messageId: input.messageId,
++        provider: input.provider,
++        model: input.model,
++        tokensIn: input.tokensIn,
++        tokensOut: input.tokensOut,
++        latencyMs: input.latencyMs,
++        costUsd: input.costUsd,
++        errorCode: input.errorCode,
++        createdAt: now,
++      })
++      .run();
++    return {
++      id,
++      messageId: input.messageId,
++      provider: input.provider,
++      model: input.model,
++      tokensIn: input.tokensIn,
++      tokensOut: input.tokensOut,
++      latencyMs: input.latencyMs,
++      costUsd: input.costUsd,
++      errorCode: input.errorCode,
++      createdAt: iso(now),
++    };
++  }
++
++  interruptOrphanStreams(): number {
++    const rows = this.db.select().from(messages).where(eq(messages.status, "streaming")).all();
++    const now = Date.now();
++    for (const row of rows) {
++      this.db.update(messages).set({ status: "interrupted" }).where(eq(messages.id, row.id)).run();
++      const existing = this.getReceipt(row.id);
++      if (existing) {
++        if (!existing.errorCode) {
++          this.db
++            .update(messageReceipts)
++            .set({ errorCode: "unknown" })
++            .where(eq(messageReceipts.id, existing.id))
++            .run();
++        }
++      } else {
++        this.db
++          .insert(messageReceipts)
++          .values({
++            id: randomUUID(),
++            messageId: row.id,
++            provider: null,
++            model: null,
++            tokensIn: null,
++            tokensOut: null,
++            latencyMs: null,
++            costUsd: null,
++            errorCode: "unknown",
++            createdAt: now,
++          })
++          .run();
++      }
++    }
++    return rows.length;
++  }
++
+   listProviders(): ProviderRecord[] {
+     return this.db.select().from(providers).all();
+   }
+@@ -308,6 +521,19 @@ export class HubRepos {
+     });
+   }
+ 
++  async getProviderSecret(id: string): Promise<ProviderSecretRecord | null> {
++    const row = this.db.select().from(providerKeys).where(eq(providerKeys.id, id)).get();
++    if (!row) {
++      return null;
++    }
++    const provider = this.db.select().from(providers).where(eq(providers.id, row.providerId)).get();
++    const secret = await this.secrets.getPassword(row.keytarAccount);
++    if (!secret || !provider) {
++      return null;
++    }
++    return { id: row.id, providerSlug: provider.slug, secret };
++  }
++
+   async saveProviderKey(input: {
+     providerSlug: string;
+     label: string;
