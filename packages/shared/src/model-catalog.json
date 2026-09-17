@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "id": "gpt-4o-mini",
+      "provider": "openai",
+      "label": "GPT-4o mini",
+      "contextWindow": 128000,
+      "inputUsdPerMillion": 0.15,
+      "outputUsdPerMillion": 0.6
+    },
+    {
+      "id": "gpt-4o",
+      "provider": "openai",
+      "label": "GPT-4o",
+      "contextWindow": 128000,
+      "inputUsdPerMillion": 2.5,
+      "outputUsdPerMillion": 10
+    }
+  ]
+}
