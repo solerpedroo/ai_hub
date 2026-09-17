@@ -30,6 +30,8 @@ import {
   providerKeyListResultSchema,
   providerListResultSchema,
   secretsSaveInputSchema,
+  secretsTestInputSchema,
+  secretsTestResultSchema,
   windowIsMaximizedResultSchema,
   workspaceSessionSchema,
 } from "@ai-hub/shared";
@@ -38,6 +40,7 @@ import { abortChat, sendChat } from "./chat-session";
 import { exportConversation } from "./conversation-export";
 import { toMessageDto } from "./message-dto";
 import { getHubDatabase } from "./persistence";
+import { testProviderKey } from "./provider-health";
 
 function registerHandler<TIn, TOut>(
   channel: string,
@@ -185,7 +188,14 @@ export function registerWorkspaceIpc(): void {
     workspaceSessionSchema,
     ipcAckResultSchema,
     (input) => {
-      getHubDatabase().repos.setWorkspaceSession(input);
+      getHubDatabase().repos.setWorkspaceSession({
+        projectId: input.projectId,
+        conversationId: input.conversationId,
+        model: input.model,
+        temperature: input.temperature ?? 1,
+        maxTokens: input.maxTokens ?? null,
+        extraSystem: input.extraSystem ?? "",
+      });
     },
   );
 
@@ -203,6 +213,10 @@ export function registerWorkspaceIpc(): void {
 
   registerHandler(IpcChannel.secretsRemove, idInputSchema, ipcAckResultSchema, (input) =>
     getHubDatabase().repos.removeProviderKey(input.id),
+  );
+
+  registerHandler(IpcChannel.secretsTest, secretsTestInputSchema, secretsTestResultSchema, (input) =>
+    testProviderKey(input.id),
   );
 
   registerHandler(IpcChannel.chatSend, chatSendInputSchema, chatSendResultSchema, (input, event) =>
