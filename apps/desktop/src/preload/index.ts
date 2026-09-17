@@ -17,6 +17,7 @@ import {
   conversationDtoSchema,
   conversationExportInputSchema,
   conversationExportResultSchema,
+  conversationTagsSetInputSchema,
   emptyIpcPayloadSchema,
   idInputSchema,
   ipcAckResultSchema,
@@ -25,12 +26,17 @@ import {
   messageListInputSchema,
   messageListResultSchema,
   messageUpdateInputSchema,
+  packetPreviewInputSchema,
+  packetPreviewResultSchema,
   projectCreateInputSchema,
   projectDtoSchema,
   projectListResultSchema,
+  projectUpdateInputSchema,
   providerKeyDtoSchema,
   providerKeyListResultSchema,
   providerListResultSchema,
+  searchInputSchema,
+  searchResultSchema,
   secretsSaveInputSchema,
   secretsTestInputSchema,
   secretsTestResultSchema,
@@ -105,6 +111,8 @@ const hub: HubApi = {
     list: () => invokeParsed(IpcChannel.projectsList, empty, emptyIpcPayloadSchema, projectListResultSchema),
     create: (input) =>
       invokeParsed(IpcChannel.projectsCreate, input, projectCreateInputSchema, projectDtoSchema),
+    update: (input) =>
+      invokeParsed(IpcChannel.projectsUpdate, input, projectUpdateInputSchema, projectDtoSchema),
     remove: (input) => invokeAckWith(IpcChannel.projectsRemove, input, idInputSchema),
   },
   conversations: {
@@ -134,6 +142,13 @@ const hub: HubApi = {
       ),
     setBranchLabel: (input) =>
       invokeAckWith(IpcChannel.conversationsSetBranchLabel, input, branchLabelSetInputSchema),
+    setTags: (input) =>
+      invokeParsed(
+        IpcChannel.conversationsSetTags,
+        input,
+        conversationTagsSetInputSchema,
+        conversationDtoSchema,
+      ),
   },
   messages: {
     list: (input) =>
@@ -173,9 +188,19 @@ const hub: HubApi = {
     test: (input) =>
       invokeParsed(IpcChannel.secretsTest, input, secretsTestInputSchema, secretsTestResultSchema),
   },
+  search: {
+    query: (input) => invokeParsed(IpcChannel.searchQuery, input, searchInputSchema, searchResultSchema),
+  },
   chat: {
     send: (input) => invokeParsed(IpcChannel.chatSend, input, chatSendInputSchema, chatSendResultSchema),
     abort: (input) => invokeAckWith(IpcChannel.chatAbort, input, chatAbortInputSchema),
+    previewPacket: (input) =>
+      invokeParsed(
+        IpcChannel.chatPreviewPacket,
+        input,
+        packetPreviewInputSchema,
+        packetPreviewResultSchema,
+      ),
     onEvent: (listener) => {
       const wrapped = (_event: unknown, payload: unknown): void => {
         try {
