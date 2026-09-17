@@ -52,9 +52,20 @@ describe("chat contracts", () => {
         conversationId: "11111111-1111-4111-8111-111111111111",
         providerKeyId: "22222222-2222-4222-8222-222222222222",
         model: "gpt-4o-mini",
+        content: "hello",
         secret: "sk-testfixtureABCDEFGH",
       }),
     ).toThrow();
+  });
+
+  it("accepts a continue send with null content", () => {
+    const parsed = chatSendInputSchema.parse({
+      conversationId: "11111111-1111-4111-8111-111111111111",
+      providerKeyId: "22222222-2222-4222-8222-222222222222",
+      model: "gpt-4o-mini",
+      content: null,
+    });
+    expect(parsed.content).toBeNull();
   });
 
   it("parses a chunk event", () => {
