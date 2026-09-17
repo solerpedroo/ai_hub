@@ -29,7 +29,7 @@ describe("consumeCrashSafeStream", () => {
     });
     expect(deltas).toEqual([chunk]);
     expect(flushes[0]).toBe(chunk);
-    expect(result).toEqual({ content: chunk, tokensIn: 9, tokensOut: 3 });
+    expect(result).toEqual({ content: chunk, tokensIn: 9, tokensOut: 3, costUsd: null });
   });
 
   it("flushes the partial before rethrowing an abort", async () => {
