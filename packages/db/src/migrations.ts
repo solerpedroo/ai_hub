@@ -125,6 +125,12 @@ INSERT INTO providers (id, slug, name) VALUES
   ('55555555-5555-4555-8555-555555555555', 'openrouter', 'OpenRouter');
 `;
 
+export const MIGRATION_0002_SQL = `
+ALTER TABLE message_receipts ADD COLUMN error_code TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS message_receipts_message_idx ON message_receipts(message_id);
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
+  { version: 2, sql: MIGRATION_0002_SQL },
 ];
