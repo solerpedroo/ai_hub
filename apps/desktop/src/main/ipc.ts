@@ -15,6 +15,7 @@ import {
   conversationExportResultSchema,
   conversationListInputSchema,
   conversationListResultSchema,
+  conversationTagsSetInputSchema,
   emptyIpcPayloadSchema,
   idInputSchema,
   ipcAckResultSchema,
@@ -23,12 +24,17 @@ import {
   messageListInputSchema,
   messageListResultSchema,
   messageUpdateInputSchema,
+  packetPreviewInputSchema,
+  packetPreviewResultSchema,
   projectCreateInputSchema,
   projectDtoSchema,
   projectListResultSchema,
+  projectUpdateInputSchema,
   providerKeyDtoSchema,
   providerKeyListResultSchema,
   providerListResultSchema,
+  searchInputSchema,
+  searchResultSchema,
   secretsSaveInputSchema,
   secretsTestInputSchema,
   secretsTestResultSchema,
@@ -39,6 +45,7 @@ import { safeErrorMessage } from "@ai-hub/security";
 import { abortChat, sendChat } from "./chat-session";
 import { exportConversation } from "./conversation-export";
 import { toMessageDto } from "./message-dto";
+import { previewPacket } from "./packet-preview";
 import { getHubDatabase } from "./persistence";
 import { testProviderKey } from "./provider-health";
 
@@ -68,7 +75,25 @@ export function registerWorkspaceIpc(): void {
   );
 
   registerHandler(IpcChannel.projectsCreate, projectCreateInputSchema, projectDtoSchema, (input) =>
-    projectDtoSchema.parse(getHubDatabase().repos.createProject(input.name)),
+    projectDtoSchema.parse(
+      getHubDatabase().repos.createProject(input.name, {
+        ...(input.color !== undefined ? { color: input.color } : {}),
+        ...(input.instructions !== undefined ? { instructions: input.instructions } : {}),
+        ...(input.preferredModel !== undefined ? { preferredModel: input.preferredModel } : {}),
+        ...(input.preferredProvider !== undefined ? { preferredProvider: input.preferredProvider } : {}),
+      }),
+    ),
+  );
+
+  registerHandler(IpcChannel.projectsUpdate, projectUpdateInputSchema, projectDtoSchema, (input) =>
+    projectDtoSchema.parse(
+      getHubDatabase().repos.updateProject(input.id, input.name, {
+        ...(input.color !== undefined ? { color: input.color } : {}),
+        ...(input.instructions !== undefined ? { instructions: input.instructions } : {}),
+        ...(input.preferredModel !== undefined ? { preferredModel: input.preferredModel } : {}),
+        ...(input.preferredProvider !== undefined ? { preferredProvider: input.preferredProvider } : {}),
+      }),
+    ),
   );
 
   registerHandler(IpcChannel.projectsRemove, idInputSchema, ipcAckResultSchema, (input) => {
@@ -122,6 +147,20 @@ export function registerWorkspaceIpc(): void {
     (input) => {
       getHubDatabase().repos.setBranchLabel(input.conversationId, input.branchId, input.label);
     },
+  );
+
+  registerHandler(
+    IpcChannel.conversationsSetTags,
+    conversationTagsSetInputSchema,
+    conversationDtoSchema,
+    (input) =>
+      conversationDtoSchema.parse(
+        getHubDatabase().repos.setConversationTags(input.conversationId, input.names),
+      ),
+  );
+
+  registerHandler(IpcChannel.searchQuery, searchInputSchema, searchResultSchema, (input) =>
+    getHubDatabase().repos.searchWorkspace(input.query),
   );
 
   registerHandler(IpcChannel.messagesList, messageListInputSchema, messageListResultSchema, (input) =>
@@ -226,6 +265,13 @@ export function registerWorkspaceIpc(): void {
   registerHandler(IpcChannel.chatAbort, chatAbortInputSchema, ipcAckResultSchema, (input) => {
     abortChat(input.runId);
   });
+
+  registerHandler(
+    IpcChannel.chatPreviewPacket,
+    packetPreviewInputSchema,
+    packetPreviewResultSchema,
+    (input) => previewPacket(input),
+  );
 }
 
 export function registerWindowIpc(
