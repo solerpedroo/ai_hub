@@ -9,6 +9,25 @@ import type {
 import { GatewayError } from "./errors";
 
 export const MOCK_ASSISTANT_TEXT = "Hello from mock";
+export const MOCK_STREAM_PAUSE_MS = 400;
+
+function waitForAbortOrTimeout(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new GatewayError("aborted", "aborted"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(new GatewayError("aborted", "aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 export function createMockOpenAIAdapter(): ProviderAdapter {
   return {
@@ -25,7 +44,9 @@ export function createMockOpenAIAdapter(): ProviderAdapter {
       if (request.signal.aborted) {
         throw new GatewayError("aborted", "aborted");
       }
-      yield { type: "delta", text: MOCK_ASSISTANT_TEXT };
+      yield { type: "delta", text: "Hello" };
+      await waitForAbortOrTimeout(MOCK_STREAM_PAUSE_MS, request.signal);
+      yield { type: "delta", text: " from mock" };
       if (request.signal.aborted) {
         throw new GatewayError("aborted", "aborted");
       }
