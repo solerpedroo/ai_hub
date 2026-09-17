@@ -13,5 +13,6 @@ export {
   type ProviderRecord,
   type ProviderSecretRecord,
   type ReceiptRecord,
+  type WorkspaceSessionRecord,
 } from "./repos";
 export { schema } from "./schema";
