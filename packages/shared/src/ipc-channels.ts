@@ -24,6 +24,7 @@ export const IpcChannel = {
   secretsList: "secrets:list",
   secretsSave: "secrets:save",
   secretsRemove: "secrets:remove",
+  secretsTest: "secrets:test",
   chatSend: "chat:send",
   chatAbort: "chat:abort",
   chatEvent: "chat:event",
