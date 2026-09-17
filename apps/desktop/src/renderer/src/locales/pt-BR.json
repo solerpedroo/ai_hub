@@ -37,6 +37,7 @@
   "workspace.composer.send": "Enviar",
   "workspace.composer.stop": "Parar",
   "workspace.composer.hint": "Enter envia · Shift+Enter quebra linha · Esc interrompe",
+  "workspace.placeholder": "…",
   "workspace.copy": "Copiar",
   "workspace.copyCode": "Copiar",
   "workspace.copied": "Copiado",
