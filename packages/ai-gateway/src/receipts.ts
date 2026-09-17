@@ -13,6 +13,7 @@ export interface ComposeReceiptInput {
   estimatedOut: number;
   latencyMs: number;
   errorCode: GatewayErrorCode | null;
+  reportedCostUsd?: string | null;
 }
 
 export interface ComposedReceipt {
@@ -35,7 +36,12 @@ export function composeReceipt(input: ComposeReceiptInput): ComposedReceipt {
     tokensIn,
     tokensOut,
     latencyMs: input.latencyMs,
-    costUsd: catalog ? estimateCostUsd(catalog, tokensIn, tokensOut) : null,
+    costUsd:
+      input.reportedCostUsd !== undefined && input.reportedCostUsd !== null
+        ? input.reportedCostUsd
+        : catalog
+          ? estimateCostUsd(catalog, tokensIn, tokensOut)
+          : null,
     errorCode: input.errorCode,
   };
 }
