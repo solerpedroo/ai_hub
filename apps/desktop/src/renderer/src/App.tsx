@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useState, type JSX } from "react";
 import { useTranslation } from "react-i18next";
-import type { ConversationDto, MessageDto, ProjectDto } from "@ai-hub/shared";
+import type {
+  ConversationDto,
+  MessageDto,
+  ProjectDto,
+  ProviderAgnosticPacket,
+  ProviderKeyDto,
+} from "@ai-hub/shared";
 import { TitleBar } from "@/components/layout/title-bar";
 import { Sidebar } from "@/components/layout/sidebar";
 import { StatusBar } from "@/components/layout/status-bar";
@@ -17,6 +23,11 @@ export function App(): JSX.Element {
   const [conversations, setConversations] = useState<ConversationDto[]>([]);
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<MessageDto[]>([]);
+  const [providerKeys, setProviderKeys] = useState<ProviderKeyDto[]>([]);
+  const [selectedKeyId, setSelectedKeyId] = useState<string | null>(null);
+  const [selectedModel, setSelectedModel] = useState("gpt-4o-mini");
+  const [packet, setPacket] = useState<ProviderAgnosticPacket | null>(null);
+  const [runId, setRunId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const fail = useCallback((): void => {
@@ -39,6 +50,13 @@ export function App(): JSX.Element {
     setMessages(list);
   }, []);
 
+  const loadKeys = useCallback(async (): Promise<void> => {
+    const list = await window.hub.secrets.list();
+    setProviderKeys(list);
+    const openai = list.find((item) => item.providerSlug === "openai");
+    setSelectedKeyId((current) => current ?? openai?.id ?? null);
+  }, []);
+
   useEffect(() => {
     void loadProjects()
       .then((list) => {
@@ -51,6 +69,13 @@ export function App(): JSX.Element {
   }, [fail, loadProjects]);
 
   useEffect(() => {
+    if (view !== "home") {
+      return;
+    }
+    void loadKeys().catch(fail);
+  }, [fail, loadKeys, view]);
+
+  useEffect(() => {
     if (!selectedProjectId) {
       setConversations([]);
       setSelectedConversationId(null);
@@ -61,9 +86,43 @@ export function App(): JSX.Element {
       .then(() => {
         setSelectedConversationId(null);
         setMessages([]);
+        setPacket(null);
+        setRunId(null);
       })
       .catch(fail);
   }, [fail, loadConversations, selectedProjectId]);
+
+  useEffect(() => {
+    const off = window.hub.chat.onEvent((event) => {
+      if (event.type === "chunk") {
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === event.messageId
+              ? { ...message, content: message.content + event.text, status: "streaming" }
+              : message,
+          ),
+        );
+        return;
+      }
+      if (event.type === "done") {
+        setMessages((current) =>
+          current.map((message) => (message.id === event.message.id ? event.message : message)),
+        );
+        setPacket(event.packet);
+        setRunId(null);
+        return;
+      }
+      setRunId(null);
+      setError(t("workspace.error.chat", { code: event.code }));
+      setSelectedConversationId((conversationId) => {
+        if (conversationId) {
+          void loadMessages(conversationId).catch(fail);
+        }
+        return conversationId;
+      });
+    });
+    return off;
+  }, [fail, loadMessages, t]);
 
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
 
@@ -98,8 +157,15 @@ export function App(): JSX.Element {
               selectedConversationId={selectedConversationId}
               messages={messages}
               error={error}
+              providerKeys={providerKeys}
+              selectedKeyId={selectedKeyId}
+              selectedModel={selectedModel}
+              packet={packet}
+              streaming={runId !== null}
               onSelectConversation={(id) => {
                 setSelectedConversationId(id);
+                setPacket(null);
+                setRunId(null);
                 void loadMessages(id).catch(fail);
               }}
               onCreateConversation={async (title) => {
@@ -115,6 +181,8 @@ export function App(): JSX.Element {
                   await loadConversations(selectedProjectId);
                   setSelectedConversationId(created.id);
                   setMessages([]);
+                  setPacket(null);
+                  setRunId(null);
                 } catch {
                   fail();
                 }
@@ -134,6 +202,55 @@ export function App(): JSX.Element {
                   });
                   setError(null);
                   await loadMessages(selectedConversationId);
+                } catch {
+                  fail();
+                }
+              }}
+              onSelectKey={setSelectedKeyId}
+              onSelectModel={setSelectedModel}
+              onSendToModel={async () => {
+                if (!selectedConversationId || !selectedKeyId) {
+                  return;
+                }
+                try {
+                  const result = await window.hub.chat.send({
+                    conversationId: selectedConversationId,
+                    providerKeyId: selectedKeyId,
+                    model: selectedModel,
+                  });
+                  setError(null);
+                  setPacket(result.packet);
+                  setRunId(result.runId);
+                  setMessages((current) => {
+                    if (current.some((item) => item.id === result.messageId)) {
+                      return current;
+                    }
+                    const last = current[current.length - 1];
+                    return [
+                      ...current,
+                      {
+                        id: result.messageId,
+                        conversationId: selectedConversationId,
+                        parentId: last?.id ?? null,
+                        branchId: last?.branchId ?? result.messageId,
+                        role: "assistant",
+                        content: "",
+                        status: "streaming",
+                        createdAt: new Date().toISOString(),
+                        receipt: null,
+                      },
+                    ];
+                  });
+                } catch {
+                  fail();
+                }
+              }}
+              onAbort={async () => {
+                if (!runId) {
+                  return;
+                }
+                try {
+                  await window.hub.chat.abort({ runId });
                 } catch {
                   fail();
                 }
