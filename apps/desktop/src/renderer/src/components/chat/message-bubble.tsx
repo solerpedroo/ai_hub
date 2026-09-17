@@ -1,25 +1,31 @@
 import { type JSX, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { MessageDto } from "@ai-hub/shared";
+import { siblingsOf, type MessageDto } from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
 import { CopyResponseButton, MessageMarkdown } from "@/components/chat/message-markdown";
 
 export function MessageBubble({
   message,
+  messages,
   isLast,
   busy,
+  hasKey,
   onRegenerate,
   onContinue,
   onEdit,
   onEditingChange,
+  onActivateSibling,
 }: {
   message: MessageDto;
+  messages: MessageDto[];
   isLast: boolean;
   busy: boolean;
+  hasKey: boolean;
   onRegenerate: () => void;
   onContinue: () => void;
   onEdit: (content: string) => Promise<void>;
   onEditingChange?: (editing: boolean) => void;
+  onActivateSibling: (id: string) => void;
 }): JSX.Element {
   const { t } = useTranslation();
   const [editing, setEditing] = useState(false);
@@ -28,11 +34,15 @@ export function MessageBubble({
     message.status === "complete" ? null : t(`workspace.status.${message.status}`);
   const canContinue =
     isLast &&
+    hasKey &&
     message.role === "assistant" &&
     (message.status === "interrupted" || message.status === "aborted");
   const canRegenerate =
-    isLast && message.role === "assistant" && message.status !== "streaming";
-  const canEdit = message.role === "user" && message.status === "complete" && !busy;
+    hasKey && message.role === "assistant" && message.status !== "streaming" && !busy;
+  const canEdit = hasKey && message.role === "user" && message.status === "complete" && !busy;
+  const siblings = siblingsOf(messages, message.id);
+  const siblingIndex = siblings.findIndex((item) => item.id === message.id);
+  const showSiblings = siblings.length > 1 && siblingIndex >= 0;
 
   return (
     <li
@@ -45,9 +55,51 @@ export function MessageBubble({
           {t(`workspace.role.${message.role}`)}
           {statusLabel ? ` · ${statusLabel}` : ""}
         </p>
-        {message.role === "assistant" && message.content.length > 0 ? (
-          <CopyResponseButton text={message.content} />
-        ) : null}
+        <div className="flex items-center gap-1">
+          {showSiblings ? (
+            <div className="flex items-center gap-0.5" data-testid="sibling-nav">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={busy || siblingIndex <= 0}
+                aria-label={t("workspace.sibling.prev")}
+                onClick={() => {
+                  const previous = siblings[siblingIndex - 1];
+                  if (previous) {
+                    onActivateSibling(previous.id);
+                  }
+                }}
+              >
+                ←
+              </Button>
+              <span className="px-1 text-[11px] text-muted-foreground" data-testid="sibling-count">
+                {t("workspace.sibling.count", {
+                  current: siblingIndex + 1,
+                  total: siblings.length,
+                })}
+              </span>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={busy || siblingIndex >= siblings.length - 1}
+                aria-label={t("workspace.sibling.next")}
+                onClick={() => {
+                  const next = siblings[siblingIndex + 1];
+                  if (next) {
+                    onActivateSibling(next.id);
+                  }
+                }}
+              >
+                →
+              </Button>
+            </div>
+          ) : null}
+          {message.role === "assistant" && message.content.length > 0 ? (
+            <CopyResponseButton text={message.content} />
+          ) : null}
+        </div>
       </div>
       {editing ? (
         <form
@@ -125,7 +177,14 @@ export function MessageBubble({
             </Button>
           ) : null}
           {canRegenerate ? (
-            <Button type="button" size="sm" variant="outline" onClick={onRegenerate} disabled={busy}>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              data-testid="message-regenerate"
+              onClick={onRegenerate}
+              disabled={busy}
+            >
               {t("workspace.regenerate")}
             </Button>
           ) : null}
