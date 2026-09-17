@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  catalogModelsForProvider,
   chatEventSchema,
   chatSendInputSchema,
   estimateCostUsd,
@@ -42,6 +43,15 @@ describe("model catalog", () => {
       return;
     }
     expect(estimateCostUsd(model, 1_000_000, 1_000_000)).toBe("0.750000");
+  });
+
+  it("lists OpenRouter as a first-class catalog provider and gates vision", () => {
+    const openrouter = catalogModelsForProvider("openrouter");
+    expect(openrouter.some((model) => model.id === "openai/gpt-4o-mini")).toBe(true);
+    const groq = findCatalogModel("llama-3.1-8b-instant", "groq");
+    expect(groq?.vision).toBe(false);
+    const gpt = findCatalogModel("gpt-4o", "openai");
+    expect(gpt?.vision).toBe(true);
   });
 });
 
@@ -90,6 +100,26 @@ describe("chat contracts", () => {
       content: "rewritten",
     });
     expect(parsed.mode).toBe("edit");
+  });
+
+  it("accepts temperature, max tokens, and extra system on send", () => {
+    const parsed = chatSendInputSchema.parse({
+      mode: "send",
+      conversationId: "11111111-1111-4111-8111-111111111111",
+      providerKeyId: "22222222-2222-4222-8222-222222222222",
+      model: "openai/gpt-4o-mini",
+      content: "hello",
+      temperature: 0.2,
+      maxTokens: 256,
+      extraSystem: "Be terse.",
+    });
+    expect(parsed.mode).toBe("send");
+    if (parsed.mode !== "send") {
+      return;
+    }
+    expect(parsed.temperature).toBe(0.2);
+    expect(parsed.maxTokens).toBe(256);
+    expect(parsed.extraSystem).toBe("Be terse.");
   });
 
   it("parses a chunk event", () => {
