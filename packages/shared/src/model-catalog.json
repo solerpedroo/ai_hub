@@ -7,7 +7,9 @@
       "label": "GPT-4o mini",
       "contextWindow": 128000,
       "inputUsdPerMillion": 0.15,
-      "outputUsdPerMillion": 0.6
+      "outputUsdPerMillion": 0.6,
+      "vision": true,
+      "tools": true
     },
     {
       "id": "gpt-4o",
@@ -15,7 +17,99 @@
       "label": "GPT-4o",
       "contextWindow": 128000,
       "inputUsdPerMillion": 2.5,
-      "outputUsdPerMillion": 10
+      "outputUsdPerMillion": 10,
+      "vision": true,
+      "tools": true
+    },
+    {
+      "id": "openai/gpt-4o-mini",
+      "provider": "openrouter",
+      "label": "GPT-4o mini (OpenRouter)",
+      "contextWindow": 128000,
+      "inputUsdPerMillion": 0.15,
+      "outputUsdPerMillion": 0.6,
+      "vision": true,
+      "tools": true
+    },
+    {
+      "id": "anthropic/claude-sonnet-4",
+      "provider": "openrouter",
+      "label": "Claude Sonnet 4 (OpenRouter)",
+      "contextWindow": 200000,
+      "inputUsdPerMillion": 3,
+      "outputUsdPerMillion": 15,
+      "vision": true,
+      "tools": true
+    },
+    {
+      "id": "google/gemini-2.0-flash",
+      "provider": "openrouter",
+      "label": "Gemini 2.0 Flash (OpenRouter)",
+      "contextWindow": 1000000,
+      "inputUsdPerMillion": 0.1,
+      "outputUsdPerMillion": 0.4,
+      "vision": true,
+      "tools": true
+    },
+    {
+      "id": "claude-sonnet-4-20250514",
+      "provider": "anthropic",
+      "label": "Claude Sonnet 4",
+      "contextWindow": 200000,
+      "inputUsdPerMillion": 3,
+      "outputUsdPerMillion": 15,
+      "vision": true,
+      "tools": true
+    },
+    {
+      "id": "claude-3-5-haiku-20241022",
+      "provider": "anthropic",
+      "label": "Claude 3.5 Haiku",
+      "contextWindow": 200000,
+      "inputUsdPerMillion": 0.8,
+      "outputUsdPerMillion": 4,
+      "vision": true,
+      "tools": true
+    },
+    {
+      "id": "gemini-2.0-flash",
+      "provider": "google",
+      "label": "Gemini 2.0 Flash",
+      "contextWindow": 1000000,
+      "inputUsdPerMillion": 0.1,
+      "outputUsdPerMillion": 0.4,
+      "vision": true,
+      "tools": true
+    },
+    {
+      "id": "gemini-2.5-flash",
+      "provider": "google",
+      "label": "Gemini 2.5 Flash",
+      "contextWindow": 1000000,
+      "inputUsdPerMillion": 0.15,
+      "outputUsdPerMillion": 0.6,
+      "vision": true,
+      "tools": true
+    },
+    {
+      "id": "llama-3.1-8b-instant",
+      "provider": "groq",
+      "label": "Llama 3.1 8B Instant",
+      "contextWindow": 131072,
+      "inputUsdPerMillion": 0.05,
+      "outputUsdPerMillion": 0.08,
+      "vision": false,
+      "tools": false
+    },
+    {
+      "id": "llama-3.3-70b-versatile",
+      "provider": "groq",
+      "label": "Llama 3.3 70B Versatile",
+      "contextWindow": 131072,
+      "inputUsdPerMillion": 0.59,
+      "outputUsdPerMillion": 0.79,
+      "vision": false,
+      "tools": false
     }
   ]
 }
