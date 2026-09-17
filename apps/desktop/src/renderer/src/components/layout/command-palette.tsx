@@ -11,7 +11,15 @@ import {
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { useTheme } from "@/lib/theme";
 
-export function ChromeCommandPalette(): JSX.Element {
+export function ChromeCommandPalette({
+  onNewProject,
+  onNewChat,
+  onSearch,
+}: {
+  onNewProject: () => void;
+  onNewChat: () => void;
+  onSearch: () => void;
+}): JSX.Element {
   const { t } = useTranslation();
   const { setTheme } = useTheme();
   const [open, setOpen] = useState(false);
@@ -43,7 +51,33 @@ export function ChromeCommandPalette(): JSX.Element {
           <CommandInput placeholder={t("command.placeholder")} />
           <CommandList>
             <CommandEmpty>{t("command.empty")}</CommandEmpty>
-            <CommandItem onSelect={() => applyTheme("light")}>{t("command.theme")}: {t("theme.light")}</CommandItem>
+            <CommandItem
+              onSelect={() => {
+                onNewProject();
+                setOpen(false);
+              }}
+            >
+              {t("command.newProject")}
+            </CommandItem>
+            <CommandItem
+              onSelect={() => {
+                onNewChat();
+                setOpen(false);
+              }}
+            >
+              {t("command.newChat")}
+            </CommandItem>
+            <CommandItem
+              onSelect={() => {
+                onSearch();
+                setOpen(false);
+              }}
+            >
+              {t("command.search")}
+            </CommandItem>
+            <CommandItem onSelect={() => applyTheme("light")}>
+              {t("command.theme")}: {t("theme.light")}
+            </CommandItem>
             <CommandItem onSelect={() => applyTheme("dark")}>
               {t("command.theme")}: {t("theme.dark")}
             </CommandItem>
