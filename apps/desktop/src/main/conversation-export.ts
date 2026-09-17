@@ -36,6 +36,7 @@ export function buildConversationExportDocument(input: {
     id: string;
     projectId: string | null;
     title: string;
+    tags: string[];
     createdAt: string;
     updatedAt: string;
   };
