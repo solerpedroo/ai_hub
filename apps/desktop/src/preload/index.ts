@@ -4,6 +4,10 @@ import {
   IpcChannel,
   type HubApi,
   appearanceSettingsSchema,
+  chatAbortInputSchema,
+  chatEventSchema,
+  chatSendInputSchema,
+  chatSendResultSchema,
   conversationCreateInputSchema,
   conversationListInputSchema,
   conversationListResultSchema,
@@ -130,6 +134,23 @@ const hub: HubApi = {
     list: () => invokeParsed(IpcChannel.secretsList, empty, emptyIpcPayloadSchema, providerKeyListResultSchema),
     save: (input) => invokeParsed(IpcChannel.secretsSave, input, secretsSaveInputSchema, providerKeyDtoSchema),
     remove: (input) => invokeAckWith(IpcChannel.secretsRemove, input, idInputSchema),
+  },
+  chat: {
+    send: (input) => invokeParsed(IpcChannel.chatSend, input, chatSendInputSchema, chatSendResultSchema),
+    abort: (input) => invokeAckWith(IpcChannel.chatAbort, input, chatAbortInputSchema),
+    onEvent: (listener) => {
+      const wrapped = (_event: unknown, payload: unknown): void => {
+        try {
+          listener(chatEventSchema.parse(payload));
+        } catch (error) {
+          rethrowIpcError(error);
+        }
+      };
+      ipcRenderer.on(IpcChannel.chatEvent, wrapped);
+      return () => {
+        ipcRenderer.removeListener(IpcChannel.chatEvent, wrapped);
+      };
+    },
   },
 };
 
