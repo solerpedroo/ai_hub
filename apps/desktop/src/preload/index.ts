@@ -4,6 +4,9 @@ import {
   IpcChannel,
   type HubApi,
   appearanceSettingsSchema,
+  branchLabelSetInputSchema,
+  branchLabelsGetInputSchema,
+  branchLabelsSchema,
   chatAbortInputSchema,
   chatEventSchema,
   chatSendInputSchema,
@@ -12,6 +15,8 @@ import {
   conversationListInputSchema,
   conversationListResultSchema,
   conversationDtoSchema,
+  conversationExportInputSchema,
+  conversationExportResultSchema,
   emptyIpcPayloadSchema,
   idInputSchema,
   ipcAckResultSchema,
@@ -111,6 +116,22 @@ const hub: HubApi = {
     create: (input) =>
       invokeParsed(IpcChannel.conversationsCreate, input, conversationCreateInputSchema, conversationDtoSchema),
     remove: (input) => invokeAckWith(IpcChannel.conversationsRemove, input, idInputSchema),
+    export: (input) =>
+      invokeParsed(
+        IpcChannel.conversationsExport,
+        input,
+        conversationExportInputSchema,
+        conversationExportResultSchema,
+      ),
+    getBranchLabels: (input) =>
+      invokeParsed(
+        IpcChannel.conversationsGetBranchLabels,
+        input,
+        branchLabelsGetInputSchema,
+        branchLabelsSchema,
+      ),
+    setBranchLabel: (input) =>
+      invokeAckWith(IpcChannel.conversationsSetBranchLabel, input, branchLabelSetInputSchema),
   },
   messages: {
     list: (input) =>
@@ -119,7 +140,7 @@ const hub: HubApi = {
       invokeParsed(IpcChannel.messagesCreate, input, messageCreateInputSchema, messageDtoSchema),
     update: (input) =>
       invokeParsed(IpcChannel.messagesUpdate, input, messageUpdateInputSchema, messageDtoSchema),
-    deleteFrom: (input) => invokeAckWith(IpcChannel.messagesDeleteFrom, input, idInputSchema),
+    activate: (input) => invokeAckWith(IpcChannel.messagesActivate, input, idInputSchema),
   },
   settings: {
     getAppearance: () =>
