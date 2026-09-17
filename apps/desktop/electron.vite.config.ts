@@ -28,10 +28,18 @@ export default defineConfig({
     },
   },
   preload: {
-    plugins: [externalizeDepsPlugin({ exclude: ["@ai-hub/shared"] })],
+    plugins: [externalizeDepsPlugin({ exclude: ["@ai-hub/shared", "zod"] })],
     resolve: {
       alias: {
         "@ai-hub/shared": shared,
+      },
+    },
+    build: {
+      rollupOptions: {
+        output: {
+          format: "cjs",
+          entryFileNames: "index.cjs",
+        },
       },
     },
   },
@@ -42,6 +50,14 @@ export default defineConfig({
         "@ai-hub/shared": shared,
       },
     },
-    plugins: [react()],
+    plugins: [
+      react(),
+      {
+        name: "strip-crossorigin-for-file-protocol",
+        transformIndexHtml(html) {
+          return html.replaceAll(" crossorigin", "");
+        },
+      },
+    ],
   },
 });
