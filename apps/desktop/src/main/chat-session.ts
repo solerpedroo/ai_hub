@@ -4,11 +4,13 @@ import {
   composeReceipt,
   compilePacket,
   consumeCrashSafeStream,
+  createMockOpenAIAdapter,
   createOpenAIAdapter,
   estimateTokensFromChars,
   GatewayError,
   GatewayStreamError,
   gatewayErrorCode,
+  type ProviderAdapter,
 } from "@ai-hub/ai-gateway";
 import { redactSecrets } from "@ai-hub/security";
 import {
@@ -39,7 +41,12 @@ interface ActiveRun {
 
 const runs = new Map<string, ActiveRun>();
 const runByConversation = new Map<string, string>();
-const openai = createOpenAIAdapter();
+
+function isE2e(): boolean {
+  return process.env.AI_HUB_E2E === "1";
+}
+
+const adapter: ProviderAdapter = isE2e() ? createMockOpenAIAdapter() : createOpenAIAdapter();
 
 function inspectablePacket(packet: ProviderAgnosticPacket): ProviderAgnosticPacket {
   return packetV0Schema.parse(JSON.parse(redactSecrets(JSON.stringify(packet))) as unknown);
@@ -109,9 +116,23 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     throw new Error("Only OpenAI is available in this wave");
   }
 
-  const history = repos.listMessages(input.conversationId);
+  let history = repos.listMessages(input.conversationId);
   if (history.some((item) => item.status === "streaming")) {
     throw new Error("A stream is already running in this conversation");
+  }
+
+  let userMessageId: string | null = null;
+  if (input.content !== null) {
+    const last = history[history.length - 1];
+    const user = repos.createMessage({
+      conversationId: input.conversationId,
+      role: "user",
+      content: input.content,
+      parentId: last?.id ?? null,
+      branchId: last?.branchId ?? null,
+    });
+    userMessageId = user.id;
+    history = [...history, user];
   }
 
   const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
@@ -171,7 +192,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
   void (async () => {
     try {
       const result = await consumeCrashSafeStream({
-        stream: openai.chatStream({
+        stream: adapter.chatStream({
           secret,
           model: input.model,
           packet,
@@ -230,5 +251,10 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     }
   })();
 
-  return { runId, messageId: assistant.id, packet: publicPacket };
+  return {
+    runId,
+    messageId: assistant.id,
+    userMessageId,
+    packet: publicPacket,
+  };
 }
