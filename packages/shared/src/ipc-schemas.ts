@@ -77,6 +77,7 @@ export const messageDtoSchema = z.object({
   conversationId: z.string().uuid(),
   parentId: z.string().uuid().nullable(),
   branchId: z.string().uuid(),
+  isActiveBranch: z.boolean(),
   role: messageRoleSchema,
   content: z.string(),
   status: messageStatusSchema,
@@ -198,3 +199,71 @@ export const chatEventSchema = z.discriminatedUnion("type", [
 ]);
 
 export type ChatEvent = z.infer<typeof chatEventSchema>;
+
+export const chatSendResultSchema = z
+  .object({
+    runId: z.string().uuid(),
+    messageId: z.string().uuid(),
+    userMessageId: z.string().uuid().nullable(),
+    packet: packetV0Schema,
+    userMessage: messageDtoSchema.nullable(),
+    assistant: messageDtoSchema,
+  })
+  .strict();
+
+export type ChatSendResult = z.infer<typeof chatSendResultSchema>;
+
+export const branchLabelsSchema = z.record(z.string().uuid(), z.string().trim().min(1).max(80));
+
+export type BranchLabels = z.infer<typeof branchLabelsSchema>;
+
+export const branchLabelsGetInputSchema = z
+  .object({
+    conversationId: z.string().uuid(),
+  })
+  .strict();
+
+export type BranchLabelsGetInput = z.infer<typeof branchLabelsGetInputSchema>;
+
+export const branchLabelSetInputSchema = z
+  .object({
+    conversationId: z.string().uuid(),
+    branchId: z.string().uuid(),
+    label: z.string().max(80),
+  })
+  .strict();
+
+export type BranchLabelSetInput = z.infer<typeof branchLabelSetInputSchema>;
+
+export const conversationExportModeSchema = z.enum(["active", "tree"]);
+
+export type ConversationExportMode = z.infer<typeof conversationExportModeSchema>;
+
+export const conversationExportInputSchema = z
+  .object({
+    conversationId: z.string().uuid(),
+    mode: conversationExportModeSchema,
+  })
+  .strict();
+
+export type ConversationExportInput = z.infer<typeof conversationExportInputSchema>;
+
+export const conversationExportResultSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("saved"), path: z.string().min(1) }).strict(),
+  z.object({ status: z.literal("cancelled") }).strict(),
+]);
+
+export type ConversationExportResult = z.infer<typeof conversationExportResultSchema>;
+
+export const conversationExportDocumentSchema = z
+  .object({
+    version: z.literal(1),
+    mode: conversationExportModeSchema,
+    exportedAt: isoTimestampSchema,
+    conversation: conversationDtoSchema,
+    branchLabels: branchLabelsSchema,
+    messages: z.array(messageDtoSchema),
+  })
+  .strict();
+
+export type ConversationExportDocument = z.infer<typeof conversationExportDocumentSchema>;
