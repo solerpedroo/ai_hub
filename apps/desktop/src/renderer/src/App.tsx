@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useState, type JSX } from "react";
 import { useTranslation } from "react-i18next";
-import type { ConversationDto, MessageDto, ProjectDto, ProviderKeyDto } from "@ai-hub/shared";
-import { findCatalogModel } from "@ai-hub/shared";
+import type {
+  BranchLabels,
+  ChatSendInput,
+  ChatSendResult,
+  ConversationDto,
+  MessageDto,
+  ProjectDto,
+  ProviderKeyDto,
+} from "@ai-hub/shared";
+import { findCatalogModel, upsertActivated } from "@ai-hub/shared";
 import { TitleBar } from "@/components/layout/title-bar";
 import { Sidebar } from "@/components/layout/sidebar";
 import { StatusBar } from "@/components/layout/status-bar";
@@ -10,23 +18,12 @@ import { SettingsView } from "@/components/layout/settings-view";
 import { ChromeCommandPalette } from "@/components/layout/command-palette";
 import type { AppView } from "@/components/layout/types";
 
-function placeholderAssistant(
-  conversationId: string,
-  messageId: string,
-  parentId: string | null,
-  branchId: string,
-): MessageDto {
-  return {
-    id: messageId,
-    conversationId,
-    parentId,
-    branchId,
-    role: "assistant",
-    content: "",
-    status: "streaming",
-    createdAt: new Date().toISOString(),
-    receipt: null,
-  };
+function applySendResult(current: MessageDto[], result: ChatSendResult): MessageDto[] {
+  let next = current;
+  if (result.userMessage) {
+    next = upsertActivated(next, result.userMessage);
+  }
+  return upsertActivated(next, result.assistant);
 }
 
 export function App(): JSX.Element {
@@ -42,8 +39,11 @@ export function App(): JSX.Element {
   const [selectedModel, setSelectedModel] = useState("gpt-4o-mini");
   const [run, setRun] = useState<{ runId: string; conversationId: string } | null>(null);
   const [sending, setSending] = useState(false);
+  const [activating, setActivating] = useState(false);
   const [sessionReady, setSessionReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [branchLabels, setBranchLabels] = useState<BranchLabels>({});
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
 
   const fail = useCallback((): void => {
     setError(t("workspace.error.generic"));
@@ -64,6 +64,8 @@ export function App(): JSX.Element {
   const loadMessages = useCallback(async (conversationId: string): Promise<MessageDto[]> => {
     const list = await window.hub.messages.list({ conversationId });
     setMessages(list);
+    const labels = await window.hub.conversations.getBranchLabels({ conversationId });
+    setBranchLabels(labels);
     return list;
   }, []);
 
@@ -170,53 +172,16 @@ export function App(): JSX.Element {
     return off;
   }, [fail, loadMessages, t]);
 
-  const sendToModel = async (content: string | null): Promise<void> => {
+  const sendToModel = async (input: ChatSendInput): Promise<void> => {
     if (!selectedConversationId || !selectedKeyId) {
       return;
     }
     setSending(true);
     try {
-      const result = await window.hub.chat.send({
-        conversationId: selectedConversationId,
-        providerKeyId: selectedKeyId,
-        model: selectedModel,
-        content,
-      });
+      const result = await window.hub.chat.send(input);
       setError(null);
       setRun({ runId: result.runId, conversationId: selectedConversationId });
-      setMessages((current) => {
-        let next = current;
-        if (result.userMessageId && content && !next.some((item) => item.id === result.userMessageId)) {
-          const last = next[next.length - 1];
-          next = [
-            ...next,
-            {
-              id: result.userMessageId,
-              conversationId: selectedConversationId,
-              parentId: last?.id ?? null,
-              branchId: last?.branchId ?? result.userMessageId,
-              role: "user",
-              content,
-              status: "complete",
-              createdAt: new Date().toISOString(),
-              receipt: null,
-            },
-          ];
-        }
-        if (next.some((item) => item.id === result.messageId)) {
-          return next;
-        }
-        const last = next[next.length - 1];
-        return [
-          ...next,
-          placeholderAssistant(
-            selectedConversationId,
-            result.messageId,
-            last?.id ?? null,
-            last?.branchId ?? result.messageId,
-          ),
-        ];
-      });
+      setMessages((current) => applySendResult(current, result));
     } catch {
       fail();
     } finally {
@@ -251,6 +216,7 @@ export function App(): JSX.Element {
             setSelectedProjectId(id);
             setSelectedConversationId(null);
             setMessages([]);
+            setBranchLabels({});
             void loadConversations(id).catch(fail);
           }}
           onCreateProject={async (name) => {
@@ -262,6 +228,7 @@ export function App(): JSX.Element {
               setSelectedProjectId(next.id);
               setSelectedConversationId(null);
               setMessages([]);
+              setBranchLabels({});
               abortIfLeaving(null);
               await loadConversations(next.id);
               setView("home");
@@ -282,7 +249,9 @@ export function App(): JSX.Element {
               selectedKeyId={selectedKeyId}
               selectedModel={selectedModel}
               streaming={run?.conversationId === selectedConversationId}
-              sending={sending}
+              sending={sending || activating}
+              branchLabels={branchLabels}
+              exportNotice={exportNotice}
               onSelectConversation={(id) => {
                 abortIfLeaving(id);
                 setSelectedConversationId(id);
@@ -301,6 +270,7 @@ export function App(): JSX.Element {
                   await loadConversations(selectedProjectId);
                   setSelectedConversationId(created.id);
                   setMessages([]);
+                  setBranchLabels({});
                   abortIfLeaving(created.id);
                 } catch {
                   fail();
@@ -308,7 +278,18 @@ export function App(): JSX.Element {
               }}
               onSelectKey={setSelectedKeyId}
               onSelectModel={setSelectedModel}
-              onSend={(content) => sendToModel(content)}
+              onSend={(content) => {
+                if (!selectedConversationId || !selectedKeyId) {
+                  return Promise.resolve();
+                }
+                return sendToModel({
+                  mode: "send",
+                  conversationId: selectedConversationId,
+                  providerKeyId: selectedKeyId,
+                  model: selectedModel,
+                  content,
+                });
+              }}
               onAbort={async () => {
                 if (!run || run.conversationId !== selectedConversationId) {
                   return;
@@ -319,46 +300,92 @@ export function App(): JSX.Element {
                   fail();
                 }
               }}
-              onRegenerate={async () => {
-                const last = messages[messages.length - 1];
-                if (!last || last.role !== "assistant") {
+              onRegenerate={async (messageId) => {
+                if (!selectedConversationId || !selectedKeyId) {
                   return;
                 }
+                await sendToModel({
+                  mode: "regenerate",
+                  conversationId: selectedConversationId,
+                  providerKeyId: selectedKeyId,
+                  model: selectedModel,
+                  messageId,
+                });
+              }}
+              onContinue={() => {
+                if (!selectedConversationId || !selectedKeyId) {
+                  return Promise.resolve();
+                }
+                return sendToModel({
+                  mode: "continue",
+                  conversationId: selectedConversationId,
+                  providerKeyId: selectedKeyId,
+                  model: selectedModel,
+                });
+              }}
+              onEditUser={async (id, content) => {
+                if (!selectedConversationId || !selectedKeyId) {
+                  return;
+                }
+                await sendToModel({
+                  mode: "edit",
+                  conversationId: selectedConversationId,
+                  providerKeyId: selectedKeyId,
+                  model: selectedModel,
+                  messageId: id,
+                  content,
+                });
+              }}
+              onActivate={async (id) => {
+                setActivating(true);
                 try {
-                  await window.hub.messages.deleteFrom({ id: last.id });
-                  const index = messages.findIndex((item) => item.id === last.id);
-                  setMessages(index < 0 ? messages : messages.slice(0, index));
-                  await sendToModel(null);
+                  await window.hub.messages.activate({ id });
+                  if (selectedConversationId) {
+                    await loadMessages(selectedConversationId);
+                  }
                 } catch {
                   fail();
-                  if (selectedConversationId) {
-                    void loadMessages(selectedConversationId).catch(fail);
-                  }
+                } finally {
+                  setActivating(false);
                 }
               }}
-              onContinue={() => sendToModel(null)}
-              onEditUser={async (id, content) => {
-                const target = messages.find((item) => item.id === id);
-                if (!target) {
+              onRenameBranch={async (branchId, label) => {
+                if (!selectedConversationId) {
                   return;
                 }
                 try {
-                  const updated = await window.hub.messages.update({ id, content });
-                  const laterFirst = messages.find((item) => item.createdAt > target.createdAt);
-                  if (laterFirst) {
-                    await window.hub.messages.deleteFrom({ id: laterFirst.id });
-                  }
-                  setMessages(
-                    messages
-                      .filter((item) => item.createdAt <= target.createdAt)
-                      .map((item) => (item.id === updated.id ? updated : item)),
+                  await window.hub.conversations.setBranchLabel({
+                    conversationId: selectedConversationId,
+                    branchId,
+                    label,
+                  });
+                  setBranchLabels(
+                    await window.hub.conversations.getBranchLabels({
+                      conversationId: selectedConversationId,
+                    }),
                   );
-                  await sendToModel(null);
                 } catch {
                   fail();
-                  if (selectedConversationId) {
-                    void loadMessages(selectedConversationId).catch(fail);
+                }
+              }}
+              onExport={async (mode) => {
+                if (!selectedConversationId) {
+                  return;
+                }
+                try {
+                  const result = await window.hub.conversations.export({
+                    conversationId: selectedConversationId,
+                    mode,
+                  });
+                  if (result.status === "saved") {
+                    const parts = result.path.split(/[/\\]/);
+                    const name = parts[parts.length - 1] ?? result.path;
+                    setExportNotice(t("workspace.export.saved", { path: name }));
+                  } else {
+                    setExportNotice(null);
                   }
+                } catch {
+                  fail();
                 }
               }}
             />
