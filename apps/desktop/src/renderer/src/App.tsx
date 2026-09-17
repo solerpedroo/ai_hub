@@ -1,12 +1,7 @@
 import { useCallback, useEffect, useState, type JSX } from "react";
 import { useTranslation } from "react-i18next";
-import type {
-  ConversationDto,
-  MessageDto,
-  ProjectDto,
-  ProviderAgnosticPacket,
-  ProviderKeyDto,
-} from "@ai-hub/shared";
+import type { ConversationDto, MessageDto, ProjectDto, ProviderKeyDto } from "@ai-hub/shared";
+import { findCatalogModel } from "@ai-hub/shared";
 import { TitleBar } from "@/components/layout/title-bar";
 import { Sidebar } from "@/components/layout/sidebar";
 import { StatusBar } from "@/components/layout/status-bar";
@@ -14,6 +9,25 @@ import { HomeView } from "@/components/layout/home-view";
 import { SettingsView } from "@/components/layout/settings-view";
 import { ChromeCommandPalette } from "@/components/layout/command-palette";
 import type { AppView } from "@/components/layout/types";
+
+function placeholderAssistant(
+  conversationId: string,
+  messageId: string,
+  parentId: string | null,
+  branchId: string,
+): MessageDto {
+  return {
+    id: messageId,
+    conversationId,
+    parentId,
+    branchId,
+    role: "assistant",
+    content: "",
+    status: "streaming",
+    createdAt: new Date().toISOString(),
+    receipt: null,
+  };
+}
 
 export function App(): JSX.Element {
   const { t } = useTranslation();
@@ -26,8 +40,9 @@ export function App(): JSX.Element {
   const [providerKeys, setProviderKeys] = useState<ProviderKeyDto[]>([]);
   const [selectedKeyId, setSelectedKeyId] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState("gpt-4o-mini");
-  const [packet, setPacket] = useState<ProviderAgnosticPacket | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
+  const [sessionReady, setSessionReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const fail = useCallback((): void => {
@@ -40,57 +55,87 @@ export function App(): JSX.Element {
     return list;
   }, []);
 
-  const loadConversations = useCallback(async (projectId: string): Promise<void> => {
+  const loadConversations = useCallback(async (projectId: string): Promise<ConversationDto[]> => {
     const list = await window.hub.conversations.list({ projectId });
     setConversations(list);
+    return list;
   }, []);
 
-  const loadMessages = useCallback(async (conversationId: string): Promise<void> => {
+  const loadMessages = useCallback(async (conversationId: string): Promise<MessageDto[]> => {
     const list = await window.hub.messages.list({ conversationId });
     setMessages(list);
+    return list;
   }, []);
 
-  const loadKeys = useCallback(async (): Promise<void> => {
+  const loadKeys = useCallback(async (): Promise<ProviderKeyDto[]> => {
     const list = await window.hub.secrets.list();
     setProviderKeys(list);
-    const openai = list.find((item) => item.providerSlug === "openai");
-    setSelectedKeyId((current) => current ?? openai?.id ?? null);
+    return list;
   }, []);
 
   useEffect(() => {
-    void loadProjects()
-      .then((list) => {
-        const first = list[0];
-        if (first) {
-          setSelectedProjectId(first.id);
+    void (async () => {
+      try {
+        const [projectList, keys, session] = await Promise.all([
+          loadProjects(),
+          loadKeys(),
+          window.hub.settings.getSession(),
+        ]);
+        const openai = keys.find((item) => item.providerSlug === "openai" && item.status === "active");
+        setSelectedKeyId(openai?.id ?? null);
+        if (findCatalogModel(session.model, "openai")) {
+          setSelectedModel(session.model);
         }
+        const project =
+          projectList.find((item) => item.id === session.projectId) ?? projectList[0] ?? null;
+        if (!project) {
+          setSessionReady(true);
+          return;
+        }
+        setSelectedProjectId(project.id);
+        const convos = await loadConversations(project.id);
+        const conversation =
+          convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
+        if (conversation) {
+          setSelectedConversationId(conversation.id);
+          await loadMessages(conversation.id);
+        }
+        setSessionReady(true);
+      } catch {
+        fail();
+        setSessionReady(true);
+      }
+    })();
+  }, [fail, loadConversations, loadKeys, loadMessages, loadProjects]);
+
+  useEffect(() => {
+    if (!sessionReady) {
+      return;
+    }
+    void window.hub.settings
+      .setSession({
+        projectId: selectedProjectId,
+        conversationId: selectedConversationId,
+        model: selectedModel,
       })
       .catch(fail);
-  }, [fail, loadProjects]);
+  }, [fail, selectedConversationId, selectedModel, selectedProjectId, sessionReady]);
 
   useEffect(() => {
     if (view !== "home") {
       return;
     }
-    void loadKeys().catch(fail);
-  }, [fail, loadKeys, view]);
-
-  useEffect(() => {
-    if (!selectedProjectId) {
-      setConversations([]);
-      setSelectedConversationId(null);
-      setMessages([]);
-      return;
-    }
-    void loadConversations(selectedProjectId)
-      .then(() => {
-        setSelectedConversationId(null);
-        setMessages([]);
-        setPacket(null);
-        setRunId(null);
+    void loadKeys()
+      .then((list) => {
+        setSelectedKeyId((current) => {
+          if (current && list.some((item) => item.id === current)) {
+            return current;
+          }
+          return list.find((item) => item.providerSlug === "openai" && item.status === "active")?.id ?? null;
+        });
       })
       .catch(fail);
-  }, [fail, loadConversations, selectedProjectId]);
+  }, [fail, loadKeys, view]);
 
   useEffect(() => {
     const off = window.hub.chat.onEvent((event) => {
@@ -108,7 +153,6 @@ export function App(): JSX.Element {
         setMessages((current) =>
           current.map((message) => (message.id === event.message.id ? event.message : message)),
         );
-        setPacket(event.packet);
         setRunId(null);
         return;
       }
@@ -124,6 +168,60 @@ export function App(): JSX.Element {
     return off;
   }, [fail, loadMessages, t]);
 
+  const sendToModel = async (content: string | null): Promise<void> => {
+    if (!selectedConversationId || !selectedKeyId) {
+      return;
+    }
+    setSending(true);
+    try {
+      const result = await window.hub.chat.send({
+        conversationId: selectedConversationId,
+        providerKeyId: selectedKeyId,
+        model: selectedModel,
+        content,
+      });
+      setError(null);
+      setRunId(result.runId);
+      setMessages((current) => {
+        let next = current;
+        if (result.userMessageId && content && !next.some((item) => item.id === result.userMessageId)) {
+          const last = next[next.length - 1];
+          next = [
+            ...next,
+            {
+              id: result.userMessageId,
+              conversationId: selectedConversationId,
+              parentId: last?.id ?? null,
+              branchId: last?.branchId ?? result.userMessageId,
+              role: "user",
+              content,
+              status: "complete",
+              createdAt: new Date().toISOString(),
+              receipt: null,
+            },
+          ];
+        }
+        if (next.some((item) => item.id === result.messageId)) {
+          return next;
+        }
+        const last = next[next.length - 1];
+        return [
+          ...next,
+          placeholderAssistant(
+            selectedConversationId,
+            result.messageId,
+            last?.id ?? null,
+            last?.branchId ?? result.messageId,
+          ),
+        ];
+      });
+    } catch {
+      fail();
+    } finally {
+      setSending(false);
+    }
+  };
+
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
 
   return (
@@ -135,7 +233,13 @@ export function App(): JSX.Element {
           onChange={setView}
           projects={projects}
           selectedProjectId={selectedProjectId}
-          onSelectProject={setSelectedProjectId}
+          onSelectProject={(id) => {
+            setSelectedProjectId(id);
+            setSelectedConversationId(null);
+            setMessages([]);
+            setRunId(null);
+            void loadConversations(id).catch(fail);
+          }}
           onCreateProject={async (name) => {
             try {
               const created = await window.hub.projects.create({ name });
@@ -143,6 +247,10 @@ export function App(): JSX.Element {
               const list = await loadProjects();
               const next = list.find((item) => item.id === created.id) ?? created;
               setSelectedProjectId(next.id);
+              setSelectedConversationId(null);
+              setMessages([]);
+              setRunId(null);
+              await loadConversations(next.id);
               setView("home");
             } catch {
               fail();
@@ -160,11 +268,10 @@ export function App(): JSX.Element {
               providerKeys={providerKeys}
               selectedKeyId={selectedKeyId}
               selectedModel={selectedModel}
-              packet={packet}
               streaming={runId !== null}
+              sending={sending}
               onSelectConversation={(id) => {
                 setSelectedConversationId(id);
-                setPacket(null);
                 setRunId(null);
                 void loadMessages(id).catch(fail);
               }}
@@ -181,70 +288,14 @@ export function App(): JSX.Element {
                   await loadConversations(selectedProjectId);
                   setSelectedConversationId(created.id);
                   setMessages([]);
-                  setPacket(null);
                   setRunId(null);
-                } catch {
-                  fail();
-                }
-              }}
-              onCreateMessage={async (content) => {
-                if (!selectedConversationId) {
-                  return;
-                }
-                const parentId = null;
-                try {
-                  await window.hub.messages.create({
-                    conversationId: selectedConversationId,
-                    role: "user",
-                    content,
-                    parentId,
-                    branchId: null,
-                  });
-                  setError(null);
-                  await loadMessages(selectedConversationId);
                 } catch {
                   fail();
                 }
               }}
               onSelectKey={setSelectedKeyId}
               onSelectModel={setSelectedModel}
-              onSendToModel={async () => {
-                if (!selectedConversationId || !selectedKeyId) {
-                  return;
-                }
-                try {
-                  const result = await window.hub.chat.send({
-                    conversationId: selectedConversationId,
-                    providerKeyId: selectedKeyId,
-                    model: selectedModel,
-                  });
-                  setError(null);
-                  setPacket(result.packet);
-                  setRunId(result.runId);
-                  setMessages((current) => {
-                    if (current.some((item) => item.id === result.messageId)) {
-                      return current;
-                    }
-                    const last = current[current.length - 1];
-                    return [
-                      ...current,
-                      {
-                        id: result.messageId,
-                        conversationId: selectedConversationId,
-                        parentId: last?.id ?? null,
-                        branchId: last?.branchId ?? result.messageId,
-                        role: "assistant",
-                        content: "",
-                        status: "streaming",
-                        createdAt: new Date().toISOString(),
-                        receipt: null,
-                      },
-                    ];
-                  });
-                } catch {
-                  fail();
-                }
-              }}
+              onSend={(content) => sendToModel(content)}
               onAbort={async () => {
                 if (!runId) {
                   return;
@@ -253,6 +304,48 @@ export function App(): JSX.Element {
                   await window.hub.chat.abort({ runId });
                 } catch {
                   fail();
+                }
+              }}
+              onRegenerate={async () => {
+                const last = messages[messages.length - 1];
+                if (!last || last.role !== "assistant") {
+                  return;
+                }
+                try {
+                  await window.hub.messages.deleteFrom({ id: last.id });
+                  const index = messages.findIndex((item) => item.id === last.id);
+                  setMessages(index < 0 ? messages : messages.slice(0, index));
+                  await sendToModel(null);
+                } catch {
+                  fail();
+                  if (selectedConversationId) {
+                    void loadMessages(selectedConversationId).catch(fail);
+                  }
+                }
+              }}
+              onContinue={() => sendToModel(null)}
+              onEditUser={async (id, content) => {
+                const target = messages.find((item) => item.id === id);
+                if (!target) {
+                  return;
+                }
+                try {
+                  const updated = await window.hub.messages.update({ id, content });
+                  const laterFirst = messages.find((item) => item.createdAt > target.createdAt);
+                  if (laterFirst) {
+                    await window.hub.messages.deleteFrom({ id: laterFirst.id });
+                  }
+                  setMessages(
+                    messages
+                      .filter((item) => item.createdAt <= target.createdAt)
+                      .map((item) => (item.id === updated.id ? updated : item)),
+                  );
+                  await sendToModel(null);
+                } catch {
+                  fail();
+                  if (selectedConversationId) {
+                    void loadMessages(selectedConversationId).catch(fail);
+                  }
                 }
               }}
             />
