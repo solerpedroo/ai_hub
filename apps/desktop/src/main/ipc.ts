@@ -3,6 +3,9 @@ import { ZodError, type ZodType } from "zod";
 import {
   IpcChannel,
   appearanceSettingsSchema,
+  chatAbortInputSchema,
+  chatSendInputSchema,
+  chatSendResultSchema,
   conversationCreateInputSchema,
   conversationDtoSchema,
   conversationListInputSchema,
@@ -24,6 +27,8 @@ import {
   windowIsMaximizedResultSchema,
 } from "@ai-hub/shared";
 import { safeErrorMessage } from "@ai-hub/security";
+import { abortChat, sendChat } from "./chat-session";
+import { toMessageDto } from "./message-dto";
 import { getHubDatabase } from "./persistence";
 
 function registerHandler<TIn, TOut>(
@@ -83,11 +88,11 @@ export function registerWorkspaceIpc(): void {
   registerHandler(IpcChannel.messagesList, messageListInputSchema, messageListResultSchema, (input) =>
     getHubDatabase()
       .repos.listMessages(input.conversationId)
-      .map((row) => messageDtoSchema.parse(row)),
+      .map((row) => toMessageDto(row)),
   );
 
   registerHandler(IpcChannel.messagesCreate, messageCreateInputSchema, messageDtoSchema, (input) =>
-    messageDtoSchema.parse(
+    toMessageDto(
       getHubDatabase().repos.createMessage({
         conversationId: input.conversationId,
         role: input.role,
@@ -129,6 +134,14 @@ export function registerWorkspaceIpc(): void {
   registerHandler(IpcChannel.secretsRemove, idInputSchema, ipcAckResultSchema, (input) =>
     getHubDatabase().repos.removeProviderKey(input.id),
   );
+
+  registerHandler(IpcChannel.chatSend, chatSendInputSchema, chatSendResultSchema, (input, event) =>
+    sendChat(input, event.sender),
+  );
+
+  registerHandler(IpcChannel.chatAbort, chatAbortInputSchema, ipcAckResultSchema, (input) => {
+    abortChat(input.runId);
+  });
 }
 
 export function registerWindowIpc(
