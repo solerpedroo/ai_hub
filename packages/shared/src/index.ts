@@ -1,6 +1,7 @@
 export { type AppLocale, type ThemeMode, localeSchema, themeModeSchema } from "./appearance";
 export {
   type HubApi,
+  type HubChatApi,
   type HubConversationsApi,
   type HubMessagesApi,
   type HubProjectsApi,
@@ -12,6 +13,7 @@ export {
 export { IpcChannel, type IpcChannelName } from "./ipc-channels";
 export {
   appearanceSettingsSchema,
+  chatEventSchema,
   conversationCreateInputSchema,
   conversationDtoSchema,
   conversationListInputSchema,
@@ -36,6 +38,7 @@ export {
   secretsSaveInputSchema,
   windowIsMaximizedResultSchema,
   type AppearanceSettings,
+  type ChatEvent,
   type ConversationCreateInput,
   type ConversationDto,
   type ConversationListInput,
@@ -52,3 +55,24 @@ export {
   type ProviderKeyDto,
   type SecretsSaveInput,
 } from "./ipc-schemas";
+export {
+  chatAbortInputSchema,
+  chatSendInputSchema,
+  chatSendResultSchema,
+  estimateCostUsd,
+  findCatalogModel,
+  gatewayErrorCodeSchema,
+  MODEL_CATALOG,
+  openaiCatalogModels,
+  packetV0Schema,
+  receiptDtoSchema,
+  type CatalogModel,
+  type ChatAbortInput,
+  type ChatSendInput,
+  type ChatSendResult,
+  type GatewayErrorCode,
+  type ModelCatalog,
+  type PacketMessage,
+  type ProviderAgnosticPacket,
+  type ReceiptDto,
+} from "./gateway";
