@@ -1,6 +1,6 @@
 import { type FormEvent, type JSX, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { AppLocale, ProviderDto, ProviderKeyDto, ThemeMode } from "@ai-hub/shared";
+import type { AppLocale, ProviderDto, ProviderKeyDto, SecretsTestResult, ThemeMode } from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { persistLocale } from "@/lib/i18n";
@@ -14,7 +14,10 @@ export function SettingsView(): JSX.Element {
   const [providerSlug, setProviderSlug] = useState("openrouter");
   const [label, setLabel] = useState("default");
   const [secret, setSecret] = useState("");
+  const [baseUrl, setBaseUrl] = useState("http://127.0.0.1:11434/v1");
   const [error, setError] = useState<string | null>(null);
+  const [testingId, setTestingId] = useState<string | null>(null);
+  const [testResults, setTestResults] = useState<Record<string, SecretsTestResult>>({});
 
   const reloadKeys = (): void => {
     void window.hub.secrets
@@ -32,9 +35,11 @@ export function SettingsView(): JSX.Element {
           return;
         }
         setProviders(list);
-        const first = list[0];
-        if (first) {
-          setProviderSlug(first.slug);
+        const openrouter = list.find((item) => item.slug === "openrouter");
+        if (openrouter) {
+          setProviderSlug(openrouter.slug);
+        } else if (list[0]) {
+          setProviderSlug(list[0].slug);
         }
       })
       .catch(() => {
@@ -67,8 +72,12 @@ export function SettingsView(): JSX.Element {
     event.preventDefault();
     const value = secret;
     setSecret("");
+    const payload =
+      providerSlug === "custom"
+        ? { providerSlug, label, secret: value, baseUrl }
+        : { providerSlug, label, secret: value };
     void window.hub.secrets
-      .save({ providerSlug, label, secret: value })
+      .save(payload)
       .then(() => {
         setError(null);
         reloadKeys();
@@ -126,6 +135,8 @@ export function SettingsView(): JSX.Element {
               className="h-8 rounded-md border border-input bg-background px-2 text-[13px]"
               value={providerSlug}
               onChange={(event) => setProviderSlug(event.target.value)}
+              data-testid="secrets-provider"
+              aria-label={t("secrets.provider")}
             >
               {providers.map((provider) => (
                 <option key={provider.id} value={provider.slug}>
@@ -138,6 +149,17 @@ export function SettingsView(): JSX.Element {
             {t("secrets.labelField")}
             <Input value={label} onChange={(event) => setLabel(event.target.value)} />
           </label>
+          {providerSlug === "custom" ? (
+            <label className="flex flex-col gap-1 text-[12px]">
+              {t("secrets.baseUrl")}
+              <Input
+                value={baseUrl}
+                onChange={(event) => setBaseUrl(event.target.value)}
+                autoComplete="off"
+                data-testid="secrets-base-url"
+              />
+            </label>
+          ) : null}
           <label className="flex flex-col gap-1 text-[12px]">
             {t("secrets.secret")}
             <Input
@@ -150,26 +172,61 @@ export function SettingsView(): JSX.Element {
           <Button type="submit">{t("secrets.save")}</Button>
         </form>
         <ul className="flex flex-col gap-1">
-          {keys.map((key) => (
-            <li key={key.id} className="flex items-center justify-between gap-2 rounded-md border px-2 py-1">
-              <span>
-                {key.providerSlug} · {key.label} · {key.maskedKey}
-              </span>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  void window.hub.secrets
-                    .remove({ id: key.id })
-                    .then(() => reloadKeys())
-                    .catch(() => setError(t("workspace.error.generic")));
-                }}
-              >
-                {t("secrets.remove")}
-              </Button>
-            </li>
-          ))}
+          {keys.map((key) => {
+            const result = testResults[key.id];
+            return (
+              <li key={key.id} className="flex flex-col gap-1 rounded-md border px-2 py-1">
+                <div className="flex items-center justify-between gap-2">
+                  <span>
+                    {key.providerSlug} · {key.label} · {key.maskedKey}
+                    {key.endpointUrl ? ` · ${key.endpointUrl}` : ""}
+                  </span>
+                  <div className="flex gap-1">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      data-testid="secrets-test"
+                      disabled={testingId === key.id}
+                      onClick={() => {
+                        setTestingId(key.id);
+                        void window.hub.secrets
+                          .test({ id: key.id })
+                          .then((next) => {
+                            setTestResults((current) => ({ ...current, [key.id]: next }));
+                            setError(null);
+                          })
+                          .catch(() => setError(t("workspace.error.generic")))
+                          .finally(() => setTestingId(null));
+                      }}
+                    >
+                      {testingId === key.id ? t("secrets.testing") : t("secrets.test")}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        void window.hub.secrets
+                          .remove({ id: key.id })
+                          .then(() => reloadKeys())
+                          .catch(() => setError(t("workspace.error.generic")));
+                      }}
+                    >
+                      {t("secrets.remove")}
+                    </Button>
+                  </div>
+                </div>
+                {result ? (
+                  <p className="text-[11px] text-muted-foreground" role="status">
+                    {result.ok
+                      ? t("secrets.testOk", { ms: result.latencyMs })
+                      : t("secrets.testFail", { code: result.errorCode ?? "unknown", ms: result.latencyMs })}
+                  </p>
+                ) : null}
+              </li>
+            );
+          })}
         </ul>
         {error ? (
           <p className="text-destructive" role="alert">
