@@ -17,6 +17,9 @@ export const IpcChannel = {
   secretsList: "secrets:list",
   secretsSave: "secrets:save",
   secretsRemove: "secrets:remove",
+  chatSend: "chat:send",
+  chatAbort: "chat:abort",
+  chatEvent: "chat:event",
 } as const;
 
 export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
