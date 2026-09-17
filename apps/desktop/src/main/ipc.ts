@@ -3,11 +3,16 @@ import { ZodError, type ZodType } from "zod";
 import {
   IpcChannel,
   appearanceSettingsSchema,
+  branchLabelSetInputSchema,
+  branchLabelsGetInputSchema,
+  branchLabelsSchema,
   chatAbortInputSchema,
   chatSendInputSchema,
   chatSendResultSchema,
   conversationCreateInputSchema,
   conversationDtoSchema,
+  conversationExportInputSchema,
+  conversationExportResultSchema,
   conversationListInputSchema,
   conversationListResultSchema,
   emptyIpcPayloadSchema,
@@ -30,6 +35,7 @@ import {
 } from "@ai-hub/shared";
 import { safeErrorMessage } from "@ai-hub/security";
 import { abortChat, sendChat } from "./chat-session";
+import { exportConversation } from "./conversation-export";
 import { toMessageDto } from "./message-dto";
 import { getHubDatabase } from "./persistence";
 
@@ -87,6 +93,34 @@ export function registerWorkspaceIpc(): void {
     getHubDatabase().repos.removeConversation(input.id);
   });
 
+  registerHandler(
+    IpcChannel.conversationsExport,
+    conversationExportInputSchema,
+    conversationExportResultSchema,
+    (input, event) => exportConversation(input, event.sender),
+  );
+
+  registerHandler(
+    IpcChannel.conversationsGetBranchLabels,
+    branchLabelsGetInputSchema,
+    branchLabelsSchema,
+    (input) => {
+      const parsed = branchLabelsSchema.safeParse(
+        getHubDatabase().repos.getBranchLabels(input.conversationId),
+      );
+      return parsed.success ? parsed.data : {};
+    },
+  );
+
+  registerHandler(
+    IpcChannel.conversationsSetBranchLabel,
+    branchLabelSetInputSchema,
+    ipcAckResultSchema,
+    (input) => {
+      getHubDatabase().repos.setBranchLabel(input.conversationId, input.branchId, input.label);
+    },
+  );
+
   registerHandler(IpcChannel.messagesList, messageListInputSchema, messageListResultSchema, (input) =>
     getHubDatabase()
       .repos.listMessages(input.conversationId)
@@ -113,8 +147,8 @@ export function registerWorkspaceIpc(): void {
     return toMessageDto(getHubDatabase().repos.updateMessage(input.id, input.content, existing.status));
   });
 
-  registerHandler(IpcChannel.messagesDeleteFrom, idInputSchema, ipcAckResultSchema, (input) => {
-    getHubDatabase().repos.deleteMessagesFrom(input.id);
+  registerHandler(IpcChannel.messagesActivate, idInputSchema, ipcAckResultSchema, (input) => {
+    getHubDatabase().repos.activatePathThrough(input.id);
   });
 
   registerHandler(
