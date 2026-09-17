@@ -54,3 +54,7 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W04-002](./ADR-W04-002-sibling-fork-not-delete.md) | W04 | Regenerar/editar criam irmãos, sem wipe | accepted |
 | [ADR-W04-003](./ADR-W04-003-compiler-active-path.md) | W04 | Compiler só no path ativo | accepted |
 | [ADR-W04-004](./ADR-W04-004-export-json-main-process.md) | W04 | Export JSON no main + labels em settings | accepted |
+| [ADR-W05-001](./ADR-W05-001-adapter-registry.md) | W05 | Registry de adapters por slug | accepted |
+| [ADR-W05-002](./ADR-W05-002-openrouter-first-class.md) | W05 | OpenRouter first-class, não URL custom | accepted |
+| [ADR-W05-003](./ADR-W05-003-custom-base-url-settings.md) | W05 | URL custom em settings, chave no keytar | accepted |
+| [ADR-W05-004](./ADR-W05-004-connection-test-health-samples.md) | W05 | Teste de conexão grava health_samples | accepted |
