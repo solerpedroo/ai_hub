@@ -68,12 +68,18 @@ function PreBlock({
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
   return (
-    <pre {...props} className={cn("relative overflow-x-auto rounded-md bg-muted p-3 pr-16", className)}>
+    <pre
+      {...props}
+      className={cn(
+        "relative overflow-x-auto rounded-md bg-zinc-900 p-3 pr-16 text-zinc-100",
+        className,
+      )}
+    >
       <Button
         type="button"
         size="sm"
         variant="outline"
-        className="absolute right-1 top-1 h-6 px-1.5 text-[11px]"
+        className="absolute right-1 top-1 h-6 px-1.5 text-[11px] border-zinc-600 bg-zinc-800 text-zinc-100 hover:bg-zinc-700"
         onClick={(event: MouseEvent<HTMLButtonElement>) => {
           event.preventDefault();
           const code = event.currentTarget.parentElement?.querySelector("code");
