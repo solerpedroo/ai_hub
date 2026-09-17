@@ -38,7 +38,7 @@ export function decryptUtf8(payload: string, key: Buffer): string {
   const ivB64 = parts[1];
   const tagB64 = parts[2];
   const dataB64 = parts[3];
-  if (parts.length !== 4 || version !== VERSION || !ivB64 || !tagB64 || !dataB64) {
+  if (parts.length !== 4 || version !== VERSION || !ivB64 || !tagB64 || dataB64 === undefined) {
     throw new EnvelopeError();
   }
   try {
