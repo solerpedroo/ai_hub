@@ -41,3 +41,7 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W01-002](./ADR-W01-002-drizzle-user-version-migrations.md) | W01 | Drizzle + migrations via `user_version` | accepted |
 | [ADR-W01-003](./ADR-W01-003-keytar-and-ipc-secrets.md) | W01 | Segredos no keytar; IPC devolve máscara | accepted |
 | [ADR-W01-004](./ADR-W01-004-message-graph-parent-branch.md) | W01 | Grafo de mensagens: `parent_id` + `branch_id` | accepted |
+| [ADR-W02-001](./ADR-W02-001-provider-adapter-fetch.md) | W02 | Adapter via `fetch` + SSE, sem AI SDK | accepted |
+| [ADR-W02-002](./ADR-W02-002-compiler-packet-v0.md) | W02 | Compiler v0 e packet JSON versão 1 | accepted |
+| [ADR-W02-003](./ADR-W02-003-crash-safe-stream.md) | W02 | Flush incremental e `interrupted` no boot | accepted |
+| [ADR-W02-004](./ADR-W02-004-gateway-errors-and-receipts.md) | W02 | Taxonomia de erro e receipts com catálogo | accepted |
