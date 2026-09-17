@@ -1,8 +1,8 @@
 import { type JSX, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { ConversationDto, MessageDto, ProjectDto, ProviderKeyDto } from "@ai-hub/shared";
-import { openaiCatalogModels } from "@ai-hub/shared";
+import { activePath, openaiCatalogModels, type BranchLabels, type ConversationDto, type MessageDto, type ProjectDto, type ProviderKeyDto } from "@ai-hub/shared";
 import { ChatComposer } from "@/components/chat/chat-composer";
+import { ConversationTree } from "@/components/chat/conversation-tree";
 import { MessageBubble } from "@/components/chat/message-bubble";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -19,6 +19,8 @@ export function HomeView({
   selectedModel,
   streaming,
   sending,
+  branchLabels,
+  exportNotice,
   onSelectConversation,
   onCreateConversation,
   onSelectKey,
@@ -28,6 +30,9 @@ export function HomeView({
   onRegenerate,
   onContinue,
   onEditUser,
+  onActivate,
+  onRenameBranch,
+  onExport,
 }: {
   project: ProjectDto | null;
   conversations: ConversationDto[];
@@ -39,27 +44,37 @@ export function HomeView({
   selectedModel: string;
   streaming: boolean;
   sending: boolean;
+  branchLabels: BranchLabels;
+  exportNotice: string | null;
   onSelectConversation: (id: string) => void;
   onCreateConversation: (title: string) => Promise<void>;
   onSelectKey: (id: string) => void;
   onSelectModel: (id: string) => void;
   onSend: (content: string) => Promise<void>;
   onAbort: () => Promise<void>;
-  onRegenerate: () => Promise<void>;
+  onRegenerate: (messageId: string) => Promise<void>;
   onContinue: () => Promise<void>;
   onEditUser: (id: string, content: string) => Promise<void>;
+  onActivate: (id: string) => Promise<void>;
+  onRenameBranch: (branchId: string, label: string) => Promise<void>;
+  onExport: (mode: "active" | "tree") => Promise<void>;
 }): JSX.Element {
   const { t } = useTranslation();
   const [title, setTitle] = useState("");
   const [draft, setDraft] = useState("");
   const [editing, setEditing] = useState(false);
+  const [treeOpen, setTreeOpen] = useState(false);
   const openaiKeys = providerKeys.filter((key) => key.providerSlug === "openai");
   const models = openaiCatalogModels();
   const hasKey = selectedKeyId !== null && openaiKeys.some((key) => key.id === selectedKeyId);
   const busy = streaming || sending;
+  const path = activePath(messages);
+  const activeIds = new Set(path.map((item) => item.id));
+  const leaf = path[path.length - 1] ?? null;
 
   useEffect(() => {
     setEditing(false);
+    setTreeOpen(false);
   }, [selectedConversationId]);
 
   if (!project) {
@@ -167,20 +182,63 @@ export function HomeView({
                   </label>
                 </>
               )}
+              <div className="ml-auto flex flex-wrap items-center gap-1">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  data-testid="tree-toggle"
+                  aria-pressed={treeOpen}
+                  onClick={() => setTreeOpen((open) => !open)}
+                >
+                  {treeOpen ? t("workspace.tree.hide") : t("workspace.tree.show")}
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={!selectedConversationId || busy}
+                  onClick={() => {
+                    void onExport("active");
+                  }}
+                >
+                  {t("workspace.export.active")}
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={!selectedConversationId || busy}
+                  onClick={() => {
+                    void onExport("tree");
+                  }}
+                >
+                  {t("workspace.export.tree")}
+                </Button>
+              </div>
             </header>
+            {exportNotice ? (
+              <p className="border-b px-3 py-1 text-[11px] text-muted-foreground" role="status">
+                {exportNotice}
+              </p>
+            ) : null}
+            <div className="flex min-h-0 flex-1">
+            <div className="flex min-w-0 flex-1 flex-col">
             <ScrollArea className="flex-1 p-4">
-              {messages.length === 0 ? (
+              {path.length === 0 ? (
                 <p className="text-muted-foreground">{t("workspace.noMessages")}</p>
               ) : (
                 <ol className="flex flex-col gap-2" aria-live="polite">
-                  {messages.map((message, index) => (
+                  {path.map((message, index) => (
                     <MessageBubble
                       key={message.id}
                       message={message}
-                      isLast={index === messages.length - 1}
+                      messages={messages}
+                      isLast={index === path.length - 1}
                       busy={busy}
+                      hasKey={hasKey}
                       onRegenerate={() => {
-                        void onRegenerate();
+                        void onRegenerate(message.id);
                       }}
                       onContinue={() => {
                         void onContinue();
@@ -189,6 +247,9 @@ export function HomeView({
                         await onEditUser(message.id, content);
                       }}
                       onEditingChange={setEditing}
+                      onActivateSibling={(id) => {
+                        void onActivate(id);
+                      }}
                     />
                   ))}
                 </ol>
@@ -212,6 +273,21 @@ export function HomeView({
                 void onAbort();
               }}
             />
+            </div>
+            {treeOpen ? (
+              <ConversationTree
+                messages={messages}
+                activeIds={activeIds}
+                labels={branchLabels}
+                activeBranchId={leaf?.branchId ?? null}
+                busy={busy}
+                onJump={(id) => {
+                  void onActivate(id);
+                }}
+                onRename={onRenameBranch}
+              />
+            ) : null}
+            </div>
           </>
         ) : (
           <div className="flex flex-1 items-center justify-center p-8 text-muted-foreground">
