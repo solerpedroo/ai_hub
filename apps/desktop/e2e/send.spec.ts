@@ -52,3 +52,26 @@ test("stop aborts the mock stream without treating it as a request failure", asy
     await app.close();
   }
 });
+
+test("regenerate keeps the previous answer as a sibling", async () => {
+  const app = await launchHub();
+  try {
+    const window = await app.firstWindow();
+    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
+    await window.getByTestId("chat-composer").fill("Hello");
+    await window.getByTestId("chat-send").click();
+    await expect(window.getByTestId("message-assistant")).toHaveAttribute("data-status", "complete", {
+      timeout: 30_000,
+    });
+    await window.getByTestId("message-regenerate").click();
+    await expect(window.getByTestId("sibling-count")).toHaveText("2 / 2", { timeout: 30_000 });
+    await expect(window.getByTestId("message-assistant")).toHaveAttribute("data-status", "complete", {
+      timeout: 30_000,
+    });
+    await window.getByTestId("tree-toggle").click();
+    await expect(window.getByTestId("conversation-tree")).toBeVisible();
+    await expect(window.getByTestId("tree-node")).toHaveCount(3);
+  } finally {
+    await app.close();
+  }
+});
