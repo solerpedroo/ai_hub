@@ -1,5 +1,5 @@
 import type { MessageStatus, ProviderAgnosticPacket } from "@ai-hub/shared";
-import { packetV0Schema } from "@ai-hub/shared";
+import { activePath, packetV0Schema, type MessageGraphNode } from "@ai-hub/shared";
 
 export interface CompilerMessage {
   id: string;
@@ -56,5 +56,19 @@ export function compilePacket(input: CompileInput): ProviderAgnosticPacket {
     messages: packetMessages,
     tokenEstimate: tokenEstimateFromChars(chars),
     excluded,
+  });
+}
+
+export interface CompilerGraphMessage extends CompilerMessage, MessageGraphNode {}
+
+export function compileActivePath(input: {
+  projectInstructions: string | null;
+  extraSystem: string | null;
+  messages: CompilerGraphMessage[];
+}): ProviderAgnosticPacket {
+  return compilePacket({
+    projectInstructions: input.projectInstructions,
+    extraSystem: input.extraSystem,
+    messages: activePath(input.messages),
   });
 }
