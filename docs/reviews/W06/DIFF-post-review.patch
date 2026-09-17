@@ -1,0 +1,1564 @@
+﻿diff --git a/apps/desktop/e2e/send.spec.ts b/apps/desktop/e2e/send.spec.ts
+index 28b18d0..11ef175 100644
+--- a/apps/desktop/e2e/send.spec.ts
++++ b/apps/desktop/e2e/send.spec.ts
+@@ -83,7 +83,77 @@ test("settings lists OpenRouter as a first-class provider", async () => {
+     await window.getByTestId("nav-settings").click();
+     await expect(window.getByTestId("secrets-provider")).toBeVisible();
+     await expect(window.getByTestId("secrets-provider")).toContainText("OpenRouter");
+-    await expect(window.getByTestId("secrets-test")).toBeVisible();
++    await expect(window.getByTestId("secrets-test").first()).toBeVisible();
++  } finally {
++    await app.close();
++  }
++});
++
++test("creates three projects and search finds an old message", async () => {
++  const app = await launchHub();
++  try {
++    const window = await app.firstWindow();
++    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
++    await window.getByTestId("chat-composer").fill("Hello");
++    await window.getByTestId("chat-send").click();
++    await expect(window.getByTestId("message-assistant")).toContainText("Hello from mock", {
++      timeout: 30_000,
++    });
++    await window.getByTestId("workspace-new-project-name").fill("Alpha");
++    await window.getByTestId("workspace-new-project").click();
++    await window.getByTestId("workspace-new-project-name").fill("Beta");
++    await window.getByTestId("workspace-new-project").click();
++    await expect(window.getByTestId("project-item")).toHaveCount(3);
++    await window.getByTestId("workspace-search").fill("Hello from mock");
++    await expect(window.getByTestId("search-hit")).toContainText("Hello from mock", { timeout: 10_000 });
++  } finally {
++    await app.close();
++  }
++});
++
++test("deletes a project and moves its chats to Inbox", async () => {
++  const app = await launchHub();
++  try {
++    const window = await app.firstWindow();
++    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
++    await expect(window.getByTestId("project-item")).toHaveCount(1);
++    await window.getByTestId("workspace-new-project-name").fill("Temp");
++    await window.getByTestId("workspace-new-project").click();
++    await expect(window.getByTestId("project-item")).toHaveCount(2);
++    window.once("dialog", (dialog) => {
++      void dialog.accept();
++    });
++    await window.getByTestId("project-delete").click();
++    await expect(window.getByTestId("project-item")).toHaveCount(1);
++    await expect(window.getByTestId("inbox-avulsas")).toBeVisible();
++  } finally {
++    await app.close();
++  }
++});
++
++test("switches from GPT to Claude on the same thread", async () => {
++  const app = await launchHub();
++  try {
++    const window = await app.firstWindow();
++    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
++    await window.getByTestId("chat-composer").fill("Hello");
++    await window.getByTestId("chat-send").click();
++    await expect(window.getByTestId("message-assistant")).toHaveAttribute("data-status", "complete", {
++      timeout: 30_000,
++    });
++    const anthropicValue = await window
++      .getByTestId("workspace-key")
++      .locator("option")
++      .filter({ hasText: "anthropic" })
++      .getAttribute("value");
++    expect(anthropicValue).toBeTruthy();
++    await window.getByTestId("workspace-key").selectOption(anthropicValue ?? "");
++    await window.getByTestId("workspace-model").selectOption("claude-sonnet-4-20250514");
++    await expect(window.getByTestId("model-switch-notice")).toBeVisible();
++    await window.getByTestId("chat-composer").fill("Follow up");
++    await window.getByTestId("chat-send").click();
++    await expect(window.getByTestId("message-assistant")).toHaveCount(2, { timeout: 30_000 });
++    await expect(window.getByTestId("packet-badge")).toBeVisible();
+   } finally {
+     await app.close();
+   }
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index e2e1b79..f48ef22 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -1,4 +1,4 @@
+-import { useCallback, useEffect, useState, type JSX } from "react";
++import { useCallback, useEffect, useRef, useState, type JSX } from "react";
+ import { useTranslation } from "react-i18next";
+ import type {
+   BranchLabels,
+@@ -6,8 +6,11 @@ import type {
+   ChatSendResult,
+   ConversationDto,
+   MessageDto,
++  PacketPreviewResult,
+   ProjectDto,
++  ProjectUpdateInput,
+   ProviderKeyDto,
++  SearchHit,
+ } from "@ai-hub/shared";
+ import {
+   catalogModelsForProvider,
+@@ -51,6 +54,15 @@ export function App(): JSX.Element {
+   const [error, setError] = useState<string | null>(null);
+   const [branchLabels, setBranchLabels] = useState<BranchLabels>({});
+   const [exportNotice, setExportNotice] = useState<string | null>(null);
++  const [compactHistory, setCompactHistory] = useState(false);
++  const [packetPreview, setPacketPreview] = useState<PacketPreviewResult | null>(null);
++  const [searchQuery, setSearchQuery] = useState("");
++  const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
++  const [threadStartModel, setThreadStartModel] = useState<string | null>(null);
++  const projectInputRef = useRef<HTMLInputElement | null>(null);
++  const searchInputRef = useRef<HTMLInputElement | null>(null);
++  const selectedModelRef = useRef(selectedModel);
++  const searchGeneration = useRef(0);
+ 
+   const fail = useCallback((): void => {
+     setError(t("workspace.error.generic"));
+@@ -62,7 +74,7 @@ export function App(): JSX.Element {
+     return list;
+   }, []);
+ 
+-  const loadConversations = useCallback(async (projectId: string): Promise<ConversationDto[]> => {
++  const loadConversations = useCallback(async (projectId: string | null): Promise<ConversationDto[]> => {
+     const list = await window.hub.conversations.list({ projectId });
+     setConversations(list);
+     return list;
+@@ -113,19 +125,37 @@ export function App(): JSX.Element {
+         if (session.extraSystem !== undefined) {
+           setExtraSystem(session.extraSystem);
+         }
+-        const project =
+-          projectList.find((item) => item.id === session.projectId) ?? projectList[0] ?? null;
+-        if (!project) {
+-          setSessionReady(true);
+-          return;
+-        }
+-        setSelectedProjectId(project.id);
+-        const convos = await loadConversations(project.id);
+-        const conversation =
+-          convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
+-        if (conversation) {
+-          setSelectedConversationId(conversation.id);
+-          await loadMessages(conversation.id);
++        if (session.projectId) {
++          const project = projectList.find((item) => item.id === session.projectId) ?? null;
++          if (!project) {
++            setSelectedProjectId(null);
++            const convos = await loadConversations(null);
++            const conversation =
++              convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
++            if (conversation) {
++              setSelectedConversationId(conversation.id);
++              await loadMessages(conversation.id);
++            }
++            setSessionReady(true);
++            return;
++          }
++          setSelectedProjectId(project.id);
++          const convos = await loadConversations(project.id);
++          const conversation =
++            convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
++          if (conversation) {
++            setSelectedConversationId(conversation.id);
++            await loadMessages(conversation.id);
++          }
++        } else {
++          setSelectedProjectId(null);
++          const convos = await loadConversations(null);
++          const conversation =
++            convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
++          if (conversation) {
++            setSelectedConversationId(conversation.id);
++            await loadMessages(conversation.id);
++          }
+         }
+         setSessionReady(true);
+       } catch {
+@@ -180,6 +210,68 @@ export function App(): JSX.Element {
+     }
+   }, [providerKeys, selectedKeyId, selectedModel]);
+ 
++  useEffect(() => {
++    selectedModelRef.current = selectedModel;
++  }, [selectedModel]);
++
++  useEffect(() => {
++    setThreadStartModel(selectedModelRef.current);
++    setCompactHistory(false);
++  }, [selectedConversationId]);
++
++  useEffect(() => {
++    const query = searchQuery.trim();
++    if (query.length < 2) {
++      setSearchHits([]);
++      return;
++    }
++    const generation = searchGeneration.current + 1;
++    searchGeneration.current = generation;
++    const handle = window.setTimeout(() => {
++      void window.hub.search
++        .query({ query })
++        .then((hits) => {
++          if (searchGeneration.current === generation) {
++            setSearchHits(hits);
++          }
++        })
++        .catch(fail);
++    }, 250);
++    return () => window.clearTimeout(handle);
++  }, [fail, searchQuery]);
++
++  useEffect(() => {
++    if (!selectedConversationId) {
++      setPacketPreview(null);
++      return;
++    }
++    const key = providerKeys.find((item) => item.id === selectedKeyId);
++    if (!key) {
++      setPacketPreview(null);
++      return;
++    }
++    const extra = extraSystem.trim().length > 0 ? extraSystem : undefined;
++    void window.hub.chat
++      .previewPacket({
++        conversationId: selectedConversationId,
++        model: selectedModel,
++        providerSlug: key.providerSlug,
++        compact: compactHistory,
++        ...(extra !== undefined ? { extraSystem: extra } : {}),
++      })
++      .then(setPacketPreview)
++      .catch(fail);
++  }, [
++    compactHistory,
++    extraSystem,
++    fail,
++    messages,
++    providerKeys,
++    selectedConversationId,
++    selectedKeyId,
++    selectedModel,
++  ]);
++
+   useEffect(() => {
+     const off = window.hub.chat.onEvent((event) => {
+       if (event.type === "chunk") {
+@@ -213,13 +305,55 @@ export function App(): JSX.Element {
+     return off;
+   }, [fail, loadMessages, t]);
+ 
++  const applyProjectPreferences = useCallback(
++    (project: ProjectDto, keys: ProviderKeyDto[]): void => {
++      if (project.preferredProvider) {
++        const key = keys.find(
++          (item) => item.status === "active" && item.providerSlug === project.preferredProvider,
++        );
++        if (!key) {
++          return;
++        }
++        setSelectedKeyId(key.id);
++        if (project.preferredModel) {
++          setSelectedModel(project.preferredModel);
++        }
++        return;
++      }
++      if (project.preferredModel) {
++        setSelectedModel(project.preferredModel);
++      }
++    },
++    [],
++  );
++
++  const createUntitledChat = useCallback(async (): Promise<void> => {
++    try {
++      const created = await window.hub.conversations.create({
++        projectId: selectedProjectId,
++        title: t("workspace.untitledChat"),
++      });
++      setError(null);
++      await loadConversations(selectedProjectId);
++      setSelectedConversationId(created.id);
++      setMessages([]);
++      setBranchLabels({});
++      if (run && run.conversationId !== created.id) {
++        void window.hub.chat.abort({ runId: run.runId }).catch(fail);
++      }
++      setView("home");
++    } catch {
++      fail();
++    }
++  }, [fail, loadConversations, run, selectedProjectId, t]);
++
+   const sendToModel = async (input: ChatSendInput): Promise<void> => {
+     if (!selectedConversationId || !selectedKeyId) {
+       return;
+     }
+     setSending(true);
+     try {
+-      const result = await window.hub.chat.send(input);
++      const result = await window.hub.chat.send({ ...input, compactHistory });
+       setError(null);
+       setRun({ runId: result.runId, conversationId: selectedConversationId });
+       setMessages((current) => applySendResult(current, result));
+@@ -238,6 +372,27 @@ export function App(): JSX.Element {
+ 
+   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
+ 
++  useEffect(() => {
++    const onKey = (event: KeyboardEvent): void => {
++      const modifier = event.ctrlKey || event.metaKey;
++      if (!modifier) {
++        return;
++      }
++      if (event.shiftKey && event.key.toLowerCase() === "n") {
++        event.preventDefault();
++        setView("home");
++        window.setTimeout(() => projectInputRef.current?.focus(), 0);
++        return;
++      }
++      if (event.key.toLowerCase() === "n") {
++        event.preventDefault();
++        void createUntitledChat();
++      }
++    };
++    window.addEventListener("keydown", onKey);
++    return () => window.removeEventListener("keydown", onKey);
++  }, [createUntitledChat]);
++
+   return (
+     <div className="flex h-full flex-col overflow-hidden">
+       <TitleBar />
+@@ -258,6 +413,12 @@ export function App(): JSX.Element {
+             setSelectedConversationId(null);
+             setMessages([]);
+             setBranchLabels({});
++            if (id) {
++              const next = projects.find((item) => item.id === id);
++              if (next) {
++                applyProjectPreferences(next, providerKeys);
++              }
++            }
+             void loadConversations(id).catch(fail);
+           }}
+           onCreateProject={async (name) => {
+@@ -277,6 +438,31 @@ export function App(): JSX.Element {
+               fail();
+             }
+           }}
++          projectInputRef={projectInputRef}
++          searchQuery={searchQuery}
++          searchHits={searchHits}
++          onSearchQuery={setSearchQuery}
++          searchInputRef={searchInputRef}
++          onOpenSearchHit={(hit) => {
++            abortIfLeaving(hit.conversationId);
++            setSelectedProjectId(hit.projectId);
++            setView("home");
++            void (async () => {
++              try {
++                await loadConversations(hit.projectId);
++                setSelectedConversationId(hit.conversationId);
++                await loadMessages(hit.conversationId);
++                if (hit.messageId) {
++                  await window.hub.messages.activate({ id: hit.messageId });
++                  await loadMessages(hit.conversationId);
++                }
++                setSearchQuery("");
++                setSearchHits([]);
++              } catch {
++                fail();
++              }
++            })();
++          }}
+         />
+         <main className="min-w-0 flex-1 bg-background">
+           {view === "home" ? (
+@@ -302,9 +488,6 @@ export function App(): JSX.Element {
+                 void loadMessages(id).catch(fail);
+               }}
+               onCreateConversation={async (title) => {
+-                if (!selectedProjectId) {
+-                  return;
+-                }
+                 try {
+                   const created = await window.hub.conversations.create({
+                     projectId: selectedProjectId,
+@@ -338,6 +521,7 @@ export function App(): JSX.Element {
+                   temperature,
+                   maxTokens,
+                   extraSystem,
++                  compactHistory,
+                 });
+               }}
+               onAbort={async () => {
+@@ -447,6 +631,61 @@ export function App(): JSX.Element {
+                   fail();
+                 }
+               }}
++              onSaveProject={async (input: Omit<ProjectUpdateInput, "id">) => {
++                if (!selectedProjectId) {
++                  return;
++                }
++                try {
++                  const updated = await window.hub.projects.update({ id: selectedProjectId, ...input });
++                  setError(null);
++                  await loadProjects();
++                  applyProjectPreferences(updated, providerKeys);
++                } catch {
++                  fail();
++                }
++              }}
++              onRemoveProject={async () => {
++                if (!selectedProjectId) {
++                  return;
++                }
++                try {
++                  abortIfLeaving(null);
++                  await window.hub.projects.remove({ id: selectedProjectId });
++                  setError(null);
++                  await loadProjects();
++                  setSelectedProjectId(null);
++                  setSelectedConversationId(null);
++                  setMessages([]);
++                  setBranchLabels({});
++                  await loadConversations(null);
++                } catch {
++                  fail();
++                }
++              }}
++              onSetTags={async (names) => {
++                if (!selectedConversationId) {
++                  return;
++                }
++                try {
++                  const updated = await window.hub.conversations.setTags({
++                    conversationId: selectedConversationId,
++                    names,
++                  });
++                  setConversations((current) =>
++                    current.map((item) => (item.id === updated.id ? updated : item)),
++                  );
++                } catch {
++                  fail();
++                }
++              }}
++              compactHistory={compactHistory}
++              onToggleCompact={setCompactHistory}
++              packetPreview={packetPreview}
++              modelSwitchNotice={
++                threadStartModel !== null &&
++                threadStartModel !== selectedModel &&
++                messages.length > 0
++              }
+             />
+           ) : (
+             <SettingsView />
+@@ -454,7 +693,19 @@ export function App(): JSX.Element {
+         </main>
+       </div>
+       <StatusBar />
+-      <ChromeCommandPalette />
++      <ChromeCommandPalette
++        onNewProject={() => {
++          setView("home");
++          window.setTimeout(() => projectInputRef.current?.focus(), 0);
++        }}
++        onNewChat={() => {
++          void createUntitledChat();
++        }}
++        onSearch={() => {
++          setView("home");
++          window.setTimeout(() => searchInputRef.current?.focus(), 0);
++        }}
++      />
+     </div>
+   );
+ }
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index 08e5832..b837eb5 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -8,7 +8,9 @@ import {
+   type CatalogModel,
+   type ConversationDto,
+   type MessageDto,
++  type PacketPreviewResult,
+   type ProjectDto,
++  type ProjectUpdateInput,
+   type ProviderKeyDto,
+ } from "@ai-hub/shared";
+ import { ChatComposer } from "@/components/chat/chat-composer";
+@@ -18,6 +20,8 @@ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import { ScrollArea } from "@/components/ui/scroll-area";
+ 
++const PROJECT_COLORS = ["#64748b", "#2563eb", "#7c3aed", "#db2777", "#dc2626", "#d97706", "#16a34a", "#0891b2"] as const;
++
+ export function HomeView({
+   project,
+   conversations,
+@@ -49,6 +53,13 @@ export function HomeView({
+   onActivate,
+   onRenameBranch,
+   onExport,
++  onSaveProject,
++  onRemoveProject,
++  onSetTags,
++  compactHistory,
++  onToggleCompact,
++  packetPreview,
++  modelSwitchNotice,
+ }: {
+   project: ProjectDto | null;
+   conversations: ConversationDto[];
+@@ -80,12 +91,25 @@ export function HomeView({
+   onActivate: (id: string) => Promise<void>;
+   onRenameBranch: (branchId: string, label: string) => Promise<void>;
+   onExport: (mode: "active" | "tree") => Promise<void>;
++  onSaveProject: (input: Omit<ProjectUpdateInput, "id">) => Promise<void>;
++  onRemoveProject: () => Promise<void>;
++  onSetTags: (names: string[]) => Promise<void>;
++  compactHistory: boolean;
++  onToggleCompact: (value: boolean) => void;
++  packetPreview: PacketPreviewResult | null;
++  modelSwitchNotice: boolean;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const [title, setTitle] = useState("");
+   const [draft, setDraft] = useState("");
+   const [editing, setEditing] = useState(false);
+   const [treeOpen, setTreeOpen] = useState(false);
++  const [tagDraft, setTagDraft] = useState("");
++  const [projectName, setProjectName] = useState(project?.name ?? "");
++  const [projectColor, setProjectColor] = useState<string | null>(project?.color ?? null);
++  const [projectInstructions, setProjectInstructions] = useState(project?.instructions ?? "");
++  const [preferredProvider, setPreferredProvider] = useState(project?.preferredProvider ?? "");
++  const [preferredModel, setPreferredModel] = useState(project?.preferredModel ?? "");
+   const selectedKey = providerKeys.find((key) => key.id === selectedKeyId) ?? providerKeys[0] ?? null;
+   const providerSlug = selectedKey?.providerSlug ?? null;
+   const models = providerSlug ? catalogModelsForProvider(providerSlug) : [];
+@@ -96,38 +120,40 @@ export function HomeView({
+   const path = activePath(messages);
+   const activeIds = new Set(path.map((item) => item.id));
+   const leaf = path[path.length - 1] ?? null;
++  const selectedConversation = conversations.find((item) => item.id === selectedConversationId) ?? null;
++  const providerSlugs = [...new Set(providerKeys.map((item) => item.providerSlug))];
++  const preferredModels = preferredProvider ? catalogModelsForProvider(preferredProvider) : [];
+ 
+   useEffect(() => {
+     setEditing(false);
+     setTreeOpen(false);
++    setTagDraft("");
+   }, [selectedConversationId]);
+ 
+-  if (!project) {
+-    return (
+-      <div className="flex h-full items-center justify-center p-8">
+-        <div className="flex max-w-md flex-col items-start gap-3">
+-          <h1 className="text-base font-semibold">{t("empty.title")}</h1>
+-          <p className="text-muted-foreground">{t("empty.body")}</p>
+-          {error ? (
+-            <p className="text-destructive" role="alert">
+-              {error}
+-            </p>
+-          ) : null}
+-        </div>
+-      </div>
+-    );
+-  }
++  useEffect(() => {
++    setProjectName(project?.name ?? "");
++    setProjectColor(project?.color ?? null);
++    setProjectInstructions(project?.instructions ?? "");
++    setPreferredProvider(project?.preferredProvider ?? "");
++    setPreferredModel(project?.preferredModel ?? "");
++  }, [project]);
+ 
+   return (
+     <div className="flex h-full min-h-0">
+       <section className="flex w-64 shrink-0 flex-col border-r">
+         <div className="border-b p-3">
+-          <h1 className="truncate text-sm font-semibold">{project.name}</h1>
+-          <p className="text-muted-foreground">{t("workspace.conversations")}</p>
++          <h1 className="truncate text-sm font-semibold">
++            {project ? project.name : t("workspace.inbox")}
++          </h1>
++          <p className="text-muted-foreground">
++            {project ? t("workspace.conversations") : t("workspace.inboxHint")}
++          </p>
+         </div>
+         <ScrollArea className="flex-1 p-2">
+           {conversations.length === 0 ? (
+-            <p className="px-2 text-muted-foreground">{t("workspace.noConversations")}</p>
++            <p className="px-2 text-muted-foreground">
++              {project ? t("workspace.noConversations") : t("workspace.noConversationsInbox")}
++            </p>
+           ) : (
+             <div className="flex flex-col gap-0.5">
+               {conversations.map((conversation) => (
+@@ -144,6 +170,161 @@ export function HomeView({
+               ))}
+             </div>
+           )}
++          {selectedConversation ? (
++            <form
++              className="mt-3 flex flex-col gap-1 border-t pt-2"
++              onSubmit={(event) => {
++                event.preventDefault();
++                const next = tagDraft.trim();
++                if (!next) {
++                  return;
++                }
++                const names = selectedConversation.tags.includes(next)
++                  ? selectedConversation.tags
++                  : [...selectedConversation.tags, next];
++                void onSetTags(names).then(() => setTagDraft(""));
++              }}
++            >
++              <p className="px-1 text-[11px] text-muted-foreground">{t("workspace.tags")}</p>
++              <div className="flex flex-wrap gap-1 px-1">
++                {selectedConversation.tags.map((tag) => (
++                  <Button
++                    key={tag}
++                    type="button"
++                    size="sm"
++                    variant="secondary"
++                    className="h-6 px-2 text-[11px]"
++                    aria-label={t("workspace.tagRemove", { tag })}
++                    onClick={() => {
++                      void onSetTags(selectedConversation.tags.filter((item) => item !== tag));
++                    }}
++                  >
++                    {tag} ├ù
++                  </Button>
++                ))}
++              </div>
++              <Input
++                value={tagDraft}
++                onChange={(event) => setTagDraft(event.target.value)}
++                placeholder={t("workspace.tagPlaceholder")}
++                aria-label={t("workspace.tagPlaceholder")}
++                data-testid="conversation-tag"
++              />
++              <Button type="submit" size="sm" className="h-7" data-testid="conversation-tag-add">
++                {t("workspace.tagAdd")}
++              </Button>
++            </form>
++          ) : null}
++          {project ? (
++            <form
++              className="mt-3 flex flex-col gap-2 border-t pt-2"
++              onSubmit={(event) => {
++                event.preventDefault();
++                const name = projectName.trim();
++                if (!name) {
++                  return;
++                }
++                void onSaveProject({
++                  name,
++                  color: projectColor,
++                  instructions: projectInstructions.trim().length > 0 ? projectInstructions : null,
++                  preferredModel: preferredModel.trim().length > 0 ? preferredModel.trim() : null,
++                  preferredProvider: preferredProvider.trim().length > 0 ? preferredProvider.trim() : null,
++                });
++              }}
++            >
++              <Input
++                value={projectName}
++                onChange={(event) => setProjectName(event.target.value)}
++                aria-label={t("workspace.projectPlaceholder")}
++              />
++              <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
++                {t("workspace.projectColor")}
++                <div className="flex flex-wrap gap-1">
++                  {PROJECT_COLORS.map((color) => (
++                    <button
++                      key={color}
++                      type="button"
++                      className="h-4 w-4 rounded-full border"
++                      style={{ backgroundColor: color }}
++                      aria-label={color}
++                      aria-pressed={projectColor === color}
++                      data-testid="project-color"
++                      onClick={() => setProjectColor(color)}
++                    />
++                  ))}
++                </div>
++              </label>
++              <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
++                {t("workspace.projectInstructions")}
++                <textarea
++                  className="min-h-[4rem] resize-y rounded-md border bg-background px-2 py-1 text-[12px] text-foreground"
++                  value={projectInstructions}
++                  onChange={(event) => setProjectInstructions(event.target.value)}
++                  aria-label={t("workspace.projectInstructions")}
++                  data-testid="project-instructions"
++                />
++                <span>{t("workspace.projectInstructionsHint")}</span>
++              </label>
++              <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
++                {t("workspace.preferredProvider")}
++                <select
++                  className="h-8 rounded-md border bg-background px-2 text-sm text-foreground"
++                  value={preferredProvider}
++                  onChange={(event) => setPreferredProvider(event.target.value)}
++                  aria-label={t("workspace.preferredProvider")}
++                >
++                  <option value="">{t("workspace.preferredNone")}</option>
++                  {providerSlugs.map((slug) => (
++                    <option key={slug} value={slug}>
++                      {slug}
++                    </option>
++                  ))}
++                </select>
++              </label>
++              <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
++                {t("workspace.preferredModel")}
++                {preferredModels.length > 0 ? (
++                  <select
++                    className="h-8 rounded-md border bg-background px-2 text-sm text-foreground"
++                    value={preferredModel}
++                    onChange={(event) => setPreferredModel(event.target.value)}
++                    aria-label={t("workspace.preferredModel")}
++                  >
++                    <option value="">{t("workspace.preferredNone")}</option>
++                    {preferredModels.map((model) => (
++                      <option key={model.id} value={model.id}>
++                        {model.label}
++                      </option>
++                    ))}
++                  </select>
++                ) : (
++                  <Input
++                    value={preferredModel}
++                    onChange={(event) => setPreferredModel(event.target.value)}
++                    aria-label={t("workspace.preferredModel")}
++                  />
++                )}
++              </label>
++              <Button type="submit" size="sm" className="h-7" data-testid="project-save">
++                {t("workspace.saveProject")}
++              </Button>
++              <Button
++                type="button"
++                size="sm"
++                variant="outline"
++                className="h-7"
++                data-testid="project-delete"
++                onClick={() => {
++                  if (window.confirm(t("workspace.deleteProjectConfirm", { name: project.name }))) {
++                    void onRemoveProject();
++                  }
++                }}
++              >
++                {t("workspace.deleteProject")}
++              </Button>
++            </form>
++          ) : null}
+         </ScrollArea>
+         <form
+           className="flex flex-col gap-1 border-t p-2"
+@@ -162,7 +343,7 @@ export function HomeView({
+             placeholder={t("workspace.conversationPlaceholder")}
+             aria-label={t("workspace.conversationPlaceholder")}
+           />
+-          <Button type="submit" size="sm" className="h-7">
++          <Button type="submit" size="sm" className="h-7" data-testid="workspace-new-conversation">
+             {t("workspace.newConversation")}
+           </Button>
+         </form>
+@@ -271,6 +452,14 @@ export function HomeView({
+                 </>
+               )}
+               <div className="ml-auto flex flex-wrap items-center gap-1">
++                {packetPreview ? (
++                  <span
++                    className="rounded-md border px-2 py-1 text-[11px] text-muted-foreground"
++                    data-testid="packet-badge"
++                  >
++                    {t("workspace.packet.badge", { n: packetPreview.tokenEstimate })}
++                  </span>
++                ) : null}
+                 <Button
+                   type="button"
+                   size="sm"
+@@ -305,6 +494,32 @@ export function HomeView({
+                 </Button>
+               </div>
+             </header>
++            {modelSwitchNotice ? (
++              <p className="border-b px-3 py-1 text-[11px] text-muted-foreground" role="status" data-testid="model-switch-notice">
++                {t("workspace.modelSwitch", { model: selectedModel })}
++              </p>
++            ) : null}
++            {packetPreview?.overflow ? (
++              <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2 text-[12px]" role="status">
++                <p>
++                  {t("workspace.overflow", {
++                    window: packetPreview.contextWindow,
++                    estimate: packetPreview.tokenEstimate,
++                  })}
++                </p>
++                <Button
++                  type="button"
++                  size="sm"
++                  variant={compactHistory ? "secondary" : "outline"}
++                  data-testid="compact-history"
++                  onClick={() => onToggleCompact(!compactHistory)}
++                >
++                  {compactHistory ? t("workspace.compact.off") : t("workspace.compact")}
++                </Button>
++              </div>
++            ) : compactHistory ? (
++              <p className="border-b px-3 py-1 text-[11px] text-muted-foreground">{t("workspace.compact.on")}</p>
++            ) : null}
+             {exportNotice ? (
+               <p className="border-b px-3 py-1 text-[11px] text-muted-foreground" role="status">
+                 {exportNotice}
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index eacda6b..2391753 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -15,19 +15,44 @@
+   "window.maximize": "Maximize",
+   "window.close": "Close",
+   "empty.title": "No projects yet",
+-  "empty.body": "Create a project in the sidebar. It survives an app restart.",
++  "empty.body": "Create a project in the sidebar, or start an unfiled chat in Inbox.",
+   "empty.action": "Open settings",
+   "settings.title": "Appearance and keys",
+   "settings.hint": "Theme and language live in the local database. API keys go to Credential Manager, never SQLite.",
+   "workspace.projects": "Projects",
++  "workspace.inbox": "Inbox",
++  "workspace.inboxHint": "Unfiled chats",
+   "workspace.projectPlaceholder": "Project name",
+   "workspace.newProject": "New project",
++  "workspace.projectColor": "Color",
++  "workspace.projectInstructions": "Project instructions",
++  "workspace.projectInstructionsHint": "Always included in the compiled packet.",
++  "workspace.preferredProvider": "Preferred provider",
++  "workspace.preferredModel": "Preferred model",
++  "workspace.preferredNone": "None",
++  "workspace.saveProject": "Save project",
++  "workspace.deleteProject": "Delete project",
++  "workspace.deleteProjectConfirm": "Delete {{name}}? Chats move to Inbox. The message tree stays.",
++  "workspace.search": "Search chats",
++  "workspace.searchEmpty": "No matches",
++  "workspace.tags": "Tags",
++  "workspace.tagPlaceholder": "Add tag",
++  "workspace.tagAdd": "Add",
++  "workspace.tagRemove": "Remove tag {{tag}}",
+   "workspace.conversations": "Conversations",
+   "workspace.conversationPlaceholder": "Conversation title",
+   "workspace.newConversation": "New conversation",
+-  "workspace.noConversations": "No conversations in this project.",
++  "workspace.untitledChat": "New chat",
++  "workspace.noConversations": "No conversations in this project. Ctrl+N starts one.",
++  "workspace.noConversationsInbox": "Inbox is empty. Ctrl+N starts an unfiled chat.",
+   "workspace.noMessages": "No messages yet. Type below and press Enter to send.",
+   "workspace.pickConversation": "Pick or create a conversation.",
++  "workspace.packet.badge": "~{{n}} tokens",
++  "workspace.overflow": "This thread is over the {{window}} token window (~{{estimate}} estimated). Compact drops oldest turns from the next packet; the tree stays.",
++  "workspace.compact": "Compact history",
++  "workspace.compact.on": "Next send will drop oldest turns to fit the window.",
++  "workspace.compact.off": "Send full compiled history",
++  "workspace.modelSwitch": "Next reply uses {{model}}. History is compiled ÔÇö you do not need to paste a summary.",
+   "workspace.error.generic": "That action could not be completed. Try again.",
+   "workspace.error.chat": "The model request failed ({{code}}).",
+   "workspace.model": "Model",
+@@ -94,6 +119,9 @@
+   "command.empty": "No commands",
+   "dialog.close": "Close dialog",
+   "command.theme": "Change theme",
++  "command.newProject": "New project",
++  "command.newChat": "New chat",
++  "command.search": "Search conversations",
+   "about.title": "About",
+   "about.body": "AI Hub Desktop ÔÇö the control layer between you and AI providers. BYOK, local-first."
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index 7054f10..beae4a8 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -15,19 +15,44 @@
+   "window.maximize": "Maximizar",
+   "window.close": "Fechar",
+   "empty.title": "Nenhum projeto ainda",
+-  "empty.body": "Crie um projeto na barra lateral. Ele sobrevive ao reiniciar o app.",
++  "empty.body": "Crie um projeto na barra lateral, ou comece um chat avulso na inbox.",
+   "empty.action": "Abrir configura├º├Áes",
+   "settings.title": "Apar├¬ncia e chaves",
+   "settings.hint": "Tema e idioma ficam no banco local. Chaves de API v├úo para o Credential Manager, nunca para o SQLite.",
+   "workspace.projects": "Projetos",
++  "workspace.inbox": "Avulsas",
++  "workspace.inboxHint": "Chats sem projeto",
+   "workspace.projectPlaceholder": "Nome do projeto",
+   "workspace.newProject": "Novo projeto",
++  "workspace.projectColor": "Cor",
++  "workspace.projectInstructions": "Instru├º├Áes do projeto",
++  "workspace.projectInstructionsHint": "Entram sempre no packet compilado.",
++  "workspace.preferredProvider": "Provider preferido",
++  "workspace.preferredModel": "Modelo preferido",
++  "workspace.preferredNone": "Nenhum",
++  "workspace.saveProject": "Salvar projeto",
++  "workspace.deleteProject": "Excluir projeto",
++  "workspace.deleteProjectConfirm": "Excluir {{name}}? Os chats v├úo para Avulsas. A ├írvore de mensagens permanece.",
++  "workspace.search": "Buscar conversas",
++  "workspace.searchEmpty": "Nenhum resultado",
++  "workspace.tags": "Tags",
++  "workspace.tagPlaceholder": "Nova tag",
++  "workspace.tagAdd": "Adicionar",
++  "workspace.tagRemove": "Remover tag {{tag}}",
+   "workspace.conversations": "Conversas",
+   "workspace.conversationPlaceholder": "T├¡tulo da conversa",
+   "workspace.newConversation": "Nova conversa",
+-  "workspace.noConversations": "Nenhuma conversa neste projeto.",
++  "workspace.untitledChat": "Nova conversa",
++  "workspace.noConversations": "Nenhuma conversa neste projeto. Ctrl+N cria uma.",
++  "workspace.noConversationsInbox": "Inbox vazia. Ctrl+N cria um chat avulso.",
+   "workspace.noMessages": "Nenhuma mensagem ainda. Escreva abaixo e pressione Enter para enviar.",
+   "workspace.pickConversation": "Escolha ou crie uma conversa.",
++  "workspace.packet.badge": "~{{n}} tokens",
++  "workspace.overflow": "Este fio passa da janela de {{window}} tokens (~{{estimate}} estimados). Compactar tira os turnos antigos do pr├│ximo packet; a ├írvore permanece.",
++  "workspace.compact": "Compactar hist├│rico",
++  "workspace.compact.on": "O pr├│ximo envio descarta turnos antigos para caber na janela.",
++  "workspace.compact.off": "Enviar o hist├│rico compilado completo",
++  "workspace.modelSwitch": "A pr├│xima resposta usa {{model}}. O hist├│rico ├® compilado ÔÇö voc├¬ n├úo precisa colar um resumo.",
+   "workspace.error.generic": "N├úo foi poss├¡vel concluir a a├º├úo. Tente de novo.",
+   "workspace.error.chat": "A chamada ao modelo falhou ({{code}}).",
+   "workspace.model": "Modelo",
+@@ -94,6 +119,9 @@
+   "command.empty": "Nenhum comando",
+   "dialog.close": "Fechar di├ílogo",
+   "command.theme": "Alterar tema",
++  "command.newProject": "Novo projeto",
++  "command.newChat": "Nova conversa",
++  "command.search": "Buscar conversas",
+   "about.title": "Sobre",
+   "about.body": "AI Hub Desktop ÔÇö camada de controle entre voc├¬ e os provedores de IA. BYOK, local-first."
+ }
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index 2f8f92c..93963b4 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -115,7 +115,7 @@ describe("hub database", () => {
+       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
+       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
+       applyMigrations(second.sqlite);
+-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(3);
++      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(4);
+       second.close();
+     } finally {
+       rmSync(dir, { recursive: true, force: true });
+@@ -441,4 +441,63 @@ describe("hub database", () => {
+     expect(dump).not.toMatch(/sk-/);
+     hub.close();
+   });
++
++  it("stores three projects with instructions and finds an old message without filling FTS", () => {
++    const { hub } = openTestDb();
++    const alpha = hub.repos.createProject("Alpha", {
++      color: "#2563eb",
++      instructions: "Stay terse.",
++      preferredModel: "gpt-4o-mini",
++      preferredProvider: "openai",
++    });
++    hub.repos.createProject("Beta", { color: "#16a34a" });
++    hub.repos.createProject("Gamma");
++    expect(hub.repos.listProjects()).toHaveLength(3);
++    expect(alpha.instructions).toBe("Stay terse.");
++    expect(alpha.preferredProvider).toBe("openai");
++
++    const inbox = hub.repos.createConversation(null, "Loose note");
++    expect(inbox.projectId).toBeNull();
++    expect(hub.repos.listConversations(null).map((item) => item.title)).toEqual(["Loose note"]);
++
++    const conversation = hub.repos.createConversation(alpha.id, "Kickoff");
++    hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "user",
++      content: "remember the ancient needle phrase",
++      parentId: null,
++      branchId: null,
++    });
++    const tagged = hub.repos.setConversationTags(conversation.id, ["research", "mvp"]);
++    expect(tagged.tags).toEqual(["mvp", "research"]);
++
++    hub.repos.removeProject(alpha.id);
++    expect(hub.repos.getConversation(conversation.id)?.projectId).toBeNull();
++
++    const hits = hub.repos.searchWorkspace("ancient needle");
++    expect(hits.some((hit) => hit.snippet.includes("ancient needle"))).toBe(true);
++    const dump = dumpAllText(hub.sqlite);
++    expect(dump).not.toContain("ancient needle phrase");
++    const ftsCount = hub.sqlite.prepare(`SELECT count(*) AS n FROM messages_fts`).get() as { n: number };
++    expect(ftsCount.n).toBe(0);
++    hub.close();
++  });
++
++  it("redacts pasted secrets in search snippets", () => {
++    const { hub } = openTestDb();
++    const project = hub.repos.createProject("Vault");
++    const conversation = hub.repos.createConversation(project.id, "Keys");
++    hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "user",
++      content: "my key is sk-testfixtureABCDEFGH never store it",
++      parentId: null,
++      branchId: null,
++    });
++    const hits = hub.repos.searchWorkspace("never store");
++    expect(hits.length).toBeGreaterThan(0);
++    expect(JSON.stringify(hits)).not.toContain("sk-testfixtureABCDEFGH");
++    expect(hits[0]?.snippet).toContain("[REDACTED]");
++    hub.close();
++  });
+ });
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 41f1df5..a13b90c 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -7,10 +7,12 @@ import {
+   last4OfSecret,
+   maskSecret,
+   providerKeyAccount,
++  redactSecrets,
+   type SecretStore,
+ } from "@ai-hub/security";
+ import {
+   conversations,
++  conversationTags,
+   healthSamples,
+   messageReceipts,
+   messages,
+@@ -18,6 +20,7 @@ import {
+   providerKeys,
+   providers,
+   settings,
++  tags,
+   type schema,
+ } from "./schema";
+ 
+@@ -26,19 +29,38 @@ export type HubDrizzle = BetterSQLite3Database<typeof schema>;
+ export interface ProjectRecord {
+   id: string;
+   name: string;
++  color: string | null;
+   instructions: string | null;
++  preferredModel: string | null;
++  preferredProvider: string | null;
+   createdAt: string;
+   updatedAt: string;
+ }
+ 
++export interface ProjectWriteFields {
++  color?: string | null;
++  instructions?: string | null;
++  preferredModel?: string | null;
++  preferredProvider?: string | null;
++}
++
+ export interface ConversationRecord {
+   id: string;
+   projectId: string | null;
+   title: string;
++  tags: string[];
+   createdAt: string;
+   updatedAt: string;
+ }
+ 
++export interface SearchHitRecord {
++  conversationId: string;
++  projectId: string | null;
++  conversationTitle: string;
++  messageId: string | null;
++  snippet: string;
++}
++
+ export type MessageRole = "user" | "assistant" | "system";
+ export type MessageStatus = "complete" | "streaming" | "interrupted" | "aborted";
+ 
+@@ -173,6 +195,58 @@ function iso(ms: number): string {
+   return new Date(ms).toISOString();
+ }
+ 
++const PROJECT_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
++
++function normalizeProjectColor(value: string | null | undefined): string | null {
++  if (value === undefined || value === null || value.length === 0) {
++    return null;
++  }
++  return PROJECT_COLOR_RE.test(value) ? value : null;
++}
++
++function searchTokens(query: string): string[] {
++  return query
++    .trim()
++    .toLowerCase()
++    .split(/\s+/)
++    .filter((token) => token.length > 0);
++}
++
++function matchesAllTokens(haystack: string, tokens: string[]): boolean {
++  const lower = haystack.toLowerCase();
++  return tokens.every((token) => lower.includes(token));
++}
++
++function snippetAround(text: string, token: string, radius = 48): string {
++  const idx = text.toLowerCase().indexOf(token.toLowerCase());
++  if (idx < 0) {
++    return text.slice(0, radius * 2);
++  }
++  const start = Math.max(0, idx - radius);
++  const end = Math.min(text.length, idx + token.length + radius);
++  return `${start > 0 ? "ÔÇª" : ""}${text.slice(start, end)}${end < text.length ? "ÔÇª" : ""}`;
++}
++
++function clip(text: string, max: number): string {
++  return text.length <= max ? text : text.slice(0, max);
++}
++
++function toSearchHit(input: {
++  conversationId: string;
++  projectId: string | null;
++  title: string;
++  messageId: string | null;
++  snippet: string;
++}): SearchHitRecord {
++  return {
++    conversationId: input.conversationId,
++    projectId: input.projectId,
++    conversationTitle: clip(redactSecrets(input.title), 200),
++    messageId: input.messageId,
++    snippet: clip(redactSecrets(input.snippet), 400),
++  };
++}
++
+ function asRole(value: string): MessageRole {
+   if (value === "user" || value === "assistant" || value === "system") {
+     return value;
+@@ -218,9 +292,12 @@ export class HubRepos {
+     return {
+       id: row.id,
+       name: decryptUtf8(row.nameCipher, this.masterKey),
++      color: normalizeProjectColor(row.color),
+       instructions: row.instructionsCipher
+         ? decryptUtf8(row.instructionsCipher, this.masterKey)
+         : null,
++      preferredModel: row.preferredModel ?? null,
++      preferredProvider: row.preferredProvider ?? null,
+       createdAt: iso(row.createdAt),
+       updatedAt: iso(row.updatedAt),
+     };
+@@ -231,6 +308,7 @@ export class HubRepos {
+       id: row.id,
+       projectId: row.projectId,
+       title: decryptUtf8(row.titleCipher, this.masterKey),
++      tags: this.listConversationTagNames(row.id),
+       createdAt: iso(row.createdAt),
+       updatedAt: iso(row.updatedAt),
+     };
+@@ -286,29 +364,77 @@ export class HubRepos {
+     return row ? this.toProject(row) : null;
+   }
+ 
+-  createProject(name: string): ProjectRecord {
++  createProject(name: string, fields: ProjectWriteFields = {}): ProjectRecord {
+     const now = Date.now();
+     const id = randomUUID();
++    const instructions =
++      fields.instructions !== undefined && fields.instructions !== null && fields.instructions.trim().length > 0
++        ? fields.instructions.trim()
++        : null;
+     this.db
+       .insert(projects)
+       .values({
+         id,
+         nameCipher: encryptUtf8(name, this.masterKey),
++        color: normalizeProjectColor(fields.color),
++        instructionsCipher: instructions ? encryptUtf8(instructions, this.masterKey) : null,
++        preferredModel: fields.preferredModel ?? null,
++        preferredProvider: fields.preferredProvider ?? null,
+         createdAt: now,
+         updatedAt: now,
+       })
+       .run();
+-    return { id, name, instructions: null, createdAt: iso(now), updatedAt: iso(now) };
++    const created = this.getProject(id);
++    if (!created) {
++      throw new Error("Project not found");
++    }
++    return created;
++  }
++
++  updateProject(id: string, name: string, fields: ProjectWriteFields = {}): ProjectRecord {
++    const existing = this.getProject(id);
++    if (!existing) {
++      throw new Error("Project not found");
++    }
++    const now = Date.now();
++    const instructions =
++      fields.instructions !== undefined
++        ? fields.instructions !== null && fields.instructions.trim().length > 0
++          ? fields.instructions.trim()
++          : null
++        : existing.instructions;
++    const color = fields.color !== undefined ? normalizeProjectColor(fields.color) : existing.color;
++    const preferredModel = fields.preferredModel !== undefined ? fields.preferredModel : existing.preferredModel;
++    const preferredProvider =
++      fields.preferredProvider !== undefined ? fields.preferredProvider : existing.preferredProvider;
++    this.db
++      .update(projects)
++      .set({
++        nameCipher: encryptUtf8(name, this.masterKey),
++        color,
++        instructionsCipher: instructions ? encryptUtf8(instructions, this.masterKey) : null,
++        preferredModel,
++        preferredProvider,
++        updatedAt: now,
++      })
++      .where(eq(projects.id, id))
++      .run();
++    const updated = this.getProject(id);
++    if (!updated) {
++      throw new Error("Project not found");
++    }
++    return updated;
+   }
+ 
+   removeProject(id: string): void {
++    this.db.update(conversations).set({ projectId: null }).where(eq(conversations.projectId, id)).run();
+     this.db.delete(projects).where(eq(projects.id, id)).run();
+   }
+ 
+   listConversations(projectId: string | null): ConversationRecord[] {
+     const rows =
+       projectId === null
+-        ? this.db.select().from(conversations).all().filter((row) => row.projectId === null)
++        ? this.db.select().from(conversations).where(isNull(conversations.projectId)).all()
+         : this.db.select().from(conversations).where(eq(conversations.projectId, projectId)).all();
+     return rows
+       .map((row) => this.toConversation(row))
+@@ -333,13 +459,125 @@ export class HubRepos {
+         updatedAt: now,
+       })
+       .run();
+-    return { id, projectId, title, createdAt: iso(now), updatedAt: iso(now) };
++    return { id, projectId, title, tags: [], createdAt: iso(now), updatedAt: iso(now) };
+   }
+ 
+   removeConversation(id: string): void {
++    this.db.delete(conversationTags).where(eq(conversationTags.conversationId, id)).run();
+     this.db.delete(conversations).where(eq(conversations.id, id)).run();
+   }
+ 
++  listConversationTagNames(conversationId: string): string[] {
++    const links = this.db
++      .select()
++      .from(conversationTags)
++      .where(eq(conversationTags.conversationId, conversationId))
++      .all();
++    const names: string[] = [];
++    for (const link of links) {
++      const tag = this.db.select().from(tags).where(eq(tags.id, link.tagId)).get();
++      if (tag) {
++        names.push(tag.name);
++      }
++    }
++    return names.sort((a, b) => a.localeCompare(b));
++  }
++
++  setConversationTags(conversationId: string, names: string[]): ConversationRecord {
++    const existing = this.getConversation(conversationId);
++    if (!existing) {
++      throw new Error("Conversation not found");
++    }
++    this.db.delete(conversationTags).where(eq(conversationTags.conversationId, conversationId)).run();
++    const unique: string[] = [];
++    for (const raw of names) {
++      const name = raw.trim();
++      if (name.length === 0 || unique.includes(name)) {
++        continue;
++      }
++      unique.push(name);
++      if (unique.length >= 20) {
++        break;
++      }
++    }
++    for (const name of unique) {
++      const tag = this.getOrCreateTag(name);
++      this.db.insert(conversationTags).values({ conversationId, tagId: tag.id }).run();
++    }
++    const updated = this.getConversation(conversationId);
++    if (!updated) {
++      throw new Error("Conversation not found");
++    }
++    return updated;
++  }
++
++  searchWorkspace(query: string, limit = 50): SearchHitRecord[] {
++    const tokens = searchTokens(query);
++    if (tokens.length === 0) {
++      return [];
++    }
++    const hits: SearchHitRecord[] = [];
++    const rows = this.db
++      .select()
++      .from(conversations)
++      .all()
++      .sort((a, b) => b.updatedAt - a.updatedAt);
++    for (const row of rows) {
++      if (hits.length >= limit) {
++        break;
++      }
++      const title = decryptUtf8(row.titleCipher, this.masterKey);
++      const titleMatched = matchesAllTokens(title, tokens);
++      let messageMatched = false;
++      const messageRows = this.db
++        .select()
++        .from(messages)
++        .where(eq(messages.conversationId, row.id))
++        .all();
++      for (const message of messageRows) {
++        if (hits.length >= limit) {
++          break;
++        }
++        const content = decryptUtf8(message.contentCipher, this.masterKey);
++        if (!matchesAllTokens(content, tokens)) {
++          continue;
++        }
++        messageMatched = true;
++        hits.push(
++          toSearchHit({
++            conversationId: row.id,
++            projectId: row.projectId,
++            title,
++            messageId: message.id,
++            snippet: snippetAround(content, tokens[0] ?? ""),
++          }),
++        );
++      }
++      if (titleMatched && !messageMatched && hits.length < limit) {
++        hits.push(
++          toSearchHit({
++            conversationId: row.id,
++            projectId: row.projectId,
++            title,
++            messageId: null,
++            snippet: title,
++          }),
++        );
++      }
++    }
++    return hits;
++  }
++
++  private getOrCreateTag(name: string): { id: string; name: string } {
++    const existing = this.db.select().from(tags).where(eq(tags.name, name)).get();
++    if (existing) {
++      return existing;
++    }
++    const id = randomUUID();
++    this.db.insert(tags).values({ id, name }).run();
++    return { id, name };
++  }
++
+   listMessages(conversationId: string): MessageRecord[] {
+     return this.db
+       .select()
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index 30891a0..a6b01d5 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -7,6 +7,10 @@ import {
+   messageDtoSchema,
+   messageUpdateInputSchema,
+   providerKeyDtoSchema,
++  projectCreateInputSchema,
++  projectDtoSchema,
++  searchHitSchema,
++  searchInputSchema,
+   secretsSaveInputSchema,
+   secretsTestResultSchema,
+   windowIsMaximizedResultSchema,
+@@ -97,6 +101,7 @@ describe("conversationExportDocumentSchema", () => {
+           id: "11111111-1111-4111-8111-111111111111",
+           projectId: null,
+           title: "Chat",
++          tags: [],
+           createdAt: "2026-09-17T00:00:00.000Z",
+           updatedAt: "2026-09-17T00:00:00.000Z",
+         },
+@@ -217,3 +222,40 @@ describe("providerKeyDtoSchema", () => {
+     ).toThrow();
+   });
+ });
++
++describe("project and search contracts", () => {
++  it("accepts a full project DTO and rejects credentials in color", () => {
++    const parsed = projectDtoSchema.parse({
++      id: "11111111-1111-4111-8111-111111111111",
++      name: "Alpha",
++      color: "#2563eb",
++      instructions: "Stay terse.",
++      preferredModel: "gpt-4o-mini",
++      preferredProvider: "openai",
++      createdAt: "2026-09-17T00:00:00.000Z",
++      updatedAt: "2026-09-17T00:00:00.000Z",
++    });
++    expect(parsed.instructions).toBe("Stay terse.");
++    expect(() =>
++      projectCreateInputSchema.parse({ name: "Alpha", color: "not-a-color" }),
++    ).toThrow();
++  });
++
++  it("caps search query length", () => {
++    expect(() => searchInputSchema.parse({ query: "a".repeat(201) })).toThrow();
++    expect(searchInputSchema.parse({ query: "  needle  " }).query).toBe("needle");
++  });
++
++  it("rejects extra keys and overlong snippets on search hits", () => {
++    const hit = {
++      conversationId: "11111111-1111-4111-8111-111111111111",
++      projectId: null,
++      conversationTitle: "Kickoff",
++      messageId: null,
++      snippet: "needle",
++    };
++    expect(searchHitSchema.parse(hit).snippet).toBe("needle");
++    expect(() => searchHitSchema.parse({ ...hit, apiKey: "sk-testfixtureABCDEFGH" })).toThrow();
++    expect(() => searchHitSchema.parse({ ...hit, snippet: "x".repeat(401) })).toThrow();
++  });
++});
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index 1c2392c..9131d5f 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -40,9 +40,18 @@ export const customBaseUrlSchema = z
+     }
+   });
+ 
++export const projectColorSchema = z
++  .string()
++  .regex(/^#[0-9a-fA-F]{6}$/)
++  .nullable();
++
+ export const projectDtoSchema = z.object({
+   id: z.string().uuid(),
+   name: z.string(),
++  color: projectColorSchema,
++  instructions: z.string().nullable(),
++  preferredModel: z.string().max(128).nullable(),
++  preferredProvider: z.string().max(64).nullable(),
+   createdAt: isoTimestampSchema,
+   updatedAt: isoTimestampSchema,
+ });
+@@ -51,22 +60,37 @@ export type ProjectDto = z.infer<typeof projectDtoSchema>;
+ 
+ export const projectListResultSchema = z.array(projectDtoSchema);
+ 
+-export const projectCreateInputSchema = z
+-  .object({
+-    name: z.string().trim().min(1).max(200),
++const projectFieldsSchema = z.object({
++  name: z.string().trim().min(1).max(200),
++  color: projectColorSchema.optional(),
++  instructions: z.string().max(20_000).nullable().optional(),
++  preferredModel: z.string().trim().min(1).max(128).nullable().optional(),
++  preferredProvider: z.string().trim().min(1).max(64).nullable().optional(),
++});
++
++export const projectCreateInputSchema = projectFieldsSchema.strict();
++
++export type ProjectCreateInput = z.infer<typeof projectCreateInputSchema>;
++
++export const projectUpdateInputSchema = projectFieldsSchema
++  .extend({
++    id: z.string().uuid(),
+   })
+   .strict();
+ 
+-export type ProjectCreateInput = z.infer<typeof projectCreateInputSchema>;
++export type ProjectUpdateInput = z.infer<typeof projectUpdateInputSchema>;
+ 
+ export const idInputSchema = z.object({ id: z.string().uuid() }).strict();
+ 
+ export type IdInput = z.infer<typeof idInputSchema>;
+ 
++export const tagNameSchema = z.string().trim().min(1).max(40);
++
+ export const conversationDtoSchema = z.object({
+   id: z.string().uuid(),
+   projectId: z.string().uuid().nullable(),
+   title: z.string(),
++  tags: z.array(tagNameSchema),
+   createdAt: isoTimestampSchema,
+   updatedAt: isoTimestampSchema,
+ });
+@@ -92,6 +116,61 @@ export const conversationCreateInputSchema = z
+ 
+ export type ConversationCreateInput = z.infer<typeof conversationCreateInputSchema>;
+ 
++export const conversationTagsSetInputSchema = z
++  .object({
++    conversationId: z.string().uuid(),
++    names: z.array(tagNameSchema).max(20),
++  })
++  .strict();
++
++export type ConversationTagsSetInput = z.infer<typeof conversationTagsSetInputSchema>;
++
++export const searchInputSchema = z
++  .object({
++    query: z.string().trim().min(1).max(200),
++  })
++  .strict();
++
++export type SearchInput = z.infer<typeof searchInputSchema>;
++
++export const searchHitSchema = z
++  .object({
++    conversationId: z.string().uuid(),
++    projectId: z.string().uuid().nullable(),
++    conversationTitle: z.string().max(200),
++    messageId: z.string().uuid().nullable(),
++    snippet: z.string().max(400),
++  })
++  .strict();
++
++export type SearchHit = z.infer<typeof searchHitSchema>;
++
++export const searchResultSchema = z.array(searchHitSchema).max(50);
++
++export const packetPreviewInputSchema = z
++  .object({
++    conversationId: z.string().uuid(),
++    extraSystem: z.string().max(20_000).optional(),
++    model: z.string().min(1).max(128),
++    providerSlug: z.string().min(1).max(64),
++    compact: z.boolean().optional(),
++  })
++  .strict();
++
++export type PacketPreviewInput = z.infer<typeof packetPreviewInputSchema>;
++
++export const packetPreviewResultSchema = z
++  .object({
++    tokenEstimate: z.number().int().nonnegative(),
++    contextWindow: z.number().int().positive(),
++    overflow: z.boolean(),
++    compacted: z.boolean(),
++    excludedCount: z.number().int().nonnegative(),
++  })
++  .strict();
++
++export type PacketPreviewResult = z.infer<typeof packetPreviewResultSchema>;
++
+ export const messageRoleSchema = z.enum(["user", "assistant", "system"]);
+ 
+ export type MessageRole = z.infer<typeof messageRoleSchema>;
