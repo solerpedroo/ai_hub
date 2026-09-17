@@ -40,7 +40,7 @@ export function App(): JSX.Element {
   const [providerKeys, setProviderKeys] = useState<ProviderKeyDto[]>([]);
   const [selectedKeyId, setSelectedKeyId] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState("gpt-4o-mini");
-  const [runId, setRunId] = useState<string | null>(null);
+  const [run, setRun] = useState<{ runId: string; conversationId: string } | null>(null);
   const [sending, setSending] = useState(false);
   const [sessionReady, setSessionReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -153,11 +153,13 @@ export function App(): JSX.Element {
         setMessages((current) =>
           current.map((message) => (message.id === event.message.id ? event.message : message)),
         );
-        setRunId(null);
+        setRun((current) => (current?.runId === event.runId ? null : current));
         return;
       }
-      setRunId(null);
-      setError(t("workspace.error.chat", { code: event.code }));
+      setRun((current) => (current?.runId === event.runId ? null : current));
+      if (event.code !== "aborted") {
+        setError(t("workspace.error.chat", { code: event.code }));
+      }
       setSelectedConversationId((conversationId) => {
         if (conversationId) {
           void loadMessages(conversationId).catch(fail);
@@ -181,7 +183,7 @@ export function App(): JSX.Element {
         content,
       });
       setError(null);
-      setRunId(result.runId);
+      setRun({ runId: result.runId, conversationId: selectedConversationId });
       setMessages((current) => {
         let next = current;
         if (result.userMessageId && content && !next.some((item) => item.id === result.userMessageId)) {
@@ -222,6 +224,12 @@ export function App(): JSX.Element {
     }
   };
 
+  const abortIfLeaving = (nextConversationId: string | null): void => {
+    if (run && run.conversationId !== nextConversationId) {
+      void window.hub.chat.abort({ runId: run.runId }).catch(fail);
+    }
+  };
+
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
 
   return (
@@ -230,14 +238,19 @@ export function App(): JSX.Element {
       <div className="flex min-h-0 flex-1">
         <Sidebar
           view={view}
-          onChange={setView}
+          onChange={(next) => {
+            if (next !== "home" && run) {
+              void window.hub.chat.abort({ runId: run.runId }).catch(fail);
+            }
+            setView(next);
+          }}
           projects={projects}
           selectedProjectId={selectedProjectId}
           onSelectProject={(id) => {
+            abortIfLeaving(null);
             setSelectedProjectId(id);
             setSelectedConversationId(null);
             setMessages([]);
-            setRunId(null);
             void loadConversations(id).catch(fail);
           }}
           onCreateProject={async (name) => {
@@ -249,7 +262,7 @@ export function App(): JSX.Element {
               setSelectedProjectId(next.id);
               setSelectedConversationId(null);
               setMessages([]);
-              setRunId(null);
+              abortIfLeaving(null);
               await loadConversations(next.id);
               setView("home");
             } catch {
@@ -268,11 +281,11 @@ export function App(): JSX.Element {
               providerKeys={providerKeys}
               selectedKeyId={selectedKeyId}
               selectedModel={selectedModel}
-              streaming={runId !== null}
+              streaming={run?.conversationId === selectedConversationId}
               sending={sending}
               onSelectConversation={(id) => {
+                abortIfLeaving(id);
                 setSelectedConversationId(id);
-                setRunId(null);
                 void loadMessages(id).catch(fail);
               }}
               onCreateConversation={async (title) => {
@@ -288,7 +301,7 @@ export function App(): JSX.Element {
                   await loadConversations(selectedProjectId);
                   setSelectedConversationId(created.id);
                   setMessages([]);
-                  setRunId(null);
+                  abortIfLeaving(created.id);
                 } catch {
                   fail();
                 }
@@ -297,11 +310,11 @@ export function App(): JSX.Element {
               onSelectModel={setSelectedModel}
               onSend={(content) => sendToModel(content)}
               onAbort={async () => {
-                if (!runId) {
+                if (!run || run.conversationId !== selectedConversationId) {
                   return;
                 }
                 try {
-                  await window.hub.chat.abort({ runId });
+                  await window.hub.chat.abort({ runId: run.runId });
                 } catch {
                   fail();
                 }
