@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { WebContents } from "electron";
 import {
   composeReceipt,
+  compileActivePath,
   compilePacket,
   consumeCrashSafeStream,
   createMockOpenAIAdapter,
@@ -12,8 +13,11 @@ import {
   gatewayErrorCode,
   type ProviderAdapter,
 } from "@ai-hub/ai-gateway";
+import type { MessageRecord } from "@ai-hub/db";
 import { redactSecrets } from "@ai-hub/security";
 import {
+  activePath,
+  ancestorsOf,
   chatEventSchema,
   findCatalogModel,
   IpcChannel,
@@ -113,36 +117,106 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     throw new Error("Only OpenAI is available in this wave");
   }
 
-  let history = repos.listMessages(input.conversationId);
-  if (history.some((item) => item.status === "streaming")) {
+  const existing = repos.listMessages(input.conversationId);
+  if (existing.some((item) => item.status === "streaming")) {
     throw new Error("A stream is already running in this conversation");
   }
 
-  let userMessageId: string | null = null;
-  if (input.content !== null) {
-    const last = history[history.length - 1];
-    const user = repos.createMessage({
-      conversationId: input.conversationId,
-      role: "user",
-      content: input.content,
-      parentId: last?.id ?? null,
-      branchId: last?.branchId ?? null,
-    });
-    userMessageId = user.id;
-    history = [...history, user];
+  let userMessage: MessageRecord | null = null;
+  let compileRows: MessageRecord[] = [];
+  let assistantParentId: string | null = null;
+  let assistantBranchId: string | null = null;
+
+  switch (input.mode) {
+    case "send": {
+      const leaf = activePath(existing).at(-1);
+      userMessage = repos.createMessage({
+        conversationId: input.conversationId,
+        role: "user",
+        content: input.content,
+        parentId: leaf?.id ?? null,
+        branchId: leaf?.branchId ?? null,
+      });
+      compileRows = repos.listActivePath(input.conversationId);
+      assistantParentId = userMessage.id;
+      assistantBranchId = userMessage.branchId;
+      break;
+    }
+    case "continue": {
+      compileRows = repos.listActivePath(input.conversationId);
+      const leaf = compileRows.at(-1);
+      if (!leaf) {
+        throw new Error("Add a user message before sending");
+      }
+      assistantParentId = leaf.id;
+      assistantBranchId = leaf.branchId;
+      break;
+    }
+    case "regenerate": {
+      const target = repos.getMessage(input.messageId);
+      if (!target || target.conversationId !== input.conversationId || target.role !== "assistant") {
+        throw new Error("Assistant message not found");
+      }
+      if (target.status === "streaming") {
+        throw new Error("A stream is already running in this conversation");
+      }
+      const path = activePath(existing);
+      const index = path.findIndex((item) => item.id === target.id);
+      compileRows =
+        index >= 0 ? path.slice(0, index) : ancestorsOf(existing, target.id).slice(1).reverse();
+      assistantParentId = target.parentId;
+      assistantBranchId = randomUUID();
+      break;
+    }
+    case "edit": {
+      const target = repos.getMessage(input.messageId);
+      if (!target || target.conversationId !== input.conversationId || target.role !== "user") {
+        throw new Error("User message not found");
+      }
+      userMessage = repos.createMessage({
+        conversationId: input.conversationId,
+        role: "user",
+        content: input.content,
+        parentId: target.parentId,
+        branchId: randomUUID(),
+      });
+      compileRows = repos.listActivePath(input.conversationId);
+      assistantParentId = userMessage.id;
+      assistantBranchId = userMessage.branchId;
+      break;
+    }
+    default: {
+      const _never: never = input;
+      throw new Error(`Unknown send mode: ${String(_never)}`);
+    }
   }
 
   const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
-  const packet = compilePacket({
-    projectInstructions: project?.instructions ?? null,
-    extraSystem: null,
-    messages: history.map((item) => ({
-      id: item.id,
-      role: item.role,
-      content: item.content,
-      status: item.status,
-    })),
-  });
+  const packet =
+    input.mode === "regenerate"
+      ? compilePacket({
+          projectInstructions: project?.instructions ?? null,
+          extraSystem: null,
+          messages: compileRows.map((item) => ({
+            id: item.id,
+            role: item.role,
+            content: item.content,
+            status: item.status,
+          })),
+        })
+      : compileActivePath({
+          projectInstructions: project?.instructions ?? null,
+          extraSystem: null,
+          messages: compileRows.map((item) => ({
+            id: item.id,
+            parentId: item.parentId,
+            isActiveBranch: item.isActiveBranch,
+            createdAt: item.createdAt,
+            role: item.role,
+            content: item.content,
+            status: item.status,
+          })),
+        });
   if (packet.messages.length === 0) {
     throw new Error("Add a user message before sending");
   }
@@ -150,13 +224,12 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
   console.info("[hub:packet]", redactSecrets(JSON.stringify(packet)));
   const publicPacket = inspectablePacket(packet);
 
-  const last = history[history.length - 1];
   const assistant = repos.createMessage({
     conversationId: input.conversationId,
     role: "assistant",
     content: "",
-    parentId: last?.id ?? null,
-    branchId: last?.branchId ?? null,
+    parentId: assistantParentId,
+    branchId: assistantBranchId,
     status: "streaming",
   });
   repos.createReceipt({
@@ -169,6 +242,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     costUsd: null,
     errorCode: null,
   });
+  const assistantStored = repos.getMessage(assistant.id) ?? assistant;
 
   const runId = randomUUID();
   const run: ActiveRun = {
@@ -251,7 +325,9 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
   return {
     runId,
     messageId: assistant.id,
-    userMessageId,
+    userMessageId: userMessage?.id ?? null,
     packet: publicPacket,
+    userMessage: userMessage ? toMessageDto(userMessage) : null,
+    assistant: toMessageDto(assistantStored),
   };
 }
