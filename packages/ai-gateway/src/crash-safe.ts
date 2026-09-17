@@ -8,6 +8,7 @@ export interface CrashSafeStreamResult {
   content: string;
   tokensIn: number | null;
   tokensOut: number | null;
+  costUsd: string | null;
 }
 
 export async function consumeCrashSafeStream(input: {
@@ -22,6 +23,7 @@ export async function consumeCrashSafeStream(input: {
   let lastFlushAt = now();
   let tokensIn: number | null = null;
   let tokensOut: number | null = null;
+  let costUsd: string | null = null;
 
   const flush = (force: boolean): void => {
     if (content === lastFlushed) {
@@ -50,13 +52,16 @@ export async function consumeCrashSafeStream(input: {
       } else {
         tokensIn = event.tokensIn;
         tokensOut = event.tokensOut;
+        if (event.costUsd !== undefined) {
+          costUsd = event.costUsd;
+        }
       }
     }
     flush(true);
-    return { content, tokensIn, tokensOut };
+    return { content, tokensIn, tokensOut, costUsd };
   } catch (error) {
     flush(true);
-    throw new GatewayStreamError(error, { content, tokensIn, tokensOut });
+    throw new GatewayStreamError(error, { content, tokensIn, tokensOut, costUsd });
   } finally {
     clearInterval(timer);
   }
