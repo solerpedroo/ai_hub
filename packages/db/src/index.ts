@@ -1,5 +1,5 @@
 export { applyMigrations } from "./migrate";
-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL } from "./migrations";
+export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL } from "./migrations";
 export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
 export {
   HubRepos,
@@ -9,6 +9,7 @@ export {
   type MessageRole,
   type MessageStatus,
   type ProjectRecord,
+  type SearchHitRecord,
   type ProviderKeyRecord,
   type ProviderRecord,
   type ProviderSecretRecord,
