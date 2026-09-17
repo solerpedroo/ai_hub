@@ -11,6 +11,7 @@ import {
 } from "@ai-hub/security";
 import {
   conversations,
+  messageReceipts,
   messages,
   projects,
   providerKeys,
@@ -24,6 +25,7 @@ export type HubDrizzle = BetterSQLite3Database<typeof schema>;
 export interface ProjectRecord {
   id: string;
   name: string;
+  instructions: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -39,6 +41,19 @@ export interface ConversationRecord {
 export type MessageRole = "user" | "assistant" | "system";
 export type MessageStatus = "complete" | "streaming" | "interrupted" | "aborted";
 
+export interface ReceiptRecord {
+  id: string;
+  messageId: string;
+  provider: string | null;
+  model: string | null;
+  tokensIn: number | null;
+  tokensOut: number | null;
+  latencyMs: number | null;
+  costUsd: string | null;
+  errorCode: string | null;
+  createdAt: string;
+}
+
 export interface MessageRecord {
   id: string;
   conversationId: string;
@@ -48,6 +63,7 @@ export interface MessageRecord {
   content: string;
   status: MessageStatus;
   createdAt: string;
+  receipt: ReceiptRecord | null;
 }
 
 export interface ProviderRecord {
@@ -64,6 +80,12 @@ export interface ProviderKeyRecord {
   last4: string;
   status: "active" | "invalid";
   createdAt: string;
+}
+
+export interface ProviderSecretRecord {
+  id: string;
+  providerSlug: string;
+  secret: string;
 }
 
 export interface AppearanceRecord {
@@ -103,18 +125,90 @@ export class HubRepos {
     private readonly secrets: SecretStore,
   ) {}
 
+  private toReceipt(row: typeof messageReceipts.$inferSelect): ReceiptRecord {
+    return {
+      id: row.id,
+      messageId: row.messageId,
+      provider: row.provider,
+      model: row.model,
+      tokensIn: row.tokensIn,
+      tokensOut: row.tokensOut,
+      latencyMs: row.latencyMs,
+      costUsd: row.costUsd,
+      errorCode: row.errorCode,
+      createdAt: iso(row.createdAt),
+    };
+  }
+
+  private toProject(row: typeof projects.$inferSelect): ProjectRecord {
+    return {
+      id: row.id,
+      name: decryptUtf8(row.nameCipher, this.masterKey),
+      instructions: row.instructionsCipher
+        ? decryptUtf8(row.instructionsCipher, this.masterKey)
+        : null,
+      createdAt: iso(row.createdAt),
+      updatedAt: iso(row.updatedAt),
+    };
+  }
+
+  private toConversation(row: typeof conversations.$inferSelect): ConversationRecord {
+    return {
+      id: row.id,
+      projectId: row.projectId,
+      title: decryptUtf8(row.titleCipher, this.masterKey),
+      createdAt: iso(row.createdAt),
+      updatedAt: iso(row.updatedAt),
+    };
+  }
+
+  private toMessage(
+    row: typeof messages.$inferSelect,
+    receipt: ReceiptRecord | null,
+  ): MessageRecord {
+    return {
+      id: row.id,
+      conversationId: row.conversationId,
+      parentId: row.parentId,
+      branchId: row.branchId,
+      role: asRole(row.role),
+      content: decryptUtf8(row.contentCipher, this.masterKey),
+      status: asStatus(row.status),
+      createdAt: iso(row.createdAt),
+      receipt,
+    };
+  }
+
+  getReceipt(messageId: string): ReceiptRecord | null {
+    const row = this.db
+      .select()
+      .from(messageReceipts)
+      .where(eq(messageReceipts.messageId, messageId))
+      .all()
+      .sort((a, b) => b.createdAt - a.createdAt)[0];
+    return row ? this.toReceipt(row) : null;
+  }
+
+  getMessage(id: string): MessageRecord | null {
+    const row = this.db.select().from(messages).where(eq(messages.id, id)).get();
+    if (!row) {
+      return null;
+    }
+    return this.toMessage(row, this.getReceipt(id));
+  }
+
   listProjects(): ProjectRecord[] {
     return this.db
       .select()
       .from(projects)
       .all()
-      .map((row) => ({
-        id: row.id,
-        name: decryptUtf8(row.nameCipher, this.masterKey),
-        createdAt: iso(row.createdAt),
-        updatedAt: iso(row.updatedAt),
-      }))
+      .map((row) => this.toProject(row))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  getProject(id: string): ProjectRecord | null {
+    const row = this.db.select().from(projects).where(eq(projects.id, id)).get();
+    return row ? this.toProject(row) : null;
   }
 
   createProject(name: string): ProjectRecord {
@@ -129,7 +223,7 @@ export class HubRepos {
         updatedAt: now,
       })
       .run();
-    return { id, name, createdAt: iso(now), updatedAt: iso(now) };
+    return { id, name, instructions: null, createdAt: iso(now), updatedAt: iso(now) };
   }
 
   removeProject(id: string): void {
@@ -142,14 +236,13 @@ export class HubRepos {
         ? this.db.select().from(conversations).all().filter((row) => row.projectId === null)
         : this.db.select().from(conversations).where(eq(conversations.projectId, projectId)).all();
     return rows
-      .map((row) => ({
-        id: row.id,
-        projectId: row.projectId,
-        title: decryptUtf8(row.titleCipher, this.masterKey),
-        createdAt: iso(row.createdAt),
-        updatedAt: iso(row.updatedAt),
-      }))
+      .map((row) => this.toConversation(row))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  getConversation(id: string): ConversationRecord | null {
+    const row = this.db.select().from(conversations).where(eq(conversations.id, id)).get();
+    return row ? this.toConversation(row) : null;
   }
 
   createConversation(projectId: string | null, title: string): ConversationRecord {
@@ -178,16 +271,7 @@ export class HubRepos {
       .from(messages)
       .where(eq(messages.conversationId, conversationId))
       .all()
-      .map((row) => ({
-        id: row.id,
-        conversationId: row.conversationId,
-        parentId: row.parentId,
-        branchId: row.branchId,
-        role: asRole(row.role),
-        content: decryptUtf8(row.contentCipher, this.masterKey),
-        status: asStatus(row.status),
-        createdAt: iso(row.createdAt),
-      }))
+      .map((row) => this.toMessage(row, this.getReceipt(row.id)))
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
@@ -197,6 +281,7 @@ export class HubRepos {
     content: string;
     parentId: string | null;
     branchId: string | null;
+    status?: MessageStatus;
   }): MessageRecord {
     const conversation = this.db
       .select()
@@ -219,6 +304,7 @@ export class HubRepos {
 
     const now = Date.now();
     const id = randomUUID();
+    const status = input.status ?? "complete";
     this.db
       .insert(messages)
       .values({
@@ -229,7 +315,7 @@ export class HubRepos {
         isActiveBranch: 1,
         role: input.role,
         contentCipher: encryptUtf8(input.content, this.masterKey),
-        status: "complete",
+        status,
         createdAt: now,
       })
       .run();
@@ -246,9 +332,136 @@ export class HubRepos {
       branchId,
       role: input.role,
       content: input.content,
-      status: "complete",
+      status,
+      createdAt: iso(now),
+      receipt: null,
+    };
+  }
+
+  updateMessage(id: string, content: string, status: MessageStatus): MessageRecord {
+    const row = this.db.select().from(messages).where(eq(messages.id, id)).get();
+    if (!row) {
+      throw new Error("Message not found");
+    }
+    this.db
+      .update(messages)
+      .set({
+        contentCipher: encryptUtf8(content, this.masterKey),
+        status,
+      })
+      .where(eq(messages.id, id))
+      .run();
+    const updated = this.db.select().from(messages).where(eq(messages.id, id)).get();
+    if (!updated) {
+      throw new Error("Message not found");
+    }
+    return this.toMessage(updated, this.getReceipt(id));
+  }
+
+  createReceipt(input: {
+    messageId: string;
+    provider: string | null;
+    model: string | null;
+    tokensIn: number | null;
+    tokensOut: number | null;
+    latencyMs: number | null;
+    costUsd: string | null;
+    errorCode: string | null;
+  }): ReceiptRecord {
+    const message = this.db.select().from(messages).where(eq(messages.id, input.messageId)).get();
+    if (!message) {
+      throw new Error("Message not found");
+    }
+    const existing = this.getReceipt(input.messageId);
+    if (existing) {
+      this.db
+        .update(messageReceipts)
+        .set({
+          provider: input.provider,
+          model: input.model,
+          tokensIn: input.tokensIn,
+          tokensOut: input.tokensOut,
+          latencyMs: input.latencyMs,
+          costUsd: input.costUsd,
+          errorCode: input.errorCode,
+        })
+        .where(eq(messageReceipts.id, existing.id))
+        .run();
+      return {
+        ...existing,
+        provider: input.provider,
+        model: input.model,
+        tokensIn: input.tokensIn,
+        tokensOut: input.tokensOut,
+        latencyMs: input.latencyMs,
+        costUsd: input.costUsd,
+        errorCode: input.errorCode,
+      };
+    }
+    const now = Date.now();
+    const id = randomUUID();
+    this.db
+      .insert(messageReceipts)
+      .values({
+        id,
+        messageId: input.messageId,
+        provider: input.provider,
+        model: input.model,
+        tokensIn: input.tokensIn,
+        tokensOut: input.tokensOut,
+        latencyMs: input.latencyMs,
+        costUsd: input.costUsd,
+        errorCode: input.errorCode,
+        createdAt: now,
+      })
+      .run();
+    return {
+      id,
+      messageId: input.messageId,
+      provider: input.provider,
+      model: input.model,
+      tokensIn: input.tokensIn,
+      tokensOut: input.tokensOut,
+      latencyMs: input.latencyMs,
+      costUsd: input.costUsd,
+      errorCode: input.errorCode,
       createdAt: iso(now),
     };
+  }
+
+  interruptOrphanStreams(): number {
+    const rows = this.db.select().from(messages).where(eq(messages.status, "streaming")).all();
+    const now = Date.now();
+    for (const row of rows) {
+      this.db.update(messages).set({ status: "interrupted" }).where(eq(messages.id, row.id)).run();
+      const existing = this.getReceipt(row.id);
+      if (existing) {
+        if (!existing.errorCode) {
+          this.db
+            .update(messageReceipts)
+            .set({ errorCode: "unknown" })
+            .where(eq(messageReceipts.id, existing.id))
+            .run();
+        }
+      } else {
+        this.db
+          .insert(messageReceipts)
+          .values({
+            id: randomUUID(),
+            messageId: row.id,
+            provider: null,
+            model: null,
+            tokensIn: null,
+            tokensOut: null,
+            latencyMs: null,
+            costUsd: null,
+            errorCode: "unknown",
+            createdAt: now,
+          })
+          .run();
+      }
+    }
+    return rows.length;
   }
 
   listProviders(): ProviderRecord[] {
@@ -306,6 +519,19 @@ export class HubRepos {
         createdAt: iso(row.createdAt),
       };
     });
+  }
+
+  async getProviderSecret(id: string): Promise<ProviderSecretRecord | null> {
+    const row = this.db.select().from(providerKeys).where(eq(providerKeys.id, id)).get();
+    if (!row) {
+      return null;
+    }
+    const provider = this.db.select().from(providers).where(eq(providers.id, row.providerId)).get();
+    const secret = await this.secrets.getPassword(row.keytarAccount);
+    if (!secret || !provider) {
+      return null;
+    }
+    return { id: row.id, providerSlug: provider.slug, secret };
   }
 
   async saveProviderKey(input: {
