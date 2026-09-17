@@ -1,10 +1,16 @@
 import type { AppLocale, ThemeMode } from "./appearance";
-import type { ChatAbortInput, ChatSendInput, ChatSendResult } from "./gateway";
+import type { ChatAbortInput, ChatSendInput } from "./gateway";
 import type {
   AppearanceSettings,
+  BranchLabelSetInput,
+  BranchLabels,
+  BranchLabelsGetInput,
   ChatEvent,
+  ChatSendResult,
   ConversationCreateInput,
   ConversationDto,
+  ConversationExportInput,
+  ConversationExportResult,
   ConversationListInput,
   IdInput,
   MessageCreateInput,
@@ -36,13 +42,16 @@ export interface HubConversationsApi {
   list: (input: ConversationListInput) => Promise<ConversationDto[]>;
   create: (input: ConversationCreateInput) => Promise<ConversationDto>;
   remove: (input: IdInput) => Promise<void>;
+  export: (input: ConversationExportInput) => Promise<ConversationExportResult>;
+  getBranchLabels: (input: BranchLabelsGetInput) => Promise<BranchLabels>;
+  setBranchLabel: (input: BranchLabelSetInput) => Promise<void>;
 }
 
 export interface HubMessagesApi {
   list: (input: MessageListInput) => Promise<MessageDto[]>;
   create: (input: MessageCreateInput) => Promise<MessageDto>;
   update: (input: MessageUpdateInput) => Promise<MessageDto>;
-  deleteFrom: (input: IdInput) => Promise<void>;
+  activate: (input: IdInput) => Promise<void>;
 }
 
 export interface HubSettingsApi {
