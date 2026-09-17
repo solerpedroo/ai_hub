@@ -34,4 +34,19 @@ describe("composeReceipt", () => {
     expect(receipt.errorCode).toBe("network");
     expect(receipt.costUsd).not.toBeNull();
   });
+
+  it("prefers provider-reported cost over the local catalog", () => {
+    const receipt = composeReceipt({
+      provider: "openrouter",
+      model: "openai/gpt-4o-mini",
+      tokensIn: 1_000_000,
+      tokensOut: 1_000_000,
+      estimatedIn: 1,
+      estimatedOut: 1,
+      latencyMs: 40,
+      errorCode: null,
+      reportedCostUsd: "0.000042",
+    });
+    expect(receipt.costUsd).toBe("0.000042");
+  });
 });
