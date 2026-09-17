@@ -1,0 +1,577 @@
+﻿diff --git a/apps/desktop/e2e/send.spec.ts b/apps/desktop/e2e/send.spec.ts
+index ac91f8a..f55b80d 100644
+--- a/apps/desktop/e2e/send.spec.ts
++++ b/apps/desktop/e2e/send.spec.ts
+@@ -1,14 +1,14 @@
+ import { createRequire } from "node:module";
+ import path from "node:path";
+ import { fileURLToPath } from "node:url";
+-import { _electron as electron, expect, test } from "@playwright/test";
++import { _electron as electron, expect, test, type ElectronApplication } from "@playwright/test";
+ 
+ const require = createRequire(import.meta.url);
+ const electronBinary = require("electron") as string;
+ const appRoot = path.join(fileURLToPath(new URL("..", import.meta.url)));
+ 
+-test("sends a mocked message and shows the assistant bubble", async () => {
+-  const app = await electron.launch({
++async function launchHub(): Promise<ElectronApplication> {
++  return electron.launch({
+     executablePath: electronBinary,
+     args: [path.join(appRoot, "out/main/index.js")],
+     cwd: appRoot,
+@@ -18,7 +18,10 @@ test("sends a mocked message and shows the assistant bubble", async () => {
+       NODE_ENV: "production",
+     },
+   });
++}
+ 
++test("sends a mocked message and shows the assistant bubble", async () => {
++  const app = await launchHub();
+   try {
+     const window = await app.firstWindow();
+     await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
+@@ -27,6 +30,24 @@ test("sends a mocked message and shows the assistant bubble", async () => {
+     await expect(window.getByTestId("message-assistant")).toContainText("Hello from mock", {
+       timeout: 30_000,
+     });
++    await expect(window.getByTestId("message-assistant")).toHaveAttribute("data-status", "complete");
++  } finally {
++    await app.close();
++  }
++});
++
++test("stop aborts the mock stream without treating it as a request failure", async () => {
++  const app = await launchHub();
++  try {
++    const window = await app.firstWindow();
++    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
++    await window.getByTestId("chat-composer").fill("Hello");
++    await window.getByTestId("chat-send").click();
++    const bubble = window.getByTestId("message-assistant");
++    await expect(bubble).toHaveAttribute("data-status", "streaming", { timeout: 30_000 });
++    await window.getByTestId("chat-stop").click();
++    await expect(bubble).toHaveAttribute("data-status", "aborted", { timeout: 30_000 });
++    await expect(window.getByTestId("workspace-error")).toHaveCount(0);
+   } finally {
+     await app.close();
+   }
+diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts
+index 84a7951..ce28634 100644
+--- a/apps/desktop/src/main/chat-session.ts
++++ b/apps/desktop/src/main/chat-session.ts
+@@ -25,6 +25,7 @@ import {
+   type ProviderAgnosticPacket,
+ } from "@ai-hub/shared";
+ import { getHubDatabase } from "./persistence";
++import { isE2eMode } from "./e2e-mode";
+ import { toMessageDto } from "./message-dto";
+ 
+ interface ActiveRun {
+@@ -42,11 +43,7 @@ interface ActiveRun {
+ const runs = new Map<string, ActiveRun>();
+ const runByConversation = new Map<string, string>();
+ 
+-function isE2e(): boolean {
+-  return process.env.AI_HUB_E2E === "1";
+-}
+-
+-const adapter: ProviderAdapter = isE2e() ? createMockOpenAIAdapter() : createOpenAIAdapter();
++const adapter: ProviderAdapter = isE2eMode() ? createMockOpenAIAdapter() : createOpenAIAdapter();
+ 
+ function inspectablePacket(packet: ProviderAgnosticPacket): ProviderAgnosticPacket {
+   return packetV0Schema.parse(JSON.parse(redactSecrets(JSON.stringify(packet))) as unknown);
+diff --git a/apps/desktop/src/main/e2e-mode.ts b/apps/desktop/src/main/e2e-mode.ts
+new file mode 100644
+index 0000000..4a9e1c2
+--- /dev/null
++++ b/apps/desktop/src/main/e2e-mode.ts
+@@ -0,0 +1,5 @@
++import { app } from "electron";
++
++export function isE2eMode(): boolean {
++  return process.env.AI_HUB_E2E === "1" && !app.isPackaged;
++}
+diff --git a/apps/desktop/src/main/index.ts b/apps/desktop/src/main/index.ts
+index 0cdaeb1..d3a9ba0 100644
+--- a/apps/desktop/src/main/index.ts
++++ b/apps/desktop/src/main/index.ts
+@@ -6,8 +6,9 @@ import { electronApp, is, optimizer } from "@electron-toolkit/utils";
+ import { safeErrorMessage } from "@ai-hub/security";
+ import { registerWindowIpc, registerWorkspaceIpc } from "./ipc";
+ import { bootPersistence } from "./persistence";
++import { isE2eMode } from "./e2e-mode";
+ 
+-if (process.env.AI_HUB_E2E === "1") {
++if (isE2eMode()) {
+   app.setPath("userData", mkdtempSync(join(tmpdir(), "ai-hub-e2e-")));
+ }
+ 
+@@ -137,7 +138,7 @@ function createWindow(): void {
+     window.show();
+   });
+ 
+-  if ((is.dev && process.env.AI_HUB_E2E !== "1") && process.env["ELECTRON_RENDERER_URL"]) {
++  if ((is.dev && !isE2eMode()) && process.env["ELECTRON_RENDERER_URL"]) {
+     void window.loadURL(process.env["ELECTRON_RENDERER_URL"]);
+   } else {
+     void window.loadFile(join(__dirname, "../renderer/index.html"));
+diff --git a/apps/desktop/src/main/persistence.ts b/apps/desktop/src/main/persistence.ts
+index 8bcc4c9..dededdf 100644
+--- a/apps/desktop/src/main/persistence.ts
++++ b/apps/desktop/src/main/persistence.ts
+@@ -3,13 +3,10 @@ import { app } from "electron";
+ import { openHubDatabase, type HubDatabase } from "@ai-hub/db";
+ import { loadOrCreateMasterKey, MemorySecretStore } from "@ai-hub/security";
+ import { KeytarSecretStore } from "@ai-hub/security/keytar";
++import { isE2eMode } from "./e2e-mode";
+ 
+ let hub: HubDatabase | null = null;
+ 
+-function isE2e(): boolean {
+-  return process.env.AI_HUB_E2E === "1";
+-}
+-
+ async function seedE2eWorkspace(database: HubDatabase): Promise<void> {
+   const project = database.repos.createProject("E2E");
+   const conversation = database.repos.createConversation(project.id, "Chat");
+@@ -29,11 +26,11 @@ export async function bootPersistence(): Promise<HubDatabase> {
+   if (hub) {
+     return hub;
+   }
+-  const store = isE2e() ? new MemorySecretStore() : new KeytarSecretStore();
++  const store = isE2eMode() ? new MemorySecretStore() : new KeytarSecretStore();
+   const masterKey = await loadOrCreateMasterKey(store);
+   const dbPath = join(app.getPath("userData"), "ai-hub.sqlite");
+   hub = openHubDatabase({ path: dbPath, masterKey, secretStore: store });
+-  if (isE2e()) {
++  if (isE2eMode()) {
+     await seedE2eWorkspace(hub);
+   }
+   hub.repos.interruptOrphanStreams();
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index 84c2d00..1eb7c14 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -40,7 +40,7 @@ export function App(): JSX.Element {
+   const [providerKeys, setProviderKeys] = useState<ProviderKeyDto[]>([]);
+   const [selectedKeyId, setSelectedKeyId] = useState<string | null>(null);
+   const [selectedModel, setSelectedModel] = useState("gpt-4o-mini");
+-  const [runId, setRunId] = useState<string | null>(null);
++  const [run, setRun] = useState<{ runId: string; conversationId: string } | null>(null);
+   const [sending, setSending] = useState(false);
+   const [sessionReady, setSessionReady] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+@@ -153,11 +153,13 @@ export function App(): JSX.Element {
+         setMessages((current) =>
+           current.map((message) => (message.id === event.message.id ? event.message : message)),
+         );
+-        setRunId(null);
++        setRun((current) => (current?.runId === event.runId ? null : current));
+         return;
+       }
+-      setRunId(null);
+-      setError(t("workspace.error.chat", { code: event.code }));
++      setRun((current) => (current?.runId === event.runId ? null : current));
++      if (event.code !== "aborted") {
++        setError(t("workspace.error.chat", { code: event.code }));
++      }
+       setSelectedConversationId((conversationId) => {
+         if (conversationId) {
+           void loadMessages(conversationId).catch(fail);
+@@ -181,7 +183,7 @@ export function App(): JSX.Element {
+         content,
+       });
+       setError(null);
+-      setRunId(result.runId);
++      setRun({ runId: result.runId, conversationId: selectedConversationId });
+       setMessages((current) => {
+         let next = current;
+         if (result.userMessageId && content && !next.some((item) => item.id === result.userMessageId)) {
+@@ -222,6 +224,12 @@ export function App(): JSX.Element {
+     }
+   };
+ 
++  const abortIfLeaving = (nextConversationId: string | null): void => {
++    if (run && run.conversationId !== nextConversationId) {
++      void window.hub.chat.abort({ runId: run.runId }).catch(fail);
++    }
++  };
++
+   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
+ 
+   return (
+@@ -230,14 +238,19 @@ export function App(): JSX.Element {
+       <div className="flex min-h-0 flex-1">
+         <Sidebar
+           view={view}
+-          onChange={setView}
++          onChange={(next) => {
++            if (next !== "home" && run) {
++              void window.hub.chat.abort({ runId: run.runId }).catch(fail);
++            }
++            setView(next);
++          }}
+           projects={projects}
+           selectedProjectId={selectedProjectId}
+           onSelectProject={(id) => {
++            abortIfLeaving(null);
+             setSelectedProjectId(id);
+             setSelectedConversationId(null);
+             setMessages([]);
+-            setRunId(null);
+             void loadConversations(id).catch(fail);
+           }}
+           onCreateProject={async (name) => {
+@@ -249,7 +262,7 @@ export function App(): JSX.Element {
+               setSelectedProjectId(next.id);
+               setSelectedConversationId(null);
+               setMessages([]);
+-              setRunId(null);
++              abortIfLeaving(null);
+               await loadConversations(next.id);
+               setView("home");
+             } catch {
+@@ -268,11 +281,11 @@ export function App(): JSX.Element {
+               providerKeys={providerKeys}
+               selectedKeyId={selectedKeyId}
+               selectedModel={selectedModel}
+-              streaming={runId !== null}
++              streaming={run?.conversationId === selectedConversationId}
+               sending={sending}
+               onSelectConversation={(id) => {
++                abortIfLeaving(id);
+                 setSelectedConversationId(id);
+-                setRunId(null);
+                 void loadMessages(id).catch(fail);
+               }}
+               onCreateConversation={async (title) => {
+@@ -288,7 +301,7 @@ export function App(): JSX.Element {
+                   await loadConversations(selectedProjectId);
+                   setSelectedConversationId(created.id);
+                   setMessages([]);
+-                  setRunId(null);
++                  abortIfLeaving(created.id);
+                 } catch {
+                   fail();
+                 }
+@@ -297,11 +310,11 @@ export function App(): JSX.Element {
+               onSelectModel={setSelectedModel}
+               onSend={(content) => sendToModel(content)}
+               onAbort={async () => {
+-                if (!runId) {
++                if (!run || run.conversationId !== selectedConversationId) {
+                   return;
+                 }
+                 try {
+-                  await window.hub.chat.abort({ runId });
++                  await window.hub.chat.abort({ runId: run.runId });
+                 } catch {
+                   fail();
+                 }
+diff --git a/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx b/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
+index 6477e43..30f01f8 100644
+--- a/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
++++ b/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
+@@ -49,6 +49,7 @@ export function ChatComposer({
+         ref={areaRef}
+         id="chat-composer"
+         data-testid="chat-composer"
++        aria-busy={busy}
+         value={value}
+         disabled={disabled || sending}
+         rows={3}
+diff --git a/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx b/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx
+index 634d234..7018a51 100644
+--- a/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx
++++ b/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx
+@@ -11,6 +11,7 @@ export function MessageBubble({
+   onRegenerate,
+   onContinue,
+   onEdit,
++  onEditingChange,
+ }: {
+   message: MessageDto;
+   isLast: boolean;
+@@ -18,6 +19,7 @@ export function MessageBubble({
+   onRegenerate: () => void;
+   onContinue: () => void;
+   onEdit: (content: string) => Promise<void>;
++  onEditingChange?: (editing: boolean) => void;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const [editing, setEditing] = useState(false);
+@@ -28,13 +30,15 @@ export function MessageBubble({
+     isLast &&
+     message.role === "assistant" &&
+     (message.status === "interrupted" || message.status === "aborted");
+-  const canRegenerate = isLast && message.role === "assistant" && message.status === "complete";
++  const canRegenerate =
++    isLast && message.role === "assistant" && message.status !== "streaming";
+   const canEdit = message.role === "user" && message.status === "complete" && !busy;
+ 
+   return (
+     <li
+       className="rounded-md border bg-card p-2"
+       data-testid={message.role === "assistant" ? "message-assistant" : "message-user"}
++      data-status={message.status}
+     >
+       <div className="mb-1 flex items-center justify-between gap-2">
+         <p className="text-[11px] uppercase text-muted-foreground">
+@@ -54,7 +58,10 @@ export function MessageBubble({
+             if (!next) {
+               return;
+             }
+-            void onEdit(next).then(() => setEditing(false));
++            void onEdit(next).then(() => {
++              setEditing(false);
++              onEditingChange?.(false);
++            });
+           }}
+         >
+           <textarea
+@@ -75,6 +82,7 @@ export function MessageBubble({
+               onClick={() => {
+                 setDraft(message.content);
+                 setEditing(false);
++                onEditingChange?.(false);
+               }}
+             >
+               {t("workspace.cancelEdit")}
+@@ -82,7 +90,7 @@ export function MessageBubble({
+           </div>
+         </form>
+       ) : message.role === "assistant" ? (
+-        <MessageMarkdown content={message.content.length > 0 ? message.content : "ÔÇª"} />
++        <MessageMarkdown content={message.content.length > 0 ? message.content : t("workspace.placeholder")} />
+       ) : (
+         <p className="whitespace-pre-wrap">{message.content}</p>
+       )}
+@@ -110,6 +118,7 @@ export function MessageBubble({
+               onClick={() => {
+                 setDraft(message.content);
+                 setEditing(true);
++                onEditingChange?.(true);
+               }}
+             >
+               {t("workspace.edit")}
+diff --git a/apps/desktop/src/renderer/src/components/chat/message-markdown.tsx b/apps/desktop/src/renderer/src/components/chat/message-markdown.tsx
+index a9b5afa..93fbe27 100644
+--- a/apps/desktop/src/renderer/src/components/chat/message-markdown.tsx
++++ b/apps/desktop/src/renderer/src/components/chat/message-markdown.tsx
+@@ -68,12 +68,18 @@ function PreBlock({
+   const { t } = useTranslation();
+   const [copied, setCopied] = useState(false);
+   return (
+-    <pre {...props} className={cn("relative overflow-x-auto rounded-md bg-muted p-3 pr-16", className)}>
++    <pre
++      {...props}
++      className={cn(
++        "relative overflow-x-auto rounded-md bg-zinc-900 p-3 pr-16 text-zinc-100",
++        className,
++      )}
++    >
+       <Button
+         type="button"
+         size="sm"
+         variant="outline"
+-        className="absolute right-1 top-1 h-6 px-1.5 text-[11px]"
++        className="absolute right-1 top-1 h-6 px-1.5 text-[11px] border-zinc-600 bg-zinc-800 text-zinc-100 hover:bg-zinc-700"
+         onClick={(event: MouseEvent<HTMLButtonElement>) => {
+           event.preventDefault();
+           const code = event.currentTarget.parentElement?.querySelector("code");
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index 70861fc..b60f156 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -1,4 +1,4 @@
+-import { type JSX, useState } from "react";
++import { type JSX, useEffect, useState } from "react";
+ import { useTranslation } from "react-i18next";
+ import type { ConversationDto, MessageDto, ProjectDto, ProviderKeyDto } from "@ai-hub/shared";
+ import { openaiCatalogModels } from "@ai-hub/shared";
+@@ -52,11 +52,16 @@ export function HomeView({
+   const { t } = useTranslation();
+   const [title, setTitle] = useState("");
+   const [draft, setDraft] = useState("");
++  const [editing, setEditing] = useState(false);
+   const openaiKeys = providerKeys.filter((key) => key.providerSlug === "openai");
+   const models = openaiCatalogModels();
+   const hasKey = selectedKeyId !== null && openaiKeys.some((key) => key.id === selectedKeyId);
+   const busy = streaming || sending;
+ 
++  useEffect(() => {
++    setEditing(false);
++  }, [selectedConversationId]);
++
+   if (!project) {
+     return (
+       <div className="flex h-full items-center justify-center p-8">
+@@ -183,6 +188,7 @@ export function HomeView({
+                       onEdit={async (content) => {
+                         await onEditUser(message.id, content);
+                       }}
++                      onEditingChange={setEditing}
+                     />
+                   ))}
+                 </ol>
+@@ -194,7 +200,7 @@ export function HomeView({
+               onChange={setDraft}
+               streaming={streaming}
+               sending={sending}
+-              disabled={!hasKey}
++              disabled={!hasKey || editing}
+               onSend={() => {
+                 const next = draft.trim();
+                 if (!next) {
+@@ -213,7 +219,7 @@ export function HomeView({
+           </div>
+         )}
+         {error ? (
+-          <p className="border-t px-3 py-2 text-destructive" role="alert">
++          <p className="border-t px-3 py-2 text-destructive" role="alert" data-testid="workspace-error">
+             {error}
+           </p>
+         ) : null}
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index a6f9cb4..89bbaef 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -37,6 +37,7 @@
+   "workspace.composer.send": "Send",
+   "workspace.composer.stop": "Stop",
+   "workspace.composer.hint": "Enter to send ┬À Shift+Enter for a new line ┬À Esc to stop",
++  "workspace.placeholder": "ÔÇª",
+   "workspace.copy": "Copy",
+   "workspace.copyCode": "Copy",
+   "workspace.copied": "Copied",
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index 220ac55..f4a9693 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -37,6 +37,7 @@
+   "workspace.composer.send": "Enviar",
+   "workspace.composer.stop": "Parar",
+   "workspace.composer.hint": "Enter envia ┬À Shift+Enter quebra linha ┬À Esc interrompe",
++  "workspace.placeholder": "ÔÇª",
+   "workspace.copy": "Copiar",
+   "workspace.copyCode": "Copiar",
+   "workspace.copied": "Copiado",
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 3769d97..56ff2b3 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave
+ 
+ | Field | Value |
+ |---|---|
+-| Wave | **W03** |
++| Wave | **W04** |
+ | Marco | B ÔÇö MVP |
+-| State | `in_progress` |
+-| Last completed | **W02** |
+-| Next action | Chat core: composer, bolhas markdown, restore, Playwright mock |
++| State | `pending` |
++| Last completed | **W03** |
++| Next action | Wave 4 ÔÇö Conversation branching (D4) |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -20,7 +20,7 @@ None.
+ 
+ ## Open residual risks
+ 
+-- W00ÔÇôW02 n├úo revalidaram a janela Electron com chave real ap├│s o ├║ltimo gate (s├│ typecheck/lint/test + fixtures).
++- W00ÔÇôW03 n├úo revalidaram a janela Electron com chave real ap├│s o ├║ltimo gate (e2e W3 usa mock).
+ - macOS n├úo exercitado.
+ - Dev CSP com `unsafe-eval` para HMR (ADR-W00-003).
+ - `better-sqlite3` tem um bin├írio s├│: `pnpm dev` recompila para Electron; `pnpm test` no `db` restaura o ABI do Node.
+@@ -28,14 +28,15 @@ None.
+ - Redaction regex n├úo cobre todos os formatos de chave colados na conversa.
+ - Caps (W7) ainda n├úo hard-stopam `chat:send`.
+ - Zustand ainda n├úo foi introduzido; W0ÔÇôW3 usam `useState` (barulho vs stack travada).
++- `AI_HUB_E2E=1` s├│ liga mock se o app **n├úo** est├í empacotado; unpackaged + env ainda ├® o caminho CI.
+ 
+ ## Notes for the next session
+ 
+-- W03 em curso: composer + bolhas markdown + restore + Playwright mock. N├úo fechar sem o gate ┬º9. W4 branching, W5 OpenRouter, W7 receipts/caps.
++- W04: regenerar/editar criam irm├úos; **n├úo** usar `deleteMessagesFrom` como wipe do ramo antigo. Compiler no path ativo. Continue/regenerate continuam a ser novo send.
+ 
+ ## Last review / ADR
+ 
+ | Kind | Path |
+ |---|---|
+-| Review | `docs/reviews/W02/REVIEW.md` |
++| Review | `docs/reviews/W03/REVIEW.md` |
+ | Latest ADR | `docs/ADR/ADR-W03-005-sandboxed-cjs-preload.md` |
+diff --git a/packages/ai-gateway/src/mock-adapter.test.ts b/packages/ai-gateway/src/mock-adapter.test.ts
+index 92fbd88..267b306 100644
+--- a/packages/ai-gateway/src/mock-adapter.test.ts
++++ b/packages/ai-gateway/src/mock-adapter.test.ts
+@@ -43,4 +43,25 @@ describe("createMockOpenAIAdapter", () => {
+       }
+     }).rejects.toBeInstanceOf(GatewayError);
+   });
++
++  it("aborts during the pause between deltas", async () => {
++    const adapter = createMockOpenAIAdapter();
++    const abort = new AbortController();
++    const events: string[] = [];
++    const consume = (async () => {
++      for await (const event of adapter.chatStream({
++        secret: "sk-e2efixtureABCDEFGH",
++        model: "gpt-4o-mini",
++        packet,
++        signal: abort.signal,
++      })) {
++        if (event.type === "delta") {
++          events.push(event.text);
++          abort.abort();
++        }
++      }
++    })();
++    await expect(consume).rejects.toBeInstanceOf(GatewayError);
++    expect(events.join("")).toBe("Hello");
++  });
+ });
+diff --git a/packages/ai-gateway/src/mock-adapter.ts b/packages/ai-gateway/src/mock-adapter.ts
+index 44b16cf..2223389 100644
+--- a/packages/ai-gateway/src/mock-adapter.ts
++++ b/packages/ai-gateway/src/mock-adapter.ts
+@@ -9,6 +9,25 @@ import type {
+ import { GatewayError } from "./errors";
+ 
+ export const MOCK_ASSISTANT_TEXT = "Hello from mock";
++export const MOCK_STREAM_PAUSE_MS = 400;
++
++function waitForAbortOrTimeout(ms: number, signal: AbortSignal): Promise<void> {
++  return new Promise((resolve, reject) => {
++    if (signal.aborted) {
++      reject(new GatewayError("aborted", "aborted"));
++      return;
++    }
++    const timer = setTimeout(() => {
++      signal.removeEventListener("abort", onAbort);
++      resolve();
++    }, ms);
++    const onAbort = (): void => {
++      clearTimeout(timer);
++      reject(new GatewayError("aborted", "aborted"));
++    };
++    signal.addEventListener("abort", onAbort, { once: true });
++  });
++}
+ 
+ export function createMockOpenAIAdapter(): ProviderAdapter {
+   return {
+@@ -25,7 +44,9 @@ export function createMockOpenAIAdapter(): ProviderAdapter {
+       if (request.signal.aborted) {
+         throw new GatewayError("aborted", "aborted");
+       }
+-      yield { type: "delta", text: MOCK_ASSISTANT_TEXT };
++      yield { type: "delta", text: "Hello" };
++      await waitForAbortOrTimeout(MOCK_STREAM_PAUSE_MS, request.signal);
++      yield { type: "delta", text: " from mock" };
+       if (request.signal.aborted) {
+         throw new GatewayError("aborted", "aborted");
+       }
