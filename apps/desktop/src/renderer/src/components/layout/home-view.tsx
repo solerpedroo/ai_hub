@@ -8,7 +8,9 @@ import {
   type CatalogModel,
   type ConversationDto,
   type MessageDto,
+  type PacketPreviewResult,
   type ProjectDto,
+  type ProjectUpdateInput,
   type ProviderKeyDto,
 } from "@ai-hub/shared";
 import { ChatComposer } from "@/components/chat/chat-composer";
@@ -17,6 +19,8 @@ import { MessageBubble } from "@/components/chat/message-bubble";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
+
+const PROJECT_COLORS = ["#64748b", "#2563eb", "#7c3aed", "#db2777", "#dc2626", "#d97706", "#16a34a", "#0891b2"] as const;
 
 export function HomeView({
   project,
@@ -49,6 +53,13 @@ export function HomeView({
   onActivate,
   onRenameBranch,
   onExport,
+  onSaveProject,
+  onRemoveProject,
+  onSetTags,
+  compactHistory,
+  onToggleCompact,
+  packetPreview,
+  modelSwitchNotice,
 }: {
   project: ProjectDto | null;
   conversations: ConversationDto[];
@@ -80,12 +91,25 @@ export function HomeView({
   onActivate: (id: string) => Promise<void>;
   onRenameBranch: (branchId: string, label: string) => Promise<void>;
   onExport: (mode: "active" | "tree") => Promise<void>;
+  onSaveProject: (input: Omit<ProjectUpdateInput, "id">) => Promise<void>;
+  onRemoveProject: () => Promise<void>;
+  onSetTags: (names: string[]) => Promise<void>;
+  compactHistory: boolean;
+  onToggleCompact: (value: boolean) => void;
+  packetPreview: PacketPreviewResult | null;
+  modelSwitchNotice: boolean;
 }): JSX.Element {
   const { t } = useTranslation();
   const [title, setTitle] = useState("");
   const [draft, setDraft] = useState("");
   const [editing, setEditing] = useState(false);
   const [treeOpen, setTreeOpen] = useState(false);
+  const [tagDraft, setTagDraft] = useState("");
+  const [projectName, setProjectName] = useState(project?.name ?? "");
+  const [projectColor, setProjectColor] = useState<string | null>(project?.color ?? null);
+  const [projectInstructions, setProjectInstructions] = useState(project?.instructions ?? "");
+  const [preferredProvider, setPreferredProvider] = useState(project?.preferredProvider ?? "");
+  const [preferredModel, setPreferredModel] = useState(project?.preferredModel ?? "");
   const selectedKey = providerKeys.find((key) => key.id === selectedKeyId) ?? providerKeys[0] ?? null;
   const providerSlug = selectedKey?.providerSlug ?? null;
   const models = providerSlug ? catalogModelsForProvider(providerSlug) : [];
@@ -96,38 +120,40 @@ export function HomeView({
   const path = activePath(messages);
   const activeIds = new Set(path.map((item) => item.id));
   const leaf = path[path.length - 1] ?? null;
+  const selectedConversation = conversations.find((item) => item.id === selectedConversationId) ?? null;
+  const providerSlugs = [...new Set(providerKeys.map((item) => item.providerSlug))];
+  const preferredModels = preferredProvider ? catalogModelsForProvider(preferredProvider) : [];
 
   useEffect(() => {
     setEditing(false);
     setTreeOpen(false);
+    setTagDraft("");
   }, [selectedConversationId]);
 
-  if (!project) {
-    return (
-      <div className="flex h-full items-center justify-center p-8">
-        <div className="flex max-w-md flex-col items-start gap-3">
-          <h1 className="text-base font-semibold">{t("empty.title")}</h1>
-          <p className="text-muted-foreground">{t("empty.body")}</p>
-          {error ? (
-            <p className="text-destructive" role="alert">
-              {error}
-            </p>
-          ) : null}
-        </div>
-      </div>
-    );
-  }
+  useEffect(() => {
+    setProjectName(project?.name ?? "");
+    setProjectColor(project?.color ?? null);
+    setProjectInstructions(project?.instructions ?? "");
+    setPreferredProvider(project?.preferredProvider ?? "");
+    setPreferredModel(project?.preferredModel ?? "");
+  }, [project]);
 
   return (
     <div className="flex h-full min-h-0">
       <section className="flex w-64 shrink-0 flex-col border-r">
         <div className="border-b p-3">
-          <h1 className="truncate text-sm font-semibold">{project.name}</h1>
-          <p className="text-muted-foreground">{t("workspace.conversations")}</p>
+          <h1 className="truncate text-sm font-semibold">
+            {project ? project.name : t("workspace.inbox")}
+          </h1>
+          <p className="text-muted-foreground">
+            {project ? t("workspace.conversations") : t("workspace.inboxHint")}
+          </p>
         </div>
         <ScrollArea className="flex-1 p-2">
           {conversations.length === 0 ? (
-            <p className="px-2 text-muted-foreground">{t("workspace.noConversations")}</p>
+            <p className="px-2 text-muted-foreground">
+              {project ? t("workspace.noConversations") : t("workspace.noConversationsInbox")}
+            </p>
           ) : (
             <div className="flex flex-col gap-0.5">
               {conversations.map((conversation) => (
@@ -144,6 +170,161 @@ export function HomeView({
               ))}
             </div>
           )}
+          {selectedConversation ? (
+            <form
+              className="mt-3 flex flex-col gap-1 border-t pt-2"
+              onSubmit={(event) => {
+                event.preventDefault();
+                const next = tagDraft.trim();
+                if (!next) {
+                  return;
+                }
+                const names = selectedConversation.tags.includes(next)
+                  ? selectedConversation.tags
+                  : [...selectedConversation.tags, next];
+                void onSetTags(names).then(() => setTagDraft(""));
+              }}
+            >
+              <p className="px-1 text-[11px] text-muted-foreground">{t("workspace.tags")}</p>
+              <div className="flex flex-wrap gap-1 px-1">
+                {selectedConversation.tags.map((tag) => (
+                  <Button
+                    key={tag}
+                    type="button"
+                    size="sm"
+                    variant="secondary"
+                    className="h-6 px-2 text-[11px]"
+                    aria-label={t("workspace.tagRemove", { tag })}
+                    onClick={() => {
+                      void onSetTags(selectedConversation.tags.filter((item) => item !== tag));
+                    }}
+                  >
+                    {tag} ×
+                  </Button>
+                ))}
+              </div>
+              <Input
+                value={tagDraft}
+                onChange={(event) => setTagDraft(event.target.value)}
+                placeholder={t("workspace.tagPlaceholder")}
+                aria-label={t("workspace.tagPlaceholder")}
+                data-testid="conversation-tag"
+              />
+              <Button type="submit" size="sm" className="h-7" data-testid="conversation-tag-add">
+                {t("workspace.tagAdd")}
+              </Button>
+            </form>
+          ) : null}
+          {project ? (
+            <form
+              className="mt-3 flex flex-col gap-2 border-t pt-2"
+              onSubmit={(event) => {
+                event.preventDefault();
+                const name = projectName.trim();
+                if (!name) {
+                  return;
+                }
+                void onSaveProject({
+                  name,
+                  color: projectColor,
+                  instructions: projectInstructions.trim().length > 0 ? projectInstructions : null,
+                  preferredModel: preferredModel.trim().length > 0 ? preferredModel.trim() : null,
+                  preferredProvider: preferredProvider.trim().length > 0 ? preferredProvider.trim() : null,
+                });
+              }}
+            >
+              <Input
+                value={projectName}
+                onChange={(event) => setProjectName(event.target.value)}
+                aria-label={t("workspace.projectPlaceholder")}
+              />
+              <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
+                {t("workspace.projectColor")}
+                <div className="flex flex-wrap gap-1">
+                  {PROJECT_COLORS.map((color) => (
+                    <button
+                      key={color}
+                      type="button"
+                      className="h-4 w-4 rounded-full border"
+                      style={{ backgroundColor: color }}
+                      aria-label={color}
+                      aria-pressed={projectColor === color}
+                      data-testid="project-color"
+                      onClick={() => setProjectColor(color)}
+                    />
+                  ))}
+                </div>
+              </label>
+              <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
+                {t("workspace.projectInstructions")}
+                <textarea
+                  className="min-h-[4rem] resize-y rounded-md border bg-background px-2 py-1 text-[12px] text-foreground"
+                  value={projectInstructions}
+                  onChange={(event) => setProjectInstructions(event.target.value)}
+                  aria-label={t("workspace.projectInstructions")}
+                  data-testid="project-instructions"
+                />
+                <span>{t("workspace.projectInstructionsHint")}</span>
+              </label>
+              <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
+                {t("workspace.preferredProvider")}
+                <select
+                  className="h-8 rounded-md border bg-background px-2 text-sm text-foreground"
+                  value={preferredProvider}
+                  onChange={(event) => setPreferredProvider(event.target.value)}
+                  aria-label={t("workspace.preferredProvider")}
+                >
+                  <option value="">{t("workspace.preferredNone")}</option>
+                  {providerSlugs.map((slug) => (
+                    <option key={slug} value={slug}>
+                      {slug}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
+                {t("workspace.preferredModel")}
+                {preferredModels.length > 0 ? (
+                  <select
+                    className="h-8 rounded-md border bg-background px-2 text-sm text-foreground"
+                    value={preferredModel}
+                    onChange={(event) => setPreferredModel(event.target.value)}
+                    aria-label={t("workspace.preferredModel")}
+                  >
+                    <option value="">{t("workspace.preferredNone")}</option>
+                    {preferredModels.map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.label}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <Input
+                    value={preferredModel}
+                    onChange={(event) => setPreferredModel(event.target.value)}
+                    aria-label={t("workspace.preferredModel")}
+                  />
+                )}
+              </label>
+              <Button type="submit" size="sm" className="h-7" data-testid="project-save">
+                {t("workspace.saveProject")}
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="h-7"
+                data-testid="project-delete"
+                onClick={() => {
+                  if (window.confirm(t("workspace.deleteProjectConfirm", { name: project.name }))) {
+                    void onRemoveProject();
+                  }
+                }}
+              >
+                {t("workspace.deleteProject")}
+              </Button>
+            </form>
+          ) : null}
         </ScrollArea>
         <form
           className="flex flex-col gap-1 border-t p-2"
@@ -162,7 +343,7 @@ export function HomeView({
             placeholder={t("workspace.conversationPlaceholder")}
             aria-label={t("workspace.conversationPlaceholder")}
           />
-          <Button type="submit" size="sm" className="h-7">
+          <Button type="submit" size="sm" className="h-7" data-testid="workspace-new-conversation">
             {t("workspace.newConversation")}
           </Button>
         </form>
@@ -271,6 +452,14 @@ export function HomeView({
                 </>
               )}
               <div className="ml-auto flex flex-wrap items-center gap-1">
+                {packetPreview ? (
+                  <span
+                    className="rounded-md border px-2 py-1 text-[11px] text-muted-foreground"
+                    data-testid="packet-badge"
+                  >
+                    {t("workspace.packet.badge", { n: packetPreview.tokenEstimate })}
+                  </span>
+                ) : null}
                 <Button
                   type="button"
                   size="sm"
@@ -305,6 +494,32 @@ export function HomeView({
                 </Button>
               </div>
             </header>
+            {modelSwitchNotice ? (
+              <p className="border-b px-3 py-1 text-[11px] text-muted-foreground" role="status" data-testid="model-switch-notice">
+                {t("workspace.modelSwitch", { model: selectedModel })}
+              </p>
+            ) : null}
+            {packetPreview?.overflow ? (
+              <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2 text-[12px]" role="status">
+                <p>
+                  {t("workspace.overflow", {
+                    window: packetPreview.contextWindow,
+                    estimate: packetPreview.tokenEstimate,
+                  })}
+                </p>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={compactHistory ? "secondary" : "outline"}
+                  data-testid="compact-history"
+                  onClick={() => onToggleCompact(!compactHistory)}
+                >
+                  {compactHistory ? t("workspace.compact.off") : t("workspace.compact")}
+                </Button>
+              </div>
+            ) : compactHistory ? (
+              <p className="border-b px-3 py-1 text-[11px] text-muted-foreground">{t("workspace.compact.on")}</p>
+            ) : null}
             {exportNotice ? (
               <p className="border-b px-3 py-1 text-[11px] text-muted-foreground" role="status">
                 {exportNotice}
