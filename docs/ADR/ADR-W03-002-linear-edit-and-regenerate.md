@@ -1,11 +1,11 @@
 # ADR-W03-002-linear-edit-and-regenerate
 
-- **Status:** accepted
+- **Status:** superseded by ADR-W04-002
 - **Onda:** W03
 - **Data:** 2026-09-16
 - **Deciders:** agent / Pedro
 - **Supersedes:** —
-- **Superseded by:** —
+- **Superseded by:** ADR-W04-002-sibling-fork-not-delete
 
 ## Contexto
 
