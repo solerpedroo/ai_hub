@@ -9,7 +9,11 @@ import type {
   ProjectDto,
   ProviderKeyDto,
 } from "@ai-hub/shared";
-import { findCatalogModel, upsertActivated } from "@ai-hub/shared";
+import {
+  catalogModelsForProvider,
+  findCatalogModel,
+  upsertActivated,
+} from "@ai-hub/shared";
 import { TitleBar } from "@/components/layout/title-bar";
 import { Sidebar } from "@/components/layout/sidebar";
 import { StatusBar } from "@/components/layout/status-bar";
@@ -37,6 +41,9 @@ export function App(): JSX.Element {
   const [providerKeys, setProviderKeys] = useState<ProviderKeyDto[]>([]);
   const [selectedKeyId, setSelectedKeyId] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState("gpt-4o-mini");
+  const [temperature, setTemperature] = useState(1);
+  const [maxTokens, setMaxTokens] = useState<number | null>(null);
+  const [extraSystem, setExtraSystem] = useState("");
   const [run, setRun] = useState<{ runId: string; conversationId: string } | null>(null);
   const [sending, setSending] = useState(false);
   const [activating, setActivating] = useState(false);
@@ -83,10 +90,28 @@ export function App(): JSX.Element {
           loadKeys(),
           window.hub.settings.getSession(),
         ]);
-        const openai = keys.find((item) => item.providerSlug === "openai" && item.status === "active");
-        setSelectedKeyId(openai?.id ?? null);
-        if (findCatalogModel(session.model, "openai")) {
+        const matchingKey =
+          keys.find(
+            (item) => item.status === "active" && findCatalogModel(session.model, item.providerSlug) !== null,
+          ) ??
+          keys.find((item) => item.status === "active") ??
+          null;
+        setSelectedKeyId(matchingKey?.id ?? null);
+        if (matchingKey?.providerSlug === "custom") {
           setSelectedModel(session.model);
+        } else if (matchingKey && findCatalogModel(session.model, matchingKey.providerSlug)) {
+          setSelectedModel(session.model);
+        } else if (matchingKey) {
+          setSelectedModel(catalogModelsForProvider(matchingKey.providerSlug)[0]?.id ?? session.model);
+        }
+        if (session.temperature !== undefined) {
+          setTemperature(session.temperature);
+        }
+        if (session.maxTokens !== undefined) {
+          setMaxTokens(session.maxTokens);
+        }
+        if (session.extraSystem !== undefined) {
+          setExtraSystem(session.extraSystem);
         }
         const project =
           projectList.find((item) => item.id === session.projectId) ?? projectList[0] ?? null;
@@ -119,9 +144,12 @@ export function App(): JSX.Element {
         projectId: selectedProjectId,
         conversationId: selectedConversationId,
         model: selectedModel,
+        temperature,
+        maxTokens,
+        extraSystem,
       })
       .catch(fail);
-  }, [fail, selectedConversationId, selectedModel, selectedProjectId, sessionReady]);
+  }, [extraSystem, fail, maxTokens, selectedConversationId, selectedModel, selectedProjectId, sessionReady, temperature]);
 
   useEffect(() => {
     if (view !== "home") {
@@ -133,11 +161,24 @@ export function App(): JSX.Element {
           if (current && list.some((item) => item.id === current)) {
             return current;
           }
-          return list.find((item) => item.providerSlug === "openai" && item.status === "active")?.id ?? null;
+          return list.find((item) => item.status === "active")?.id ?? null;
         });
       })
       .catch(fail);
   }, [fail, loadKeys, view]);
+
+  useEffect(() => {
+    const key = providerKeys.find((item) => item.id === selectedKeyId);
+    if (!key || key.providerSlug === "custom") {
+      return;
+    }
+    if (!findCatalogModel(selectedModel, key.providerSlug)) {
+      const first = catalogModelsForProvider(key.providerSlug)[0];
+      if (first) {
+        setSelectedModel(first.id);
+      }
+    }
+  }, [providerKeys, selectedKeyId, selectedModel]);
 
   useEffect(() => {
     const off = window.hub.chat.onEvent((event) => {
@@ -248,6 +289,9 @@ export function App(): JSX.Element {
               providerKeys={providerKeys}
               selectedKeyId={selectedKeyId}
               selectedModel={selectedModel}
+              temperature={temperature}
+              maxTokens={maxTokens}
+              extraSystem={extraSystem}
               streaming={run?.conversationId === selectedConversationId}
               sending={sending || activating}
               branchLabels={branchLabels}
@@ -278,6 +322,9 @@ export function App(): JSX.Element {
               }}
               onSelectKey={setSelectedKeyId}
               onSelectModel={setSelectedModel}
+              onSelectTemperature={setTemperature}
+              onSelectMaxTokens={setMaxTokens}
+              onSelectExtraSystem={setExtraSystem}
               onSend={(content) => {
                 if (!selectedConversationId || !selectedKeyId) {
                   return Promise.resolve();
@@ -288,6 +335,9 @@ export function App(): JSX.Element {
                   providerKeyId: selectedKeyId,
                   model: selectedModel,
                   content,
+                  temperature,
+                  maxTokens,
+                  extraSystem,
                 });
               }}
               onAbort={async () => {
@@ -310,6 +360,9 @@ export function App(): JSX.Element {
                   providerKeyId: selectedKeyId,
                   model: selectedModel,
                   messageId,
+                  temperature,
+                  maxTokens,
+                  extraSystem,
                 });
               }}
               onContinue={() => {
@@ -321,6 +374,9 @@ export function App(): JSX.Element {
                   conversationId: selectedConversationId,
                   providerKeyId: selectedKeyId,
                   model: selectedModel,
+                  temperature,
+                  maxTokens,
+                  extraSystem,
                 });
               }}
               onEditUser={async (id, content) => {
@@ -334,6 +390,9 @@ export function App(): JSX.Element {
                   model: selectedModel,
                   messageId: id,
                   content,
+                  temperature,
+                  maxTokens,
+                  extraSystem,
                 });
               }}
               onActivate={async (id) => {
