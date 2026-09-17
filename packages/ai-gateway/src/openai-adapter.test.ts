@@ -66,6 +66,32 @@ describe("createOpenAIAdapter", () => {
     expect(usage).toEqual({ tokensIn: 11, tokensOut: 2 });
   });
 
+  it("forwards provider-reported usage.cost on the usage event", async () => {
+    const adapter = createOpenAIAdapter({
+      fetch: async () =>
+        new Response(
+          sseBody([
+            `data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n`,
+            `data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"cost":0.000042}}\n\n`,
+            `data: [DONE]\n\n`,
+          ]),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } },
+        ),
+    });
+    let costUsd: string | undefined;
+    for await (const event of adapter.chatStream({
+      secret: "sk-testfixtureABCDEFGH",
+      model: "gpt-4o-mini",
+      packet,
+      signal: new AbortController().signal,
+    })) {
+      if (event.type === "usage") {
+        costUsd = event.costUsd;
+      }
+    }
+    expect(costUsd).toBe("0.000042");
+  });
+
   it("maps 401 to auth and never throws the secret", async () => {
     const secret = "sk-testfixtureABCDEFGH";
     const adapter = createOpenAIAdapter({
