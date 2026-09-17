@@ -17,6 +17,7 @@
     "src/renderer/**/*.tsx",
     "src/renderer/**/*.json",
     "src/preload/index.d.ts",
-    "../../packages/shared/src/**/*.ts"
+    "../../packages/shared/src/**/*.ts",
+    "../../packages/shared/src/**/*.json"
   ]
 }
