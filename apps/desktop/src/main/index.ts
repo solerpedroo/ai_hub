@@ -6,8 +6,9 @@ import { electronApp, is, optimizer } from "@electron-toolkit/utils";
 import { safeErrorMessage } from "@ai-hub/security";
 import { registerWindowIpc, registerWorkspaceIpc } from "./ipc";
 import { bootPersistence } from "./persistence";
+import { isE2eMode } from "./e2e-mode";
 
-if (process.env.AI_HUB_E2E === "1") {
+if (isE2eMode()) {
   app.setPath("userData", mkdtempSync(join(tmpdir(), "ai-hub-e2e-")));
 }
 
@@ -137,7 +138,7 @@ function createWindow(): void {
     window.show();
   });
 
-  if ((is.dev && process.env.AI_HUB_E2E !== "1") && process.env["ELECTRON_RENDERER_URL"]) {
+  if ((is.dev && !isE2eMode()) && process.env["ELECTRON_RENDERER_URL"]) {
     void window.loadURL(process.env["ELECTRON_RENDERER_URL"]);
   } else {
     void window.loadFile(join(__dirname, "../renderer/index.html"));
