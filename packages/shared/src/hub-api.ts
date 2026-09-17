@@ -10,6 +10,7 @@ import type {
   ConversationCreateInput,
   ConversationDto,
   ConversationExportInput,
+  ConversationTagsSetInput,
   ConversationExportResult,
   ConversationListInput,
   IdInput,
@@ -17,9 +18,14 @@ import type {
   MessageDto,
   MessageListInput,
   MessageUpdateInput,
+  PacketPreviewInput,
+  PacketPreviewResult,
   ProjectCreateInput,
   ProjectDto,
+  ProjectUpdateInput,
   ProviderDto,
+  SearchHit,
+  SearchInput,
   ProviderKeyDto,
   SecretsSaveInput,
   SecretsTestInput,
@@ -37,6 +43,7 @@ export interface HubWindowApi {
 export interface HubProjectsApi {
   list: () => Promise<ProjectDto[]>;
   create: (input: ProjectCreateInput) => Promise<ProjectDto>;
+  update: (input: ProjectUpdateInput) => Promise<ProjectDto>;
   remove: (input: IdInput) => Promise<void>;
 }
 
@@ -47,6 +54,7 @@ export interface HubConversationsApi {
   export: (input: ConversationExportInput) => Promise<ConversationExportResult>;
   getBranchLabels: (input: BranchLabelsGetInput) => Promise<BranchLabels>;
   setBranchLabel: (input: BranchLabelSetInput) => Promise<void>;
+  setTags: (input: ConversationTagsSetInput) => Promise<ConversationDto>;
 }
 
 export interface HubMessagesApi {
@@ -74,9 +82,14 @@ export interface HubSecretsApi {
   test: (input: SecretsTestInput) => Promise<SecretsTestResult>;
 }
 
+export interface HubSearchApi {
+  query: (input: SearchInput) => Promise<SearchHit[]>;
+}
+
 export interface HubChatApi {
   send: (input: ChatSendInput) => Promise<ChatSendResult>;
   abort: (input: ChatAbortInput) => Promise<void>;
+  previewPacket: (input: PacketPreviewInput) => Promise<PacketPreviewResult>;
   onEvent: (listener: (event: ChatEvent) => void) => () => void;
 }
 
@@ -89,6 +102,7 @@ export interface HubApi {
   settings: HubSettingsApi;
   providers: HubProvidersApi;
   secrets: HubSecretsApi;
+  search: HubSearchApi;
   chat: HubChatApi;
 }
 
