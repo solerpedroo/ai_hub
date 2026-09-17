@@ -5,6 +5,7 @@ import { ThemeProvider } from "@/lib/theme";
 import { App } from "./App";
 import "./lib/i18n";
 import "./index.css";
+import "highlight.js/styles/github-dark.min.css";
 
 const root = document.getElementById("root");
 if (!root) {
