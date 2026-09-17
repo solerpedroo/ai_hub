@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  conversationExportDocumentSchema,
   emptyIpcPayloadSchema,
   ipcAckResultSchema,
   messageCreateInputSchema,
+  messageDtoSchema,
   messageUpdateInputSchema,
   providerKeyDtoSchema,
   secretsSaveInputSchema,
@@ -78,6 +80,46 @@ describe("workspaceSessionSchema", () => {
         conversationId: null,
         model: "gpt-4o-mini",
         providerKeyId: "33333333-3333-4333-8333-333333333333",
+      }),
+    ).toThrow();
+  });
+});
+
+describe("conversationExportDocumentSchema", () => {
+  it("rejects extra keys so secrets cannot piggyback on an export", () => {
+    expect(() =>
+      conversationExportDocumentSchema.parse({
+        version: 1,
+        mode: "active",
+        exportedAt: "2026-09-17T00:00:00.000Z",
+        conversation: {
+          id: "11111111-1111-4111-8111-111111111111",
+          projectId: null,
+          title: "Chat",
+          createdAt: "2026-09-17T00:00:00.000Z",
+          updatedAt: "2026-09-17T00:00:00.000Z",
+        },
+        branchLabels: {},
+        messages: [],
+        apiKey: "sk-testfixtureABCDEFGH",
+      }),
+    ).toThrow();
+  });
+});
+
+describe("messageDtoSchema", () => {
+  it("requires isActiveBranch", () => {
+    expect(() =>
+      messageDtoSchema.parse({
+        id: "11111111-1111-4111-8111-111111111111",
+        conversationId: "22222222-2222-4222-8222-222222222222",
+        parentId: null,
+        branchId: "33333333-3333-4333-8333-333333333333",
+        role: "user",
+        content: "hi",
+        status: "complete",
+        createdAt: "2026-09-17T00:00:00.000Z",
+        receipt: null,
       }),
     ).toThrow();
   });
