@@ -49,6 +49,7 @@ describe("chat contracts", () => {
   it("rejects extra keys on chat send", () => {
     expect(() =>
       chatSendInputSchema.parse({
+        mode: "send",
         conversationId: "11111111-1111-4111-8111-111111111111",
         providerKeyId: "22222222-2222-4222-8222-222222222222",
         model: "gpt-4o-mini",
@@ -58,14 +59,37 @@ describe("chat contracts", () => {
     ).toThrow();
   });
 
-  it("accepts a continue send with null content", () => {
+  it("accepts a continue send without content", () => {
     const parsed = chatSendInputSchema.parse({
+      mode: "continue",
       conversationId: "11111111-1111-4111-8111-111111111111",
       providerKeyId: "22222222-2222-4222-8222-222222222222",
       model: "gpt-4o-mini",
-      content: null,
     });
-    expect(parsed.content).toBeNull();
+    expect(parsed.mode).toBe("continue");
+  });
+
+  it("requires messageId for regenerate", () => {
+    expect(() =>
+      chatSendInputSchema.parse({
+        mode: "regenerate",
+        conversationId: "11111111-1111-4111-8111-111111111111",
+        providerKeyId: "22222222-2222-4222-8222-222222222222",
+        model: "gpt-4o-mini",
+      }),
+    ).toThrow();
+  });
+
+  it("accepts an edit send with content and messageId", () => {
+    const parsed = chatSendInputSchema.parse({
+      mode: "edit",
+      conversationId: "11111111-1111-4111-8111-111111111111",
+      providerKeyId: "22222222-2222-4222-8222-222222222222",
+      model: "gpt-4o-mini",
+      messageId: "33333333-3333-4333-8333-333333333333",
+      content: "rewritten",
+    });
+    expect(parsed.mode).toBe("edit");
   });
 
   it("parses a chunk event", () => {
