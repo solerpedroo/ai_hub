@@ -46,7 +46,11 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W02-003](./ADR-W02-003-crash-safe-stream.md) | W02 | Flush incremental e `interrupted` no boot | accepted |
 | [ADR-W02-004](./ADR-W02-004-gateway-errors-and-receipts.md) | W02 | Taxonomia de erro e receipts com catálogo | accepted |
 | [ADR-W03-001](./ADR-W03-001-react-markdown-gfm.md) | W03 | Markdown no renderer com GFM e highlight | accepted |
-| [ADR-W03-002](./ADR-W03-002-linear-edit-and-regenerate.md) | W03 | Edit/regenerate lineares até a W4 | accepted |
+| [ADR-W03-002](./ADR-W03-002-linear-edit-and-regenerate.md) | W03 | Edit/regenerate lineares até a W4 | superseded by ADR-W04-002 |
 | [ADR-W03-003](./ADR-W03-003-session-restore-settings.md) | W03 | Restore da sessão em `settings` | accepted |
 | [ADR-W03-004](./ADR-W03-004-e2e-mock-adapter.md) | W03 | Playwright com adapter mock, sem rede | accepted |
 | [ADR-W03-005](./ADR-W03-005-sandboxed-cjs-preload.md) | W03 | Preload CJS sandboxed + HTML sem crossorigin | accepted |
+| [ADR-W04-001](./ADR-W04-001-active-path-is-active-branch.md) | W04 | Path ativo via `is_active_branch` | accepted |
+| [ADR-W04-002](./ADR-W04-002-sibling-fork-not-delete.md) | W04 | Regenerar/editar criam irmãos, sem wipe | accepted |
+| [ADR-W04-003](./ADR-W04-003-compiler-active-path.md) | W04 | Compiler só no path ativo | accepted |
+| [ADR-W04-004](./ADR-W04-004-export-json-main-process.md) | W04 | Export JSON no main + labels em settings | accepted |
