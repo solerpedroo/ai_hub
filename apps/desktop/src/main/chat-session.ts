@@ -25,6 +25,7 @@ import {
   type ProviderAgnosticPacket,
 } from "@ai-hub/shared";
 import { getHubDatabase } from "./persistence";
+import { isE2eMode } from "./e2e-mode";
 import { toMessageDto } from "./message-dto";
 
 interface ActiveRun {
@@ -42,11 +43,7 @@ interface ActiveRun {
 const runs = new Map<string, ActiveRun>();
 const runByConversation = new Map<string, string>();
 
-function isE2e(): boolean {
-  return process.env.AI_HUB_E2E === "1";
-}
-
-const adapter: ProviderAdapter = isE2e() ? createMockOpenAIAdapter() : createOpenAIAdapter();
+const adapter: ProviderAdapter = isE2eMode() ? createMockOpenAIAdapter() : createOpenAIAdapter();
 
 function inspectablePacket(packet: ProviderAgnosticPacket): ProviderAgnosticPacket {
   return packetV0Schema.parse(JSON.parse(redactSecrets(JSON.stringify(packet))) as unknown);
