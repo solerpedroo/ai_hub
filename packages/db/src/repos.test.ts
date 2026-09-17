@@ -115,10 +115,93 @@ describe("hub database", () => {
       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
       applyMigrations(second.sqlite);
-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(1);
+      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(2);
       second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("flushes streaming content and marks orphans interrupted with a receipt", () => {
+    const { hub } = openTestDb();
+    const project = hub.repos.createProject("Stream");
+    const conversation = hub.repos.createConversation(project.id, "Thread");
+    const user = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "user",
+      content: "hello",
+      parentId: null,
+      branchId: null,
+    });
+    const assistant = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "assistant",
+      content: "",
+      parentId: user.id,
+      branchId: null,
+      status: "streaming",
+    });
+    hub.repos.updateMessage(assistant.id, "Hel", "streaming");
+    hub.repos.createReceipt({
+      messageId: assistant.id,
+      provider: "openai",
+      model: "gpt-4o-mini",
+      tokensIn: null,
+      tokensOut: null,
+      latencyMs: null,
+      costUsd: null,
+      errorCode: null,
+    });
+    expect(hub.repos.interruptOrphanStreams()).toBe(1);
+    const stored = hub.repos.getMessage(assistant.id);
+    expect(stored?.content).toBe("Hel");
+    expect(stored?.status).toBe("interrupted");
+    expect(stored?.receipt?.errorCode).toBe("unknown");
+    expect(stored?.receipt?.provider).toBe("openai");
+    expect(stored?.receipt?.model).toBe("gpt-4o-mini");
+    hub.close();
+  });
+
+  it("stores a receipt without the API secret", async () => {
+    const { hub } = openTestDb();
+    const secret = "sk-testfixtureNEVERSQLITE9999";
+    await hub.repos.saveProviderKey({ providerSlug: "openai", label: "work", secret });
+    const project = hub.repos.createProject("Receipts");
+    const conversation = hub.repos.createConversation(project.id, "Thread");
+    const message = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "assistant",
+      content: "hi",
+      parentId: null,
+      branchId: null,
+    });
+    hub.repos.createReceipt({
+      messageId: message.id,
+      provider: "openai",
+      model: "gpt-4o-mini",
+      tokensIn: 8,
+      tokensOut: 2,
+      latencyMs: 40,
+      costUsd: "0.000001",
+      errorCode: null,
+    });
+    const dump = dumpAllText(hub.sqlite);
+    expect(dump).not.toContain(secret);
+    expect(hub.repos.getReceipt(message.id)?.model).toBe("gpt-4o-mini");
+    hub.close();
+  });
+
+  it("reads a provider secret from the store, not sqlite", async () => {
+    const { hub } = openTestDb();
+    const secret = "sk-testfixtureNEVERSQLITE9999";
+    const saved = await hub.repos.saveProviderKey({
+      providerSlug: "openai",
+      label: "work",
+      secret,
+    });
+    const loaded = await hub.repos.getProviderSecret(saved.id);
+    expect(loaded?.secret).toBe(secret);
+    expect(dumpAllText(hub.sqlite)).not.toContain(secret);
+    hub.close();
   });
 });
