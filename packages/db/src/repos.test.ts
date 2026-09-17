@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -234,6 +234,37 @@ describe("hub database", () => {
     hub.close();
   });
 
+  it("does not delete a later sibling when removing a subtree", () => {
+    const { hub } = openTestDb();
+    const project = hub.repos.createProject("GraphDelete");
+    const conversation = hub.repos.createConversation(project.id, "Thread");
+    const user = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "user",
+      content: "prompt",
+      parentId: null,
+      branchId: null,
+    });
+    const first = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "assistant",
+      content: "one",
+      parentId: user.id,
+      branchId: null,
+    });
+    const second = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "assistant",
+      content: "two",
+      parentId: user.id,
+      branchId: randomUUID(),
+    });
+    hub.repos.deleteMessagesFrom(first.id);
+    const remaining = hub.repos.listMessages(conversation.id);
+    expect(remaining.map((item) => item.id).sort()).toEqual([user.id, second.id].sort());
+    hub.close();
+  });
+
   it("round-trips workspace session without a provider key id", () => {
     const { hub } = openTestDb();
     const project = hub.repos.createProject("Session");
@@ -262,6 +293,105 @@ describe("hub database", () => {
     const loaded = await hub.repos.getProviderSecret(saved.id);
     expect(loaded?.secret).toBe(secret);
     expect(dumpAllText(hub.sqlite)).not.toContain(secret);
+    hub.close();
+  });
+
+  it("keeps three branches, switches the active sibling, and survives reopen", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ai-hub-branch-"));
+    const path = join(dir, "ai-hub.sqlite");
+    const masterKey = randomBytes(32);
+    const secrets = new MemorySecretStore();
+    try {
+      const first = openHubDatabase({ path, masterKey, secretStore: secrets });
+      const project = first.repos.createProject("Graph");
+      const conversation = first.repos.createConversation(project.id, "Thread");
+      const user = first.repos.createMessage({
+        conversationId: conversation.id,
+        role: "user",
+        content: "prompt",
+        parentId: null,
+        branchId: null,
+      });
+      const a1 = first.repos.createMessage({
+        conversationId: conversation.id,
+        role: "assistant",
+        content: "one",
+        parentId: user.id,
+        branchId: null,
+      });
+      const a2 = first.repos.createMessage({
+        conversationId: conversation.id,
+        role: "assistant",
+        content: "two",
+        parentId: user.id,
+        branchId: randomUUID(),
+      });
+      const a3 = first.repos.createMessage({
+        conversationId: conversation.id,
+        role: "assistant",
+        content: "three",
+        parentId: user.id,
+        branchId: randomUUID(),
+      });
+      expect(first.repos.getMessage(a1.id)?.isActiveBranch).toBe(false);
+      expect(first.repos.getMessage(a2.id)?.isActiveBranch).toBe(false);
+      expect(first.repos.getMessage(a3.id)?.isActiveBranch).toBe(true);
+      expect(first.repos.listActivePath(conversation.id).map((item) => item.id)).toEqual([
+        user.id,
+        a3.id,
+      ]);
+      first.repos.activatePathThrough(a1.id);
+      expect(first.repos.listActivePath(conversation.id).map((item) => item.id)).toEqual([
+        user.id,
+        a1.id,
+      ]);
+      expect(first.repos.listMessages(conversation.id)).toHaveLength(4);
+      first.repos.setBranchLabel(conversation.id, a2.branchId, "alt-b");
+      first.close();
+
+      const second = openHubDatabase({ path, masterKey, secretStore: secrets });
+      expect(second.repos.listActivePath(conversation.id).map((item) => item.id)).toEqual([
+        user.id,
+        a1.id,
+      ]);
+      expect(second.repos.getMessage(a2.id)?.content).toBe("two");
+      expect(second.repos.getMessage(a2.id)?.isActiveBranch).toBe(false);
+      expect(second.repos.getBranchLabels(conversation.id)[a2.branchId]).toBe("alt-b");
+      second.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("forks a user sibling without deleting the original prompt", () => {
+    const { hub } = openTestDb();
+    const project = hub.repos.createProject("Edit");
+    const conversation = hub.repos.createConversation(project.id, "Thread");
+    const user = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "user",
+      content: "original",
+      parentId: null,
+      branchId: null,
+    });
+    const assistant = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "assistant",
+      content: "reply",
+      parentId: user.id,
+      branchId: null,
+    });
+    const edited = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "user",
+      content: "edited",
+      parentId: null,
+      branchId: randomUUID(),
+    });
+    expect(hub.repos.getMessage(user.id)?.isActiveBranch).toBe(false);
+    expect(edited.isActiveBranch).toBe(true);
+    expect(hub.repos.getMessage(assistant.id)?.content).toBe("reply");
+    expect(hub.repos.listActivePath(conversation.id).map((item) => item.id)).toEqual([edited.id]);
     hub.close();
   });
 });
