@@ -42,12 +42,14 @@ export function Sidebar({
             icon={<Home className="h-3.5 w-3.5" />}
             label={t("nav.home")}
             onClick={() => onChange("home")}
+            testId="nav-home"
           />
           <NavButton
             active={view === "settings"}
             icon={<Settings className="h-3.5 w-3.5" />}
             label={t("nav.settings")}
             onClick={() => onChange("settings")}
+            testId="nav-settings"
           />
         </nav>
         <p className="mt-4 px-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
@@ -97,11 +99,13 @@ function NavButton({
   icon,
   label,
   onClick,
+  testId,
 }: {
   active: boolean;
   icon: ReactNode;
   label: string;
   onClick: () => void;
+  testId?: string;
 }): JSX.Element {
   return (
     <Button
@@ -109,6 +113,7 @@ function NavButton({
       variant={active ? "secondary" : "ghost"}
       className="h-8 w-full justify-start gap-2"
       onClick={onClick}
+      data-testid={testId}
     >
       {icon}
       {label}
