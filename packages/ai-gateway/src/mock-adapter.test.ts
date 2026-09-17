@@ -1,0 +1,46 @@
+import { describe, expect, it } from "vitest";
+import { createMockOpenAIAdapter, MOCK_ASSISTANT_TEXT } from "./mock-adapter";
+import { GatewayError } from "./errors";
+import type { ProviderAgnosticPacket } from "@ai-hub/shared";
+
+const packet: ProviderAgnosticPacket = {
+  version: 1,
+  system: "",
+  messages: [{ role: "user", content: "hi" }],
+  tokenEstimate: 1,
+  excluded: [],
+};
+
+describe("createMockOpenAIAdapter", () => {
+  it("streams the fixture text without calling the network", async () => {
+    const adapter = createMockOpenAIAdapter();
+    const events: string[] = [];
+    for await (const event of adapter.chatStream({
+      secret: "sk-e2efixtureABCDEFGH",
+      model: "gpt-4o-mini",
+      packet,
+      signal: new AbortController().signal,
+    })) {
+      if (event.type === "delta") {
+        events.push(event.text);
+      }
+    }
+    expect(events.join("")).toBe(MOCK_ASSISTANT_TEXT);
+  });
+
+  it("aborts before yielding when the signal is already aborted", async () => {
+    const adapter = createMockOpenAIAdapter();
+    const abort = new AbortController();
+    abort.abort();
+    await expect(async () => {
+      for await (const _event of adapter.chatStream({
+        secret: "sk-e2efixtureABCDEFGH",
+        model: "gpt-4o-mini",
+        packet,
+        signal: abort.signal,
+      })) {
+        // drain
+      }
+    }).rejects.toBeInstanceOf(GatewayError);
+  });
+});
