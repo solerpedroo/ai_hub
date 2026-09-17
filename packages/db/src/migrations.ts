@@ -130,7 +130,13 @@ ALTER TABLE message_receipts ADD COLUMN error_code TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS message_receipts_message_idx ON message_receipts(message_id);
 `;
 
+export const MIGRATION_0003_SQL = `
+INSERT INTO providers (id, slug, name) VALUES
+  ('66666666-6666-4666-8666-666666666666', 'custom', 'Custom (OpenAI-compatible)');
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
+  { version: 3, sql: MIGRATION_0003_SQL },
 ];
