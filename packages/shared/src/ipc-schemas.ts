@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { localeSchema, themeModeSchema } from "./appearance";
+import { gatewayErrorCodeSchema, packetV0Schema, receiptDtoSchema } from "./gateway";
 
 export const emptyIpcPayloadSchema = z.object({}).strict();
 
@@ -80,6 +81,7 @@ export const messageDtoSchema = z.object({
   content: z.string(),
   status: messageStatusSchema,
   createdAt: isoTimestampSchema,
+  receipt: receiptDtoSchema.nullable(),
 });
 
 export type MessageDto = z.infer<typeof messageDtoSchema>;
@@ -154,3 +156,26 @@ export const secretsSaveInputSchema = z
   .strict();
 
 export type SecretsSaveInput = z.infer<typeof secretsSaveInputSchema>;
+
+export const chatEventSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("chunk"),
+    runId: z.string().uuid(),
+    messageId: z.string().uuid(),
+    text: z.string(),
+  }),
+  z.object({
+    type: z.literal("done"),
+    runId: z.string().uuid(),
+    message: messageDtoSchema,
+    packet: packetV0Schema,
+  }),
+  z.object({
+    type: z.literal("error"),
+    runId: z.string().uuid(),
+    messageId: z.string().uuid(),
+    code: gatewayErrorCodeSchema,
+  }),
+]);
+
+export type ChatEvent = z.infer<typeof chatEventSchema>;
