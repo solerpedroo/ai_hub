@@ -8,6 +8,7 @@ import {
   messageUpdateInputSchema,
   providerKeyDtoSchema,
   secretsSaveInputSchema,
+  secretsTestResultSchema,
   windowIsMaximizedResultSchema,
   workspaceSessionSchema,
 } from "./ipc-schemas";
@@ -136,6 +137,63 @@ describe("secretsSaveInputSchema", () => {
       }),
     ).toThrow();
   });
+
+  it("requires a base URL only for custom providers", () => {
+    expect(() =>
+      secretsSaveInputSchema.parse({
+        providerSlug: "custom",
+        label: "local",
+        secret: "sk-testfixtureABCDEFGH",
+      }),
+    ).toThrow();
+    expect(() =>
+      secretsSaveInputSchema.parse({
+        providerSlug: "openai",
+        label: "work",
+        secret: "sk-testfixtureABCDEFGH",
+        baseUrl: "https://api.openai.com/v1",
+      }),
+    ).toThrow();
+    const parsed = secretsSaveInputSchema.parse({
+      providerSlug: "custom",
+      label: "local",
+      secret: "sk-testfixtureABCDEFGH",
+      baseUrl: "http://127.0.0.1:8080/v1",
+    });
+    expect(parsed.baseUrl).toBe("http://127.0.0.1:8080/v1");
+  });
+
+  it("rejects custom URLs that embed credentials", () => {
+    expect(() =>
+      secretsSaveInputSchema.parse({
+        providerSlug: "custom",
+        label: "local",
+        secret: "sk-testfixtureABCDEFGH",
+        baseUrl: "https://user:KEY@127.0.0.1/v1",
+      }),
+    ).toThrow();
+    expect(() =>
+      secretsSaveInputSchema.parse({
+        providerSlug: "custom",
+        label: "local",
+        secret: "sk-testfixtureABCDEFGH",
+        baseUrl: "http://127.0.0.1:8080/v1?api_key=secret",
+      }),
+    ).toThrow();
+  });
+});
+
+describe("secretsTestResultSchema", () => {
+  it("never accepts a secret field", () => {
+    expect(() =>
+      secretsTestResultSchema.parse({
+        ok: true,
+        latencyMs: 12,
+        errorCode: null,
+        secret: "sk-testfixtureABCDEFGH",
+      }),
+    ).toThrow();
+  });
 });
 
 describe("providerKeyDtoSchema", () => {
@@ -145,6 +203,7 @@ describe("providerKeyDtoSchema", () => {
     label: "work",
     last4: "stuv",
     status: "active" as const,
+    endpointUrl: null,
     createdAt: "2026-09-15T00:00:00.000Z",
   };
 
