@@ -3,9 +3,11 @@ import {
   emptyIpcPayloadSchema,
   ipcAckResultSchema,
   messageCreateInputSchema,
+  messageUpdateInputSchema,
   providerKeyDtoSchema,
   secretsSaveInputSchema,
   windowIsMaximizedResultSchema,
+  workspaceSessionSchema,
 } from "./ipc-schemas";
 
 describe("emptyIpcPayloadSchema", () => {
@@ -43,6 +45,41 @@ describe("messageCreateInputSchema", () => {
       branchId: null,
     });
     expect(parsed.parentId).toBeNull();
+  });
+});
+
+describe("messageUpdateInputSchema", () => {
+  it("rejects extra keys", () => {
+    expect(() =>
+      messageUpdateInputSchema.parse({
+        id: "11111111-1111-4111-8111-111111111111",
+        content: "edited",
+        secret: "sk-testfixtureABCDEFGH",
+      }),
+    ).toThrow();
+  });
+});
+
+describe("workspaceSessionSchema", () => {
+  it("accepts a restore payload without a provider key id", () => {
+    const parsed = workspaceSessionSchema.parse({
+      projectId: "11111111-1111-4111-8111-111111111111",
+      conversationId: "22222222-2222-4222-8222-222222222222",
+      model: "gpt-4o-mini",
+    });
+    expect(parsed.model).toBe("gpt-4o-mini");
+    expect("providerKeyId" in parsed).toBe(false);
+  });
+
+  it("rejects extra keys so secrets cannot piggyback on session", () => {
+    expect(() =>
+      workspaceSessionSchema.parse({
+        projectId: null,
+        conversationId: null,
+        model: "gpt-4o-mini",
+        providerKeyId: "33333333-3333-4333-8333-333333333333",
+      }),
+    ).toThrow();
   });
 });
 
