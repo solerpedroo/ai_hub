@@ -17,6 +17,11 @@ describe("envelope AES-256-GCM", () => {
     expect(() => decryptUtf8(cipher, randomBytes(32))).toThrow(EnvelopeError);
   });
 
+  it("round-trips an empty string used for streaming placeholders", () => {
+    const key = randomBytes(32);
+    expect(decryptUtf8(encryptUtf8("", key), key)).toBe("");
+  });
+
   it("rejects truncated payloads", () => {
     expect(() => decryptUtf8("v1.abc", randomBytes(32))).toThrow(EnvelopeError);
   });
