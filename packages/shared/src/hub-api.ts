@@ -22,6 +22,8 @@ import type {
   ProviderDto,
   ProviderKeyDto,
   SecretsSaveInput,
+  SecretsTestInput,
+  SecretsTestResult,
   WorkspaceSession,
 } from "./ipc-schemas";
 
@@ -69,6 +71,7 @@ export interface HubSecretsApi {
   list: () => Promise<ProviderKeyDto[]>;
   save: (input: SecretsSaveInput) => Promise<ProviderKeyDto>;
   remove: (input: IdInput) => Promise<void>;
+  test: (input: SecretsTestInput) => Promise<SecretsTestResult>;
 }
 
 export interface HubChatApi {
