@@ -122,6 +122,18 @@ describe("chat contracts", () => {
     expect(parsed.extraSystem).toBe("Be terse.");
   });
 
+  it("accepts compactHistory on send", () => {
+    const parsed = chatSendInputSchema.parse({
+      mode: "send",
+      conversationId: "11111111-1111-4111-8111-111111111111",
+      providerKeyId: "22222222-2222-4222-8222-222222222222",
+      model: "gpt-4o-mini",
+      content: "hello",
+      compactHistory: true,
+    });
+    expect(parsed.compactHistory).toBe(true);
+  });
+
   it("parses a chunk event", () => {
     const event = chatEventSchema.parse({
       type: "chunk",
