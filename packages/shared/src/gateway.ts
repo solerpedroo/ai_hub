@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 export {
+  catalogModelsForProvider,
   estimateCostUsd,
   findCatalogModel,
   MODEL_CATALOG,
@@ -60,6 +61,9 @@ const chatSendBaseSchema = z.object({
   conversationId: z.string().uuid(),
   providerKeyId: z.string().uuid(),
   model: z.string().min(1).max(128),
+  temperature: z.number().min(0).max(2).optional(),
+  maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
+  extraSystem: z.string().max(20_000).optional(),
 });
 
 export const chatSendInputSchema = z.discriminatedUnion("mode", [
