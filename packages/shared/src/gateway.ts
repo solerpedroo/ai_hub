@@ -56,27 +56,36 @@ export const receiptDtoSchema = z.object({
 
 export type ReceiptDto = z.infer<typeof receiptDtoSchema>;
 
-export const chatSendInputSchema = z
-  .object({
-    conversationId: z.string().uuid(),
-    providerKeyId: z.string().uuid(),
-    model: z.string().min(1).max(128),
-    content: z.string().min(1).max(100_000).nullable(),
-  })
-  .strict();
+const chatSendBaseSchema = z.object({
+  conversationId: z.string().uuid(),
+  providerKeyId: z.string().uuid(),
+  model: z.string().min(1).max(128),
+});
+
+export const chatSendInputSchema = z.discriminatedUnion("mode", [
+  chatSendBaseSchema
+    .extend({
+      mode: z.literal("send"),
+      content: z.string().min(1).max(100_000),
+    })
+    .strict(),
+  chatSendBaseSchema.extend({ mode: z.literal("continue") }).strict(),
+  chatSendBaseSchema
+    .extend({
+      mode: z.literal("regenerate"),
+      messageId: z.string().uuid(),
+    })
+    .strict(),
+  chatSendBaseSchema
+    .extend({
+      mode: z.literal("edit"),
+      messageId: z.string().uuid(),
+      content: z.string().min(1).max(100_000),
+    })
+    .strict(),
+]);
 
 export type ChatSendInput = z.infer<typeof chatSendInputSchema>;
-
-export const chatSendResultSchema = z
-  .object({
-    runId: z.string().uuid(),
-    messageId: z.string().uuid(),
-    userMessageId: z.string().uuid().nullable(),
-    packet: packetV0Schema,
-  })
-  .strict();
-
-export type ChatSendResult = z.infer<typeof chatSendResultSchema>;
 
 export const chatAbortInputSchema = z.object({ runId: z.string().uuid() }).strict();
 
