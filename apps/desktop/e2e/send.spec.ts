@@ -83,7 +83,77 @@ test("settings lists OpenRouter as a first-class provider", async () => {
     await window.getByTestId("nav-settings").click();
     await expect(window.getByTestId("secrets-provider")).toBeVisible();
     await expect(window.getByTestId("secrets-provider")).toContainText("OpenRouter");
-    await expect(window.getByTestId("secrets-test")).toBeVisible();
+    await expect(window.getByTestId("secrets-test").first()).toBeVisible();
+  } finally {
+    await app.close();
+  }
+});
+
+test("creates three projects and search finds an old message", async () => {
+  const app = await launchHub();
+  try {
+    const window = await app.firstWindow();
+    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
+    await window.getByTestId("chat-composer").fill("Hello");
+    await window.getByTestId("chat-send").click();
+    await expect(window.getByTestId("message-assistant")).toContainText("Hello from mock", {
+      timeout: 30_000,
+    });
+    await window.getByTestId("workspace-new-project-name").fill("Alpha");
+    await window.getByTestId("workspace-new-project").click();
+    await window.getByTestId("workspace-new-project-name").fill("Beta");
+    await window.getByTestId("workspace-new-project").click();
+    await expect(window.getByTestId("project-item")).toHaveCount(3);
+    await window.getByTestId("workspace-search").fill("Hello from mock");
+    await expect(window.getByTestId("search-hit")).toContainText("Hello from mock", { timeout: 10_000 });
+  } finally {
+    await app.close();
+  }
+});
+
+test("deletes a project and moves its chats to Inbox", async () => {
+  const app = await launchHub();
+  try {
+    const window = await app.firstWindow();
+    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
+    await expect(window.getByTestId("project-item")).toHaveCount(1);
+    await window.getByTestId("workspace-new-project-name").fill("Temp");
+    await window.getByTestId("workspace-new-project").click();
+    await expect(window.getByTestId("project-item")).toHaveCount(2);
+    window.once("dialog", (dialog) => {
+      void dialog.accept();
+    });
+    await window.getByTestId("project-delete").click();
+    await expect(window.getByTestId("project-item")).toHaveCount(1);
+    await expect(window.getByTestId("inbox-avulsas")).toBeVisible();
+  } finally {
+    await app.close();
+  }
+});
+
+test("switches from GPT to Claude on the same thread", async () => {
+  const app = await launchHub();
+  try {
+    const window = await app.firstWindow();
+    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
+    await window.getByTestId("chat-composer").fill("Hello");
+    await window.getByTestId("chat-send").click();
+    await expect(window.getByTestId("message-assistant")).toHaveAttribute("data-status", "complete", {
+      timeout: 30_000,
+    });
+    const anthropicValue = await window
+      .getByTestId("workspace-key")
+      .locator("option")
+      .filter({ hasText: "anthropic" })
+      .getAttribute("value");
+    expect(anthropicValue).toBeTruthy();
+    await window.getByTestId("workspace-key").selectOption(anthropicValue ?? "");
+    await window.getByTestId("workspace-model").selectOption("claude-sonnet-4-20250514");
+    await expect(window.getByTestId("model-switch-notice")).toBeVisible();
+    await window.getByTestId("chat-composer").fill("Follow up");
+    await window.getByTestId("chat-send").click();
+    await expect(window.getByTestId("message-assistant")).toHaveCount(2, { timeout: 30_000 });
+    await expect(window.getByTestId("packet-badge")).toBeVisible();
   } finally {
     await app.close();
   }
