@@ -6,11 +6,11 @@ import {
   compilePacket,
   consumeCrashSafeStream,
   createMockOpenAIAdapter,
-  createOpenAIAdapter,
   estimateTokensFromChars,
   GatewayError,
   GatewayStreamError,
   gatewayErrorCode,
+  resolveAdapter,
   type ProviderAdapter,
 } from "@ai-hub/ai-gateway";
 import type { MessageRecord } from "@ai-hub/db";
@@ -47,7 +47,18 @@ interface ActiveRun {
 const runs = new Map<string, ActiveRun>();
 const runByConversation = new Map<string, string>();
 
-const adapter: ProviderAdapter = isE2eMode() ? createMockOpenAIAdapter() : createOpenAIAdapter();
+function adapterFor(slug: string, baseUrl: string | null): ProviderAdapter {
+  if (isE2eMode()) {
+    return createMockOpenAIAdapter();
+  }
+  if (slug === "custom") {
+    if (baseUrl === null || baseUrl.length === 0) {
+      throw new GatewayError("unknown", "Custom provider requires a base URL");
+    }
+    return resolveAdapter("custom", { baseUrl });
+  }
+  return resolveAdapter(slug);
+}
 
 function inspectablePacket(packet: ProviderAgnosticPacket): ProviderAgnosticPacket {
   return packetV0Schema.parse(JSON.parse(redactSecrets(JSON.stringify(packet))) as unknown);
@@ -67,6 +78,7 @@ function writeReceipt(
   tokensOut: number | null,
   outputChars: number,
   errorCode: GatewayErrorCode | null,
+  reportedCostUsd: string | null,
 ): void {
   const composed = composeReceipt({
     provider: run.provider,
@@ -77,6 +89,7 @@ function writeReceipt(
     estimatedOut: estimateTokensFromChars(outputChars),
     latencyMs: Math.max(0, Date.now() - run.startedAt),
     errorCode,
+    reportedCostUsd,
   });
   getHubDatabase().repos.createReceipt({
     messageId,
@@ -105,17 +118,19 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     throw new Error("Conversation not found");
   }
 
-  if (!findCatalogModel(input.model, "openai")) {
-    throw new Error("Unknown model");
-  }
-
   const key = await repos.getProviderSecret(input.providerKeyId);
   if (!key) {
     throw new GatewayError("auth", "Provider key is missing");
   }
-  if (key.providerSlug !== "openai") {
-    throw new Error("Only OpenAI is available in this wave");
+  if (key.providerSlug === "custom") {
+    if (input.model.trim().length === 0) {
+      throw new Error("Unknown model");
+    }
+  } else if (!findCatalogModel(input.model, key.providerSlug)) {
+    throw new Error("Unknown model");
   }
+
+  const adapter = adapterFor(key.providerSlug, repos.getCustomBaseUrl(key.id));
 
   const existing = repos.listMessages(input.conversationId);
   if (existing.some((item) => item.status === "streaming")) {
@@ -191,12 +206,14 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     }
   }
 
+  const extraSystem =
+    input.extraSystem !== undefined && input.extraSystem.trim().length > 0 ? input.extraSystem.trim() : null;
   const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
   const packet =
     input.mode === "regenerate"
       ? compilePacket({
           projectInstructions: project?.instructions ?? null,
-          extraSystem: null,
+          extraSystem,
           messages: compileRows.map((item) => ({
             id: item.id,
             role: item.role,
@@ -206,7 +223,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
         })
       : compileActivePath({
           projectInstructions: project?.instructions ?? null,
-          extraSystem: null,
+          extraSystem,
           messages: compileRows.map((item) => ({
             id: item.id,
             parentId: item.parentId,
@@ -234,7 +251,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
   });
   repos.createReceipt({
     messageId: assistant.id,
-    provider: "openai",
+    provider: key.providerSlug,
     model: input.model,
     tokensIn: null,
     tokensOut: null,
@@ -254,7 +271,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     packetEstimate: packet.tokenEstimate,
     startedAt: Date.now(),
     model: input.model,
-    provider: "openai",
+    provider: key.providerSlug,
   };
   runs.set(runId, run);
   runByConversation.set(input.conversationId, runId);
@@ -268,6 +285,8 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
           model: input.model,
           packet,
           signal: run.abort.signal,
+          temperature: input.temperature ?? 1,
+          maxTokens: input.maxTokens ?? null,
         }),
         onDelta: (text) => {
           emit(run.sender, {
@@ -282,7 +301,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
         },
       });
       repos.updateMessage(assistant.id, result.content, "complete");
-      writeReceipt(assistant.id, run, result.tokensIn, result.tokensOut, result.content.length, null);
+      writeReceipt(assistant.id, run, result.tokensIn, result.tokensOut, result.content.length, null, result.costUsd);
       const stored = repos.getMessage(assistant.id);
       if (!stored) {
         throw new Error("Message not found");
@@ -309,6 +328,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
         streamed?.tokensOut ?? null,
         content.length,
         code,
+        streamed?.costUsd ?? null,
       );
       emit(run.sender, {
         type: "error",
