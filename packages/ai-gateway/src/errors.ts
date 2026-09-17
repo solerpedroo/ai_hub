@@ -18,10 +18,11 @@ export class GatewayStreamError extends GatewayError {
   readonly content: string;
   readonly tokensIn: number | null;
   readonly tokensOut: number | null;
+  readonly costUsd: string | null;
 
   constructor(
     cause: unknown,
-    partial: { content: string; tokensIn: number | null; tokensOut: number | null },
+    partial: { content: string; tokensIn: number | null; tokensOut: number | null; costUsd: string | null },
   ) {
     const code = gatewayErrorCode(cause);
     const message = cause instanceof Error ? cause.message : "Stream failed";
@@ -34,6 +35,7 @@ export class GatewayStreamError extends GatewayError {
     this.content = partial.content;
     this.tokensIn = partial.tokensIn;
     this.tokensOut = partial.tokensOut;
+    this.costUsd = partial.costUsd;
   }
 }
 
