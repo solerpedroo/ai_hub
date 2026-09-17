@@ -9,6 +9,13 @@ describe("redactSecrets", () => {
     expect(redacted).not.toContain("Bearer abc");
     expect(redacted).toContain("[REDACTED]");
   });
+
+  it("strips unlabeled Gemini and Groq keys", () => {
+    const gemini = "AIzaSyTestfixtureGeminiKey99";
+    const groq = "gsk_testfixtureGROQKEY99";
+    expect(redactSecrets(`echo ${gemini}`)).not.toContain(gemini);
+    expect(redactSecrets(`echo ${groq}`)).not.toContain(groq);
+  });
 });
 
 describe("maskSecret", () => {
