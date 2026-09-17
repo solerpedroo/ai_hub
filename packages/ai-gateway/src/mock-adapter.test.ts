@@ -43,4 +43,25 @@ describe("createMockOpenAIAdapter", () => {
       }
     }).rejects.toBeInstanceOf(GatewayError);
   });
+
+  it("aborts during the pause between deltas", async () => {
+    const adapter = createMockOpenAIAdapter();
+    const abort = new AbortController();
+    const events: string[] = [];
+    const consume = (async () => {
+      for await (const event of adapter.chatStream({
+        secret: "sk-e2efixtureABCDEFGH",
+        model: "gpt-4o-mini",
+        packet,
+        signal: abort.signal,
+      })) {
+        if (event.type === "delta") {
+          events.push(event.text);
+          abort.abort();
+        }
+      }
+    })();
+    await expect(consume).rejects.toBeInstanceOf(GatewayError);
+    expect(events.join("")).toBe("Hello");
+  });
 });
