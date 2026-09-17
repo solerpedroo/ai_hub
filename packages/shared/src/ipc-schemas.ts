@@ -12,6 +12,34 @@ export const ipcAckResultSchema = z.union([z.void(), z.undefined(), z.null()]);
 
 export const isoTimestampSchema = z.string().min(1);
 
+const CREDENTIAL_QUERY_KEYS = new Set(["api_key", "apikey", "key", "token", "secret", "access_token"]);
+
+export const customBaseUrlSchema = z
+  .string()
+  .url()
+  .max(512)
+  .superRefine((value, ctx) => {
+    let parsed: URL;
+    try {
+      parsed = new URL(value);
+    } catch {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Invalid URL" });
+      return;
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Only http(s) URLs are allowed" });
+    }
+    if (parsed.username !== "" || parsed.password !== "") {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Credentials in URLs are not allowed" });
+    }
+    for (const name of parsed.searchParams.keys()) {
+      if (CREDENTIAL_QUERY_KEYS.has(name.toLowerCase())) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Credential query parameters are not allowed" });
+        break;
+      }
+    }
+  });
+
 export const projectDtoSchema = z.object({
   id: z.string().uuid(),
   name: z.string(),
@@ -123,6 +151,9 @@ export const workspaceSessionSchema = z
     projectId: z.string().uuid().nullable(),
     conversationId: z.string().uuid().nullable(),
     model: z.string().min(1).max(128),
+    temperature: z.number().min(0).max(2).optional(),
+    maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
+    extraSystem: z.string().max(20_000).optional(),
   })
   .strict();
 
@@ -160,6 +191,7 @@ export const providerKeyDtoSchema = z.object({
   maskedKey: maskedKeySchema,
   last4: z.string().min(1).max(8),
   status: z.enum(["active", "invalid"]),
+  endpointUrl: z.string().max(512).nullable(),
   createdAt: isoTimestampSchema,
 });
 
@@ -172,10 +204,44 @@ export const secretsSaveInputSchema = z
     providerSlug: z.string().min(1).max(64),
     label: z.string().trim().min(1).max(80),
     secret: z.string().min(8).max(4096),
+    baseUrl: customBaseUrlSchema.optional(),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    if (value.providerSlug === "custom") {
+      if (value.baseUrl === undefined || value.baseUrl.trim().length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Custom providers require a base URL",
+          path: ["baseUrl"],
+        });
+      }
+      return;
+    }
+    if (value.baseUrl !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "baseUrl is only valid for custom providers",
+        path: ["baseUrl"],
+      });
+    }
+  });
+
+export type SecretsSaveInput = z.infer<typeof secretsSaveInputSchema>;
+
+export const secretsTestInputSchema = idInputSchema;
+
+export type SecretsTestInput = z.infer<typeof secretsTestInputSchema>;
+
+export const secretsTestResultSchema = z
+  .object({
+    ok: z.boolean(),
+    latencyMs: z.number().int().nonnegative(),
+    errorCode: gatewayErrorCodeSchema.nullable(),
   })
   .strict();
 
-export type SecretsSaveInput = z.infer<typeof secretsSaveInputSchema>;
+export type SecretsTestResult = z.infer<typeof secretsTestResultSchema>;
 
 export const chatEventSchema = z.discriminatedUnion("type", [
   z.object({
