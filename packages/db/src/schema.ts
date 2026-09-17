@@ -39,6 +39,7 @@ export const messageReceipts = sqliteTable("message_receipts", {
   tokensOut: integer("tokens_out", { mode: "number" }),
   latencyMs: integer("latency_ms", { mode: "number" }),
   costUsd: text("cost_usd"),
+  errorCode: text("error_code"),
   createdAt: integer("created_at", { mode: "number" }).notNull(),
 });
 
