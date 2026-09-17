@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq, isNull, ne } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import {
   decryptUtf8,
@@ -59,6 +59,7 @@ export interface MessageRecord {
   conversationId: string;
   parentId: string | null;
   branchId: string;
+  isActiveBranch: boolean;
   role: MessageRole;
   content: string;
   status: MessageStatus;
@@ -101,6 +102,7 @@ export interface WorkspaceSessionRecord {
 
 const APPEARANCE_KEY = "appearance";
 const SESSION_KEY = "workspace-session";
+const BRANCH_LABELS_PREFIX = "branch-labels:";
 const DEFAULT_SESSION: WorkspaceSessionRecord = {
   projectId: null,
   conversationId: null,
@@ -183,6 +185,7 @@ export class HubRepos {
       conversationId: row.conversationId,
       parentId: row.parentId,
       branchId: row.branchId,
+      isActiveBranch: row.isActiveBranch === 1,
       role: asRole(row.role),
       content: decryptUtf8(row.contentCipher, this.masterKey),
       status: asStatus(row.status),
@@ -336,18 +339,143 @@ export class HubRepos {
       .set({ updatedAt: now })
       .where(eq(conversations.id, input.conversationId))
       .run();
+    this.activateAmongSiblings(id);
+    const stored = this.getMessage(id);
+    if (!stored) {
+      throw new Error("Message not found");
+    }
+    return stored;
+  }
 
-    return {
-      id,
-      conversationId: input.conversationId,
-      parentId: input.parentId,
-      branchId,
-      role: input.role,
-      content: input.content,
-      status,
-      createdAt: iso(now),
-      receipt: null,
-    };
+  private activateAmongSiblings(messageId: string): void {
+    const row = this.db.select().from(messages).where(eq(messages.id, messageId)).get();
+    if (!row) {
+      throw new Error("Message not found");
+    }
+    const siblingFilter =
+      row.parentId === null
+        ? and(
+            eq(messages.conversationId, row.conversationId),
+            isNull(messages.parentId),
+            ne(messages.id, messageId),
+          )
+        : and(
+            eq(messages.conversationId, row.conversationId),
+            eq(messages.parentId, row.parentId),
+            ne(messages.id, messageId),
+          );
+    if (siblingFilter) {
+      this.db.update(messages).set({ isActiveBranch: 0 }).where(siblingFilter).run();
+    }
+    this.db.update(messages).set({ isActiveBranch: 1 }).where(eq(messages.id, messageId)).run();
+  }
+
+  activatePathThrough(id: string): MessageRecord {
+    const target = this.getMessage(id);
+    if (!target) {
+      throw new Error("Message not found");
+    }
+    const chain: string[] = [];
+    const seen = new Set<string>();
+    let current: typeof messages.$inferSelect | undefined = this.db
+      .select()
+      .from(messages)
+      .where(eq(messages.id, id))
+      .get();
+    while (current && !seen.has(current.id)) {
+      seen.add(current.id);
+      chain.push(current.id);
+      current = current.parentId
+        ? this.db.select().from(messages).where(eq(messages.id, current.parentId)).get()
+        : undefined;
+    }
+    for (const nodeId of chain) {
+      this.activateAmongSiblings(nodeId);
+    }
+    const stored = this.getMessage(id);
+    if (!stored) {
+      throw new Error("Message not found");
+    }
+    return stored;
+  }
+
+  listActivePath(conversationId: string): MessageRecord[] {
+    const all = this.listMessages(conversationId);
+    const path: MessageRecord[] = [];
+    const seen = new Set<string>();
+    let parentId: string | null = null;
+    for (;;) {
+      const children = all
+        .filter((item) => item.parentId === parentId)
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+      if (children.length === 0) {
+        return path;
+      }
+      const next = children.find((item) => item.isActiveBranch) ?? children[0];
+      if (!next || seen.has(next.id)) {
+        return path;
+      }
+      seen.add(next.id);
+      path.push(next);
+      parentId = next.id;
+    }
+  }
+
+  getBranchLabels(conversationId: string): Record<string, string> {
+    const row = this.db
+      .select()
+      .from(settings)
+      .where(eq(settings.key, `${BRANCH_LABELS_PREFIX}${conversationId}`))
+      .get();
+    if (!row) {
+      return {};
+    }
+    const parsed: unknown = JSON.parse(row.value);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return {};
+    }
+    const labels: Record<string, string> = {};
+    for (const [key, value] of Object.entries(parsed)) {
+      if (typeof value === "string") {
+        const trimmed = value.trim();
+        if (trimmed.length > 0 && trimmed.length <= 80) {
+          labels[key] = trimmed;
+        }
+      }
+    }
+    return labels;
+  }
+
+  setBranchLabel(conversationId: string, branchId: string, label: string): void {
+    const conversation = this.db
+      .select()
+      .from(conversations)
+      .where(eq(conversations.id, conversationId))
+      .get();
+    if (!conversation) {
+      throw new Error("Conversation not found");
+    }
+    const next = { ...this.getBranchLabels(conversationId) };
+    const trimmed = label.trim();
+    if (trimmed.length === 0) {
+      delete next[branchId];
+    } else {
+      next[branchId] = trimmed.slice(0, 80);
+    }
+    const now = Date.now();
+    const key = `${BRANCH_LABELS_PREFIX}${conversationId}`;
+    this.db
+      .insert(settings)
+      .values({
+        key,
+        value: JSON.stringify(next),
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: settings.key,
+        set: { value: JSON.stringify(next), updatedAt: now },
+      })
+      .run();
   }
 
   updateMessage(id: string, content: string, status: MessageStatus): MessageRecord {
@@ -376,13 +504,16 @@ export class HubRepos {
       throw new Error("Message not found");
     }
     const rows = this.listMessages(target.conversationId);
-    const index = rows.findIndex((row) => row.id === id);
-    if (index < 0) {
-      throw new Error("Message not found");
-    }
-    const doomed = rows.slice(index).reverse();
-    for (const row of doomed) {
-      this.db.delete(messages).where(eq(messages.id, row.id)).run();
+    const doomed: string[] = [];
+    const walk = (nodeId: string): void => {
+      for (const child of rows.filter((row) => row.parentId === nodeId)) {
+        walk(child.id);
+      }
+      doomed.push(nodeId);
+    };
+    walk(id);
+    for (const nodeId of doomed) {
+      this.db.delete(messages).where(eq(messages.id, nodeId)).run();
     }
   }
 
