@@ -1,6 +1,8 @@
 import type { AppLocale, ThemeMode } from "./appearance";
+import type { ChatAbortInput, ChatSendInput, ChatSendResult } from "./gateway";
 import type {
   AppearanceSettings,
+  ChatEvent,
   ConversationCreateInput,
   ConversationDto,
   ConversationListInput,
@@ -54,6 +56,12 @@ export interface HubSecretsApi {
   remove: (input: IdInput) => Promise<void>;
 }
 
+export interface HubChatApi {
+  send: (input: ChatSendInput) => Promise<ChatSendResult>;
+  abort: (input: ChatAbortInput) => Promise<void>;
+  onEvent: (listener: (event: ChatEvent) => void) => () => void;
+}
+
 export interface HubApi {
   platform: "win32" | "darwin" | "linux";
   window: HubWindowApi;
@@ -63,6 +71,7 @@ export interface HubApi {
   settings: HubSettingsApi;
   providers: HubProvidersApi;
   secrets: HubSecretsApi;
+  chat: HubChatApi;
 }
 
 export type { AppLocale, ThemeMode };
