@@ -6,6 +6,7 @@ export const projects = sqliteTable("projects", {
   color: text("color"),
   instructionsCipher: text("instructions_cipher"),
   preferredModel: text("preferred_model"),
+  preferredProvider: text("preferred_provider"),
   createdAt: integer("created_at", { mode: "number" }).notNull(),
   updatedAt: integer("updated_at", { mode: "number" }).notNull(),
 });
