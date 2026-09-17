@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type JSX } from "react";
+import { useCallback, useEffect, useRef, useState, type JSX } from "react";
 import { useTranslation } from "react-i18next";
 import type {
   BranchLabels,
@@ -6,8 +6,11 @@ import type {
   ChatSendResult,
   ConversationDto,
   MessageDto,
+  PacketPreviewResult,
   ProjectDto,
+  ProjectUpdateInput,
   ProviderKeyDto,
+  SearchHit,
 } from "@ai-hub/shared";
 import {
   catalogModelsForProvider,
@@ -51,6 +54,15 @@ export function App(): JSX.Element {
   const [error, setError] = useState<string | null>(null);
   const [branchLabels, setBranchLabels] = useState<BranchLabels>({});
   const [exportNotice, setExportNotice] = useState<string | null>(null);
+  const [compactHistory, setCompactHistory] = useState(false);
+  const [packetPreview, setPacketPreview] = useState<PacketPreviewResult | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
+  const [threadStartModel, setThreadStartModel] = useState<string | null>(null);
+  const projectInputRef = useRef<HTMLInputElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const selectedModelRef = useRef(selectedModel);
+  const searchGeneration = useRef(0);
 
   const fail = useCallback((): void => {
     setError(t("workspace.error.generic"));
@@ -62,7 +74,7 @@ export function App(): JSX.Element {
     return list;
   }, []);
 
-  const loadConversations = useCallback(async (projectId: string): Promise<ConversationDto[]> => {
+  const loadConversations = useCallback(async (projectId: string | null): Promise<ConversationDto[]> => {
     const list = await window.hub.conversations.list({ projectId });
     setConversations(list);
     return list;
@@ -113,19 +125,37 @@ export function App(): JSX.Element {
         if (session.extraSystem !== undefined) {
           setExtraSystem(session.extraSystem);
         }
-        const project =
-          projectList.find((item) => item.id === session.projectId) ?? projectList[0] ?? null;
-        if (!project) {
-          setSessionReady(true);
-          return;
-        }
-        setSelectedProjectId(project.id);
-        const convos = await loadConversations(project.id);
-        const conversation =
-          convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
-        if (conversation) {
-          setSelectedConversationId(conversation.id);
-          await loadMessages(conversation.id);
+        if (session.projectId) {
+          const project = projectList.find((item) => item.id === session.projectId) ?? null;
+          if (!project) {
+            setSelectedProjectId(null);
+            const convos = await loadConversations(null);
+            const conversation =
+              convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
+            if (conversation) {
+              setSelectedConversationId(conversation.id);
+              await loadMessages(conversation.id);
+            }
+            setSessionReady(true);
+            return;
+          }
+          setSelectedProjectId(project.id);
+          const convos = await loadConversations(project.id);
+          const conversation =
+            convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
+          if (conversation) {
+            setSelectedConversationId(conversation.id);
+            await loadMessages(conversation.id);
+          }
+        } else {
+          setSelectedProjectId(null);
+          const convos = await loadConversations(null);
+          const conversation =
+            convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
+          if (conversation) {
+            setSelectedConversationId(conversation.id);
+            await loadMessages(conversation.id);
+          }
         }
         setSessionReady(true);
       } catch {
@@ -181,6 +211,68 @@ export function App(): JSX.Element {
   }, [providerKeys, selectedKeyId, selectedModel]);
 
   useEffect(() => {
+    selectedModelRef.current = selectedModel;
+  }, [selectedModel]);
+
+  useEffect(() => {
+    setThreadStartModel(selectedModelRef.current);
+    setCompactHistory(false);
+  }, [selectedConversationId]);
+
+  useEffect(() => {
+    const query = searchQuery.trim();
+    if (query.length < 2) {
+      setSearchHits([]);
+      return;
+    }
+    const generation = searchGeneration.current + 1;
+    searchGeneration.current = generation;
+    const handle = window.setTimeout(() => {
+      void window.hub.search
+        .query({ query })
+        .then((hits) => {
+          if (searchGeneration.current === generation) {
+            setSearchHits(hits);
+          }
+        })
+        .catch(fail);
+    }, 250);
+    return () => window.clearTimeout(handle);
+  }, [fail, searchQuery]);
+
+  useEffect(() => {
+    if (!selectedConversationId) {
+      setPacketPreview(null);
+      return;
+    }
+    const key = providerKeys.find((item) => item.id === selectedKeyId);
+    if (!key) {
+      setPacketPreview(null);
+      return;
+    }
+    const extra = extraSystem.trim().length > 0 ? extraSystem : undefined;
+    void window.hub.chat
+      .previewPacket({
+        conversationId: selectedConversationId,
+        model: selectedModel,
+        providerSlug: key.providerSlug,
+        compact: compactHistory,
+        ...(extra !== undefined ? { extraSystem: extra } : {}),
+      })
+      .then(setPacketPreview)
+      .catch(fail);
+  }, [
+    compactHistory,
+    extraSystem,
+    fail,
+    messages,
+    providerKeys,
+    selectedConversationId,
+    selectedKeyId,
+    selectedModel,
+  ]);
+
+  useEffect(() => {
     const off = window.hub.chat.onEvent((event) => {
       if (event.type === "chunk") {
         setMessages((current) =>
@@ -213,13 +305,55 @@ export function App(): JSX.Element {
     return off;
   }, [fail, loadMessages, t]);
 
+  const applyProjectPreferences = useCallback(
+    (project: ProjectDto, keys: ProviderKeyDto[]): void => {
+      if (project.preferredProvider) {
+        const key = keys.find(
+          (item) => item.status === "active" && item.providerSlug === project.preferredProvider,
+        );
+        if (!key) {
+          return;
+        }
+        setSelectedKeyId(key.id);
+        if (project.preferredModel) {
+          setSelectedModel(project.preferredModel);
+        }
+        return;
+      }
+      if (project.preferredModel) {
+        setSelectedModel(project.preferredModel);
+      }
+    },
+    [],
+  );
+
+  const createUntitledChat = useCallback(async (): Promise<void> => {
+    try {
+      const created = await window.hub.conversations.create({
+        projectId: selectedProjectId,
+        title: t("workspace.untitledChat"),
+      });
+      setError(null);
+      await loadConversations(selectedProjectId);
+      setSelectedConversationId(created.id);
+      setMessages([]);
+      setBranchLabels({});
+      if (run && run.conversationId !== created.id) {
+        void window.hub.chat.abort({ runId: run.runId }).catch(fail);
+      }
+      setView("home");
+    } catch {
+      fail();
+    }
+  }, [fail, loadConversations, run, selectedProjectId, t]);
+
   const sendToModel = async (input: ChatSendInput): Promise<void> => {
     if (!selectedConversationId || !selectedKeyId) {
       return;
     }
     setSending(true);
     try {
-      const result = await window.hub.chat.send(input);
+      const result = await window.hub.chat.send({ ...input, compactHistory });
       setError(null);
       setRun({ runId: result.runId, conversationId: selectedConversationId });
       setMessages((current) => applySendResult(current, result));
@@ -237,6 +371,27 @@ export function App(): JSX.Element {
   };
 
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent): void => {
+      const modifier = event.ctrlKey || event.metaKey;
+      if (!modifier) {
+        return;
+      }
+      if (event.shiftKey && event.key.toLowerCase() === "n") {
+        event.preventDefault();
+        setView("home");
+        window.setTimeout(() => projectInputRef.current?.focus(), 0);
+        return;
+      }
+      if (event.key.toLowerCase() === "n") {
+        event.preventDefault();
+        void createUntitledChat();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [createUntitledChat]);
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -258,6 +413,12 @@ export function App(): JSX.Element {
             setSelectedConversationId(null);
             setMessages([]);
             setBranchLabels({});
+            if (id) {
+              const next = projects.find((item) => item.id === id);
+              if (next) {
+                applyProjectPreferences(next, providerKeys);
+              }
+            }
             void loadConversations(id).catch(fail);
           }}
           onCreateProject={async (name) => {
@@ -276,6 +437,31 @@ export function App(): JSX.Element {
             } catch {
               fail();
             }
+          }}
+          projectInputRef={projectInputRef}
+          searchQuery={searchQuery}
+          searchHits={searchHits}
+          onSearchQuery={setSearchQuery}
+          searchInputRef={searchInputRef}
+          onOpenSearchHit={(hit) => {
+            abortIfLeaving(hit.conversationId);
+            setSelectedProjectId(hit.projectId);
+            setView("home");
+            void (async () => {
+              try {
+                await loadConversations(hit.projectId);
+                setSelectedConversationId(hit.conversationId);
+                await loadMessages(hit.conversationId);
+                if (hit.messageId) {
+                  await window.hub.messages.activate({ id: hit.messageId });
+                  await loadMessages(hit.conversationId);
+                }
+                setSearchQuery("");
+                setSearchHits([]);
+              } catch {
+                fail();
+              }
+            })();
           }}
         />
         <main className="min-w-0 flex-1 bg-background">
@@ -302,9 +488,6 @@ export function App(): JSX.Element {
                 void loadMessages(id).catch(fail);
               }}
               onCreateConversation={async (title) => {
-                if (!selectedProjectId) {
-                  return;
-                }
                 try {
                   const created = await window.hub.conversations.create({
                     projectId: selectedProjectId,
@@ -338,6 +521,7 @@ export function App(): JSX.Element {
                   temperature,
                   maxTokens,
                   extraSystem,
+                  compactHistory,
                 });
               }}
               onAbort={async () => {
@@ -447,6 +631,61 @@ export function App(): JSX.Element {
                   fail();
                 }
               }}
+              onSaveProject={async (input: Omit<ProjectUpdateInput, "id">) => {
+                if (!selectedProjectId) {
+                  return;
+                }
+                try {
+                  const updated = await window.hub.projects.update({ id: selectedProjectId, ...input });
+                  setError(null);
+                  await loadProjects();
+                  applyProjectPreferences(updated, providerKeys);
+                } catch {
+                  fail();
+                }
+              }}
+              onRemoveProject={async () => {
+                if (!selectedProjectId) {
+                  return;
+                }
+                try {
+                  abortIfLeaving(null);
+                  await window.hub.projects.remove({ id: selectedProjectId });
+                  setError(null);
+                  await loadProjects();
+                  setSelectedProjectId(null);
+                  setSelectedConversationId(null);
+                  setMessages([]);
+                  setBranchLabels({});
+                  await loadConversations(null);
+                } catch {
+                  fail();
+                }
+              }}
+              onSetTags={async (names) => {
+                if (!selectedConversationId) {
+                  return;
+                }
+                try {
+                  const updated = await window.hub.conversations.setTags({
+                    conversationId: selectedConversationId,
+                    names,
+                  });
+                  setConversations((current) =>
+                    current.map((item) => (item.id === updated.id ? updated : item)),
+                  );
+                } catch {
+                  fail();
+                }
+              }}
+              compactHistory={compactHistory}
+              onToggleCompact={setCompactHistory}
+              packetPreview={packetPreview}
+              modelSwitchNotice={
+                threadStartModel !== null &&
+                threadStartModel !== selectedModel &&
+                messages.length > 0
+              }
             />
           ) : (
             <SettingsView />
@@ -454,7 +693,19 @@ export function App(): JSX.Element {
         </main>
       </div>
       <StatusBar />
-      <ChromeCommandPalette />
+      <ChromeCommandPalette
+        onNewProject={() => {
+          setView("home");
+          window.setTimeout(() => projectInputRef.current?.focus(), 0);
+        }}
+        onNewChat={() => {
+          void createUntitledChat();
+        }}
+        onSearch={() => {
+          setView("home");
+          window.setTimeout(() => searchInputRef.current?.focus(), 0);
+        }}
+      />
     </div>
   );
 }
