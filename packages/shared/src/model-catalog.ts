@@ -7,6 +7,8 @@ export interface CatalogModel {
   contextWindow: number;
   inputUsdPerMillion: number;
   outputUsdPerMillion: number;
+  vision: boolean;
+  tools: boolean;
 }
 
 export interface ModelCatalog {
@@ -22,6 +24,14 @@ export function findCatalogModel(modelId: string, provider: string): CatalogMode
   );
 }
 
+export function catalogModelsForProvider(provider: string): CatalogModel[] {
+  return MODEL_CATALOG.models.filter((model) => model.provider === provider);
+}
+
+export function openaiCatalogModels(): CatalogModel[] {
+  return catalogModelsForProvider("openai");
+}
+
 export function estimateCostUsd(
   model: CatalogModel,
   tokensIn: number,
@@ -31,8 +41,4 @@ export function estimateCostUsd(
     (tokensIn / 1_000_000) * model.inputUsdPerMillion +
     (tokensOut / 1_000_000) * model.outputUsdPerMillion;
   return cost.toFixed(6);
-}
-
-export function openaiCatalogModels(): CatalogModel[] {
-  return MODEL_CATALOG.models.filter((model) => model.provider === "openai");
 }
