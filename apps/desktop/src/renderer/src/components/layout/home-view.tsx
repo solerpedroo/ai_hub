@@ -1,4 +1,4 @@
-import { type JSX, useState } from "react";
+import { type JSX, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ConversationDto, MessageDto, ProjectDto, ProviderKeyDto } from "@ai-hub/shared";
 import { openaiCatalogModels } from "@ai-hub/shared";
@@ -52,10 +52,15 @@ export function HomeView({
   const { t } = useTranslation();
   const [title, setTitle] = useState("");
   const [draft, setDraft] = useState("");
+  const [editing, setEditing] = useState(false);
   const openaiKeys = providerKeys.filter((key) => key.providerSlug === "openai");
   const models = openaiCatalogModels();
   const hasKey = selectedKeyId !== null && openaiKeys.some((key) => key.id === selectedKeyId);
   const busy = streaming || sending;
+
+  useEffect(() => {
+    setEditing(false);
+  }, [selectedConversationId]);
 
   if (!project) {
     return (
@@ -183,6 +188,7 @@ export function HomeView({
                       onEdit={async (content) => {
                         await onEditUser(message.id, content);
                       }}
+                      onEditingChange={setEditing}
                     />
                   ))}
                 </ol>
@@ -194,7 +200,7 @@ export function HomeView({
               onChange={setDraft}
               streaming={streaming}
               sending={sending}
-              disabled={!hasKey}
+              disabled={!hasKey || editing}
               onSend={() => {
                 const next = draft.trim();
                 if (!next) {
@@ -213,7 +219,7 @@ export function HomeView({
           </div>
         )}
         {error ? (
-          <p className="border-t px-3 py-2 text-destructive" role="alert">
+          <p className="border-t px-3 py-2 text-destructive" role="alert" data-testid="workspace-error">
             {error}
           </p>
         ) : null}
