@@ -45,3 +45,8 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W02-002](./ADR-W02-002-compiler-packet-v0.md) | W02 | Compiler v0 e packet JSON versão 1 | accepted |
 | [ADR-W02-003](./ADR-W02-003-crash-safe-stream.md) | W02 | Flush incremental e `interrupted` no boot | accepted |
 | [ADR-W02-004](./ADR-W02-004-gateway-errors-and-receipts.md) | W02 | Taxonomia de erro e receipts com catálogo | accepted |
+| [ADR-W03-001](./ADR-W03-001-react-markdown-gfm.md) | W03 | Markdown no renderer com GFM e highlight | accepted |
+| [ADR-W03-002](./ADR-W03-002-linear-edit-and-regenerate.md) | W03 | Edit/regenerate lineares até a W4 | accepted |
+| [ADR-W03-003](./ADR-W03-003-session-restore-settings.md) | W03 | Restore da sessão em `settings` | accepted |
+| [ADR-W03-004](./ADR-W03-004-e2e-mock-adapter.md) | W03 | Playwright com adapter mock, sem rede | accepted |
+| [ADR-W03-005](./ADR-W03-005-sandboxed-cjs-preload.md) | W03 | Preload CJS sandboxed + HTML sem crossorigin | accepted |
