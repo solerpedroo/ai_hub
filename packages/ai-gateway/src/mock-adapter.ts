@@ -1,4 +1,4 @@
-import { openaiCatalogModels } from "@ai-hub/shared";
+import { catalogModelsForProvider } from "@ai-hub/shared";
 import type {
   ChatStreamEvent,
   ChatStreamRequest,
@@ -31,9 +31,9 @@ function waitForAbortOrTimeout(ms: number, signal: AbortSignal): Promise<void> {
 
 export function createMockOpenAIAdapter(): ProviderAdapter {
   return {
-    id: "openai",
+    id: "mock",
     listModels: (): ModelRef[] =>
-      openaiCatalogModels().map((model) => ({ id: model.id, label: model.label })),
+      catalogModelsForProvider("openai").map((model) => ({ id: model.id, label: model.label })),
     capabilities: (): ProviderCapabilities => ({ streaming: true, tools: false }),
     testConnection: async (): Promise<void> => {
       return;
