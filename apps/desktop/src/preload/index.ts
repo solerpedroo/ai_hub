@@ -32,6 +32,8 @@ import {
   providerKeyListResultSchema,
   providerListResultSchema,
   secretsSaveInputSchema,
+  secretsTestInputSchema,
+  secretsTestResultSchema,
   windowIsMaximizedResultSchema,
   workspaceSessionSchema,
 } from "@ai-hub/shared";
@@ -168,6 +170,8 @@ const hub: HubApi = {
     list: () => invokeParsed(IpcChannel.secretsList, empty, emptyIpcPayloadSchema, providerKeyListResultSchema),
     save: (input) => invokeParsed(IpcChannel.secretsSave, input, secretsSaveInputSchema, providerKeyDtoSchema),
     remove: (input) => invokeAckWith(IpcChannel.secretsRemove, input, idInputSchema),
+    test: (input) =>
+      invokeParsed(IpcChannel.secretsTest, input, secretsTestInputSchema, secretsTestResultSchema),
   },
   chat: {
     send: (input) => invokeParsed(IpcChannel.chatSend, input, chatSendInputSchema, chatSendResultSchema),
