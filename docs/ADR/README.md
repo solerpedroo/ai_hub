@@ -58,3 +58,8 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W05-002](./ADR-W05-002-openrouter-first-class.md) | W05 | OpenRouter first-class, não URL custom | accepted |
 | [ADR-W05-003](./ADR-W05-003-custom-base-url-settings.md) | W05 | URL custom em settings, chave no keytar | accepted |
 | [ADR-W05-004](./ADR-W05-004-connection-test-health-samples.md) | W05 | Teste de conexão grava health_samples | accepted |
+| [ADR-W06-001](./ADR-W06-001-search-decrypt-not-plaintext-fts.md) | W06 | Busca decripta no main; FTS5 vazio | accepted |
+| [ADR-W06-002](./ADR-W06-002-inbox-null-project.md) | W06 | Inbox Avulsas é `projectId: null` | accepted |
+| [ADR-W06-003](./ADR-W06-003-compile-trim-context-window.md) | W06 | Compactar histórico só no packet | accepted |
+| [ADR-W06-004](./ADR-W06-004-plaintext-conversation-tags.md) | W06 | Nomes de tags em plaintext | accepted |
+| [ADR-W06-005](./ADR-W06-005-model-switch-via-compiler.md) | W06 | Troca de modelo no mesmo fio via Compiler | accepted |
