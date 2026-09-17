@@ -61,6 +61,7 @@ export const chatSendInputSchema = z
     conversationId: z.string().uuid(),
     providerKeyId: z.string().uuid(),
     model: z.string().min(1).max(128),
+    content: z.string().min(1).max(100_000).nullable(),
   })
   .strict();
 
@@ -70,6 +71,7 @@ export const chatSendResultSchema = z
   .object({
     runId: z.string().uuid(),
     messageId: z.string().uuid(),
+    userMessageId: z.string().uuid().nullable(),
     packet: packetV0Schema,
   })
   .strict();
