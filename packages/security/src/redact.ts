@@ -1,7 +1,9 @@
 const SECRET_PATTERNS: readonly RegExp[] = [
   /sk-[A-Za-z0-9_-]{8,}/g,
+  /gsk_[A-Za-z0-9]{8,}/g,
+  /AIza[A-Za-z0-9_-]{10,}/g,
   /Bearer\s+[A-Za-z0-9._\-+=/]+/gi,
-  /(?:api[_-]?key|access[_-]?token|secret)[=:\s]+['"]?[^\s'"]+/gi,
+  /(?:api[_-]?key|access[_-]?token|secret|x-api-key|x-goog-api-key)[=:\s]+['"]?[^\s'"]+/gi,
 ];
 
 export function redactSecrets(text: string): string {
