@@ -10,11 +10,13 @@ import type {
   MessageCreateInput,
   MessageDto,
   MessageListInput,
+  MessageUpdateInput,
   ProjectCreateInput,
   ProjectDto,
   ProviderDto,
   ProviderKeyDto,
   SecretsSaveInput,
+  WorkspaceSession,
 } from "./ipc-schemas";
 
 export interface HubWindowApi {
@@ -39,11 +41,15 @@ export interface HubConversationsApi {
 export interface HubMessagesApi {
   list: (input: MessageListInput) => Promise<MessageDto[]>;
   create: (input: MessageCreateInput) => Promise<MessageDto>;
+  update: (input: MessageUpdateInput) => Promise<MessageDto>;
+  deleteFrom: (input: IdInput) => Promise<void>;
 }
 
 export interface HubSettingsApi {
   getAppearance: () => Promise<AppearanceSettings>;
   setAppearance: (input: AppearanceSettings) => Promise<void>;
+  getSession: () => Promise<WorkspaceSession>;
+  setSession: (input: WorkspaceSession) => Promise<void>;
 }
 
 export interface HubProvidersApi {
