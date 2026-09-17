@@ -14,6 +14,7 @@ export {
 } from "./crash-safe";
 export { GatewayError, GatewayStreamError, gatewayErrorCode, isGatewayError } from "./errors";
 export { createOpenAIAdapter, type OpenAIAdapterOptions } from "./openai-adapter";
+export { createMockOpenAIAdapter, MOCK_ASSISTANT_TEXT } from "./mock-adapter";
 export {
   composeReceipt,
   estimateTokensFromChars,
