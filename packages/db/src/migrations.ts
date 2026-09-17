@@ -135,8 +135,14 @@ INSERT INTO providers (id, slug, name) VALUES
   ('66666666-6666-4666-8666-666666666666', 'custom', 'Custom (OpenAI-compatible)');
 `;
 
+export const MIGRATION_0004_SQL = `
+ALTER TABLE projects ADD COLUMN preferred_provider TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS conversation_tags_pk ON conversation_tags(conversation_id, tag_id);
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
   { version: 3, sql: MIGRATION_0003_SQL },
+  { version: 4, sql: MIGRATION_0004_SQL },
 ];
