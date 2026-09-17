@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave 
 |---|---|
 | Wave | **W03** |
 | Marco | B — MVP |
-| State | `pending` |
+| State | `in_progress` |
 | Last completed | **W02** |
-| Next action | Wave 3 — Chat core |
+| Next action | Chat core: composer, bolhas markdown, restore, Playwright mock |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
@@ -27,14 +27,15 @@ None.
 - FTS5 existe e fica vazia; W6 não pode popular plaintext sem nova decisão (ADR-W01-001).
 - Redaction regex não cobre todos os formatos de chave colados na conversa.
 - Caps (W7) ainda não hard-stopam `chat:send`.
+- Zustand ainda não foi introduzido; W0–W3 usam `useState` (barulho vs stack travada).
 
 ## Notes for the next session
 
-- W03: composer (Enter envia, Stop), stream na bolha, markdown, restore de sessão, encadear `parentId`. Continue/regenerate = novo send (ADR-W02-003). Sem OpenRouter first-class (W5), sem UI polida de receipts (W7).
+- W03 em curso: composer + bolhas markdown + restore + Playwright mock. Não fechar sem o gate §9. W4 branching, W5 OpenRouter, W7 receipts/caps.
 
 ## Last review / ADR
 
 | Kind | Path |
 |---|---|
 | Review | `docs/reviews/W02/REVIEW.md` |
-| Latest ADR | `docs/ADR/ADR-W02-004-gateway-errors-and-receipts.md` |
+| Latest ADR | `docs/ADR/ADR-W03-005-sandboxed-cjs-preload.md` |
