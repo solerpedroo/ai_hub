@@ -1,0 +1,2714 @@
+diff --git a/apps/desktop/e2e/send.spec.ts b/apps/desktop/e2e/send.spec.ts
+index b1c83f7..28b18d0 100644
+--- a/apps/desktop/e2e/send.spec.ts
++++ b/apps/desktop/e2e/send.spec.ts
+@@ -75,3 +75,16 @@ test("regenerate keeps the previous answer as a sibling", async () => {
+     await app.close();
+   }
+ });
++
++test("settings lists OpenRouter as a first-class provider", async () => {
++  const app = await launchHub();
++  try {
++    const window = await app.firstWindow();
++    await window.getByTestId("nav-settings").click();
++    await expect(window.getByTestId("secrets-provider")).toBeVisible();
++    await expect(window.getByTestId("secrets-provider")).toContainText("OpenRouter");
++    await expect(window.getByTestId("secrets-test")).toBeVisible();
++  } finally {
++    await app.close();
++  }
++});
+diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts
+index dd576a0..349f754 100644
+--- a/apps/desktop/src/main/chat-session.ts
++++ b/apps/desktop/src/main/chat-session.ts
+@@ -6,11 +6,11 @@ import {
+   compilePacket,
+   consumeCrashSafeStream,
+   createMockOpenAIAdapter,
+-  createOpenAIAdapter,
+   estimateTokensFromChars,
+   GatewayError,
+   GatewayStreamError,
+   gatewayErrorCode,
++  resolveAdapter,
+   type ProviderAdapter,
+ } from "@ai-hub/ai-gateway";
+ import type { MessageRecord } from "@ai-hub/db";
+@@ -47,7 +47,18 @@ interface ActiveRun {
+ const runs = new Map<string, ActiveRun>();
+ const runByConversation = new Map<string, string>();
+ 
+-const adapter: ProviderAdapter = isE2eMode() ? createMockOpenAIAdapter() : createOpenAIAdapter();
++function adapterFor(slug: string, baseUrl: string | null): ProviderAdapter {
++  if (isE2eMode()) {
++    return createMockOpenAIAdapter();
++  }
++  if (slug === "custom") {
++    if (baseUrl === null || baseUrl.length === 0) {
++      throw new GatewayError("unknown", "Custom provider requires a base URL");
++    }
++    return resolveAdapter("custom", { baseUrl });
++  }
++  return resolveAdapter(slug);
++}
+ 
+ function inspectablePacket(packet: ProviderAgnosticPacket): ProviderAgnosticPacket {
+   return packetV0Schema.parse(JSON.parse(redactSecrets(JSON.stringify(packet))) as unknown);
+@@ -105,18 +116,20 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+     throw new Error("Conversation not found");
+   }
+ 
+-  if (!findCatalogModel(input.model, "openai")) {
+-    throw new Error("Unknown model");
+-  }
+-
+   const key = await repos.getProviderSecret(input.providerKeyId);
+   if (!key) {
+     throw new GatewayError("auth", "Provider key is missing");
+   }
+-  if (key.providerSlug !== "openai") {
+-    throw new Error("Only OpenAI is available in this wave");
++  if (key.providerSlug === "custom") {
++    if (input.model.trim().length === 0) {
++      throw new Error("Unknown model");
++    }
++  } else if (!findCatalogModel(input.model, key.providerSlug)) {
++    throw new Error("Unknown model");
+   }
+ 
++  const adapter = adapterFor(key.providerSlug, repos.getCustomBaseUrl(key.id));
++
+   const existing = repos.listMessages(input.conversationId);
+   if (existing.some((item) => item.status === "streaming")) {
+     throw new Error("A stream is already running in this conversation");
+@@ -191,12 +204,14 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+     }
+   }
+ 
++  const extraSystem =
++    input.extraSystem !== undefined && input.extraSystem.trim().length > 0 ? input.extraSystem.trim() : null;
+   const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
+   const packet =
+     input.mode === "regenerate"
+       ? compilePacket({
+           projectInstructions: project?.instructions ?? null,
+-          extraSystem: null,
++          extraSystem,
+           messages: compileRows.map((item) => ({
+             id: item.id,
+             role: item.role,
+@@ -206,7 +221,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+         })
+       : compileActivePath({
+           projectInstructions: project?.instructions ?? null,
+-          extraSystem: null,
++          extraSystem,
+           messages: compileRows.map((item) => ({
+             id: item.id,
+             parentId: item.parentId,
+@@ -234,7 +249,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+   });
+   repos.createReceipt({
+     messageId: assistant.id,
+-    provider: "openai",
++    provider: key.providerSlug,
+     model: input.model,
+     tokensIn: null,
+     tokensOut: null,
+@@ -254,7 +269,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+     packetEstimate: packet.tokenEstimate,
+     startedAt: Date.now(),
+     model: input.model,
+-    provider: "openai",
++    provider: key.providerSlug,
+   };
+   runs.set(runId, run);
+   runByConversation.set(input.conversationId, runId);
+@@ -268,6 +283,8 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+           model: input.model,
+           packet,
+           signal: run.abort.signal,
++          temperature: input.temperature ?? 1,
++          maxTokens: input.maxTokens ?? null,
+         }),
+         onDelta: (text) => {
+           emit(run.sender, {
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index b2e4352..213df29 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -30,6 +30,8 @@ import {
+   providerKeyListResultSchema,
+   providerListResultSchema,
+   secretsSaveInputSchema,
++  secretsTestInputSchema,
++  secretsTestResultSchema,
+   windowIsMaximizedResultSchema,
+   workspaceSessionSchema,
+ } from "@ai-hub/shared";
+@@ -38,6 +40,7 @@ import { abortChat, sendChat } from "./chat-session";
+ import { exportConversation } from "./conversation-export";
+ import { toMessageDto } from "./message-dto";
+ import { getHubDatabase } from "./persistence";
++import { testProviderKey } from "./provider-health";
+ 
+ function registerHandler<TIn, TOut>(
+   channel: string,
+@@ -205,6 +208,10 @@ export function registerWorkspaceIpc(): void {
+     getHubDatabase().repos.removeProviderKey(input.id),
+   );
+ 
++  registerHandler(IpcChannel.secretsTest, secretsTestInputSchema, secretsTestResultSchema, (input) =>
++    testProviderKey(input.id),
++  );
++
+   registerHandler(IpcChannel.chatSend, chatSendInputSchema, chatSendResultSchema, (input, event) =>
+     sendChat(input, event.sender),
+   );
+diff --git a/apps/desktop/src/main/provider-health.ts b/apps/desktop/src/main/provider-health.ts
+new file mode 100644
+index 0000000..1c5f576
+--- /dev/null
++++ b/apps/desktop/src/main/provider-health.ts
+@@ -0,0 +1,40 @@
++import { gatewayErrorCode, resolveAdapter, createMockOpenAIAdapter, type ProviderAdapter } from "@ai-hub/ai-gateway";
++import type { SecretsTestResult } from "@ai-hub/shared";
++import { isE2eMode } from "./e2e-mode";
++import { getHubDatabase } from "./persistence";
++
++export async function testProviderKey(id: string): Promise<SecretsTestResult> {
++  const started = Date.now();
++  const repos = getHubDatabase().repos;
++  const key = await repos.getProviderSecret(id);
++  if (!key) {
++    throw new Error("Provider key is missing");
++  }
++
++  let adapter: ProviderAdapter;
++  if (isE2eMode()) {
++    adapter = createMockOpenAIAdapter();
++  } else if (key.providerSlug === "custom") {
++    const baseUrl = repos.getCustomBaseUrl(key.id);
++    if (baseUrl === null) {
++      const latencyMs = Math.max(0, Date.now() - started);
++      repos.recordHealthSample({ providerSlug: key.providerSlug, ok: false, latencyMs });
++      return { ok: false, latencyMs, errorCode: "unknown" };
++    }
++    adapter = resolveAdapter("custom", { baseUrl });
++  } else {
++    adapter = resolveAdapter(key.providerSlug);
++  }
++
++  try {
++    await adapter.testConnection(key.secret, AbortSignal.timeout(15_000));
++    const latencyMs = Math.max(0, Date.now() - started);
++    repos.recordHealthSample({ providerSlug: key.providerSlug, ok: true, latencyMs });
++    return { ok: true, latencyMs, errorCode: null };
++  } catch (error) {
++    const latencyMs = Math.max(0, Date.now() - started);
++    const errorCode = gatewayErrorCode(error);
++    repos.recordHealthSample({ providerSlug: key.providerSlug, ok: false, latencyMs });
++    return { ok: false, latencyMs, errorCode };
++  }
++}
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index 2140521..37c0dae 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -32,6 +32,8 @@ import {
+   providerKeyListResultSchema,
+   providerListResultSchema,
+   secretsSaveInputSchema,
++  secretsTestInputSchema,
++  secretsTestResultSchema,
+   windowIsMaximizedResultSchema,
+   workspaceSessionSchema,
+ } from "@ai-hub/shared";
+@@ -168,6 +170,8 @@ const hub: HubApi = {
+     list: () => invokeParsed(IpcChannel.secretsList, empty, emptyIpcPayloadSchema, providerKeyListResultSchema),
+     save: (input) => invokeParsed(IpcChannel.secretsSave, input, secretsSaveInputSchema, providerKeyDtoSchema),
+     remove: (input) => invokeAckWith(IpcChannel.secretsRemove, input, idInputSchema),
++    test: (input) =>
++      invokeParsed(IpcChannel.secretsTest, input, secretsTestInputSchema, secretsTestResultSchema),
+   },
+   chat: {
+     send: (input) => invokeParsed(IpcChannel.chatSend, input, chatSendInputSchema, chatSendResultSchema),
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index 2e24f02..e2e1b79 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -9,7 +9,11 @@ import type {
+   ProjectDto,
+   ProviderKeyDto,
+ } from "@ai-hub/shared";
+-import { findCatalogModel, upsertActivated } from "@ai-hub/shared";
++import {
++  catalogModelsForProvider,
++  findCatalogModel,
++  upsertActivated,
++} from "@ai-hub/shared";
+ import { TitleBar } from "@/components/layout/title-bar";
+ import { Sidebar } from "@/components/layout/sidebar";
+ import { StatusBar } from "@/components/layout/status-bar";
+@@ -37,6 +41,9 @@ export function App(): JSX.Element {
+   const [providerKeys, setProviderKeys] = useState<ProviderKeyDto[]>([]);
+   const [selectedKeyId, setSelectedKeyId] = useState<string | null>(null);
+   const [selectedModel, setSelectedModel] = useState("gpt-4o-mini");
++  const [temperature, setTemperature] = useState(1);
++  const [maxTokens, setMaxTokens] = useState<number | null>(null);
++  const [extraSystem, setExtraSystem] = useState("");
+   const [run, setRun] = useState<{ runId: string; conversationId: string } | null>(null);
+   const [sending, setSending] = useState(false);
+   const [activating, setActivating] = useState(false);
+@@ -83,10 +90,28 @@ export function App(): JSX.Element {
+           loadKeys(),
+           window.hub.settings.getSession(),
+         ]);
+-        const openai = keys.find((item) => item.providerSlug === "openai" && item.status === "active");
+-        setSelectedKeyId(openai?.id ?? null);
+-        if (findCatalogModel(session.model, "openai")) {
++        const matchingKey =
++          keys.find(
++            (item) => item.status === "active" && findCatalogModel(session.model, item.providerSlug) !== null,
++          ) ??
++          keys.find((item) => item.status === "active") ??
++          null;
++        setSelectedKeyId(matchingKey?.id ?? null);
++        if (matchingKey?.providerSlug === "custom") {
++          setSelectedModel(session.model);
++        } else if (matchingKey && findCatalogModel(session.model, matchingKey.providerSlug)) {
+           setSelectedModel(session.model);
++        } else if (matchingKey) {
++          setSelectedModel(catalogModelsForProvider(matchingKey.providerSlug)[0]?.id ?? session.model);
++        }
++        if (session.temperature !== undefined) {
++          setTemperature(session.temperature);
++        }
++        if (session.maxTokens !== undefined) {
++          setMaxTokens(session.maxTokens);
++        }
++        if (session.extraSystem !== undefined) {
++          setExtraSystem(session.extraSystem);
+         }
+         const project =
+           projectList.find((item) => item.id === session.projectId) ?? projectList[0] ?? null;
+@@ -119,9 +144,12 @@ export function App(): JSX.Element {
+         projectId: selectedProjectId,
+         conversationId: selectedConversationId,
+         model: selectedModel,
++        temperature,
++        maxTokens,
++        extraSystem,
+       })
+       .catch(fail);
+-  }, [fail, selectedConversationId, selectedModel, selectedProjectId, sessionReady]);
++  }, [extraSystem, fail, maxTokens, selectedConversationId, selectedModel, selectedProjectId, sessionReady, temperature]);
+ 
+   useEffect(() => {
+     if (view !== "home") {
+@@ -133,12 +161,25 @@ export function App(): JSX.Element {
+           if (current && list.some((item) => item.id === current)) {
+             return current;
+           }
+-          return list.find((item) => item.providerSlug === "openai" && item.status === "active")?.id ?? null;
++          return list.find((item) => item.status === "active")?.id ?? null;
+         });
+       })
+       .catch(fail);
+   }, [fail, loadKeys, view]);
+ 
++  useEffect(() => {
++    const key = providerKeys.find((item) => item.id === selectedKeyId);
++    if (!key || key.providerSlug === "custom") {
++      return;
++    }
++    if (!findCatalogModel(selectedModel, key.providerSlug)) {
++      const first = catalogModelsForProvider(key.providerSlug)[0];
++      if (first) {
++        setSelectedModel(first.id);
++      }
++    }
++  }, [providerKeys, selectedKeyId, selectedModel]);
++
+   useEffect(() => {
+     const off = window.hub.chat.onEvent((event) => {
+       if (event.type === "chunk") {
+@@ -248,6 +289,9 @@ export function App(): JSX.Element {
+               providerKeys={providerKeys}
+               selectedKeyId={selectedKeyId}
+               selectedModel={selectedModel}
++              temperature={temperature}
++              maxTokens={maxTokens}
++              extraSystem={extraSystem}
+               streaming={run?.conversationId === selectedConversationId}
+               sending={sending || activating}
+               branchLabels={branchLabels}
+@@ -278,6 +322,9 @@ export function App(): JSX.Element {
+               }}
+               onSelectKey={setSelectedKeyId}
+               onSelectModel={setSelectedModel}
++              onSelectTemperature={setTemperature}
++              onSelectMaxTokens={setMaxTokens}
++              onSelectExtraSystem={setExtraSystem}
+               onSend={(content) => {
+                 if (!selectedConversationId || !selectedKeyId) {
+                   return Promise.resolve();
+@@ -288,6 +335,9 @@ export function App(): JSX.Element {
+                   providerKeyId: selectedKeyId,
+                   model: selectedModel,
+                   content,
++                  temperature,
++                  maxTokens,
++                  extraSystem,
+                 });
+               }}
+               onAbort={async () => {
+@@ -310,6 +360,9 @@ export function App(): JSX.Element {
+                   providerKeyId: selectedKeyId,
+                   model: selectedModel,
+                   messageId,
++                  temperature,
++                  maxTokens,
++                  extraSystem,
+                 });
+               }}
+               onContinue={() => {
+@@ -321,6 +374,9 @@ export function App(): JSX.Element {
+                   conversationId: selectedConversationId,
+                   providerKeyId: selectedKeyId,
+                   model: selectedModel,
++                  temperature,
++                  maxTokens,
++                  extraSystem,
+                 });
+               }}
+               onEditUser={async (id, content) => {
+@@ -334,6 +390,9 @@ export function App(): JSX.Element {
+                   model: selectedModel,
+                   messageId: id,
+                   content,
++                  temperature,
++                  maxTokens,
++                  extraSystem,
+                 });
+               }}
+               onActivate={async (id) => {
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index a6518b7..7eb6409 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -1,6 +1,16 @@
+ import { type JSX, useEffect, useState } from "react";
+ import { useTranslation } from "react-i18next";
+-import { activePath, openaiCatalogModels, type BranchLabels, type ConversationDto, type MessageDto, type ProjectDto, type ProviderKeyDto } from "@ai-hub/shared";
++import {
++  activePath,
++  catalogModelsForProvider,
++  findCatalogModel,
++  type BranchLabels,
++  type CatalogModel,
++  type ConversationDto,
++  type MessageDto,
++  type ProjectDto,
++  type ProviderKeyDto,
++} from "@ai-hub/shared";
+ import { ChatComposer } from "@/components/chat/chat-composer";
+ import { ConversationTree } from "@/components/chat/conversation-tree";
+ import { MessageBubble } from "@/components/chat/message-bubble";
+@@ -17,6 +27,9 @@ export function HomeView({
+   providerKeys,
+   selectedKeyId,
+   selectedModel,
++  temperature,
++  maxTokens,
++  extraSystem,
+   streaming,
+   sending,
+   branchLabels,
+@@ -25,6 +38,9 @@ export function HomeView({
+   onCreateConversation,
+   onSelectKey,
+   onSelectModel,
++  onSelectTemperature,
++  onSelectMaxTokens,
++  onSelectExtraSystem,
+   onSend,
+   onAbort,
+   onRegenerate,
+@@ -42,6 +58,9 @@ export function HomeView({
+   providerKeys: ProviderKeyDto[];
+   selectedKeyId: string | null;
+   selectedModel: string;
++  temperature: number;
++  maxTokens: number | null;
++  extraSystem: string;
+   streaming: boolean;
+   sending: boolean;
+   branchLabels: BranchLabels;
+@@ -50,6 +69,9 @@ export function HomeView({
+   onCreateConversation: (title: string) => Promise<void>;
+   onSelectKey: (id: string) => void;
+   onSelectModel: (id: string) => void;
++  onSelectTemperature: (value: number) => void;
++  onSelectMaxTokens: (value: number | null) => void;
++  onSelectExtraSystem: (value: string) => void;
+   onSend: (content: string) => Promise<void>;
+   onAbort: () => Promise<void>;
+   onRegenerate: (messageId: string) => Promise<void>;
+@@ -64,9 +86,12 @@ export function HomeView({
+   const [draft, setDraft] = useState("");
+   const [editing, setEditing] = useState(false);
+   const [treeOpen, setTreeOpen] = useState(false);
+-  const openaiKeys = providerKeys.filter((key) => key.providerSlug === "openai");
+-  const models = openaiCatalogModels();
+-  const hasKey = selectedKeyId !== null && openaiKeys.some((key) => key.id === selectedKeyId);
++  const selectedKey = providerKeys.find((key) => key.id === selectedKeyId) ?? providerKeys[0] ?? null;
++  const providerSlug = selectedKey?.providerSlug ?? null;
++  const models = providerSlug ? catalogModelsForProvider(providerSlug) : [];
++  const selectedCatalog: CatalogModel | null =
++    providerSlug && selectedModel ? findCatalogModel(selectedModel, providerSlug) : null;
++  const hasKey = selectedKeyId !== null && providerKeys.some((key) => key.id === selectedKeyId);
+   const busy = streaming || sending;
+   const path = activePath(messages);
+   const activeIds = new Set(path.map((item) => item.id));
+@@ -146,7 +171,7 @@ export function HomeView({
+         {selectedConversationId ? (
+           <>
+             <header className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
+-              {openaiKeys.length === 0 ? (
++              {providerKeys.length === 0 ? (
+                 <p className="text-muted-foreground">{t("workspace.noKey")}</p>
+               ) : (
+                 <>
+@@ -154,31 +179,93 @@ export function HomeView({
+                     <span className="text-muted-foreground">{t("workspace.key")}</span>
+                     <select
+                       className="h-8 rounded-md border bg-background px-2 text-sm"
+-                      value={selectedKeyId ?? openaiKeys[0]?.id}
++                      value={selectedKeyId ?? providerKeys[0]?.id}
+                       onChange={(event) => onSelectKey(event.target.value)}
+                       aria-label={t("workspace.key")}
++                      data-testid="workspace-key"
+                     >
+-                      {openaiKeys.map((key) => (
++                      {providerKeys.map((key) => (
+                         <option key={key.id} value={key.id}>
+-                          {key.label} ({key.maskedKey})
++                          {key.providerSlug} · {key.label} ({key.maskedKey})
+                         </option>
+                       ))}
+                     </select>
+                   </label>
+                   <label className="flex items-center gap-1">
+                     <span className="text-muted-foreground">{t("workspace.model")}</span>
+-                    <select
+-                      className="h-8 rounded-md border bg-background px-2 text-sm"
+-                      value={selectedModel}
+-                      onChange={(event) => onSelectModel(event.target.value)}
+-                      aria-label={t("workspace.model")}
+-                    >
+-                      {models.map((model) => (
+-                        <option key={model.id} value={model.id}>
+-                          {model.label}
+-                        </option>
+-                      ))}
+-                    </select>
++                    {providerSlug === "custom" ? (
++                      <Input
++                        className="h-8 w-52"
++                        value={selectedModel}
++                        onChange={(event) => onSelectModel(event.target.value)}
++                        aria-label={t("workspace.customModel")}
++                        data-testid="workspace-custom-model"
++                      />
++                    ) : (
++                      <select
++                        className="h-8 max-w-72 rounded-md border bg-background px-2 text-sm"
++                        value={selectedModel}
++                        onChange={(event) => onSelectModel(event.target.value)}
++                        aria-label={t("workspace.model")}
++                        data-testid="workspace-model"
++                      >
++                        {models.map((model) => (
++                          <option key={model.id} value={model.id}>
++                            {model.label}
++                            {model.vision ? ` · ${t("workspace.model.vision")}` : ""}
++                            {` · ${model.contextWindow / 1000}k`}
++                          </option>
++                        ))}
++                      </select>
++                    )}
++                  </label>
++                  {selectedCatalog ? (
++                    <span className="text-[11px] text-muted-foreground">
++                      {t("workspace.model.price", {
++                        input: selectedCatalog.inputUsdPerMillion,
++                        output: selectedCatalog.outputUsdPerMillion,
++                      })}
++                    </span>
++                  ) : null}
++                  <label className="flex items-center gap-1">
++                    <span className="text-muted-foreground">{t("workspace.temperature")}</span>
++                    <Input
++                      className="h-8 w-16"
++                      type="number"
++                      min={0}
++                      max={2}
++                      step={0.1}
++                      value={temperature}
++                      onChange={(event) => {
++                        const value = Number(event.target.value);
++                        if (Number.isFinite(value)) {
++                          onSelectTemperature(Math.min(2, Math.max(0, value)));
++                        }
++                      }}
++                      aria-label={t("workspace.temperature")}
++                    />
++                  </label>
++                  <label className="flex items-center gap-1">
++                    <span className="text-muted-foreground">{t("workspace.maxTokens")}</span>
++                    <Input
++                      className="h-8 w-20"
++                      type="number"
++                      min={1}
++                      placeholder={t("workspace.maxTokensDefault")}
++                      value={maxTokens ?? ""}
++                      onChange={(event) => {
++                        const raw = event.target.value.trim();
++                        if (raw.length === 0) {
++                          onSelectMaxTokens(null);
++                          return;
++                        }
++                        const value = Number(raw);
++                        if (Number.isFinite(value) && value >= 1) {
++                          onSelectMaxTokens(Math.floor(value));
++                        }
++                      }}
++                      aria-label={t("workspace.maxTokens")}
++                    />
+                   </label>
+                 </>
+               )}
+@@ -255,6 +342,15 @@ export function HomeView({
+                 </ol>
+               )}
+             </ScrollArea>
++            <label className="flex flex-col gap-1 border-t px-3 py-2 text-[12px]">
++              <span className="text-muted-foreground">{t("workspace.extraSystem")}</span>
++              <textarea
++                className="min-h-[2.5rem] resize-y rounded-md border bg-background px-2 py-1 text-[13px]"
++                value={extraSystem}
++                onChange={(event) => onSelectExtraSystem(event.target.value)}
++                aria-label={t("workspace.extraSystem")}
++              />
++            </label>
+             <ChatComposer
+               key={selectedConversationId}
+               value={draft}
+diff --git a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+index 86addca..e02e5bf 100644
+--- a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+@@ -1,6 +1,6 @@
+ import { type FormEvent, type JSX, useEffect, useState } from "react";
+ import { useTranslation } from "react-i18next";
+-import type { AppLocale, ProviderDto, ProviderKeyDto, ThemeMode } from "@ai-hub/shared";
++import type { AppLocale, ProviderDto, ProviderKeyDto, SecretsTestResult, ThemeMode } from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import { persistLocale } from "@/lib/i18n";
+@@ -14,7 +14,10 @@ export function SettingsView(): JSX.Element {
+   const [providerSlug, setProviderSlug] = useState("openrouter");
+   const [label, setLabel] = useState("default");
+   const [secret, setSecret] = useState("");
++  const [baseUrl, setBaseUrl] = useState("http://127.0.0.1:11434/v1");
+   const [error, setError] = useState<string | null>(null);
++  const [testingId, setTestingId] = useState<string | null>(null);
++  const [testResults, setTestResults] = useState<Record<string, SecretsTestResult>>({});
+ 
+   const reloadKeys = (): void => {
+     void window.hub.secrets
+@@ -32,9 +35,11 @@ export function SettingsView(): JSX.Element {
+           return;
+         }
+         setProviders(list);
+-        const first = list[0];
+-        if (first) {
+-          setProviderSlug(first.slug);
++        const openrouter = list.find((item) => item.slug === "openrouter");
++        if (openrouter) {
++          setProviderSlug(openrouter.slug);
++        } else if (list[0]) {
++          setProviderSlug(list[0].slug);
+         }
+       })
+       .catch(() => {
+@@ -67,8 +72,12 @@ export function SettingsView(): JSX.Element {
+     event.preventDefault();
+     const value = secret;
+     setSecret("");
++    const payload =
++      providerSlug === "custom"
++        ? { providerSlug, label, secret: value, baseUrl }
++        : { providerSlug, label, secret: value };
+     void window.hub.secrets
+-      .save({ providerSlug, label, secret: value })
++      .save(payload)
+       .then(() => {
+         setError(null);
+         reloadKeys();
+@@ -126,6 +135,8 @@ export function SettingsView(): JSX.Element {
+               className="h-8 rounded-md border border-input bg-background px-2 text-[13px]"
+               value={providerSlug}
+               onChange={(event) => setProviderSlug(event.target.value)}
++              data-testid="secrets-provider"
++              aria-label={t("secrets.provider")}
+             >
+               {providers.map((provider) => (
+                 <option key={provider.id} value={provider.slug}>
+@@ -138,6 +149,17 @@ export function SettingsView(): JSX.Element {
+             {t("secrets.labelField")}
+             <Input value={label} onChange={(event) => setLabel(event.target.value)} />
+           </label>
++          {providerSlug === "custom" ? (
++            <label className="flex flex-col gap-1 text-[12px]">
++              {t("secrets.baseUrl")}
++              <Input
++                value={baseUrl}
++                onChange={(event) => setBaseUrl(event.target.value)}
++                autoComplete="off"
++                data-testid="secrets-base-url"
++              />
++            </label>
++          ) : null}
+           <label className="flex flex-col gap-1 text-[12px]">
+             {t("secrets.secret")}
+             <Input
+@@ -150,26 +172,61 @@ export function SettingsView(): JSX.Element {
+           <Button type="submit">{t("secrets.save")}</Button>
+         </form>
+         <ul className="flex flex-col gap-1">
+-          {keys.map((key) => (
+-            <li key={key.id} className="flex items-center justify-between gap-2 rounded-md border px-2 py-1">
+-              <span>
+-                {key.providerSlug} · {key.label} · {key.maskedKey}
+-              </span>
+-              <Button
+-                type="button"
+-                variant="outline"
+-                size="sm"
+-                onClick={() => {
+-                  void window.hub.secrets
+-                    .remove({ id: key.id })
+-                    .then(() => reloadKeys())
+-                    .catch(() => setError(t("workspace.error.generic")));
+-                }}
+-              >
+-                {t("secrets.remove")}
+-              </Button>
+-            </li>
+-          ))}
++          {keys.map((key) => {
++            const result = testResults[key.id];
++            return (
++              <li key={key.id} className="flex flex-col gap-1 rounded-md border px-2 py-1">
++                <div className="flex items-center justify-between gap-2">
++                  <span>
++                    {key.providerSlug} · {key.label} · {key.maskedKey}
++                    {key.endpointUrl ? ` · ${key.endpointUrl}` : ""}
++                  </span>
++                  <div className="flex gap-1">
++                    <Button
++                      type="button"
++                      variant="outline"
++                      size="sm"
++                      data-testid="secrets-test"
++                      disabled={testingId === key.id}
++                      onClick={() => {
++                        setTestingId(key.id);
++                        void window.hub.secrets
++                          .test({ id: key.id })
++                          .then((next) => {
++                            setTestResults((current) => ({ ...current, [key.id]: next }));
++                            setError(null);
++                          })
++                          .catch(() => setError(t("workspace.error.generic")))
++                          .finally(() => setTestingId(null));
++                      }}
++                    >
++                      {testingId === key.id ? t("secrets.testing") : t("secrets.test")}
++                    </Button>
++                    <Button
++                      type="button"
++                      variant="outline"
++                      size="sm"
++                      onClick={() => {
++                        void window.hub.secrets
++                          .remove({ id: key.id })
++                          .then(() => reloadKeys())
++                          .catch(() => setError(t("workspace.error.generic")));
++                      }}
++                    >
++                      {t("secrets.remove")}
++                    </Button>
++                  </div>
++                </div>
++                {result ? (
++                  <p className="text-[11px] text-muted-foreground" role="status">
++                    {result.ok
++                      ? t("secrets.testOk", { ms: result.latencyMs })
++                      : t("secrets.testFail", { code: result.errorCode ?? "unknown", ms: result.latencyMs })}
++                  </p>
++                ) : null}
++              </li>
++            );
++          })}
+         </ul>
+         {error ? (
+           <p className="text-destructive" role="alert">
+diff --git a/apps/desktop/src/renderer/src/components/layout/sidebar.tsx b/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
+index b2e9682..57be607 100644
+--- a/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
+@@ -42,12 +42,14 @@ export function Sidebar({
+             icon={<Home className="h-3.5 w-3.5" />}
+             label={t("nav.home")}
+             onClick={() => onChange("home")}
++            testId="nav-home"
+           />
+           <NavButton
+             active={view === "settings"}
+             icon={<Settings className="h-3.5 w-3.5" />}
+             label={t("nav.settings")}
+             onClick={() => onChange("settings")}
++            testId="nav-settings"
+           />
+         </nav>
+         <p className="mt-4 px-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+@@ -97,11 +99,13 @@ function NavButton({
+   icon,
+   label,
+   onClick,
++  testId,
+ }: {
+   active: boolean;
+   icon: ReactNode;
+   label: string;
+   onClick: () => void;
++  testId?: string;
+ }): JSX.Element {
+   return (
+     <Button
+@@ -109,6 +113,7 @@ function NavButton({
+       variant={active ? "secondary" : "ghost"}
+       className="h-8 w-full justify-start gap-2"
+       onClick={onClick}
++      data-testid={testId}
+     >
+       {icon}
+       {label}
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 3bde3cb..52a9878 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -31,8 +31,15 @@
+   "workspace.error.generic": "That action could not be completed. Try again.",
+   "workspace.error.chat": "The model request failed ({{code}}).",
+   "workspace.model": "Model",
++  "workspace.customModel": "Custom model id",
++  "workspace.model.vision": "Vision",
++  "workspace.model.price": "${{input}} / ${{output}} per 1M tokens",
++  "workspace.temperature": "Temp",
++  "workspace.maxTokens": "Max tokens",
++  "workspace.maxTokensDefault": "default",
++  "workspace.extraSystem": "Extra system instructions",
+   "workspace.key": "Key",
+-  "workspace.noKey": "Save an OpenAI key in Settings first.",
++  "workspace.noKey": "Save a provider key in Settings first.",
+   "workspace.composer.placeholder": "Message",
+   "workspace.composer.send": "Send",
+   "workspace.composer.stop": "Stop",
+@@ -75,6 +82,11 @@
+   "secrets.labelField": "Label",
+   "secrets.secret": "Key",
+   "secrets.save": "Save key",
++  "secrets.test": "Test connection",
++  "secrets.testing": "Testing…",
++  "secrets.testOk": "Connection ok · {{ms}}ms",
++  "secrets.testFail": "Connection failed ({{code}}) · {{ms}}ms",
++  "secrets.baseUrl": "Base URL",
+   "secrets.remove": "Remove",
+   "secrets.error.save": "Could not save the key. Check the value and try again.",
+   "command.placeholder": "Search commands…",
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index 5ec3c41..53120ee 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -31,8 +31,15 @@
+   "workspace.error.generic": "Não foi possível concluir a ação. Tente de novo.",
+   "workspace.error.chat": "A chamada ao modelo falhou ({{code}}).",
+   "workspace.model": "Modelo",
++  "workspace.customModel": "Id do modelo custom",
++  "workspace.model.vision": "Visão",
++  "workspace.model.price": "${{input}} / ${{output}} por 1M tokens",
++  "workspace.temperature": "Temp",
++  "workspace.maxTokens": "Máx. tokens",
++  "workspace.maxTokensDefault": "padrão",
++  "workspace.extraSystem": "Instruções de sistema extras",
+   "workspace.key": "Chave",
+-  "workspace.noKey": "Guarde uma chave OpenAI em Configurações primeiro.",
++  "workspace.noKey": "Guarde uma chave de provedor em Configurações primeiro.",
+   "workspace.composer.placeholder": "Mensagem",
+   "workspace.composer.send": "Enviar",
+   "workspace.composer.stop": "Parar",
+@@ -75,6 +82,11 @@
+   "secrets.labelField": "Rótulo",
+   "secrets.secret": "Chave",
+   "secrets.save": "Guardar chave",
++  "secrets.test": "Testar conexão",
++  "secrets.testing": "A testar…",
++  "secrets.testOk": "Conexão ok · {{ms}}ms",
++  "secrets.testFail": "Conexão falhou ({{code}}) · {{ms}}ms",
++  "secrets.baseUrl": "URL base",
+   "secrets.remove": "Remover",
+   "secrets.error.save": "Não foi possível guardar a chave. Verifique o valor e tente de novo.",
+   "command.placeholder": "Buscar comando…",
+diff --git a/docs/ADR/ADR-W05-001-adapter-registry.md b/docs/ADR/ADR-W05-001-adapter-registry.md
+new file mode 100644
+index 0000000..140eb5a
+--- /dev/null
++++ b/docs/ADR/ADR-W05-001-adapter-registry.md
+@@ -0,0 +1,32 @@
++# ADR-W05-001-adapter-registry
++
++- **Status:** accepted
++- **Onda:** W05
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++A W2 deixou um único adapter OpenAI. A W5 precisa de vários provedores no mesmo contrato `ProviderAdapter`, sem fallback silencioso e sem o renderer falar HTTP.
++
++## Decisão
++
++`resolveAdapter(slug)` no `packages/ai-gateway` escolhe o adapter. OpenAI, OpenRouter, Groq e custom OpenAI-compatible reutilizam `createOpenAICompatibleAdapter` (fetch + SSE). Anthropic e Gemini (slug `google`) têm adapters nativos. O main resolve o slug da chave no keytar; o renderer só envia `providerKeyId` + `model`.
++
++## Alternativas consideradas
++
++- **Um adapter só com `baseUrl` por slug:** esconde OpenRouter como URL custom e quebra Anthropic/Gemini.
++- **Vercel AI SDK / SDKs oficiais:** mais superfície; fixtures de CI ficam mais pesadas. Mantém-se fetch (ADR-W02-001).
++
++## Consequências
++
++- Slug desconhecido ou custom sem URL lança `GatewayError`, não troca de provedor.
++- Catálogo local em `model-catalog.json` lista modelos por `provider`; custom não tem catálogo e aceita id livre.
++- Caps continuam W7: todo send path (incluindo o novo) ainda não hard-stopa.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 5)
++- `docs/ADR/ADR-W02-001-provider-adapter-fetch.md`
+diff --git a/docs/ADR/ADR-W05-002-openrouter-first-class.md b/docs/ADR/ADR-W05-002-openrouter-first-class.md
+new file mode 100644
+index 0000000..585814a
+--- /dev/null
++++ b/docs/ADR/ADR-W05-002-openrouter-first-class.md
+@@ -0,0 +1,32 @@
++# ADR-W05-002-openrouter-first-class
++
++- **Status:** accepted
++- **Onda:** W05
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++O plano manda OpenRouter first-class, não “URL custom escondida”. O recusar da constituição lista exatamente esse atalho.
++
++## Decisão
++
++OpenRouter é um slug de provedor (`openrouter`), com adapter próprio, catálogo próprio e URL fixa `https://openrouter.ai/api/v1`. Headers `HTTP-Referer` e `X-Title` identificam o app. A UI lista OpenRouter ao lado dos nativos; não é um campo de URL no fluxo OpenAI.
++
++## Alternativas consideradas
++
++- **Custom OpenAI-compatible apontando para OpenRouter:** viola o plano e mistura pricing/model ids.
++- **Listar modelos ao vivo na API:** precisa de rede e chave no boot; o catálogo local cobre o picker da W5. Listagem remota fica para uma onda posterior se o produto pedir.
++
++## Consequências
++
++- Model ids no catálogo usam o formato OpenRouter (`openai/gpt-4o-mini`).
++- Teste de conexão e chat usam o mesmo adapter first-class.
++- Custom continua existindo para endpoints OpenAI-compatible *do usuário*, não como substituto do OpenRouter.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 5)
++- `docs/ADR/ADR-W05-001-adapter-registry.md`
+diff --git a/docs/ADR/ADR-W05-003-custom-base-url-settings.md b/docs/ADR/ADR-W05-003-custom-base-url-settings.md
+new file mode 100644
+index 0000000..3e6b181
+--- /dev/null
++++ b/docs/ADR/ADR-W05-003-custom-base-url-settings.md
+@@ -0,0 +1,32 @@
++# ADR-W05-003-custom-base-url-settings
++
++- **Status:** accepted
++- **Onda:** W05
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++O sub-task pede um adapter OpenAI-compatible custom. A chave continua no keytar. A URL do endpoint não é segredo, mas não deve viver na mesma linha que a chave nem ir para o renderer como secret.
++
++## Decisão
++
++Novo provedor `custom` (migração 0003). A URL fica em `settings` com chave `custom-base-url:{keyId}` (plaintext). O save IPC aceita `baseUrl` **só** para `custom`. O DTO devolve `endpointUrl` (máscara da chave inalterada). Rotação = apagar + criar; a chave inteira nunca é reexibida.
++
++## Alternativas consideradas
++
++- **Coluna em `provider_keys`:** mistura metadado de endpoint com a conta keytar; exigiria schema extra sem ganho de trust.
++- **Pedir a URL em todo send:** frágil e vaza o endpoint para o fluxo de chat sem necessidade.
++
++## Consequências
++
++- `http` e `https` são aceites (localhost).
++- Remover a chave apaga a URL correspondente.
++- O renderer pode mostrar a URL; nunca a chave completa.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 5)
++- `docs/ADR/ADR-W01-003-keytar-and-ipc-secrets.md`
+diff --git a/docs/ADR/ADR-W05-004-connection-test-health-samples.md b/docs/ADR/ADR-W05-004-connection-test-health-samples.md
+new file mode 100644
+index 0000000..ec9c85d
+--- /dev/null
++++ b/docs/ADR/ADR-W05-004-connection-test-health-samples.md
+@@ -0,0 +1,32 @@
++# ADR-W05-004-connection-test-health-samples
++
++- **Status:** accepted
++- **Onda:** W05
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++A W5 pede teste de conexão que grava sample de health para a W7 consumir. A tabela `health_samples` já existia (hook W1) sem escrita.
++
++## Decisão
++
++IPC `secrets:test` recebe só `{ id }`. O main lê a chave no keytar, chama `adapter.testConnection`, grava `health_samples` (`ok`, `latency_ms`, `provider_slug`) e devolve `{ ok, latencyMs, errorCode }`. Sem secret, sem body de provider, sem mensagem crua no DTO.
++
++## Alternativas consideradas
++
++- **Ping HTTP genérico:** não valida o contrato de chat do adapter.
++- **Guardar a mensagem de erro do provider:** risco de eco de chave; W7 usa ok/latência/código.
++
++## Consequências
++
++- A UI de Settings mostra o resultado imediato; a status bar de health é W7.
++- Sample não inclui `error_code` na tabela (schema atual); o código vai só no resultado IPC.
++- Caps (W7) ainda não bloqueiam send.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 5, Wave 7)
++- `docs/ADR/ADR-W01-003-keytar-and-ipc-secrets.md`
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index 57c5ef4..524ffad 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -54,3 +54,7 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider
+ | [ADR-W04-002](./ADR-W04-002-sibling-fork-not-delete.md) | W04 | Regenerar/editar criam irmãos, sem wipe | accepted |
+ | [ADR-W04-003](./ADR-W04-003-compiler-active-path.md) | W04 | Compiler só no path ativo | accepted |
+ | [ADR-W04-004](./ADR-W04-004-export-json-main-process.md) | W04 | Export JSON no main + labels em settings | accepted |
++| [ADR-W05-001](./ADR-W05-001-adapter-registry.md) | W05 | Registry de adapters por slug | accepted |
++| [ADR-W05-002](./ADR-W05-002-openrouter-first-class.md) | W05 | OpenRouter first-class, não URL custom | accepted |
++| [ADR-W05-003](./ADR-W05-003-custom-base-url-settings.md) | W05 | URL custom em settings, chave no keytar | accepted |
++| [ADR-W05-004](./ADR-W05-004-connection-test-health-samples.md) | W05 | Teste de conexão grava health_samples | accepted |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 3ab9f33..ddc7f46 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave
+ |---|---|
+ | Wave | **W05** |
+ | Marco | B — MVP |
+-| State | `pending` |
++| State | `review` |
+ | Last completed | **W04** |
+-| Next action | Wave 5 — Providers + OpenRouter + vault |
++| Next action | Gate §9 W05 — freeze, review independente, persistir `docs/reviews/W05/` |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -34,11 +34,11 @@ None.
+ 
+ ## Notes for the next session
+ 
+-- W05: OpenRouter first-class; adapters Anthropic/Gemini/Groq/custom; key nunca em SQLite nem no renderer. Caps continuam W7.
++- W05: OpenRouter first-class; adapters Anthropic/Gemini/Groq/custom; key nunca em SQLite nem no renderer. Caps continuam W7. Fechar W05 só com gate §9.
+ 
+ ## Last review / ADR
+ 
+ | Kind | Path |
+ |---|---|
+ | Review | `docs/reviews/W04/REVIEW.md` |
+-| Latest ADR | `docs/ADR/ADR-W04-004-export-json-main-process.md` |
++| Latest ADR | `docs/ADR/ADR-W05-004-connection-test-health-samples.md` |
+diff --git a/packages/ai-gateway/src/adapter.ts b/packages/ai-gateway/src/adapter.ts
+index 1971a0a..fd10d04 100644
+--- a/packages/ai-gateway/src/adapter.ts
++++ b/packages/ai-gateway/src/adapter.ts
+@@ -15,6 +15,8 @@ export interface ChatStreamRequest {
+   model: string;
+   packet: ProviderAgnosticPacket;
+   signal: AbortSignal;
++  temperature?: number;
++  maxTokens?: number | null;
+ }
+ 
+ export type ChatStreamEvent =
+diff --git a/packages/ai-gateway/src/anthropic-adapter.test.ts b/packages/ai-gateway/src/anthropic-adapter.test.ts
+new file mode 100644
+index 0000000..07abbb3
+--- /dev/null
++++ b/packages/ai-gateway/src/anthropic-adapter.test.ts
+@@ -0,0 +1,85 @@
++import { describe, expect, it } from "vitest";
++import { createAnthropicAdapter } from "./anthropic-adapter";
++import { GatewayError } from "./errors";
++import type { ProviderAgnosticPacket } from "@ai-hub/shared";
++
++const packet: ProviderAgnosticPacket = {
++  version: 1,
++  system: "Be brief.",
++  messages: [{ role: "user", content: "hi" }],
++  tokenEstimate: 1,
++  excluded: [],
++};
++
++function sseBody(chunks: string[]): ReadableStream<Uint8Array> {
++  const encoder = new TextEncoder();
++  return new ReadableStream({
++    start(controller) {
++      for (const chunk of chunks) {
++        controller.enqueue(encoder.encode(chunk));
++      }
++      controller.close();
++    },
++  });
++}
++
++describe("createAnthropicAdapter", () => {
++  it("streams text deltas from an SSE fixture", async () => {
++    const adapter = createAnthropicAdapter({
++      fetch: async (_input, init) => {
++        const body = JSON.parse(String(init?.body)) as { system?: string; max_tokens?: number };
++        expect(body.system).toBe("Be brief.");
++        expect(body.max_tokens).toBe(64);
++        return new Response(
++          sseBody([
++            `event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hel"}}\n\n`,
++            `event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"lo"}}\n\n`,
++            `event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":2}}\n\n`,
++          ]),
++          { status: 200, headers: { "Content-Type": "text/event-stream" } },
++        );
++      },
++    });
++    const texts: string[] = [];
++    let usage: { tokensIn: number; tokensOut: number } | null = null;
++    for await (const event of adapter.chatStream({
++      secret: "sk-ant-testfixtureABCDEFGH",
++      model: "claude-3-5-haiku-20241022",
++      packet,
++      signal: new AbortController().signal,
++      maxTokens: 64,
++    })) {
++      if (event.type === "delta") {
++        texts.push(event.text);
++      } else {
++        usage = { tokensIn: event.tokensIn, tokensOut: event.tokensOut };
++      }
++    }
++    expect(texts.join("")).toBe("Hello");
++    expect(usage?.tokensOut).toBe(2);
++  });
++
++  it("maps 401 to auth without echoing the secret", async () => {
++    const secret = "sk-ant-testfixtureABCDEFGH";
++    const adapter = createAnthropicAdapter({
++      fetch: async () =>
++        new Response(JSON.stringify({ error: { type: "authentication_error", message: secret } }), {
++          status: 401,
++        }),
++    });
++    try {
++      await adapter
++        .chatStream({
++          secret,
++          model: "claude-3-5-haiku-20241022",
++          packet,
++          signal: new AbortController().signal,
++        })
++        .next();
++      throw new Error("expected failure");
++    } catch (error) {
++      expect((error as GatewayError).code).toBe("auth");
++      expect(String(error)).not.toContain(secret);
++    }
++  });
++});
+diff --git a/packages/ai-gateway/src/anthropic-adapter.ts b/packages/ai-gateway/src/anthropic-adapter.ts
+new file mode 100644
+index 0000000..27c23a6
+--- /dev/null
++++ b/packages/ai-gateway/src/anthropic-adapter.ts
+@@ -0,0 +1,198 @@
++import { redactSecrets } from "@ai-hub/security";
++import { catalogModelsForProvider, type ProviderAgnosticPacket } from "@ai-hub/shared";
++import type {
++  ChatStreamEvent,
++  ChatStreamRequest,
++  ModelRef,
++  ProviderAdapter,
++  ProviderCapabilities,
++} from "./adapter";
++import { GatewayError } from "./errors";
++import { iterateSseData } from "./sse";
++
++export interface AnthropicAdapterOptions {
++  fetch?: typeof fetch;
++  baseUrl?: string;
++  timeoutMs?: number;
++}
++
++interface AnthropicStreamEvent {
++  type?: unknown;
++  delta?: { type?: unknown; text?: unknown };
++  usage?: { input_tokens?: unknown; output_tokens?: unknown };
++  message?: { usage?: { input_tokens?: unknown; output_tokens?: unknown } };
++}
++
++function asObject(value: unknown): Record<string, unknown> | null {
++  if (typeof value === "object" && value !== null) {
++    return value as Record<string, unknown>;
++  }
++  return null;
++}
++
++function readString(value: unknown): string | null {
++  return typeof value === "string" ? value : null;
++}
++
++function readNumber(value: unknown): number | null {
++  return typeof value === "number" && Number.isFinite(value) ? value : null;
++}
++
++function mapStatus(status: number, body: unknown): GatewayError {
++  const record = asObject(body);
++  const error = record ? asObject(record.error) : null;
++  const raw = (error ? readString(error.message) : null) ?? `Anthropic HTTP ${status}`;
++  const message = redactSecrets(raw);
++  const type = error ? readString(error.type) : null;
++  if (status === 401 || status === 403 || type === "authentication_error") {
++    return new GatewayError("auth", message);
++  }
++  if (status === 402 || type === "billing_error") {
++    return new GatewayError("quota", message);
++  }
++  if (type === "invalid_request_error" && /context|too long|max_tokens/i.test(message)) {
++    return new GatewayError("context_overflow", message);
++  }
++  if (status === 429 || type === "rate_limit_error") {
++    return new GatewayError("rate_limit", message);
++  }
++  if (status >= 500) {
++    return new GatewayError("network", message);
++  }
++  return new GatewayError("unknown", message);
++}
++
++async function readJson(response: Response): Promise<unknown> {
++  try {
++    return await response.json();
++  } catch {
++    return null;
++  }
++}
++
++function classifyTransport(error: unknown, userSignal: AbortSignal, timeout: AbortSignal): never {
++  if (error instanceof GatewayError) {
++    throw error;
++  }
++  if (userSignal.aborted) {
++    throw new GatewayError("aborted", "Request aborted");
++  }
++  if (timeout.aborted) {
++    throw new GatewayError("timeout", "Request timed out");
++  }
++  const message = redactSecrets(error instanceof Error ? error.message : "Network error");
++  throw new GatewayError("network", message);
++}
++
++function packetToAnthropic(packet: ProviderAgnosticPacket): {
++  system: string | undefined;
++  messages: Array<{ role: "user" | "assistant"; content: string }>;
++} {
++  return {
++    system: packet.system.length > 0 ? packet.system : undefined,
++    messages: packet.messages.map((message) => ({ role: message.role, content: message.content })),
++  };
++}
++
++export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): ProviderAdapter {
++  const fetchFn = options.fetch ?? fetch;
++  const baseUrl = (options.baseUrl ?? "https://api.anthropic.com/v1").replace(/\/$/, "");
++  const timeoutMs = options.timeoutMs ?? 60_000;
++
++  const request = async (
++    secret: string,
++    body: Record<string, unknown>,
++    signal: AbortSignal,
++  ): Promise<{ response: Response; timeout: AbortSignal }> => {
++    const timeout = AbortSignal.timeout(timeoutMs);
++    const combined = AbortSignal.any([signal, timeout]);
++    try {
++      const response = await fetchFn(`${baseUrl}/messages`, {
++        method: "POST",
++        headers: {
++          "x-api-key": secret,
++          "anthropic-version": "2023-06-01",
++          "Content-Type": "application/json",
++        },
++        body: JSON.stringify(body),
++        signal: combined,
++      });
++      return { response, timeout };
++    } catch (error) {
++      classifyTransport(error, signal, timeout);
++    }
++  };
++
++  return {
++    id: "anthropic",
++    listModels(): ModelRef[] {
++      return catalogModelsForProvider("anthropic").map((model) => ({ id: model.id, label: model.label }));
++    },
++    capabilities(): ProviderCapabilities {
++      return { streaming: true, tools: false };
++    },
++    async testConnection(secret: string, signal: AbortSignal): Promise<void> {
++      const { response } = await request(
++        secret,
++        {
++          model: "claude-3-5-haiku-20241022",
++          max_tokens: 1,
++          messages: [{ role: "user", content: "ping" }],
++        },
++        signal,
++      );
++      if (!response.ok) {
++        throw mapStatus(response.status, await readJson(response));
++      }
++    },
++    async *chatStream(input: ChatStreamRequest): AsyncIterable<ChatStreamEvent> {
++      const converted = packetToAnthropic(input.packet);
++      const body: Record<string, unknown> = {
++        model: input.model,
++        stream: true,
++        max_tokens: input.maxTokens ?? 1024,
++        temperature: input.temperature ?? 1,
++        messages: converted.messages,
++      };
++      if (converted.system !== undefined) {
++        body.system = converted.system;
++      }
++      const { response, timeout } = await request(input.secret, body, input.signal);
++      if (!response.ok) {
++        throw mapStatus(response.status, await readJson(response));
++      }
++      if (!response.body) {
++        throw new GatewayError("network", "Anthropic response had no body");
++      }
++      let tokensIn = 0;
++      let tokensOut = 0;
++      for await (const data of iterateSseData(response.body, input.signal, timeout)) {
++        let parsed: unknown;
++        try {
++          parsed = JSON.parse(data) as unknown;
++        } catch {
++          continue;
++        }
++        const event = parsed as AnthropicStreamEvent;
++        if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
++          const text = event.delta.text;
++          if (typeof text === "string" && text.length > 0) {
++            yield { type: "delta", text };
++          }
++        }
++        const inputTokens =
++          readNumber(event.message?.usage?.input_tokens) ?? readNumber(event.usage?.input_tokens);
++        const outputTokens = readNumber(event.usage?.output_tokens);
++        if (inputTokens !== null) {
++          tokensIn = inputTokens;
++        }
++        if (outputTokens !== null) {
++          tokensOut = outputTokens;
++        }
++        if (event.type === "message_delta" && (tokensIn > 0 || tokensOut > 0)) {
++          yield { type: "usage", tokensIn, tokensOut };
++        }
++      }
++    },
++  };
++}
+diff --git a/packages/ai-gateway/src/gemini-adapter.test.ts b/packages/ai-gateway/src/gemini-adapter.test.ts
+new file mode 100644
+index 0000000..cc00a70
+--- /dev/null
++++ b/packages/ai-gateway/src/gemini-adapter.test.ts
+@@ -0,0 +1,60 @@
++import { describe, expect, it } from "vitest";
++import { createGeminiAdapter } from "./gemini-adapter";
++import type { ProviderAgnosticPacket } from "@ai-hub/shared";
++
++const packet: ProviderAgnosticPacket = {
++  version: 1,
++  system: "Be brief.",
++  messages: [{ role: "user", content: "hi" }],
++  tokenEstimate: 1,
++  excluded: [],
++};
++
++function sseBody(chunks: string[]): ReadableStream<Uint8Array> {
++  const encoder = new TextEncoder();
++  return new ReadableStream({
++    start(controller) {
++      for (const chunk of chunks) {
++        controller.enqueue(encoder.encode(chunk));
++      }
++      controller.close();
++    },
++  });
++}
++
++describe("createGeminiAdapter", () => {
++  it("streams text from an SSE fixture and keeps the key out of the URL", async () => {
++    const adapter = createGeminiAdapter({
++      fetch: async (input, init) => {
++        expect(String(input)).not.toContain("sk-");
++        expect(new Headers(init?.headers).get("x-goog-api-key")).toBe("test-gemini-fixture-key");
++        const body = JSON.parse(String(init?.body)) as {
++          systemInstruction?: { parts: Array<{ text: string }> };
++        };
++        expect(body.systemInstruction?.parts[0]?.text).toBe("Be brief.");
++        return new Response(
++          sseBody([
++            `data: {"candidates":[{"content":{"parts":[{"text":"Hi"}]}}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1}}\n\n`,
++          ]),
++          { status: 200, headers: { "Content-Type": "text/event-stream" } },
++        );
++      },
++    });
++    const texts: string[] = [];
++    let usage: { tokensIn: number; tokensOut: number } | null = null;
++    for await (const event of adapter.chatStream({
++      secret: "test-gemini-fixture-key",
++      model: "gemini-2.0-flash",
++      packet,
++      signal: new AbortController().signal,
++    })) {
++      if (event.type === "delta") {
++        texts.push(event.text);
++      } else {
++        usage = { tokensIn: event.tokensIn, tokensOut: event.tokensOut };
++      }
++    }
++    expect(texts.join("")).toBe("Hi");
++    expect(usage).toEqual({ tokensIn: 3, tokensOut: 1 });
++  });
++});
+diff --git a/packages/ai-gateway/src/gemini-adapter.ts b/packages/ai-gateway/src/gemini-adapter.ts
+new file mode 100644
+index 0000000..0da878e
+--- /dev/null
++++ b/packages/ai-gateway/src/gemini-adapter.ts
+@@ -0,0 +1,197 @@
++import { redactSecrets } from "@ai-hub/security";
++import { catalogModelsForProvider, type ProviderAgnosticPacket } from "@ai-hub/shared";
++import type {
++  ChatStreamEvent,
++  ChatStreamRequest,
++  ModelRef,
++  ProviderAdapter,
++  ProviderCapabilities,
++} from "./adapter";
++import { GatewayError } from "./errors";
++import { iterateSseData } from "./sse";
++
++export interface GeminiAdapterOptions {
++  fetch?: typeof fetch;
++  baseUrl?: string;
++  timeoutMs?: number;
++}
++
++interface GeminiStreamChunk {
++  candidates?: Array<{ content?: { parts?: Array<{ text?: unknown }> } }>;
++  usageMetadata?: { promptTokenCount?: unknown; candidatesTokenCount?: unknown };
++  error?: { message?: unknown; status?: unknown };
++}
++
++function asObject(value: unknown): Record<string, unknown> | null {
++  if (typeof value === "object" && value !== null) {
++    return value as Record<string, unknown>;
++  }
++  return null;
++}
++
++function readString(value: unknown): string | null {
++  return typeof value === "string" ? value : null;
++}
++
++function readNumber(value: unknown): number | null {
++  return typeof value === "number" && Number.isFinite(value) ? value : null;
++}
++
++function mapStatus(status: number, body: unknown): GatewayError {
++  const record = asObject(body);
++  const error = record ? asObject(record.error) : null;
++  const raw = (error ? readString(error.message) : null) ?? `Gemini HTTP ${status}`;
++  const message = redactSecrets(raw);
++  const code = error ? readString(error.status) : null;
++  if (status === 401 || status === 403 || code === "UNAUTHENTICATED" || code === "PERMISSION_DENIED") {
++    return new GatewayError("auth", message);
++  }
++  if (status === 429 || code === "RESOURCE_EXHAUSTED") {
++    return new GatewayError("rate_limit", message);
++  }
++  if (code === "INVALID_ARGUMENT" && /context|token/i.test(message)) {
++    return new GatewayError("context_overflow", message);
++  }
++  if (status >= 500) {
++    return new GatewayError("network", message);
++  }
++  return new GatewayError("unknown", message);
++}
++
++async function readJson(response: Response): Promise<unknown> {
++  try {
++    return await response.json();
++  } catch {
++    return null;
++  }
++}
++
++function classifyTransport(error: unknown, userSignal: AbortSignal, timeout: AbortSignal): never {
++  if (error instanceof GatewayError) {
++    throw error;
++  }
++  if (userSignal.aborted) {
++    throw new GatewayError("aborted", "Request aborted");
++  }
++  if (timeout.aborted) {
++    throw new GatewayError("timeout", "Request timed out");
++  }
++  const message = redactSecrets(error instanceof Error ? error.message : "Network error");
++  throw new GatewayError("network", message);
++}
++
++function packetToGemini(packet: ProviderAgnosticPacket): {
++  systemInstruction: { parts: Array<{ text: string }> } | undefined;
++  contents: Array<{ role: "user" | "model"; parts: Array<{ text: string }> }>;
++} {
++  return {
++    systemInstruction: packet.system.length > 0 ? { parts: [{ text: packet.system }] } : undefined,
++    contents: packet.messages.map((message) => ({
++      role: message.role === "assistant" ? "model" : "user",
++      parts: [{ text: message.content }],
++    })),
++  };
++}
++
++export function createGeminiAdapter(options: GeminiAdapterOptions = {}): ProviderAdapter {
++  const fetchFn = options.fetch ?? fetch;
++  const baseUrl = (options.baseUrl ?? "https://generativelanguage.googleapis.com/v1beta").replace(
++    /\/$/,
++    "",
++  );
++  const timeoutMs = options.timeoutMs ?? 60_000;
++
++  const request = async (
++    model: string,
++    secret: string,
++    body: Record<string, unknown>,
++    signal: AbortSignal,
++    stream: boolean,
++  ): Promise<{ response: Response; timeout: AbortSignal }> => {
++    const timeout = AbortSignal.timeout(timeoutMs);
++    const combined = AbortSignal.any([signal, timeout]);
++    const path = stream
++      ? `/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`
++      : `/models/${encodeURIComponent(model)}:generateContent`;
++    try {
++      const response = await fetchFn(`${baseUrl}${path}`, {
++        method: "POST",
++        headers: {
++          "x-goog-api-key": secret,
++          "Content-Type": "application/json",
++        },
++        body: JSON.stringify(body),
++        signal: combined,
++      });
++      return { response, timeout };
++    } catch (error) {
++      classifyTransport(error, signal, timeout);
++    }
++  };
++
++  return {
++    id: "google",
++    listModels(): ModelRef[] {
++      return catalogModelsForProvider("google").map((model) => ({ id: model.id, label: model.label }));
++    },
++    capabilities(): ProviderCapabilities {
++      return { streaming: true, tools: false };
++    },
++    async testConnection(secret: string, signal: AbortSignal): Promise<void> {
++      const { response } = await request(
++        "gemini-2.0-flash",
++        secret,
++        {
++          contents: [{ role: "user", parts: [{ text: "ping" }] }],
++          generationConfig: { maxOutputTokens: 1 },
++        },
++        signal,
++        false,
++      );
++      if (!response.ok) {
++        throw mapStatus(response.status, await readJson(response));
++      }
++    },
++    async *chatStream(input: ChatStreamRequest): AsyncIterable<ChatStreamEvent> {
++      const converted = packetToGemini(input.packet);
++      const generationConfig: Record<string, unknown> = {
++        temperature: input.temperature ?? 1,
++      };
++      if (input.maxTokens !== undefined && input.maxTokens !== null) {
++        generationConfig.maxOutputTokens = input.maxTokens;
++      }
++      const body: Record<string, unknown> = {
++        contents: converted.contents,
++        generationConfig,
++      };
++      if (converted.systemInstruction !== undefined) {
++        body.systemInstruction = converted.systemInstruction;
++      }
++      const { response, timeout } = await request(input.model, input.secret, body, input.signal, true);
++      if (!response.ok) {
++        throw mapStatus(response.status, await readJson(response));
++      }
++      if (!response.body) {
++        throw new GatewayError("network", "Gemini response had no body");
++      }
++      for await (const data of iterateSseData(response.body, input.signal, timeout)) {
++        let parsed: unknown;
++        try {
++          parsed = JSON.parse(data) as unknown;
++        } catch {
++          continue;
++        }
++        const chunk = parsed as GeminiStreamChunk;
++        const text = chunk.candidates?.[0]?.content?.parts?.[0]?.text;
++        if (typeof text === "string" && text.length > 0) {
++          yield { type: "delta", text };
++        }
++        const prompt = readNumber(chunk.usageMetadata?.promptTokenCount);
++        const completion = readNumber(chunk.usageMetadata?.candidatesTokenCount);
++        if (prompt !== null || completion !== null) {
++          yield { type: "usage", tokensIn: prompt ?? 0, tokensOut: completion ?? 0 };
++        }
++      }
++    },
++  };
++}
+diff --git a/packages/ai-gateway/src/groq-adapter.ts b/packages/ai-gateway/src/groq-adapter.ts
+new file mode 100644
+index 0000000..2b4d16d
+--- /dev/null
++++ b/packages/ai-gateway/src/groq-adapter.ts
+@@ -0,0 +1,17 @@
++import type { ProviderAdapter } from "./adapter";
++import {
++  createOpenAICompatibleAdapter,
++  mergeOpenAICompatibleOptions,
++  type OpenAICompatibleAdapterOptions,
++} from "./openai-adapter";
++
++export const GROQ_BASE_URL = "https://api.groq.com/openai/v1";
++
++export function createGroqAdapter(options: OpenAICompatibleAdapterOptions = {}): ProviderAdapter {
++  return createOpenAICompatibleAdapter(
++    mergeOpenAICompatibleOptions(
++      { id: "groq", baseUrl: GROQ_BASE_URL, testModel: "llama-3.1-8b-instant" },
++      options,
++    ),
++  );
++}
+diff --git a/packages/ai-gateway/src/index.ts b/packages/ai-gateway/src/index.ts
+index f6bbf46..fa27b4a 100644
+--- a/packages/ai-gateway/src/index.ts
++++ b/packages/ai-gateway/src/index.ts
+@@ -13,7 +13,12 @@ export {
+   type CrashSafeStreamResult,
+ } from "./crash-safe";
+ export { GatewayError, GatewayStreamError, gatewayErrorCode, isGatewayError } from "./errors";
+-export { createOpenAIAdapter, type OpenAIAdapterOptions } from "./openai-adapter";
++export { createAnthropicAdapter, type AnthropicAdapterOptions } from "./anthropic-adapter";
++export { createGeminiAdapter, type GeminiAdapterOptions } from "./gemini-adapter";
++export { createGroqAdapter, GROQ_BASE_URL } from "./groq-adapter";
++export { createOpenAIAdapter, createOpenAICompatibleAdapter, type OpenAIAdapterOptions } from "./openai-adapter";
++export { createOpenRouterAdapter, OPENROUTER_BASE_URL } from "./openrouter-adapter";
++export { isKnownProviderSlug, resolveAdapter, type ProviderSlug, type ResolveAdapterOptions } from "./registry";
+ export { createMockOpenAIAdapter, MOCK_ASSISTANT_TEXT } from "./mock-adapter";
+ export {
+   composeReceipt,
+diff --git a/packages/ai-gateway/src/mock-adapter.ts b/packages/ai-gateway/src/mock-adapter.ts
+index 2223389..fd0815c 100644
+--- a/packages/ai-gateway/src/mock-adapter.ts
++++ b/packages/ai-gateway/src/mock-adapter.ts
+@@ -1,4 +1,4 @@
+-import { openaiCatalogModels } from "@ai-hub/shared";
++import { catalogModelsForProvider } from "@ai-hub/shared";
+ import type {
+   ChatStreamEvent,
+   ChatStreamRequest,
+@@ -31,9 +31,9 @@ function waitForAbortOrTimeout(ms: number, signal: AbortSignal): Promise<void> {
+ 
+ export function createMockOpenAIAdapter(): ProviderAdapter {
+   return {
+-    id: "openai",
++    id: "mock",
+     listModels: (): ModelRef[] =>
+-      openaiCatalogModels().map((model) => ({ id: model.id, label: model.label })),
++      catalogModelsForProvider("openai").map((model) => ({ id: model.id, label: model.label })),
+     capabilities: (): ProviderCapabilities => ({ streaming: true, tools: false }),
+     testConnection: async (): Promise<void> => {
+       return;
+diff --git a/packages/ai-gateway/src/openai-adapter.ts b/packages/ai-gateway/src/openai-adapter.ts
+index 3dceae8..39af58a 100644
+--- a/packages/ai-gateway/src/openai-adapter.ts
++++ b/packages/ai-gateway/src/openai-adapter.ts
+@@ -1,5 +1,5 @@
+ import { redactSecrets } from "@ai-hub/security";
+-import { openaiCatalogModels, type ProviderAgnosticPacket } from "@ai-hub/shared";
++import { catalogModelsForProvider, type ProviderAgnosticPacket } from "@ai-hub/shared";
+ import type {
+   ChatStreamEvent,
+   ChatStreamRequest,
+@@ -10,10 +10,13 @@ import type {
+ import { GatewayError } from "./errors";
+ import { iterateSseData } from "./sse";
+ 
+-export interface OpenAIAdapterOptions {
++export interface OpenAICompatibleAdapterOptions {
++  id?: string;
+   fetch?: typeof fetch;
+   baseUrl?: string;
+   timeoutMs?: number;
++  extraHeaders?: Record<string, string>;
++  testModel?: string;
+ }
+ 
+ interface OpenAIStreamChunk {
+@@ -50,7 +53,7 @@ function packetMessages(packet: ProviderAgnosticPacket): Array<{ role: string; c
+ function mapStatus(status: number, body: unknown): GatewayError {
+   const record = asObject(body);
+   const error = record ? asObject(record.error) : null;
+-  const raw = (error ? readString(error.message) : null) ?? `OpenAI HTTP ${status}`;
++  const raw = (error ? readString(error.message) : null) ?? `OpenAI-compatible HTTP ${status}`;
+   const message = redactSecrets(raw);
+   const code = error ? readString(error.code) ?? readString(error.type) : null;
+   if (status === 401 || status === 403 || code === "invalid_api_key") {
+@@ -93,10 +96,13 @@ function classifyTransport(error: unknown, userSignal: AbortSignal, timeout: Abo
+   throw new GatewayError("network", message);
+ }
+ 
+-export function createOpenAIAdapter(options: OpenAIAdapterOptions = {}): ProviderAdapter {
++export function createOpenAICompatibleAdapter(
++  options: OpenAICompatibleAdapterOptions & { id: string; baseUrl: string; testModel: string },
++): ProviderAdapter {
+   const fetchFn = options.fetch ?? fetch;
+-  const baseUrl = (options.baseUrl ?? "https://api.openai.com/v1").replace(/\/$/, "");
++  const baseUrl = options.baseUrl.replace(/\/$/, "");
+   const timeoutMs = options.timeoutMs ?? 60_000;
++  const extraHeaders = options.extraHeaders ?? {};
+ 
+   const request = async (
+     path: string,
+@@ -112,6 +118,7 @@ export function createOpenAIAdapter(options: OpenAIAdapterOptions = {}): Provide
+         headers: {
+           Authorization: `Bearer ${secret}`,
+           "Content-Type": "application/json",
++          ...extraHeaders,
+         },
+         body: JSON.stringify(body),
+         signal: combined,
+@@ -123,9 +130,9 @@ export function createOpenAIAdapter(options: OpenAIAdapterOptions = {}): Provide
+   };
+ 
+   return {
+-    id: "openai",
++    id: options.id,
+     listModels(): ModelRef[] {
+-      return openaiCatalogModels().map((model) => ({ id: model.id, label: model.label }));
++      return catalogModelsForProvider(options.id).map((model) => ({ id: model.id, label: model.label }));
+     },
+     capabilities(): ProviderCapabilities {
+       return { streaming: true, tools: false };
+@@ -135,7 +142,7 @@ export function createOpenAIAdapter(options: OpenAIAdapterOptions = {}): Provide
+         "/chat/completions",
+         secret,
+         {
+-          model: "gpt-4o-mini",
++          model: options.testModel,
+           messages: [{ role: "user", content: "ping" }],
+           max_tokens: 1,
+         },
+@@ -146,22 +153,22 @@ export function createOpenAIAdapter(options: OpenAIAdapterOptions = {}): Provide
+       }
+     },
+     async *chatStream(input: ChatStreamRequest): AsyncIterable<ChatStreamEvent> {
+-      const { response, timeout } = await request(
+-        "/chat/completions",
+-        input.secret,
+-        {
+-          model: input.model,
+-          stream: true,
+-          stream_options: { include_usage: true },
+-          messages: packetMessages(input.packet),
+-        },
+-        input.signal,
+-      );
++      const body: Record<string, unknown> = {
++        model: input.model,
++        stream: true,
++        stream_options: { include_usage: true },
++        messages: packetMessages(input.packet),
++        temperature: input.temperature ?? 1,
++      };
++      if (input.maxTokens !== undefined && input.maxTokens !== null) {
++        body.max_tokens = input.maxTokens;
++      }
++      const { response, timeout } = await request("/chat/completions", input.secret, body, input.signal);
+       if (!response.ok) {
+         throw mapStatus(response.status, await readJson(response));
+       }
+       if (!response.body) {
+-        throw new GatewayError("network", "OpenAI response had no body");
++        throw new GatewayError("network", "OpenAI-compatible response had no body");
+       }
+       for await (const data of iterateSseData(response.body, input.signal, timeout)) {
+         let parsed: unknown;
+@@ -184,3 +191,36 @@ export function createOpenAIAdapter(options: OpenAIAdapterOptions = {}): Provide
+     },
+   };
+ }
++
++export function mergeOpenAICompatibleOptions(
++  defaults: { id: string; baseUrl: string; testModel: string; extraHeaders?: Record<string, string> },
++  options: OpenAICompatibleAdapterOptions,
++): OpenAICompatibleAdapterOptions & { id: string; baseUrl: string; testModel: string } {
++  const extraHeaders = { ...defaults.extraHeaders, ...options.extraHeaders };
++  const merged: OpenAICompatibleAdapterOptions & { id: string; baseUrl: string; testModel: string } = {
++    id: options.id ?? defaults.id,
++    baseUrl: options.baseUrl ?? defaults.baseUrl,
++    testModel: options.testModel ?? defaults.testModel,
++  };
++  if (options.fetch !== undefined) {
++    merged.fetch = options.fetch;
++  }
++  if (options.timeoutMs !== undefined) {
++    merged.timeoutMs = options.timeoutMs;
++  }
++  if (Object.keys(extraHeaders).length > 0) {
++    merged.extraHeaders = extraHeaders;
++  }
++  return merged;
++}
++
++export function createOpenAIAdapter(options: OpenAICompatibleAdapterOptions = {}): ProviderAdapter {
++  return createOpenAICompatibleAdapter(
++    mergeOpenAICompatibleOptions(
++      { id: "openai", baseUrl: "https://api.openai.com/v1", testModel: "gpt-4o-mini" },
++      options,
++    ),
++  );
++}
++
++export type OpenAIAdapterOptions = OpenAICompatibleAdapterOptions;
+diff --git a/packages/ai-gateway/src/openrouter-adapter.ts b/packages/ai-gateway/src/openrouter-adapter.ts
+new file mode 100644
+index 0000000..5399350
+--- /dev/null
++++ b/packages/ai-gateway/src/openrouter-adapter.ts
+@@ -0,0 +1,25 @@
++import type { ProviderAdapter } from "./adapter";
++import {
++  createOpenAICompatibleAdapter,
++  mergeOpenAICompatibleOptions,
++  type OpenAICompatibleAdapterOptions,
++} from "./openai-adapter";
++
++export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
++
++export function createOpenRouterAdapter(options: OpenAICompatibleAdapterOptions = {}): ProviderAdapter {
++  return createOpenAICompatibleAdapter(
++    mergeOpenAICompatibleOptions(
++      {
++        id: "openrouter",
++        baseUrl: OPENROUTER_BASE_URL,
++        testModel: "openai/gpt-4o-mini",
++        extraHeaders: {
++          "HTTP-Referer": "https://github.com/solerpedroo/ai_hub",
++          "X-Title": "AI Hub Desktop",
++        },
++      },
++      options,
++    ),
++  );
++}
+diff --git a/packages/ai-gateway/src/registry.test.ts b/packages/ai-gateway/src/registry.test.ts
+new file mode 100644
+index 0000000..2f27d12
+--- /dev/null
++++ b/packages/ai-gateway/src/registry.test.ts
+@@ -0,0 +1,76 @@
++import { describe, expect, it } from "vitest";
++import { GatewayError } from "./errors";
++import { createOpenRouterAdapter } from "./openrouter-adapter";
++import { resolveAdapter } from "./registry";
++import type { ProviderAgnosticPacket } from "@ai-hub/shared";
++
++const packet: ProviderAgnosticPacket = {
++  version: 1,
++  system: "",
++  messages: [{ role: "user", content: "hi" }],
++  tokenEstimate: 1,
++  excluded: [],
++};
++
++function sseBody(chunks: string[]): ReadableStream<Uint8Array> {
++  const encoder = new TextEncoder();
++  return new ReadableStream({
++    start(controller) {
++      for (const chunk of chunks) {
++        controller.enqueue(encoder.encode(chunk));
++      }
++      controller.close();
++    },
++  });
++}
++
++describe("resolveAdapter", () => {
++  it("maps first-class slugs without treating OpenRouter as a custom URL", () => {
++    expect(resolveAdapter("openai").id).toBe("openai");
++    expect(resolveAdapter("openrouter").id).toBe("openrouter");
++    expect(resolveAdapter("anthropic").id).toBe("anthropic");
++    expect(resolveAdapter("google").id).toBe("google");
++    expect(resolveAdapter("groq").id).toBe("groq");
++    expect(resolveAdapter("custom", { baseUrl: "http://127.0.0.1:8080/v1" }).id).toBe("custom");
++  });
++
++  it("rejects custom without a base URL and unknown slugs", () => {
++    expect(() => resolveAdapter("custom")).toThrow(GatewayError);
++    expect(() => resolveAdapter("chatgpt")).toThrow(GatewayError);
++  });
++});
++
++describe("createOpenRouterAdapter", () => {
++  it("sends OpenRouter identity headers on a fixture stream", async () => {
++    const seen: string[] = [];
++    const adapter = createOpenRouterAdapter({
++      fetch: async (input, init) => {
++        seen.push(String(input));
++        const headers = new Headers(init?.headers);
++        expect(headers.get("HTTP-Referer")).toBe("https://github.com/solerpedroo/ai_hub");
++        expect(headers.get("X-Title")).toBe("AI Hub Desktop");
++        expect(headers.get("Authorization")).toBe("Bearer sk-or-testfixtureABCDEFGH");
++        return new Response(
++          sseBody([
++            `data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n`,
++            `data: [DONE]\n\n`,
++          ]),
++          { status: 200, headers: { "Content-Type": "text/event-stream" } },
++        );
++      },
++    });
++    const texts: string[] = [];
++    for await (const event of adapter.chatStream({
++      secret: "sk-or-testfixtureABCDEFGH",
++      model: "openai/gpt-4o-mini",
++      packet,
++      signal: new AbortController().signal,
++    })) {
++      if (event.type === "delta") {
++        texts.push(event.text);
++      }
++    }
++    expect(texts.join("")).toBe("Hi");
++    expect(seen[0]).toContain("openrouter.ai/api/v1/chat/completions");
++  });
++});
+diff --git a/packages/ai-gateway/src/registry.ts b/packages/ai-gateway/src/registry.ts
+new file mode 100644
+index 0000000..11cae6d
+--- /dev/null
++++ b/packages/ai-gateway/src/registry.ts
+@@ -0,0 +1,49 @@
++import type { ProviderAdapter } from "./adapter";
++import { createAnthropicAdapter } from "./anthropic-adapter";
++import { GatewayError } from "./errors";
++import { createGeminiAdapter } from "./gemini-adapter";
++import { createGroqAdapter } from "./groq-adapter";
++import { createOpenAIAdapter, createOpenAICompatibleAdapter, mergeOpenAICompatibleOptions } from "./openai-adapter";
++import { createOpenRouterAdapter } from "./openrouter-adapter";
++
++export interface ResolveAdapterOptions {
++  fetch?: typeof fetch;
++  baseUrl?: string;
++  timeoutMs?: number;
++}
++
++const KNOWN_SLUGS = ["openai", "openrouter", "anthropic", "google", "groq", "custom"] as const;
++
++export type ProviderSlug = (typeof KNOWN_SLUGS)[number];
++
++export function isKnownProviderSlug(slug: string): slug is ProviderSlug {
++  return (KNOWN_SLUGS as readonly string[]).includes(slug);
++}
++
++export function resolveAdapter(slug: string, options: ResolveAdapterOptions = {}): ProviderAdapter {
++  switch (slug) {
++    case "openai":
++      return createOpenAIAdapter(options);
++    case "openrouter":
++      return createOpenRouterAdapter(options);
++    case "anthropic":
++      return createAnthropicAdapter(options);
++    case "google":
++      return createGeminiAdapter(options);
++    case "groq":
++      return createGroqAdapter(options);
++    case "custom": {
++      if (options.baseUrl === undefined || options.baseUrl.trim().length === 0) {
++        throw new GatewayError("unknown", "Custom provider requires a base URL");
++      }
++      return createOpenAICompatibleAdapter(
++        mergeOpenAICompatibleOptions(
++          { id: "custom", baseUrl: options.baseUrl, testModel: "gpt-4o-mini" },
++          options,
++        ),
++      );
++    }
++    default:
++      throw new GatewayError("unknown", `Unknown provider: ${slug}`);
++  }
++}
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index ca4ef3b..d9273ed 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -1,5 +1,5 @@
+ export { applyMigrations } from "./migrate";
+-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL } from "./migrations";
++export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL } from "./migrations";
+ export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
+ export {
+   HubRepos,
+@@ -13,6 +13,7 @@ export {
+   type ProviderRecord,
+   type ProviderSecretRecord,
+   type ReceiptRecord,
++  type HealthSampleRecord,
+   type WorkspaceSessionRecord,
+ } from "./repos";
+ export { schema } from "./schema";
+diff --git a/packages/db/src/migrations.ts b/packages/db/src/migrations.ts
+index 973213e..d7b0483 100644
+--- a/packages/db/src/migrations.ts
++++ b/packages/db/src/migrations.ts
+@@ -130,7 +130,13 @@ ALTER TABLE message_receipts ADD COLUMN error_code TEXT;
+ CREATE UNIQUE INDEX IF NOT EXISTS message_receipts_message_idx ON message_receipts(message_id);
+ `;
+ 
++export const MIGRATION_0003_SQL = `
++INSERT INTO providers (id, slug, name) VALUES
++  ('66666666-6666-4666-8666-666666666666', 'custom', 'Custom (OpenAI-compatible)');
++`;
++
+ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 1, sql: MIGRATION_0001_SQL },
+   { version: 2, sql: MIGRATION_0002_SQL },
++  { version: 3, sql: MIGRATION_0003_SQL },
+ ];
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index 03a1cb7..b2af8d7 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -115,7 +115,7 @@ describe("hub database", () => {
+       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
+       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
+       applyMigrations(second.sqlite);
+-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(2);
++      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(3);
+       second.close();
+     } finally {
+       rmSync(dir, { recursive: true, force: true });
+@@ -394,4 +394,37 @@ describe("hub database", () => {
+     expect(hub.repos.listActivePath(conversation.id).map((item) => item.id)).toEqual([edited.id]);
+     hub.close();
+   });
++
++  it("seeds custom and OpenRouter providers and stores custom URL without the secret", async () => {
++    const { hub } = openTestDb();
++    const slugs = hub.repos.listProviders().map((item) => item.slug);
++    expect(slugs).toEqual(expect.arrayContaining(["openai", "openrouter", "anthropic", "google", "groq", "custom"]));
++    const secret = "sk-customfixtureNEVERSQLITE9999";
++    const saved = await hub.repos.saveProviderKey({
++      providerSlug: "custom",
++      label: "local",
++      secret,
++      baseUrl: "http://127.0.0.1:8080/v1",
++    });
++    expect(saved.endpointUrl).toBe("http://127.0.0.1:8080/v1");
++    expect(saved.maskedKey).not.toBe(secret);
++    const dump = dumpAllText(hub.sqlite);
++    expect(dump).not.toContain(secret);
++    expect(dump).toContain("http://127.0.0.1:8080/v1");
++    hub.close();
++  });
++
++  it("records a health sample without storing secrets", () => {
++    const { hub } = openTestDb();
++    const sample = hub.repos.recordHealthSample({
++      providerSlug: "openrouter",
++      ok: true,
++      latencyMs: 42,
++    });
++    expect(sample.ok).toBe(true);
++    expect(hub.repos.listHealthSamples("openrouter")).toHaveLength(1);
++    const dump = dumpAllText(hub.sqlite);
++    expect(dump).not.toMatch(/sk-/);
++    hub.close();
++  });
+ });
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 4a3c600..1012a14 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -11,6 +11,7 @@ import {
+ } from "@ai-hub/security";
+ import {
+   conversations,
++  healthSamples,
+   messageReceipts,
+   messages,
+   projects,
+@@ -80,6 +81,15 @@ export interface ProviderKeyRecord {
+   maskedKey: string;
+   last4: string;
+   status: "active" | "invalid";
++  endpointUrl: string | null;
++  createdAt: string;
++}
++
++export interface HealthSampleRecord {
++  id: string;
++  providerSlug: string;
++  ok: boolean;
++  latencyMs: number | null;
+   createdAt: string;
+ }
+ 
+@@ -103,6 +113,7 @@ export interface WorkspaceSessionRecord {
+ const APPEARANCE_KEY = "appearance";
+ const SESSION_KEY = "workspace-session";
+ const BRANCH_LABELS_PREFIX = "branch-labels:";
++const CUSTOM_BASE_URL_PREFIX = "custom-base-url:";
+ const DEFAULT_SESSION: WorkspaceSessionRecord = {
+   projectId: null,
+   conversationId: null,
+@@ -707,19 +718,90 @@ export class HubRepos {
+       .run();
+   }
+ 
++  getCustomBaseUrl(keyId: string): string | null {
++    const row = this.db
++      .select()
++      .from(settings)
++      .where(eq(settings.key, `${CUSTOM_BASE_URL_PREFIX}${keyId}`))
++      .get();
++    if (!row || row.value.trim().length === 0) {
++      return null;
++    }
++    return row.value;
++  }
++
++  setCustomBaseUrl(keyId: string, baseUrl: string): void {
++    const now = Date.now();
++    this.db
++      .insert(settings)
++      .values({
++        key: `${CUSTOM_BASE_URL_PREFIX}${keyId}`,
++        value: baseUrl,
++        updatedAt: now,
++      })
++      .onConflictDoUpdate({
++        target: settings.key,
++        set: { value: baseUrl, updatedAt: now },
++      })
++      .run();
++  }
++
++  deleteCustomBaseUrl(keyId: string): void {
++    this.db.delete(settings).where(eq(settings.key, `${CUSTOM_BASE_URL_PREFIX}${keyId}`)).run();
++  }
++
++  recordHealthSample(input: { providerSlug: string; ok: boolean; latencyMs: number | null }): HealthSampleRecord {
++    const now = Date.now();
++    const id = randomUUID();
++    this.db
++      .insert(healthSamples)
++      .values({
++        id,
++        providerSlug: input.providerSlug,
++        ok: input.ok ? 1 : 0,
++        latencyMs: input.latencyMs,
++        createdAt: now,
++      })
++      .run();
++    return {
++      id,
++      providerSlug: input.providerSlug,
++      ok: input.ok,
++      latencyMs: input.latencyMs,
++      createdAt: iso(now),
++    };
++  }
++
++  listHealthSamples(providerSlug: string): HealthSampleRecord[] {
++    return this.db
++      .select()
++      .from(healthSamples)
++      .where(eq(healthSamples.providerSlug, providerSlug))
++      .all()
++      .map((row) => ({
++        id: row.id,
++        providerSlug: row.providerSlug,
++        ok: row.ok === 1,
++        latencyMs: row.latencyMs,
++        createdAt: iso(row.createdAt),
++      }));
++  }
++
+   async listProviderKeys(): Promise<ProviderKeyRecord[]> {
+     const rows = this.db.select().from(providerKeys).all();
+     const catalog = this.listProviders();
+     return rows.map((row) => {
+       const provider = catalog.find((item) => item.id === row.providerId);
+       const prefix = row.last4.length > 0 ? `sk-…${row.last4}` : "sk-…";
++      const slug = provider?.slug ?? "unknown";
+       return {
+         id: row.id,
+-        providerSlug: provider?.slug ?? "unknown",
++        providerSlug: slug,
+         label: row.label,
+         maskedKey: prefix,
+         last4: row.last4,
+         status: row.status === "invalid" ? "invalid" : "active",
++        endpointUrl: slug === "custom" ? this.getCustomBaseUrl(row.id) : null,
+         createdAt: iso(row.createdAt),
+       };
+     });
+@@ -742,6 +824,7 @@ export class HubRepos {
+     providerSlug: string;
+     label: string;
+     secret: string;
++    baseUrl?: string | undefined;
+   }): Promise<ProviderKeyRecord> {
+     const provider = this.db
+       .select()
+@@ -751,6 +834,9 @@ export class HubRepos {
+     if (!provider) {
+       throw new Error("Unknown provider");
+     }
++    if (input.providerSlug === "custom" && (input.baseUrl === undefined || input.baseUrl.trim().length === 0)) {
++      throw new Error("Custom provider requires a base URL");
++    }
+     const id = randomUUID();
+     const account = providerKeyAccount(id);
+     const last4 = last4OfSecret(input.secret);
+@@ -769,6 +855,9 @@ export class HubRepos {
+           createdAt: now,
+         })
+         .run();
++      if (input.providerSlug === "custom" && input.baseUrl !== undefined) {
++        this.setCustomBaseUrl(id, input.baseUrl.replace(/\/$/, ""));
++      }
+     } catch (error) {
+       await this.secrets.deletePassword(account);
+       throw error;
+@@ -780,6 +869,7 @@ export class HubRepos {
+       maskedKey: maskSecret(input.secret),
+       last4,
+       status: "active",
++      endpointUrl: input.providerSlug === "custom" ? this.getCustomBaseUrl(id) : null,
+       createdAt: iso(now),
+     };
+   }
+@@ -790,6 +880,7 @@ export class HubRepos {
+       return;
+     }
+     this.db.delete(providerKeys).where(eq(providerKeys.id, id)).run();
++    this.deleteCustomBaseUrl(id);
+     await this.secrets.deletePassword(row.keytarAccount);
+   }
+ }
+diff --git a/packages/shared/src/gateway.test.ts b/packages/shared/src/gateway.test.ts
+index c6f7905..0653001 100644
+--- a/packages/shared/src/gateway.test.ts
++++ b/packages/shared/src/gateway.test.ts
+@@ -1,5 +1,6 @@
+ import { describe, expect, it } from "vitest";
+ import {
++  catalogModelsForProvider,
+   chatEventSchema,
+   chatSendInputSchema,
+   estimateCostUsd,
+@@ -43,6 +44,15 @@ describe("model catalog", () => {
+     }
+     expect(estimateCostUsd(model, 1_000_000, 1_000_000)).toBe("0.750000");
+   });
++
++  it("lists OpenRouter as a first-class catalog provider and gates vision", () => {
++    const openrouter = catalogModelsForProvider("openrouter");
++    expect(openrouter.some((model) => model.id === "openai/gpt-4o-mini")).toBe(true);
++    const groq = findCatalogModel("llama-3.1-8b-instant", "groq");
++    expect(groq?.vision).toBe(false);
++    const gpt = findCatalogModel("gpt-4o", "openai");
++    expect(gpt?.vision).toBe(true);
++  });
+ });
+ 
+ describe("chat contracts", () => {
+@@ -92,6 +102,26 @@ describe("chat contracts", () => {
+     expect(parsed.mode).toBe("edit");
+   });
+ 
++  it("accepts temperature, max tokens, and extra system on send", () => {
++    const parsed = chatSendInputSchema.parse({
++      mode: "send",
++      conversationId: "11111111-1111-4111-8111-111111111111",
++      providerKeyId: "22222222-2222-4222-8222-222222222222",
++      model: "openai/gpt-4o-mini",
++      content: "hello",
++      temperature: 0.2,
++      maxTokens: 256,
++      extraSystem: "Be terse.",
++    });
++    expect(parsed.mode).toBe("send");
++    if (parsed.mode !== "send") {
++      return;
++    }
++    expect(parsed.temperature).toBe(0.2);
++    expect(parsed.maxTokens).toBe(256);
++    expect(parsed.extraSystem).toBe("Be terse.");
++  });
++
+   it("parses a chunk event", () => {
+     const event = chatEventSchema.parse({
+       type: "chunk",
+diff --git a/packages/shared/src/gateway.ts b/packages/shared/src/gateway.ts
+index f7d468d..3ed794c 100644
+--- a/packages/shared/src/gateway.ts
++++ b/packages/shared/src/gateway.ts
+@@ -1,6 +1,7 @@
+ import { z } from "zod";
+ 
+ export {
++  catalogModelsForProvider,
+   estimateCostUsd,
+   findCatalogModel,
+   MODEL_CATALOG,
+@@ -60,6 +61,9 @@ const chatSendBaseSchema = z.object({
+   conversationId: z.string().uuid(),
+   providerKeyId: z.string().uuid(),
+   model: z.string().min(1).max(128),
++  temperature: z.number().min(0).max(2).optional(),
++  maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
++  extraSystem: z.string().max(20_000).optional(),
+ });
+ 
+ export const chatSendInputSchema = z.discriminatedUnion("mode", [
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index d360764..4c770da 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -22,6 +22,8 @@ import type {
+   ProviderDto,
+   ProviderKeyDto,
+   SecretsSaveInput,
++  SecretsTestInput,
++  SecretsTestResult,
+   WorkspaceSession,
+ } from "./ipc-schemas";
+ 
+@@ -69,6 +71,7 @@ export interface HubSecretsApi {
+   list: () => Promise<ProviderKeyDto[]>;
+   save: (input: SecretsSaveInput) => Promise<ProviderKeyDto>;
+   remove: (input: IdInput) => Promise<void>;
++  test: (input: SecretsTestInput) => Promise<SecretsTestResult>;
+ }
+ 
+ export interface HubChatApi {
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 58b84ee..df622fe 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -55,6 +55,8 @@ export {
+   providerKeyListResultSchema,
+   providerListResultSchema,
+   secretsSaveInputSchema,
++  secretsTestInputSchema,
++  secretsTestResultSchema,
+   windowIsMaximizedResultSchema,
+   workspaceSessionSchema,
+   type AppearanceSettings,
+@@ -83,11 +85,14 @@ export {
+   type ProviderDto,
+   type ProviderKeyDto,
+   type SecretsSaveInput,
++  type SecretsTestInput,
++  type SecretsTestResult,
+   type WorkspaceSession,
+ } from "./ipc-schemas";
+ export {
+   chatAbortInputSchema,
+   chatSendInputSchema,
++  catalogModelsForProvider,
+   estimateCostUsd,
+   findCatalogModel,
+   gatewayErrorCodeSchema,
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index 0653e7e..4202f9c 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -24,6 +24,7 @@ export const IpcChannel = {
+   secretsList: "secrets:list",
+   secretsSave: "secrets:save",
+   secretsRemove: "secrets:remove",
++  secretsTest: "secrets:test",
+   chatSend: "chat:send",
+   chatAbort: "chat:abort",
+   chatEvent: "chat:event",
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index 6416517..80eed65 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -8,6 +8,7 @@ import {
+   messageUpdateInputSchema,
+   providerKeyDtoSchema,
+   secretsSaveInputSchema,
++  secretsTestResultSchema,
+   windowIsMaximizedResultSchema,
+   workspaceSessionSchema,
+ } from "./ipc-schemas";
+@@ -136,6 +137,44 @@ describe("secretsSaveInputSchema", () => {
+       }),
+     ).toThrow();
+   });
++
++  it("requires a base URL only for custom providers", () => {
++    expect(() =>
++      secretsSaveInputSchema.parse({
++        providerSlug: "custom",
++        label: "local",
++        secret: "sk-testfixtureABCDEFGH",
++      }),
++    ).toThrow();
++    expect(() =>
++      secretsSaveInputSchema.parse({
++        providerSlug: "openai",
++        label: "work",
++        secret: "sk-testfixtureABCDEFGH",
++        baseUrl: "https://api.openai.com/v1",
++      }),
++    ).toThrow();
++    const parsed = secretsSaveInputSchema.parse({
++      providerSlug: "custom",
++      label: "local",
++      secret: "sk-testfixtureABCDEFGH",
++      baseUrl: "http://127.0.0.1:8080/v1",
++    });
++    expect(parsed.baseUrl).toBe("http://127.0.0.1:8080/v1");
++  });
++});
++
++describe("secretsTestResultSchema", () => {
++  it("never accepts a secret field", () => {
++    expect(() =>
++      secretsTestResultSchema.parse({
++        ok: true,
++        latencyMs: 12,
++        errorCode: null,
++        secret: "sk-testfixtureABCDEFGH",
++      }),
++    ).toThrow();
++  });
+ });
+ 
+ describe("providerKeyDtoSchema", () => {
+@@ -145,6 +184,7 @@ describe("providerKeyDtoSchema", () => {
+     label: "work",
+     last4: "stuv",
+     status: "active" as const,
++    endpointUrl: null,
+     createdAt: "2026-09-15T00:00:00.000Z",
+   };
+ 
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index a51312b..d0cf737 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -123,6 +123,9 @@ export const workspaceSessionSchema = z
+     projectId: z.string().uuid().nullable(),
+     conversationId: z.string().uuid().nullable(),
+     model: z.string().min(1).max(128),
++    temperature: z.number().min(0).max(2).optional(),
++    maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
++    extraSystem: z.string().max(20_000).optional(),
+   })
+   .strict();
+ 
+@@ -160,6 +163,7 @@ export const providerKeyDtoSchema = z.object({
+   maskedKey: maskedKeySchema,
+   last4: z.string().min(1).max(8),
+   status: z.enum(["active", "invalid"]),
++  endpointUrl: z.string().max(512).nullable(),
+   createdAt: isoTimestampSchema,
+ });
+ 
+@@ -172,11 +176,45 @@ export const secretsSaveInputSchema = z
+     providerSlug: z.string().min(1).max(64),
+     label: z.string().trim().min(1).max(80),
+     secret: z.string().min(8).max(4096),
++    baseUrl: z.string().url().max(512).optional(),
+   })
+-  .strict();
++  .strict()
++  .superRefine((value, ctx) => {
++    if (value.providerSlug === "custom") {
++      if (value.baseUrl === undefined || value.baseUrl.trim().length === 0) {
++        ctx.addIssue({
++          code: z.ZodIssueCode.custom,
++          message: "Custom providers require a base URL",
++          path: ["baseUrl"],
++        });
++      }
++      return;
++    }
++    if (value.baseUrl !== undefined) {
++      ctx.addIssue({
++        code: z.ZodIssueCode.custom,
++        message: "baseUrl is only valid for custom providers",
++        path: ["baseUrl"],
++      });
++    }
++  });
+ 
+ export type SecretsSaveInput = z.infer<typeof secretsSaveInputSchema>;
+ 
++export const secretsTestInputSchema = idInputSchema;
++
++export type SecretsTestInput = z.infer<typeof secretsTestInputSchema>;
++
++export const secretsTestResultSchema = z
++  .object({
++    ok: z.boolean(),
++    latencyMs: z.number().int().nonnegative(),
++    errorCode: gatewayErrorCodeSchema.nullable(),
++  })
++  .strict();
++
++export type SecretsTestResult = z.infer<typeof secretsTestResultSchema>;
++
+ export const chatEventSchema = z.discriminatedUnion("type", [
+   z.object({
+     type: z.literal("chunk"),
+diff --git a/packages/shared/src/model-catalog.json b/packages/shared/src/model-catalog.json
+index 4817e6f..2b28734 100644
+--- a/packages/shared/src/model-catalog.json
++++ b/packages/shared/src/model-catalog.json
+@@ -7,7 +7,9 @@
+       "label": "GPT-4o mini",
+       "contextWindow": 128000,
+       "inputUsdPerMillion": 0.15,
+-      "outputUsdPerMillion": 0.6
++      "outputUsdPerMillion": 0.6,
++      "vision": true,
++      "tools": true
+     },
+     {
+       "id": "gpt-4o",
+@@ -15,7 +17,99 @@
+       "label": "GPT-4o",
+       "contextWindow": 128000,
+       "inputUsdPerMillion": 2.5,
+-      "outputUsdPerMillion": 10
++      "outputUsdPerMillion": 10,
++      "vision": true,
++      "tools": true
++    },
++    {
++      "id": "openai/gpt-4o-mini",
++      "provider": "openrouter",
++      "label": "GPT-4o mini (OpenRouter)",
++      "contextWindow": 128000,
++      "inputUsdPerMillion": 0.15,
++      "outputUsdPerMillion": 0.6,
++      "vision": true,
++      "tools": true
++    },
++    {
++      "id": "anthropic/claude-sonnet-4",
++      "provider": "openrouter",
++      "label": "Claude Sonnet 4 (OpenRouter)",
++      "contextWindow": 200000,
++      "inputUsdPerMillion": 3,
++      "outputUsdPerMillion": 15,
++      "vision": true,
++      "tools": true
++    },
++    {
++      "id": "google/gemini-2.0-flash",
++      "provider": "openrouter",
++      "label": "Gemini 2.0 Flash (OpenRouter)",
++      "contextWindow": 1000000,
++      "inputUsdPerMillion": 0.1,
++      "outputUsdPerMillion": 0.4,
++      "vision": true,
++      "tools": true
++    },
++    {
++      "id": "claude-sonnet-4-20250514",
++      "provider": "anthropic",
++      "label": "Claude Sonnet 4",
++      "contextWindow": 200000,
++      "inputUsdPerMillion": 3,
++      "outputUsdPerMillion": 15,
++      "vision": true,
++      "tools": true
++    },
++    {
++      "id": "claude-3-5-haiku-20241022",
++      "provider": "anthropic",
++      "label": "Claude 3.5 Haiku",
++      "contextWindow": 200000,
++      "inputUsdPerMillion": 0.8,
++      "outputUsdPerMillion": 4,
++      "vision": true,
++      "tools": true
++    },
++    {
++      "id": "gemini-2.0-flash",
++      "provider": "google",
++      "label": "Gemini 2.0 Flash",
++      "contextWindow": 1000000,
++      "inputUsdPerMillion": 0.1,
++      "outputUsdPerMillion": 0.4,
++      "vision": true,
++      "tools": true
++    },
++    {
++      "id": "gemini-2.5-flash",
++      "provider": "google",
++      "label": "Gemini 2.5 Flash",
++      "contextWindow": 1000000,
++      "inputUsdPerMillion": 0.15,
++      "outputUsdPerMillion": 0.6,
++      "vision": true,
++      "tools": true
++    },
++    {
++      "id": "llama-3.1-8b-instant",
++      "provider": "groq",
++      "label": "Llama 3.1 8B Instant",
++      "contextWindow": 131072,
++      "inputUsdPerMillion": 0.05,
++      "outputUsdPerMillion": 0.08,
++      "vision": false,
++      "tools": false
++    },
++    {
++      "id": "llama-3.3-70b-versatile",
++      "provider": "groq",
++      "label": "Llama 3.3 70B Versatile",
++      "contextWindow": 131072,
++      "inputUsdPerMillion": 0.59,
++      "outputUsdPerMillion": 0.79,
++      "vision": false,
++      "tools": false
+     }
+   ]
+ }
+diff --git a/packages/shared/src/model-catalog.ts b/packages/shared/src/model-catalog.ts
+index 83a8f3d..7f8993f 100644
+--- a/packages/shared/src/model-catalog.ts
++++ b/packages/shared/src/model-catalog.ts
+@@ -7,6 +7,8 @@ export interface CatalogModel {
+   contextWindow: number;
+   inputUsdPerMillion: number;
+   outputUsdPerMillion: number;
++  vision: boolean;
++  tools: boolean;
+ }
+ 
+ export interface ModelCatalog {
+@@ -22,6 +24,14 @@ export function findCatalogModel(modelId: string, provider: string): CatalogMode
+   );
+ }
+ 
++export function catalogModelsForProvider(provider: string): CatalogModel[] {
++  return MODEL_CATALOG.models.filter((model) => model.provider === provider);
++}
++
++export function openaiCatalogModels(): CatalogModel[] {
++  return catalogModelsForProvider("openai");
++}
++
+ export function estimateCostUsd(
+   model: CatalogModel,
+   tokensIn: number,
+@@ -32,7 +42,3 @@ export function estimateCostUsd(
+     (tokensOut / 1_000_000) * model.outputUsdPerMillion;
+   return cost.toFixed(6);
+ }
+-
+-export function openaiCatalogModels(): CatalogModel[] {
+-  return MODEL_CATALOG.models.filter((model) => model.provider === "openai");
+-}
