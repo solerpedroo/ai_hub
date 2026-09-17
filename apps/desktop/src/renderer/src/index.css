@@ -69,7 +69,9 @@
 
   button,
   input,
-  [role="textbox"] {
+  textarea,
+  [role="textbox"],
+  .chat-md {
     user-select: text;
   }
 }
