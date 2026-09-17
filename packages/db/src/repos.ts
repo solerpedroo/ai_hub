@@ -11,6 +11,7 @@ import {
 } from "@ai-hub/security";
 import {
   conversations,
+  healthSamples,
   messageReceipts,
   messages,
   projects,
@@ -80,6 +81,15 @@ export interface ProviderKeyRecord {
   maskedKey: string;
   last4: string;
   status: "active" | "invalid";
+  endpointUrl: string | null;
+  createdAt: string;
+}
+
+export interface HealthSampleRecord {
+  id: string;
+  providerSlug: string;
+  ok: boolean;
+  latencyMs: number | null;
   createdAt: string;
 }
 
@@ -98,16 +108,66 @@ export interface WorkspaceSessionRecord {
   projectId: string | null;
   conversationId: string | null;
   model: string;
+  temperature: number;
+  maxTokens: number | null;
+  extraSystem: string;
 }
 
 const APPEARANCE_KEY = "appearance";
 const SESSION_KEY = "workspace-session";
 const BRANCH_LABELS_PREFIX = "branch-labels:";
+const CUSTOM_BASE_URL_PREFIX = "custom-base-url:";
 const DEFAULT_SESSION: WorkspaceSessionRecord = {
   projectId: null,
   conversationId: null,
   model: "gpt-4o-mini",
+  temperature: 1,
+  maxTokens: null,
+  extraSystem: "",
 };
+
+function maskListedKey(last4: string, slug: string): string {
+  if (last4.length === 0) {
+    return slug === "openai" || slug === "openrouter" ? "sk-…" : "…";
+  }
+  if (slug === "openai" || slug === "openrouter") {
+    return `sk-…${last4}`;
+  }
+  return `…${last4}`;
+}
+
+function assertSafeEndpointUrl(raw: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("Invalid custom base URL");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Invalid custom base URL");
+  }
+  if (parsed.username !== "" || parsed.password !== "") {
+    throw new Error("Invalid custom base URL");
+  }
+  const banned = new Set(["api_key", "apikey", "key", "token", "secret", "access_token"]);
+  for (const name of parsed.searchParams.keys()) {
+    if (banned.has(name.toLowerCase())) {
+      throw new Error("Invalid custom base URL");
+    }
+  }
+  return raw.replace(/\/$/, "");
+}
+
+function endpointUrlForDto(raw: string | null): string | null {
+  if (raw === null) {
+    return null;
+  }
+  try {
+    return assertSafeEndpointUrl(raw);
+  } catch {
+    return null;
+  }
+}
 
 function iso(ms: number): string {
   return new Date(ms).toISOString();
@@ -681,10 +741,27 @@ export class HubRepos {
       const projectOk = projectId === null || typeof projectId === "string";
       const conversationOk = conversationId === null || typeof conversationId === "string";
       if (projectOk && conversationOk && typeof model === "string" && model.length > 0) {
+        const temperature =
+          "temperature" in parsed && typeof parsed.temperature === "number" && Number.isFinite(parsed.temperature)
+            ? Math.min(2, Math.max(0, parsed.temperature))
+            : DEFAULT_SESSION.temperature;
+        const maxTokens =
+          "maxTokens" in parsed && parsed.maxTokens === null
+            ? null
+            : "maxTokens" in parsed && typeof parsed.maxTokens === "number" && Number.isInteger(parsed.maxTokens)
+              ? parsed.maxTokens
+              : DEFAULT_SESSION.maxTokens;
+        const extraSystem =
+          "extraSystem" in parsed && typeof parsed.extraSystem === "string"
+            ? parsed.extraSystem.slice(0, 20_000)
+            : DEFAULT_SESSION.extraSystem;
         return {
           projectId,
           conversationId,
           model,
+          temperature,
+          maxTokens,
+          extraSystem,
         };
       }
     }
@@ -707,19 +784,90 @@ export class HubRepos {
       .run();
   }
 
+  getCustomBaseUrl(keyId: string): string | null {
+    const row = this.db
+      .select()
+      .from(settings)
+      .where(eq(settings.key, `${CUSTOM_BASE_URL_PREFIX}${keyId}`))
+      .get();
+    if (!row || row.value.trim().length === 0) {
+      return null;
+    }
+    return endpointUrlForDto(row.value);
+  }
+
+  setCustomBaseUrl(keyId: string, baseUrl: string): void {
+    const sanitized = assertSafeEndpointUrl(baseUrl);
+    const now = Date.now();
+    this.db
+      .insert(settings)
+      .values({
+        key: `${CUSTOM_BASE_URL_PREFIX}${keyId}`,
+        value: sanitized,
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: settings.key,
+        set: { value: sanitized, updatedAt: now },
+      })
+      .run();
+  }
+
+  deleteCustomBaseUrl(keyId: string): void {
+    this.db.delete(settings).where(eq(settings.key, `${CUSTOM_BASE_URL_PREFIX}${keyId}`)).run();
+  }
+
+  recordHealthSample(input: { providerSlug: string; ok: boolean; latencyMs: number | null }): HealthSampleRecord {
+    const now = Date.now();
+    const id = randomUUID();
+    this.db
+      .insert(healthSamples)
+      .values({
+        id,
+        providerSlug: input.providerSlug,
+        ok: input.ok ? 1 : 0,
+        latencyMs: input.latencyMs,
+        createdAt: now,
+      })
+      .run();
+    return {
+      id,
+      providerSlug: input.providerSlug,
+      ok: input.ok,
+      latencyMs: input.latencyMs,
+      createdAt: iso(now),
+    };
+  }
+
+  listHealthSamples(providerSlug: string): HealthSampleRecord[] {
+    return this.db
+      .select()
+      .from(healthSamples)
+      .where(eq(healthSamples.providerSlug, providerSlug))
+      .all()
+      .map((row) => ({
+        id: row.id,
+        providerSlug: row.providerSlug,
+        ok: row.ok === 1,
+        latencyMs: row.latencyMs,
+        createdAt: iso(row.createdAt),
+      }));
+  }
+
   async listProviderKeys(): Promise<ProviderKeyRecord[]> {
     const rows = this.db.select().from(providerKeys).all();
     const catalog = this.listProviders();
     return rows.map((row) => {
       const provider = catalog.find((item) => item.id === row.providerId);
-      const prefix = row.last4.length > 0 ? `sk-…${row.last4}` : "sk-…";
+      const slug = provider?.slug ?? "unknown";
       return {
         id: row.id,
-        providerSlug: provider?.slug ?? "unknown",
+        providerSlug: slug,
         label: row.label,
-        maskedKey: prefix,
+        maskedKey: maskListedKey(row.last4, slug),
         last4: row.last4,
         status: row.status === "invalid" ? "invalid" : "active",
+        endpointUrl: slug === "custom" ? this.getCustomBaseUrl(row.id) : null,
         createdAt: iso(row.createdAt),
       };
     });
@@ -742,6 +890,7 @@ export class HubRepos {
     providerSlug: string;
     label: string;
     secret: string;
+    baseUrl?: string | undefined;
   }): Promise<ProviderKeyRecord> {
     const provider = this.db
       .select()
@@ -750,6 +899,9 @@ export class HubRepos {
       .get();
     if (!provider) {
       throw new Error("Unknown provider");
+    }
+    if (input.providerSlug === "custom" && (input.baseUrl === undefined || input.baseUrl.trim().length === 0)) {
+      throw new Error("Custom provider requires a base URL");
     }
     const id = randomUUID();
     const account = providerKeyAccount(id);
@@ -769,6 +921,9 @@ export class HubRepos {
           createdAt: now,
         })
         .run();
+      if (input.providerSlug === "custom" && input.baseUrl !== undefined) {
+        this.setCustomBaseUrl(id, input.baseUrl);
+      }
     } catch (error) {
       await this.secrets.deletePassword(account);
       throw error;
@@ -780,6 +935,7 @@ export class HubRepos {
       maskedKey: maskSecret(input.secret),
       last4,
       status: "active",
+      endpointUrl: input.providerSlug === "custom" ? this.getCustomBaseUrl(id) : null,
       createdAt: iso(now),
     };
   }
@@ -790,6 +946,7 @@ export class HubRepos {
       return;
     }
     this.db.delete(providerKeys).where(eq(providerKeys.id, id)).run();
+    this.deleteCustomBaseUrl(id);
     await this.secrets.deletePassword(row.keytarAccount);
   }
 }
