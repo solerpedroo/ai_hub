@@ -64,6 +64,7 @@ const chatSendBaseSchema = z.object({
   temperature: z.number().min(0).max(2).optional(),
   maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
   extraSystem: z.string().max(20_000).optional(),
+  compactHistory: z.boolean().optional(),
 });
 
 export const chatSendInputSchema = z.discriminatedUnion("mode", [
