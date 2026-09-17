@@ -40,9 +40,18 @@ export const customBaseUrlSchema = z
     }
   });
 
+export const projectColorSchema = z
+  .string()
+  .regex(/^#[0-9a-fA-F]{6}$/)
+  .nullable();
+
 export const projectDtoSchema = z.object({
   id: z.string().uuid(),
   name: z.string(),
+  color: projectColorSchema,
+  instructions: z.string().nullable(),
+  preferredModel: z.string().max(128).nullable(),
+  preferredProvider: z.string().max(64).nullable(),
   createdAt: isoTimestampSchema,
   updatedAt: isoTimestampSchema,
 });
@@ -51,22 +60,37 @@ export type ProjectDto = z.infer<typeof projectDtoSchema>;
 
 export const projectListResultSchema = z.array(projectDtoSchema);
 
-export const projectCreateInputSchema = z
-  .object({
-    name: z.string().trim().min(1).max(200),
+const projectFieldsSchema = z.object({
+  name: z.string().trim().min(1).max(200),
+  color: projectColorSchema.optional(),
+  instructions: z.string().max(20_000).nullable().optional(),
+  preferredModel: z.string().trim().min(1).max(128).nullable().optional(),
+  preferredProvider: z.string().trim().min(1).max(64).nullable().optional(),
+});
+
+export const projectCreateInputSchema = projectFieldsSchema.strict();
+
+export type ProjectCreateInput = z.infer<typeof projectCreateInputSchema>;
+
+export const projectUpdateInputSchema = projectFieldsSchema
+  .extend({
+    id: z.string().uuid(),
   })
   .strict();
 
-export type ProjectCreateInput = z.infer<typeof projectCreateInputSchema>;
+export type ProjectUpdateInput = z.infer<typeof projectUpdateInputSchema>;
 
 export const idInputSchema = z.object({ id: z.string().uuid() }).strict();
 
 export type IdInput = z.infer<typeof idInputSchema>;
 
+export const tagNameSchema = z.string().trim().min(1).max(40);
+
 export const conversationDtoSchema = z.object({
   id: z.string().uuid(),
   projectId: z.string().uuid().nullable(),
   title: z.string(),
+  tags: z.array(tagNameSchema),
   createdAt: isoTimestampSchema,
   updatedAt: isoTimestampSchema,
 });
@@ -91,6 +115,61 @@ export const conversationCreateInputSchema = z
   .strict();
 
 export type ConversationCreateInput = z.infer<typeof conversationCreateInputSchema>;
+
+export const conversationTagsSetInputSchema = z
+  .object({
+    conversationId: z.string().uuid(),
+    names: z.array(tagNameSchema).max(20),
+  })
+  .strict();
+
+export type ConversationTagsSetInput = z.infer<typeof conversationTagsSetInputSchema>;
+
+export const searchInputSchema = z
+  .object({
+    query: z.string().trim().min(1).max(200),
+  })
+  .strict();
+
+export type SearchInput = z.infer<typeof searchInputSchema>;
+
+export const searchHitSchema = z
+  .object({
+    conversationId: z.string().uuid(),
+    projectId: z.string().uuid().nullable(),
+    conversationTitle: z.string().max(200),
+    messageId: z.string().uuid().nullable(),
+    snippet: z.string().max(400),
+  })
+  .strict();
+
+export type SearchHit = z.infer<typeof searchHitSchema>;
+
+export const searchResultSchema = z.array(searchHitSchema).max(50);
+
+export const packetPreviewInputSchema = z
+  .object({
+    conversationId: z.string().uuid(),
+    extraSystem: z.string().max(20_000).optional(),
+    model: z.string().min(1).max(128),
+    providerSlug: z.string().min(1).max(64),
+    compact: z.boolean().optional(),
+  })
+  .strict();
+
+export type PacketPreviewInput = z.infer<typeof packetPreviewInputSchema>;
+
+export const packetPreviewResultSchema = z
+  .object({
+    tokenEstimate: z.number().int().nonnegative(),
+    contextWindow: z.number().int().positive(),
+    overflow: z.boolean(),
+    compacted: z.boolean(),
+    excludedCount: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export type PacketPreviewResult = z.infer<typeof packetPreviewResultSchema>;
 
 export const messageRoleSchema = z.enum(["user", "assistant", "system"]);
 
