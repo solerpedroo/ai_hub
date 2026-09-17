@@ -7,10 +7,12 @@ import {
   last4OfSecret,
   maskSecret,
   providerKeyAccount,
+  redactSecrets,
   type SecretStore,
 } from "@ai-hub/security";
 import {
   conversations,
+  conversationTags,
   healthSamples,
   messageReceipts,
   messages,
@@ -18,6 +20,7 @@ import {
   providerKeys,
   providers,
   settings,
+  tags,
   type schema,
 } from "./schema";
 
@@ -26,17 +29,36 @@ export type HubDrizzle = BetterSQLite3Database<typeof schema>;
 export interface ProjectRecord {
   id: string;
   name: string;
+  color: string | null;
   instructions: string | null;
+  preferredModel: string | null;
+  preferredProvider: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ProjectWriteFields {
+  color?: string | null;
+  instructions?: string | null;
+  preferredModel?: string | null;
+  preferredProvider?: string | null;
 }
 
 export interface ConversationRecord {
   id: string;
   projectId: string | null;
   title: string;
+  tags: string[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface SearchHitRecord {
+  conversationId: string;
+  projectId: string | null;
+  conversationTitle: string;
+  messageId: string | null;
+  snippet: string;
 }
 
 export type MessageRole = "user" | "assistant" | "system";
@@ -173,6 +195,58 @@ function iso(ms: number): string {
   return new Date(ms).toISOString();
 }
 
+const PROJECT_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+
+function normalizeProjectColor(value: string | null | undefined): string | null {
+  if (value === undefined || value === null || value.length === 0) {
+    return null;
+  }
+  return PROJECT_COLOR_RE.test(value) ? value : null;
+}
+
+function searchTokens(query: string): string[] {
+  return query
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((token) => token.length > 0);
+}
+
+function matchesAllTokens(haystack: string, tokens: string[]): boolean {
+  const lower = haystack.toLowerCase();
+  return tokens.every((token) => lower.includes(token));
+}
+
+function snippetAround(text: string, token: string, radius = 48): string {
+  const idx = text.toLowerCase().indexOf(token.toLowerCase());
+  if (idx < 0) {
+    return text.slice(0, radius * 2);
+  }
+  const start = Math.max(0, idx - radius);
+  const end = Math.min(text.length, idx + token.length + radius);
+  return `${start > 0 ? "…" : ""}${text.slice(start, end)}${end < text.length ? "…" : ""}`;
+}
+
+function clip(text: string, max: number): string {
+  return text.length <= max ? text : text.slice(0, max);
+}
+
+function toSearchHit(input: {
+  conversationId: string;
+  projectId: string | null;
+  title: string;
+  messageId: string | null;
+  snippet: string;
+}): SearchHitRecord {
+  return {
+    conversationId: input.conversationId,
+    projectId: input.projectId,
+    conversationTitle: clip(redactSecrets(input.title), 200),
+    messageId: input.messageId,
+    snippet: clip(redactSecrets(input.snippet), 400),
+  };
+}
+
 function asRole(value: string): MessageRole {
   if (value === "user" || value === "assistant" || value === "system") {
     return value;
@@ -218,9 +292,12 @@ export class HubRepos {
     return {
       id: row.id,
       name: decryptUtf8(row.nameCipher, this.masterKey),
+      color: normalizeProjectColor(row.color),
       instructions: row.instructionsCipher
         ? decryptUtf8(row.instructionsCipher, this.masterKey)
         : null,
+      preferredModel: row.preferredModel ?? null,
+      preferredProvider: row.preferredProvider ?? null,
       createdAt: iso(row.createdAt),
       updatedAt: iso(row.updatedAt),
     };
@@ -231,6 +308,7 @@ export class HubRepos {
       id: row.id,
       projectId: row.projectId,
       title: decryptUtf8(row.titleCipher, this.masterKey),
+      tags: this.listConversationTagNames(row.id),
       createdAt: iso(row.createdAt),
       updatedAt: iso(row.updatedAt),
     };
@@ -286,29 +364,77 @@ export class HubRepos {
     return row ? this.toProject(row) : null;
   }
 
-  createProject(name: string): ProjectRecord {
+  createProject(name: string, fields: ProjectWriteFields = {}): ProjectRecord {
     const now = Date.now();
     const id = randomUUID();
+    const instructions =
+      fields.instructions !== undefined && fields.instructions !== null && fields.instructions.trim().length > 0
+        ? fields.instructions.trim()
+        : null;
     this.db
       .insert(projects)
       .values({
         id,
         nameCipher: encryptUtf8(name, this.masterKey),
+        color: normalizeProjectColor(fields.color),
+        instructionsCipher: instructions ? encryptUtf8(instructions, this.masterKey) : null,
+        preferredModel: fields.preferredModel ?? null,
+        preferredProvider: fields.preferredProvider ?? null,
         createdAt: now,
         updatedAt: now,
       })
       .run();
-    return { id, name, instructions: null, createdAt: iso(now), updatedAt: iso(now) };
+    const created = this.getProject(id);
+    if (!created) {
+      throw new Error("Project not found");
+    }
+    return created;
+  }
+
+  updateProject(id: string, name: string, fields: ProjectWriteFields = {}): ProjectRecord {
+    const existing = this.getProject(id);
+    if (!existing) {
+      throw new Error("Project not found");
+    }
+    const now = Date.now();
+    const instructions =
+      fields.instructions !== undefined
+        ? fields.instructions !== null && fields.instructions.trim().length > 0
+          ? fields.instructions.trim()
+          : null
+        : existing.instructions;
+    const color = fields.color !== undefined ? normalizeProjectColor(fields.color) : existing.color;
+    const preferredModel = fields.preferredModel !== undefined ? fields.preferredModel : existing.preferredModel;
+    const preferredProvider =
+      fields.preferredProvider !== undefined ? fields.preferredProvider : existing.preferredProvider;
+    this.db
+      .update(projects)
+      .set({
+        nameCipher: encryptUtf8(name, this.masterKey),
+        color,
+        instructionsCipher: instructions ? encryptUtf8(instructions, this.masterKey) : null,
+        preferredModel,
+        preferredProvider,
+        updatedAt: now,
+      })
+      .where(eq(projects.id, id))
+      .run();
+    const updated = this.getProject(id);
+    if (!updated) {
+      throw new Error("Project not found");
+    }
+    return updated;
   }
 
   removeProject(id: string): void {
+    this.db.update(conversations).set({ projectId: null }).where(eq(conversations.projectId, id)).run();
     this.db.delete(projects).where(eq(projects.id, id)).run();
   }
 
   listConversations(projectId: string | null): ConversationRecord[] {
     const rows =
       projectId === null
-        ? this.db.select().from(conversations).all().filter((row) => row.projectId === null)
+        ? this.db.select().from(conversations).where(isNull(conversations.projectId)).all()
         : this.db.select().from(conversations).where(eq(conversations.projectId, projectId)).all();
     return rows
       .map((row) => this.toConversation(row))
@@ -333,11 +459,123 @@ export class HubRepos {
         updatedAt: now,
       })
       .run();
-    return { id, projectId, title, createdAt: iso(now), updatedAt: iso(now) };
+    return { id, projectId, title, tags: [], createdAt: iso(now), updatedAt: iso(now) };
   }
 
   removeConversation(id: string): void {
+    this.db.delete(conversationTags).where(eq(conversationTags.conversationId, id)).run();
     this.db.delete(conversations).where(eq(conversations.id, id)).run();
+  }
+
+  listConversationTagNames(conversationId: string): string[] {
+    const links = this.db
+      .select()
+      .from(conversationTags)
+      .where(eq(conversationTags.conversationId, conversationId))
+      .all();
+    const names: string[] = [];
+    for (const link of links) {
+      const tag = this.db.select().from(tags).where(eq(tags.id, link.tagId)).get();
+      if (tag) {
+        names.push(tag.name);
+      }
+    }
+    return names.sort((a, b) => a.localeCompare(b));
+  }
+
+  setConversationTags(conversationId: string, names: string[]): ConversationRecord {
+    const existing = this.getConversation(conversationId);
+    if (!existing) {
+      throw new Error("Conversation not found");
+    }
+    this.db.delete(conversationTags).where(eq(conversationTags.conversationId, conversationId)).run();
+    const unique: string[] = [];
+    for (const raw of names) {
+      const name = raw.trim();
+      if (name.length === 0 || unique.includes(name)) {
+        continue;
+      }
+      unique.push(name);
+      if (unique.length >= 20) {
+        break;
+      }
+    }
+    for (const name of unique) {
+      const tag = this.getOrCreateTag(name);
+      this.db.insert(conversationTags).values({ conversationId, tagId: tag.id }).run();
+    }
+    const updated = this.getConversation(conversationId);
+    if (!updated) {
+      throw new Error("Conversation not found");
+    }
+    return updated;
+  }
+
+  searchWorkspace(query: string, limit = 50): SearchHitRecord[] {
+    const tokens = searchTokens(query);
+    if (tokens.length === 0) {
+      return [];
+    }
+    const hits: SearchHitRecord[] = [];
+    const rows = this.db
+      .select()
+      .from(conversations)
+      .all()
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+    for (const row of rows) {
+      if (hits.length >= limit) {
+        break;
+      }
+      const title = decryptUtf8(row.titleCipher, this.masterKey);
+      const titleMatched = matchesAllTokens(title, tokens);
+      let messageMatched = false;
+      const messageRows = this.db
+        .select()
+        .from(messages)
+        .where(eq(messages.conversationId, row.id))
+        .all();
+      for (const message of messageRows) {
+        if (hits.length >= limit) {
+          break;
+        }
+        const content = decryptUtf8(message.contentCipher, this.masterKey);
+        if (!matchesAllTokens(content, tokens)) {
+          continue;
+        }
+        messageMatched = true;
+        hits.push(
+          toSearchHit({
+            conversationId: row.id,
+            projectId: row.projectId,
+            title,
+            messageId: message.id,
+            snippet: snippetAround(content, tokens[0] ?? ""),
+          }),
+        );
+      }
+      if (titleMatched && !messageMatched && hits.length < limit) {
+        hits.push(
+          toSearchHit({
+            conversationId: row.id,
+            projectId: row.projectId,
+            title,
+            messageId: null,
+            snippet: title,
+          }),
+        );
+      }
+    }
+    return hits;
+  }
+
+  private getOrCreateTag(name: string): { id: string; name: string } {
+    const existing = this.db.select().from(tags).where(eq(tags.name, name)).get();
+    if (existing) {
+      return existing;
+    }
+    const id = randomUUID();
+    this.db.insert(tags).values({ id, name }).run();
+    return { id, name };
   }
 
   listMessages(conversationId: string): MessageRecord[] {
