@@ -5,6 +5,7 @@ export const IpcChannel = {
   windowIsMaximized: "window:isMaximized",
   projectsList: "projects:list",
   projectsCreate: "projects:create",
+  projectsUpdate: "projects:update",
   projectsRemove: "projects:remove",
   conversationsList: "conversations:list",
   conversationsCreate: "conversations:create",
@@ -12,6 +13,8 @@ export const IpcChannel = {
   conversationsExport: "conversations:export",
   conversationsGetBranchLabels: "conversations:getBranchLabels",
   conversationsSetBranchLabel: "conversations:setBranchLabel",
+  conversationsSetTags: "conversations:setTags",
+  searchQuery: "search:query",
   messagesList: "messages:list",
   messagesCreate: "messages:create",
   messagesUpdate: "messages:update",
@@ -28,6 +31,7 @@ export const IpcChannel = {
   chatSend: "chat:send",
   chatAbort: "chat:abort",
   chatEvent: "chat:event",
+  chatPreviewPacket: "chat:previewPacket",
 } as const;
 
 export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
