@@ -14,6 +14,7 @@ export async function bootPersistence(): Promise<HubDatabase> {
   const masterKey = await loadOrCreateMasterKey(store);
   const dbPath = join(app.getPath("userData"), "ai-hub.sqlite");
   hub = openHubDatabase({ path: dbPath, masterKey, secretStore: store });
+  hub.repos.interruptOrphanStreams();
   return hub;
 }
 
