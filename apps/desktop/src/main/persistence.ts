@@ -15,6 +15,11 @@ async function seedE2eWorkspace(database: HubDatabase): Promise<void> {
     label: "e2e",
     secret: "sk-e2efixtureABCDEFGH",
   });
+  await database.repos.saveProviderKey({
+    providerSlug: "anthropic",
+    label: "e2e-claude",
+    secret: "sk-ant-e2efixtureABCDEFGH",
+  });
   database.repos.setWorkspaceSession({
     projectId: project.id,
     conversationId: conversation.id,
