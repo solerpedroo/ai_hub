@@ -19,6 +19,7 @@ import {
   messageDtoSchema,
   messageListInputSchema,
   messageListResultSchema,
+  messageUpdateInputSchema,
   projectCreateInputSchema,
   projectDtoSchema,
   projectListResultSchema,
@@ -27,6 +28,7 @@ import {
   providerListResultSchema,
   secretsSaveInputSchema,
   windowIsMaximizedResultSchema,
+  workspaceSessionSchema,
 } from "@ai-hub/shared";
 
 const empty = emptyIpcPayloadSchema.parse({});
@@ -115,6 +117,9 @@ const hub: HubApi = {
       invokeParsed(IpcChannel.messagesList, input, messageListInputSchema, messageListResultSchema),
     create: (input) =>
       invokeParsed(IpcChannel.messagesCreate, input, messageCreateInputSchema, messageDtoSchema),
+    update: (input) =>
+      invokeParsed(IpcChannel.messagesUpdate, input, messageUpdateInputSchema, messageDtoSchema),
+    deleteFrom: (input) => invokeAckWith(IpcChannel.messagesDeleteFrom, input, idInputSchema),
   },
   settings: {
     getAppearance: () =>
@@ -126,6 +131,14 @@ const hub: HubApi = {
       ),
     setAppearance: (input) =>
       invokeAckWith(IpcChannel.settingsSetAppearance, input, appearanceSettingsSchema),
+    getSession: () =>
+      invokeParsed(
+        IpcChannel.settingsGetSession,
+        empty,
+        emptyIpcPayloadSchema,
+        workspaceSessionSchema,
+      ),
+    setSession: (input) => invokeAckWith(IpcChannel.settingsSetSession, input, workspaceSessionSchema),
   },
   providers: {
     list: () => invokeParsed(IpcChannel.providersList, empty, emptyIpcPayloadSchema, providerListResultSchema),
