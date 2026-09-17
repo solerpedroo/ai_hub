@@ -191,6 +191,66 @@ describe("hub database", () => {
     hub.close();
   });
 
+  it("deletes a message and later siblings, keeping earlier ones", () => {
+    const { hub } = openTestDb();
+    const project = hub.repos.createProject("Linear");
+    const conversation = hub.repos.createConversation(project.id, "Thread");
+    const user = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "user",
+      content: "one",
+      parentId: null,
+      branchId: null,
+    });
+    const assistant = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "assistant",
+      content: "two",
+      parentId: user.id,
+      branchId: null,
+    });
+    const followUp = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "user",
+      content: "three",
+      parentId: assistant.id,
+      branchId: null,
+    });
+    hub.repos.createReceipt({
+      messageId: assistant.id,
+      provider: "openai",
+      model: "gpt-4o-mini",
+      tokensIn: 1,
+      tokensOut: 1,
+      latencyMs: 10,
+      costUsd: "0.000001",
+      errorCode: null,
+    });
+    hub.repos.deleteMessagesFrom(assistant.id);
+    const remaining = hub.repos.listMessages(conversation.id);
+    expect(remaining.map((item) => item.id)).toEqual([user.id]);
+    expect(hub.repos.getMessage(followUp.id)).toBeNull();
+    expect(hub.repos.getReceipt(assistant.id)).toBeNull();
+    hub.close();
+  });
+
+  it("round-trips workspace session without a provider key id", () => {
+    const { hub } = openTestDb();
+    const project = hub.repos.createProject("Session");
+    const conversation = hub.repos.createConversation(project.id, "Thread");
+    hub.repos.setWorkspaceSession({
+      projectId: project.id,
+      conversationId: conversation.id,
+      model: "gpt-4o",
+    });
+    expect(hub.repos.getWorkspaceSession()).toEqual({
+      projectId: project.id,
+      conversationId: conversation.id,
+      model: "gpt-4o",
+    });
+    hub.close();
+  });
+
   it("reads a provider secret from the store, not sqlite", async () => {
     const { hub } = openTestDb();
     const secret = "sk-testfixtureNEVERSQLITE9999";
