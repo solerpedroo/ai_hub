@@ -7,6 +7,8 @@ out/
 release/
 build/
 coverage/
+test-results/
+playwright-report/
 *.tsbuildinfo
 .eslintcache
 .cache/
