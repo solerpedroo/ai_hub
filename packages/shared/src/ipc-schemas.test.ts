@@ -4,6 +4,8 @@ import {
   conversationExportDocumentSchema,
   debugSnapshotSchema,
   emptyIpcPayloadSchema,
+  importReportSchema,
+  importStartInputSchema,
   ipcAckResultSchema,
   messageCreateInputSchema,
   messageDtoSchema,
@@ -261,6 +263,40 @@ describe("project and search contracts", () => {
     expect(searchHitSchema.parse(hit).snippet).toBe("needle");
     expect(() => searchHitSchema.parse({ ...hit, apiKey: "sk-testfixtureABCDEFGH" })).toThrow();
     expect(() => searchHitSchema.parse({ ...hit, snippet: "x".repeat(401) })).toThrow();
+  });
+});
+
+describe("import start payload", () => {
+  it("rejects a filesystem path piggybacked on start", () => {
+    expect(() =>
+      importStartInputSchema.parse({
+        ticket: "11111111-1111-4111-8111-111111111111",
+        source: "chatgpt",
+        projectId: null,
+        path: "C:\\\\secrets\\\\export.json",
+      }),
+    ).toThrow();
+  });
+
+  it("rejects conversation titles and vendor ids on import reports", () => {
+    expect(() =>
+      importReportSchema.parse({
+        ok: 0,
+        skipped: 0,
+        errors: [{ reason: "failed", title: "sk-live", externalId: "conv-1" }],
+        attachmentsSkipped: 0,
+        total: 1,
+      }),
+    ).toThrow();
+    expect(
+      importReportSchema.parse({
+        ok: 0,
+        skipped: 0,
+        errors: [{ reason: "empty" }],
+        attachmentsSkipped: 0,
+        total: 1,
+      }).errors,
+    ).toEqual([{ reason: "empty" }]);
   });
 });
 
