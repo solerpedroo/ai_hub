@@ -13,6 +13,7 @@ import type {
   ConversationTagsSetInput,
   ConversationExportResult,
   ConversationListInput,
+  ConversationMoveInput,
   IdInput,
   MessageCreateInput,
   MessageDto,
@@ -35,6 +36,11 @@ import type {
   AppPrefs,
   AppPrefsPatch,
   UpdateCheckResult,
+  ImportCancelInput,
+  ImportEvent,
+  ImportPickResult,
+  ImportStartInput,
+  ImportStartResult,
   ProviderKeyDto,
   SecretsSaveInput,
   SecretsTestInput,
@@ -64,6 +70,7 @@ export interface HubConversationsApi {
   getBranchLabels: (input: BranchLabelsGetInput) => Promise<BranchLabels>;
   setBranchLabel: (input: BranchLabelSetInput) => Promise<void>;
   setTags: (input: ConversationTagsSetInput) => Promise<ConversationDto>;
+  move: (input: ConversationMoveInput) => Promise<ConversationDto>;
 }
 
 export interface HubMessagesApi {
@@ -121,6 +128,13 @@ export interface HubDebugApi {
   getLatest: () => Promise<DebugSnapshot | null>;
 }
 
+export interface HubImportApi {
+  pickFile: () => Promise<ImportPickResult>;
+  start: (input: ImportStartInput) => Promise<ImportStartResult>;
+  cancel: (input: ImportCancelInput) => Promise<void>;
+  onEvent: (listener: (event: ImportEvent) => void) => () => void;
+}
+
 export interface HubChatApi {
   send: (input: ChatSendInput) => Promise<ChatSendResult>;
   abort: (input: ChatAbortInput) => Promise<void>;
@@ -145,6 +159,7 @@ export interface HubApi {
   costs: HubCostsApi;
   debug: HubDebugApi;
   chat: HubChatApi;
+  import: HubImportApi;
 }
 
 export type { AppLocale, ThemeMode };
