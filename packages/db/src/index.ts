@@ -18,5 +18,6 @@ export {
   type SpendCapRecord,
   type SpendCapOverrideRecord,
   type WorkspaceSessionRecord,
+  type AppPrefsRecord,
 } from "./repos";
 export { schema } from "./schema";
