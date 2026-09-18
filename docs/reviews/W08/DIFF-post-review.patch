@@ -1,0 +1,1832 @@
+diff --git a/README.md b/README.md
+index c5f4c59..b4ca634 100644
+--- a/README.md
++++ b/README.md
+@@ -18,11 +18,22 @@ Outros scripts na raiz:
+ - `pnpm typecheck` — TypeScript em `apps/desktop` e `packages/*`
+ - `pnpm lint` — ESLint
+ - `pnpm test` — Vitest (sem chaves reais)
+-- `pnpm build` — bundle Electron (sem instalador; isso é Wave 8)
++- `pnpm build` — bundle Electron
++- `pnpm --filter @ai-hub/desktop dist` — instalador NSIS em `apps/desktop/release/`
+ 
+ Após o install, `pnpm dev` recompila nativos para o Electron. `pnpm test` no pacote `db` restaura o ABI do Node se o binário estiver no ABI do Electron.
+ 
+-A janela é frameless. Projetos e conversas ficam no SQLite local (campos sensíveis em envelope AES-GCM). Tema/idioma persistem em `settings`. Chaves de API vão para o Credential Manager. `Ctrl+K` abre um command palette de chrome (tema).
++A janela é frameless. Projetos e conversas ficam no SQLite local (campos sensíveis em envelope AES-GCM). Tema/idioma persistem em `settings`. Chaves de API vão para o Credential Manager. `Ctrl+K` abre um command palette de chrome (tema). First-run: idioma → um provider (OpenRouter em destaque) → teste → composer.
++
++## Limitações do MVP
++
++- Windows first. **Sem build macOS assinado.**
++- Sem RAG, MCP, agentes, import Hub, packet portátil completo, artifacts, skills, @-mentions, sync ou team.
++- Auto-update consulta GitHub Releases; feed vazio/fora **não** fecha o app.
++- Crash dumps são **opt-in** e só locais (sem upload, sem conversa).
++- e2e de CI usa adapter mock (`AI_HUB_E2E=1`), não chaves reais.
++
++UAT: [`docs/UAT-MVP.md`](docs/UAT-MVP.md).
+ 
+ ## Docs
+ 
+@@ -31,6 +42,7 @@ A janela é frameless. Projetos e conversas ficam no SQLite local (campos sensí
+ | [Escopo](docs/AI_Hub_Desktop_Escopo.md) | Produto |
+ | [Implementation plan](docs/IMPLEMENTATION_PLAN.md) | Ondas, DoD, diferenciais |
+ | [STATUS](docs/STATUS.md) | Onde a implementação está agora |
++| [UAT MVP](docs/UAT-MVP.md) | Checklist da Wave 8 |
+ | [ADRs](docs/ADR/README.md) | Decisões (`ADR-WXX-NNN-…`) |
+ | [Reviews](docs/reviews/README.md) | Close gate por onda |
+ 
+diff --git a/apps/desktop/e2e/onboarding.spec.ts b/apps/desktop/e2e/onboarding.spec.ts
+new file mode 100644
+index 0000000..8aa1515
+--- /dev/null
++++ b/apps/desktop/e2e/onboarding.spec.ts
+@@ -0,0 +1,47 @@
++import { createRequire } from "node:module";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { _electron as electron, expect, test, type ElectronApplication } from "@playwright/test";
++
++const require = createRequire(import.meta.url);
++const electronBinary = require("electron") as string;
++const appRoot = path.join(fileURLToPath(new URL("..", import.meta.url)));
++
++async function launchEmptyHub(): Promise<ElectronApplication> {
++  return electron.launch({
++    executablePath: electronBinary,
++    args: [path.join(appRoot, "out/main/index.js")],
++    cwd: appRoot,
++    env: {
++      ...process.env,
++      AI_HUB_E2E: "1",
++      AI_HUB_E2E_EMPTY: "1",
++      NODE_ENV: "production",
++    },
++  });
++}
++
++test("first-run wizard reaches a mocked first answer", async () => {
++  const app = await launchEmptyHub();
++  const started = Date.now();
++  try {
++    const window = await app.firstWindow();
++    await window.getByTestId("onboarding").waitFor({ state: "visible", timeout: 30_000 });
++    await window.getByTestId("onboarding-locale-en").click();
++    await window.getByTestId("onboarding-locale-next").click();
++    await window.getByTestId("onboarding-provider").selectOption("openrouter");
++    await window.getByTestId("onboarding-secret").fill("sk-e2ewizardABCDEFGH");
++    await window.getByTestId("onboarding-save-test").click();
++    await expect(window.getByTestId("onboarding-test-ok")).toBeVisible({ timeout: 15_000 });
++    await window.getByTestId("onboarding-finish").click();
++    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
++    await window.getByTestId("chat-composer").fill("Hello");
++    await window.getByTestId("chat-send").click();
++    await expect(window.getByTestId("message-assistant")).toContainText("Hello from mock", {
++      timeout: 30_000,
++    });
++    expect(Date.now() - started).toBeLessThan(90_000);
++  } finally {
++    await app.close();
++  }
++});
+diff --git a/apps/desktop/e2e/send.spec.ts b/apps/desktop/e2e/send.spec.ts
+index c929172..f5b30a0 100644
+--- a/apps/desktop/e2e/send.spec.ts
++++ b/apps/desktop/e2e/send.spec.ts
+@@ -84,6 +84,8 @@ test("settings lists OpenRouter as a first-class provider", async () => {
+     await expect(window.getByTestId("secrets-provider")).toBeVisible();
+     await expect(window.getByTestId("secrets-provider")).toContainText("OpenRouter");
+     await expect(window.getByTestId("secrets-test").first()).toBeVisible();
++    await window.getByTestId("updates-check").click();
++    await expect(window.getByTestId("updates-status")).toHaveAttribute("data-status", "skipped");
+   } finally {
+     await app.close();
+   }
+@@ -202,3 +204,18 @@ test("assistant receipt opens a detail dialog without treating abort as failure"
+     await app.close();
+   }
+ });
++
++test("composer warns when the draft looks like an API key", async () => {
++  const app = await launchHub();
++  try {
++    const window = await app.firstWindow();
++    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
++    await window.getByTestId("chat-composer").fill("sk-testfixtureABCDEFGH leftover");
++    await expect(window.getByTestId("composer-secret-warning")).toBeVisible();
++    await window.getByTestId("composer-secret-redact").click();
++    await expect(window.getByTestId("composer-secret-warning")).toHaveCount(0);
++    await expect(window.getByTestId("chat-composer")).toHaveValue("[REDACTED] leftover");
++  } finally {
++    await app.close();
++  }
++});
+diff --git a/apps/desktop/electron-builder.yml b/apps/desktop/electron-builder.yml
+new file mode 100644
+index 0000000..d29ea95
+--- /dev/null
++++ b/apps/desktop/electron-builder.yml
+@@ -0,0 +1,31 @@
++appId: com.aihub.desktop
++productName: AI Hub
++copyright: Copyright © AI Hub
++directories:
++  output: release
++  buildResources: resources
++files:
++  - out/**/*
++  - package.json
++asar: true
++asarUnpack:
++  - "**/{better-sqlite3,keytar}/**/*"
++win:
++  icon: resources/icon.png
++  target:
++    - target: nsis
++      arch:
++        - x64
++nsis:
++  oneClick: false
++  allowToChangeInstallationDirectory: true
++  shortcutName: AI Hub
++  uninstallDisplayName: AI Hub
++  artifactName: AI-Hub-Setup-${version}.${ext}
++publish:
++  provider: github
++  owner: solerpedroo
++  repo: ai_hub
++electronLanguages:
++  - en-US
++  - pt-BR
+diff --git a/apps/desktop/package.json b/apps/desktop/package.json
+index 7058af4..e55ce45 100644
+--- a/apps/desktop/package.json
++++ b/apps/desktop/package.json
+@@ -1,12 +1,16 @@
+ {
+   "name": "@ai-hub/desktop",
+-  "version": "0.0.0",
++  "version": "0.1.0",
+   "private": true,
++  "description": "AI Hub Desktop — local-first BYOK control layer for AI providers",
++  "author": "AI Hub",
+   "type": "module",
+   "main": "out/main/index.js",
+   "scripts": {
+     "dev": "electron-rebuild -f -w better-sqlite3 -w keytar && electron-vite dev",
+     "build": "electron-vite build",
++    "dist": "electron-vite build && electron-builder --win nsis",
++    "dist:dir": "electron-vite build && electron-builder --win nsis --dir",
+     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+     "lint": "eslint src --max-warnings 0",
+     "rebuild:native": "electron-rebuild -f -w better-sqlite3 -w keytar",
+@@ -27,6 +31,7 @@
+     "clsx": "^2.1.1",
+     "cmdk": "^1.1.1",
+     "drizzle-orm": "^0.44.5",
++    "electron-updater": "^6.8.9",
+     "highlight.js": "^11.12.0",
+     "i18next": "^25.4.2",
+     "keytar": "^7.9.0",
+@@ -52,6 +57,7 @@
+     "@vitejs/plugin-react": "^5.0.2",
+     "autoprefixer": "^10.4.21",
+     "electron": "^37.3.1",
++    "electron-builder": "^26.15.3",
+     "electron-vite": "^4.0.0",
+     "postcss": "^8.5.6",
+     "tailwindcss": "^3.4.17",
+diff --git a/apps/desktop/resources/icon.png b/apps/desktop/resources/icon.png
+new file mode 100644
+index 0000000..f689cef
+Binary files /dev/null and b/apps/desktop/resources/icon.png differ
+diff --git a/apps/desktop/src/main/crash-reporter.ts b/apps/desktop/src/main/crash-reporter.ts
+new file mode 100644
+index 0000000..6ebf11a
+--- /dev/null
++++ b/apps/desktop/src/main/crash-reporter.ts
+@@ -0,0 +1,21 @@
++import { app, crashReporter } from "electron";
++
++let started = false;
++
++export function applyCrashReporterOptIn(optIn: boolean): void {
++  if (!optIn || started) {
++    return;
++  }
++  crashReporter.start({
++    productName: "AI Hub",
++    companyName: "AI Hub",
++    submitURL: "https://127.0.0.1/crash-disabled",
++    uploadToServer: false,
++    compress: true,
++    extra: {
++      version: app.getVersion(),
++      platform: process.platform,
++    },
++  });
++  started = true;
++}
+diff --git a/apps/desktop/src/main/index.ts b/apps/desktop/src/main/index.ts
+index d3a9ba0..2836a6d 100644
+--- a/apps/desktop/src/main/index.ts
++++ b/apps/desktop/src/main/index.ts
+@@ -5,8 +5,10 @@ import { BrowserWindow, app, dialog, session, shell } from "electron";
+ import { electronApp, is, optimizer } from "@electron-toolkit/utils";
+ import { safeErrorMessage } from "@ai-hub/security";
+ import { registerWindowIpc, registerWorkspaceIpc } from "./ipc";
+-import { bootPersistence } from "./persistence";
++import { applyCrashReporterOptIn } from "./crash-reporter";
++import { bootPersistence, getHubDatabase } from "./persistence";
+ import { isE2eMode } from "./e2e-mode";
++import { checkForAppUpdates } from "./updater";
+ 
+ if (isE2eMode()) {
+   app.setPath("userData", mkdtempSync(join(tmpdir(), "ai-hub-e2e-")));
+@@ -157,6 +159,17 @@ app.whenReady().then(async () => {
+     return;
+   }
+   registerWorkspaceIpc();
++  applyCrashReporterOptIn(getHubDatabase().repos.getAppPrefs().crashReporterOptIn);
++  void checkForAppUpdates()
++    .then((result) => {
++      getHubDatabase().repos.setAppPrefs({
++        lastUpdateCheckAt: new Date().toISOString(),
++        lastUpdateStatus: result.status,
++      });
++    })
++    .catch(() => {
++      // Feed down or unpackaged: never block boot.
++    });
+ 
+   app.on("browser-window-created", (_event, window) => {
+     optimizer.watchWindowShortcuts(window);
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index 64f0ed5..234a059 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -21,6 +21,9 @@ import {
+   debugSnapshotResultSchema,
+   emptyIpcPayloadSchema,
+   healthSummaryListSchema,
++  appPrefsSchema,
++  appPrefsPatchSchema,
++  updateCheckResultSchema,
+   idInputSchema,
+   ipcAckResultSchema,
+   messageCreateInputSchema,
+@@ -52,12 +55,14 @@ import {
+ import { safeErrorMessage } from "@ai-hub/security";
+ import { abortChat, sendChat } from "./chat-session";
+ import { exportConversation } from "./conversation-export";
++import { applyCrashReporterOptIn } from "./crash-reporter";
+ import { getLatestDebugSnapshot } from "./debug-snapshot";
+ import { toMessageDto } from "./message-dto";
+ import { previewPacket } from "./packet-preview";
+ import { getHubDatabase } from "./persistence";
+ import { testProviderKey } from "./provider-health";
+ import { localDayStartMs } from "./spend-guard";
++import { checkForAppUpdates } from "./updater";
+ 
+ function registerHandler<TIn, TOut>(
+   channel: string,
+@@ -349,6 +354,25 @@ export function registerWorkspaceIpc(): void {
+   registerHandler(IpcChannel.debugGetLatest, emptyIpcPayloadSchema, debugSnapshotResultSchema, () =>
+     getLatestDebugSnapshot(),
+   );
++
++  registerHandler(IpcChannel.prefsGet, emptyIpcPayloadSchema, appPrefsSchema, () =>
++    appPrefsSchema.parse(getHubDatabase().repos.getAppPrefs()),
++  );
++
++  registerHandler(IpcChannel.prefsSet, appPrefsPatchSchema, appPrefsSchema, (input) => {
++    const next = appPrefsSchema.parse(getHubDatabase().repos.setAppPrefs(input));
++    applyCrashReporterOptIn(next.crashReporterOptIn);
++    return next;
++  });
++
++  registerHandler(IpcChannel.updatesCheck, emptyIpcPayloadSchema, updateCheckResultSchema, async () => {
++    const result = await checkForAppUpdates();
++    getHubDatabase().repos.setAppPrefs({
++      lastUpdateCheckAt: new Date().toISOString(),
++      lastUpdateStatus: result.status,
++    });
++    return result;
++  });
+ }
+ 
+ export function registerWindowIpc(
+diff --git a/apps/desktop/src/main/persistence.ts b/apps/desktop/src/main/persistence.ts
+index ed3c05a..6791aa5 100644
+--- a/apps/desktop/src/main/persistence.ts
++++ b/apps/desktop/src/main/persistence.ts
+@@ -38,7 +38,7 @@ export async function bootPersistence(): Promise<HubDatabase> {
+   const masterKey = await loadOrCreateMasterKey(store);
+   const dbPath = join(app.getPath("userData"), "ai-hub.sqlite");
+   hub = openHubDatabase({ path: dbPath, masterKey, secretStore: store });
+-  if (isE2eMode()) {
++  if (isE2eMode() && process.env.AI_HUB_E2E_EMPTY !== "1") {
+     await seedE2eWorkspace(hub);
+   }
+   hub.repos.interruptOrphanStreams();
+diff --git a/apps/desktop/src/main/updater.ts b/apps/desktop/src/main/updater.ts
+new file mode 100644
+index 0000000..8236e13
+--- /dev/null
++++ b/apps/desktop/src/main/updater.ts
+@@ -0,0 +1,32 @@
++import { app } from "electron";
++import { resolveUpdateCheckResult, type UpdateCheckResult } from "@ai-hub/shared";
++
++export async function checkForAppUpdates(): Promise<UpdateCheckResult> {
++  if (!app.isPackaged) {
++    return resolveUpdateCheckResult({
++      packaged: false,
++      currentVersion: app.getVersion(),
++      failed: false,
++      remoteVersion: null,
++    });
++  }
++  try {
++    const { autoUpdater } = await import("electron-updater");
++    autoUpdater.autoDownload = false;
++    autoUpdater.autoInstallOnAppQuit = false;
++    const result = await autoUpdater.checkForUpdates();
++    return resolveUpdateCheckResult({
++      packaged: true,
++      currentVersion: app.getVersion(),
++      failed: false,
++      remoteVersion: result?.updateInfo.version ?? null,
++    });
++  } catch {
++    return resolveUpdateCheckResult({
++      packaged: true,
++      currentVersion: app.getVersion(),
++      failed: true,
++      remoteVersion: null,
++    });
++  }
++}
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index 41bcb33..f5f166f 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -23,6 +23,9 @@ import {
+   debugSnapshotResultSchema,
+   emptyIpcPayloadSchema,
+   healthSummaryListSchema,
++  appPrefsSchema,
++  appPrefsPatchSchema,
++  updateCheckResultSchema,
+   idInputSchema,
+   ipcAckResultSchema,
+   messageCreateInputSchema,
+@@ -184,6 +187,13 @@ const hub: HubApi = {
+       ),
+     setSession: (input) => invokeAckWith(IpcChannel.settingsSetSession, input, workspaceSessionSchema),
+   },
++  prefs: {
++    get: () => invokeParsed(IpcChannel.prefsGet, empty, emptyIpcPayloadSchema, appPrefsSchema),
++    set: (input) => invokeParsed(IpcChannel.prefsSet, input, appPrefsPatchSchema, appPrefsSchema),
++  },
++  updates: {
++    check: () => invokeParsed(IpcChannel.updatesCheck, empty, emptyIpcPayloadSchema, updateCheckResultSchema),
++  },
+   providers: {
+     list: () => invokeParsed(IpcChannel.providersList, empty, emptyIpcPayloadSchema, providerListResultSchema),
+   },
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index 7bcc83f..d773f19 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -20,7 +20,9 @@ import {
+   catalogModelsForProvider,
+   classifyHubIpcError,
+   findCatalogModel,
++  shouldShowOnboarding,
+   upsertActivated,
++  WIZARD_TTFT_BUDGET_MS,
+ } from "@ai-hub/shared";
+ import { TitleBar } from "@/components/layout/title-bar";
+ import { Sidebar } from "@/components/layout/sidebar";
+@@ -28,6 +30,7 @@ import { StatusBar } from "@/components/layout/status-bar";
+ import { HomeView } from "@/components/layout/home-view";
+ import { SettingsView } from "@/components/layout/settings-view";
+ import { DebugView } from "@/components/layout/debug-view";
++import { OnboardingView } from "@/components/layout/onboarding-view";
+ import { ChromeCommandPalette } from "@/components/layout/command-palette";
+ import type { AppView } from "@/components/layout/types";
+ import { Button } from "@/components/ui/button";
+@@ -91,6 +94,7 @@ export function App(): JSX.Element {
+   const [sending, setSending] = useState(false);
+   const [activating, setActivating] = useState(false);
+   const [sessionReady, setSessionReady] = useState(false);
++  const [showOnboarding, setShowOnboarding] = useState<boolean | null>(null);
+   const [error, setError] = useState<string | null>(null);
+   const [branchLabels, setBranchLabels] = useState<BranchLabels>({});
+   const [exportNotice, setExportNotice] = useState<string | null>(null);
+@@ -117,6 +121,7 @@ export function App(): JSX.Element {
+   const selectedModelRef = useRef(selectedModel);
+   const searchGeneration = useRef(0);
+   const lastSendRef = useRef<ChatSendInput | null>(null);
++  const wizardStartedAt = useRef<number | null>(null);
+ 
+   const reportComposerDraft = useCallback((value: string): void => {
+     setComposerDraft(value);
+@@ -163,10 +168,11 @@ export function App(): JSX.Element {
+   useEffect(() => {
+     void (async () => {
+       try {
+-        const [projectList, keys, session] = await Promise.all([
++        const [projectList, keys, session, prefs] = await Promise.all([
+           loadProjects(),
+           loadKeys(),
+           window.hub.settings.getSession(),
++          window.hub.prefs.get(),
+         ]);
+         const matchingKey =
+           keys.find(
+@@ -191,6 +197,14 @@ export function App(): JSX.Element {
+         if (session.extraSystem !== undefined) {
+           setExtraSystem(session.extraSystem);
+         }
++        const showWizard = shouldShowOnboarding({
++          hasProviderKey: keys.length > 0,
++          onboardingComplete: prefs.onboardingComplete,
++        });
++        setShowOnboarding(showWizard);
++        if (showWizard) {
++          wizardStartedAt.current = Date.now();
++        }
+         if (session.projectId) {
+           const project = projectList.find((item) => item.id === session.projectId) ?? null;
+           if (!project) {
+@@ -226,6 +240,7 @@ export function App(): JSX.Element {
+         setSessionReady(true);
+       } catch {
+         fail();
++        setShowOnboarding(false);
+         setSessionReady(true);
+       }
+     })();
+@@ -367,6 +382,18 @@ export function App(): JSX.Element {
+   useEffect(() => {
+     const off = window.hub.chat.onEvent((event) => {
+       if (event.type === "chunk") {
++        if (wizardStartedAt.current !== null) {
++          const elapsed = Date.now() - wizardStartedAt.current;
++          wizardStartedAt.current = null;
++          void window.hub.prefs.set({ lastWizardTtftMs: elapsed }).catch(() => {
++            // Prefs are best-effort telemetry for the 90s budget.
++          });
++          if (elapsed > WIZARD_TTFT_BUDGET_MS) {
++            console.warn("[hub:wizard-ttft]", elapsed);
++          } else {
++            console.info("[hub:wizard-ttft]", elapsed);
++          }
++        }
+         setMessages((current) =>
+           current.map((message) =>
+             message.id === event.messageId
+@@ -526,6 +553,38 @@ export function App(): JSX.Element {
+     return () => window.removeEventListener("keydown", onKey);
+   }, [createUntitledChat]);
+ 
++  if (showOnboarding === null) {
++    return (
++      <div className="flex h-full flex-col overflow-hidden">
++        <TitleBar />
++      </div>
++    );
++  }
++
++  if (showOnboarding) {
++    return (
++      <div className="flex h-full flex-col overflow-hidden">
++        <TitleBar />
++        <OnboardingView
++          onComplete={(key) => {
++            const models = catalogModelsForProvider(key.providerSlug);
++            const nextModel = models[0]?.id ?? selectedModel;
++            setSelectedKeyId(key.id);
++            setSelectedModel(nextModel);
++            void window.hub.prefs
++              .set({ onboardingComplete: true })
++              .then(async () => {
++                await loadKeys();
++                setShowOnboarding(false);
++                await createUntitledChat();
++              })
++              .catch(fail);
++          }}
++        />
++      </div>
++    );
++  }
++
+   return (
+     <div className="flex h-full flex-col overflow-hidden">
+       <TitleBar />
+diff --git a/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx b/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
+index 30f01f8..f2e8458 100644
+--- a/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
++++ b/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
+@@ -1,5 +1,6 @@
+ import { type FormEvent, type JSX, type KeyboardEvent, useEffect, useRef } from "react";
+ import { useTranslation } from "react-i18next";
++import { looksLikePastedSecret, redactPastedSecrets } from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
+ 
+ export function ChatComposer({
+@@ -22,6 +23,7 @@ export function ChatComposer({
+   const { t } = useTranslation();
+   const areaRef = useRef<HTMLTextAreaElement>(null);
+   const busy = streaming || sending;
++  const secretWarning = looksLikePastedSecret(value);
+ 
+   useEffect(() => {
+     areaRef.current?.focus();
+@@ -69,7 +71,21 @@ export function ChatComposer({
+         }}
+       />
+       <div className="flex items-center justify-between gap-2">
+-        <p className="text-[11px] text-muted-foreground">{t("workspace.composer.hint")}</p>
++        {secretWarning ? (
++          <p className="text-[11px] text-destructive" role="status" data-testid="composer-secret-warning">
++            {t("workspace.composer.secretWarning")}{" "}
++            <button
++              type="button"
++              className="underline"
++              data-testid="composer-secret-redact"
++              onClick={() => onChange(redactPastedSecrets(value))}
++            >
++              {t("workspace.composer.secretRedact")}
++            </button>
++          </p>
++        ) : (
++          <p className="text-[11px] text-muted-foreground">{t("workspace.composer.hint")}</p>
++        )}
+         {streaming ? (
+           <Button
+             type="button"
+diff --git a/apps/desktop/src/renderer/src/components/layout/onboarding-view.tsx b/apps/desktop/src/renderer/src/components/layout/onboarding-view.tsx
+new file mode 100644
+index 0000000..78ab5b0
+--- /dev/null
++++ b/apps/desktop/src/renderer/src/components/layout/onboarding-view.tsx
+@@ -0,0 +1,187 @@
++import { type FormEvent, type JSX, useEffect, useState } from "react";
++import { useTranslation } from "react-i18next";
++import type { AppLocale, ProviderDto, ProviderKeyDto, SecretsTestResult } from "@ai-hub/shared";
++import { sortProvidersForWizard } from "@ai-hub/shared";
++import { Button } from "@/components/ui/button";
++import { Input } from "@/components/ui/input";
++import { persistLocale } from "@/lib/i18n";
++
++export function OnboardingView({
++  onComplete,
++}: {
++  onComplete: (key: ProviderKeyDto) => void;
++}): JSX.Element {
++  const { t, i18n } = useTranslation();
++  const [step, setStep] = useState<"locale" | "provider">("locale");
++  const [providers, setProviders] = useState<ProviderDto[]>([]);
++  const [providerSlug, setProviderSlug] = useState("openrouter");
++  const [secret, setSecret] = useState("");
++  const [baseUrl, setBaseUrl] = useState("http://127.0.0.1:11434/v1");
++  const [savedKey, setSavedKey] = useState<ProviderKeyDto | null>(null);
++  const [testResult, setTestResult] = useState<SecretsTestResult | null>(null);
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  useEffect(() => {
++    let cancelled = false;
++    void window.hub.providers
++      .list()
++      .then((list) => {
++        if (cancelled) {
++          return;
++        }
++        const ordered = sortProvidersForWizard(list);
++        setProviders(ordered);
++        const featured = ordered.find((item) => item.slug === "openrouter") ?? ordered[0];
++        if (featured) {
++          setProviderSlug(featured.slug);
++        }
++      })
++      .catch(() => {
++        if (!cancelled) {
++          setError(t("workspace.error.generic"));
++        }
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, [t]);
++
++  const onSaveAndTest = (event: FormEvent): void => {
++    event.preventDefault();
++    const value = secret.trim();
++    if (value.length === 0) {
++      return;
++    }
++    setBusy(true);
++    setError(null);
++    const payload =
++      providerSlug === "custom"
++        ? { providerSlug, label: "default", secret: value, baseUrl }
++        : { providerSlug, label: "default", secret: value };
++    void window.hub.secrets
++      .save(payload)
++      .then((key) => {
++        setSecret("");
++        setSavedKey(key);
++        return window.hub.secrets.test({ id: key.id }).then((result) => {
++          setTestResult(result);
++          if (!result.ok) {
++            setError(t("secrets.testFail", { code: result.errorCode ?? "unknown", ms: result.latencyMs }));
++          }
++          return key;
++        });
++      })
++      .catch(() => setError(t("secrets.error.save")))
++      .finally(() => setBusy(false));
++  };
++
++  return (
++    <div className="mx-auto flex w-full max-w-lg flex-col gap-6 p-8" data-testid="onboarding">
++      <div>
++        <h1 className="text-base font-semibold">{t("onboarding.title")}</h1>
++        <p className="mt-1 text-muted-foreground">{t("onboarding.hint")}</p>
++      </div>
++      {step === "locale" ? (
++        <section className="flex flex-col gap-3">
++          <p className="text-[12px] font-medium">{t("locale.label")}</p>
++          <div className="flex gap-2">
++            <Button
++              type="button"
++              variant={i18n.language === "pt-BR" ? "default" : "outline"}
++              data-testid="onboarding-locale-pt"
++              onClick={() => persistLocale("pt-BR" satisfies AppLocale)}
++            >
++              {t("locale.ptBR")}
++            </Button>
++            <Button
++              type="button"
++              variant={i18n.language.startsWith("en") ? "default" : "outline"}
++              data-testid="onboarding-locale-en"
++              onClick={() => persistLocale("en")}
++            >
++              {t("locale.en")}
++            </Button>
++          </div>
++          <Button type="button" data-testid="onboarding-locale-next" onClick={() => setStep("provider")}>
++            {t("onboarding.next")}
++          </Button>
++        </section>
++      ) : (
++        <section className="flex flex-col gap-3">
++          <p className="text-[12px] font-medium">{t("onboarding.provider")}</p>
++          <p className="text-muted-foreground">{t("onboarding.providerHint")}</p>
++          <form className="flex flex-col gap-2" onSubmit={onSaveAndTest}>
++            <label className="flex flex-col gap-1 text-[12px]">
++              {t("secrets.provider")}
++              <select
++                className="h-8 rounded-md border border-input bg-background px-2 text-[13px]"
++                value={providerSlug}
++                onChange={(event) => {
++                  setProviderSlug(event.target.value);
++                  setSavedKey(null);
++                  setTestResult(null);
++                }}
++                data-testid="onboarding-provider"
++                aria-label={t("secrets.provider")}
++              >
++                {providers.map((provider) => (
++                  <option key={provider.id} value={provider.slug}>
++                    {provider.slug === "openrouter"
++                      ? t("onboarding.openrouter", { name: provider.name })
++                      : provider.name}
++                  </option>
++                ))}
++              </select>
++            </label>
++            {providerSlug === "custom" ? (
++              <label className="flex flex-col gap-1 text-[12px]">
++                {t("secrets.baseUrl")}
++                <Input
++                  value={baseUrl}
++                  onChange={(event) => setBaseUrl(event.target.value)}
++                  autoComplete="off"
++                />
++              </label>
++            ) : null}
++            <label className="flex flex-col gap-1 text-[12px]">
++              {t("secrets.secret")}
++              <Input
++                type="password"
++                autoComplete="off"
++                value={secret}
++                onChange={(event) => setSecret(event.target.value)}
++                data-testid="onboarding-secret"
++              />
++            </label>
++            <Button type="submit" disabled={busy || secret.trim().length === 0} data-testid="onboarding-save-test">
++              {busy ? t("secrets.testing") : t("onboarding.saveTest")}
++            </Button>
++          </form>
++          {testResult?.ok ? (
++            <p className="text-[12px] text-muted-foreground" role="status" data-testid="onboarding-test-ok">
++              {t("secrets.testOk", { ms: testResult.latencyMs })}
++            </p>
++          ) : null}
++          <Button
++            type="button"
++            data-testid="onboarding-finish"
++            disabled={!savedKey || testResult?.ok !== true}
++            onClick={() => {
++              if (savedKey) {
++                onComplete(savedKey);
++              }
++            }}
++          >
++            {t("onboarding.ask")}
++          </Button>
++        </section>
++      )}
++      {error ? (
++        <p className="text-destructive" role="alert">
++          {error}
++        </p>
++      ) : null}
++    </div>
++  );
++}
+diff --git a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+index 8389f16..073ccf2 100644
+--- a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+@@ -1,6 +1,15 @@
+ import { type FormEvent, type JSX, useEffect, useState } from "react";
+ import { useTranslation } from "react-i18next";
+-import type { AppLocale, ProviderDto, ProviderKeyDto, SecretsTestResult, SpendCapDto, ThemeMode } from "@ai-hub/shared";
++import type {
++  AppLocale,
++  AppPrefs,
++  ProviderDto,
++  ProviderKeyDto,
++  SecretsTestResult,
++  SpendCapDto,
++  ThemeMode,
++  UpdateCheckResult,
++} from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import { persistLocale } from "@/lib/i18n";
+@@ -24,6 +33,9 @@ export function SettingsView(): JSX.Element {
+     global: "",
+   });
+   const [capsNotice, setCapsNotice] = useState<string | null>(null);
++  const [prefs, setPrefs] = useState<AppPrefs | null>(null);
++  const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
++  const [checkingUpdate, setCheckingUpdate] = useState(false);
+ 
+   const reloadKeys = (): void => {
+     void window.hub.secrets
+@@ -82,6 +94,18 @@ export function SettingsView(): JSX.Element {
+           setError(t("workspace.error.generic"));
+         }
+       });
++    void window.hub.prefs
++      .get()
++      .then((next) => {
++        if (!cancelled) {
++          setPrefs(next);
++        }
++      })
++      .catch(() => {
++        if (!cancelled) {
++          setError(t("workspace.error.generic"));
++        }
++      });
+     return () => {
+       cancelled = true;
+     };
+@@ -314,6 +338,69 @@ export function SettingsView(): JSX.Element {
+           </p>
+         ) : null}
+       </section>
++      <section className="flex flex-col gap-2">
++        <h2 className="text-[12px] font-medium">{t("privacy.title")}</h2>
++        <p className="text-muted-foreground">{t("privacy.hint")}</p>
++        <label className="flex items-center gap-2 text-[13px]">
++          <input
++            type="checkbox"
++            data-testid="crash-reporter-opt-in"
++            checked={prefs?.crashReporterOptIn === true}
++            onChange={(event) => {
++              const optIn = event.target.checked;
++              void window.hub.prefs
++                .set({ crashReporterOptIn: optIn })
++                .then(setPrefs)
++                .catch(() => setError(t("workspace.error.generic")));
++            }}
++          />
++          {t("privacy.crashOptIn")}
++        </label>
++        <p className="text-[11px] text-muted-foreground">{t("privacy.crashDetail")}</p>
++      </section>
++      <section className="flex flex-col gap-2">
++        <h2 className="text-[12px] font-medium">{t("updates.title")}</h2>
++        <p className="text-muted-foreground">{t("updates.hint")}</p>
++        <Button
++          type="button"
++          variant="outline"
++          data-testid="updates-check"
++          disabled={checkingUpdate}
++          onClick={() => {
++            setCheckingUpdate(true);
++            void window.hub.updates
++              .check()
++              .then((result) => {
++                setUpdateResult(result);
++                return window.hub.prefs.get();
++              })
++              .then(setPrefs)
++              .catch(() => setError(t("workspace.error.generic")))
++              .finally(() => setCheckingUpdate(false));
++          }}
++        >
++          {checkingUpdate ? t("updates.checking") : t("updates.check")}
++        </Button>
++        {updateResult ? (
++          <p
++            className="text-[11px] text-muted-foreground"
++            role="status"
++            data-testid="updates-status"
++            data-status={updateResult.status}
++          >
++            {t(`updates.status.${updateResult.status}`, { version: updateResult.version ?? "—" })}
++          </p>
++        ) : prefs?.lastUpdateStatus && prefs.lastUpdateStatus !== "idle" ? (
++          <p
++            className="text-[11px] text-muted-foreground"
++            role="status"
++            data-testid="updates-status"
++            data-status={prefs.lastUpdateStatus}
++          >
++            {t(`updates.status.${prefs.lastUpdateStatus}`, { version: "—" })}
++          </p>
++        ) : null}
++      </section>
+     </div>
+   );
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index ce2c2e8..326e97e 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -87,6 +87,8 @@
+   "workspace.composer.send": "Send",
+   "workspace.composer.stop": "Stop",
+   "workspace.composer.hint": "Enter to send · Shift+Enter for a new line · Esc to stop",
++  "workspace.composer.secretWarning": "This looks like an API key. Do not send secrets to a model.",
++  "workspace.composer.secretRedact": "Remove secrets",
+   "workspace.placeholder": "…",
+   "workspace.copy": "Copy",
+   "workspace.copyCode": "Copy",
+@@ -179,5 +181,26 @@
+   "command.newChat": "New chat",
+   "command.search": "Search conversations",
+   "about.title": "About",
+-  "about.body": "AI Hub Desktop — the control layer between you and AI providers. BYOK, local-first."
++  "about.body": "AI Hub Desktop — the control layer between you and AI providers. BYOK, local-first.",
++  "onboarding.title": "Get to your first answer",
++  "onboarding.hint": "Language, one provider, a connection test — then ask. No cloud account.",
++  "onboarding.next": "Continue",
++  "onboarding.provider": "Connect one provider",
++  "onboarding.providerHint": "OpenRouter is recommended. Native providers sit beside it. The key stays in Credential Manager.",
++  "onboarding.openrouter": "{{name}} (recommended)",
++  "onboarding.saveTest": "Save and test",
++  "onboarding.ask": "Ask your first question",
++  "privacy.title": "Crash reports",
++  "privacy.hint": "Off by default. Opt-in writes local Crashpad dumps with no upload. Annotations are only app version and platform — dump files can still contain process memory.",
++  "privacy.crashOptIn": "Enable local crash dumps",
++  "privacy.crashDetail": "Turning this off takes effect the next time the app starts if dumps were already enabled this session.",
++  "updates.title": "Updates",
++  "updates.hint": "Checks GitHub Releases. A missing feed must not break the app.",
++  "updates.check": "Check for updates",
++  "updates.checking": "Checking…",
++  "updates.status.idle": "No check yet",
++  "updates.status.skipped": "Skipped (development build)",
++  "updates.status.uptodate": "Up to date",
++  "updates.status.available": "Update available ({{version}})",
++  "updates.status.unavailable": "Update feed unavailable — the app keeps running"
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index cfa15a9..0e4930e 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -87,6 +87,8 @@
+   "workspace.composer.send": "Enviar",
+   "workspace.composer.stop": "Parar",
+   "workspace.composer.hint": "Enter envia · Shift+Enter quebra linha · Esc interrompe",
++  "workspace.composer.secretWarning": "Isso parece uma chave de API. Não envie segredos para o modelo.",
++  "workspace.composer.secretRedact": "Remover segredos",
+   "workspace.placeholder": "…",
+   "workspace.copy": "Copiar",
+   "workspace.copyCode": "Copiar",
+@@ -179,5 +181,26 @@
+   "command.newChat": "Nova conversa",
+   "command.search": "Buscar conversas",
+   "about.title": "Sobre",
+-  "about.body": "AI Hub Desktop — camada de controle entre você e os provedores de IA. BYOK, local-first."
++  "about.body": "AI Hub Desktop — camada de controle entre você e os provedores de IA. BYOK, local-first.",
++  "onboarding.title": "Chegue à primeira resposta",
++  "onboarding.hint": "Idioma, um provider, um teste de conexão — depois pergunte. Sem conta na nuvem.",
++  "onboarding.next": "Continuar",
++  "onboarding.provider": "Conecte um provider",
++  "onboarding.providerHint": "OpenRouter é o recomendado. Os nativos ficam ao lado. A chave fica no Credential Manager.",
++  "onboarding.openrouter": "{{name}} (recomendado)",
++  "onboarding.saveTest": "Salvar e testar",
++  "onboarding.ask": "Fazer a primeira pergunta",
++  "privacy.title": "Relatórios de crash",
++  "privacy.hint": "Desligado por padrão. O opt-in grava dumps locais do Crashpad, sem upload. Anotações só têm versão e plataforma — o ficheiro ainda pode incluir memória do processo.",
++  "privacy.crashOptIn": "Ativar dumps locais de crash",
++  "privacy.crashDetail": "Desligar só vale no próximo start se os dumps já foram ligados nesta sessão.",
++  "updates.title": "Atualizações",
++  "updates.hint": "Consulta o GitHub Releases. Feed fora não pode derrubar o app.",
++  "updates.check": "Verificar atualizações",
++  "updates.checking": "Verificando…",
++  "updates.status.idle": "Nenhuma verificação ainda",
++  "updates.status.skipped": "Ignorado (build de desenvolvimento)",
++  "updates.status.uptodate": "Já está atualizado",
++  "updates.status.available": "Atualização disponível ({{version}})",
++  "updates.status.unavailable": "Feed de update indisponível — o app continua"
+ }
+diff --git a/docs/ADR/ADR-W08-001-first-run-wizard.md b/docs/ADR/ADR-W08-001-first-run-wizard.md
+new file mode 100644
+index 0000000..0a89210
+--- /dev/null
++++ b/docs/ADR/ADR-W08-001-first-run-wizard.md
+@@ -0,0 +1,37 @@
++# ADR-W08-001-first-run-wizard
++
++- **Status:** accepted
++- **Onda:** W08
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++D9 exige first token em menos de 90s. Um tour longo mata o onboarding. Quem já tem chave (upgrade W7) não deve ver o wizard de novo.
++
++## Decisão
++
++O wizard tem **dois passos**: idioma → um provider (OpenRouter em destaque) com save+teste. A **primeira pergunta é o composer** da home, não um terceiro ecrã. Sem conta cloud.
++
++Skip se já existe provider key **ou** `onboardingComplete`. Preferências em `settings` key `app-prefs` (JSON). TTFT do wizard: relógio no mount até o primeiro `chunk`; log `[hub:wizard-ttft]`; orçamento 90s (`WIZARD_TTFT_BUDGET_MS`). Primeira resposta usa o mesmo `chat:send` (caps/health/receipts).
++
++E2E com chaves seedadas não vê o wizard. `AI_HUB_E2E_EMPTY=1` cobre o caminho feliz com o adapter mock.
++
++## Alternativas consideradas
++
++- **Wizard de 4+ ecrãs:** estoura 90s e contradiz D9.
++- **Primeira pergunta dentro do overlay:** duplica o composer e o caminho de send.
++
++## Consequências
++
++- Positivas: caminho curto; skip automático para quem já tem key.
++- Negativas: custom ainda pede URL no mesmo passo.
++- Riscos aceitos: TTFT medido em dev/e2e mock, não com latência real de provider.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 8 / D9
++- `docs/reviews/W08/REVIEW.md`
++- ADR-W05-002 (OpenRouter first-class)
+diff --git a/docs/ADR/ADR-W08-002-electron-builder-nsis.md b/docs/ADR/ADR-W08-002-electron-builder-nsis.md
+new file mode 100644
+index 0000000..373b50a
+--- /dev/null
++++ b/docs/ADR/ADR-W08-002-electron-builder-nsis.md
+@@ -0,0 +1,32 @@
++# ADR-W08-002-electron-builder-nsis
++
++- **Status:** accepted
++- **Onda:** W08
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++O plano trava `electron-builder` + NSIS no Windows. Sem instalador, o DoD de “outra pessoa instala” falha. macOS assinado fica fora desta onda.
++
++## Decisão
++
++`electron-builder` gera NSIS x64. `appId` `com.aihub.desktop` (igual ao AppUserModelId). Ícone em `apps/desktop/resources/icon.png`. Artefactos em `release/` (gitignored). `better-sqlite3` e `keytar` saem do asar (`asarUnpack`). Script `pnpm --filter @ai-hub/desktop dist`. Build macOS/Linux não é alvo do MVP.
++
++## Alternativas consideradas
++
++- **Squirrel / MSI only:** NSIS é o alvo do plano.
++- **Tauri installer:** stack travada em Electron.
++
++## Consequências
++
++- Positivas: instalador Windows alinhado ao plano.
++- Negativas: nativos pnpm+asar exigem unpack; CI pode não assinar o binário.
++- Riscos aceitos: unsigned Windows; macOS unsigned não é entregue.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` tabela de arquitetura / Wave 8
++- `docs/reviews/W08/REVIEW.md`
+diff --git a/docs/ADR/ADR-W08-003-electron-updater-github.md b/docs/ADR/ADR-W08-003-electron-updater-github.md
+new file mode 100644
+index 0000000..42993e7
+--- /dev/null
++++ b/docs/ADR/ADR-W08-003-electron-updater-github.md
+@@ -0,0 +1,32 @@
++# ADR-W08-003-electron-updater-github
++
++- **Status:** accepted
++- **Onda:** W08
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++UAT W8: o check de auto-update **não pode derrubar o app** se o feed estiver fora. O remote é `solerpedroo/ai_hub`.
++
++## Decisão
++
++`electron-updater` com provider GitHub (`owner: solerpedroo`, `repo: ai_hub`). `autoDownload: false`. App **unpackaged** devolve `skipped`. Qualquer erro de rede/feed devolve `unavailable` — nunca throw para o renderer. Check no boot após persistência e via IPC `updates:check`. Resultado em `app-prefs` (`lastUpdateCheckAt`, `lastUpdateStatus`). Sem install automático nesta onda.
++
++## Alternativas consideradas
++
++- **Generic URL self-hosted:** extra infra; GitHub Releases já é o remote.
++- **autoDownload true:** surpresa de custo/rede; o UAT só exige check.
++
++## Consequências
++
++- Positivas: feed morto não quebra o boot.
++- Negativas: sem token, repos privados falham no check (status `unavailable`).
++- Riscos aceitos: nenhum release publicado ainda → sempre unavailable até haver artefacto.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 8 / UAT §8
++- `docs/reviews/W08/REVIEW.md`
+diff --git a/docs/ADR/ADR-W08-004-crash-reporter-opt-in-local.md b/docs/ADR/ADR-W08-004-crash-reporter-opt-in-local.md
+new file mode 100644
+index 0000000..004eb0b
+--- /dev/null
++++ b/docs/ADR/ADR-W08-004-crash-reporter-opt-in-local.md
+@@ -0,0 +1,35 @@
++# ADR-W08-004-crash-reporter-opt-in-local
++
++- **Status:** accepted
++- **Onda:** W08
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++Crash reporter é opt-in, sem PII e sem conteúdo de conversa. Não há servidor nosso de crash.
++
++## Decisão
++
++Electron `crashReporter.start` só se `crashReporterOptIn` for true (default **false**). `uploadToServer: false`. `extra` só `version` e `platform`. Sem conversation id, sem keys. Opt-in imediato nesta sessão; opt-out efetivo no próximo start (a API não para o reporter). Dumps locais no userData do Electron.
++
++Isto **não** é o crash-safe streaming (ADR-W02-003).
++
++## Alternativas consideradas
++
++- **Sentry/telemetry cloud:** viola opt-in local-first e o “sem PII”.
++- **Ligado por default:** contradiz o plano.
++
++## Consequências
++
++- Positivas: zero upload; utilizador controla.
++- Negativas: dumps locais só úteis se o utilizador os copiar; opt-out nesta sessão não para o reporter.
++- Riscos aceitos: `submitURL` dummy exigido pela API mesmo com upload off; dumps Crashpad **podem conter memória do processo** (conversa/chave one-shot) se o utilizador optar — anotações extra não incluem conteúdo.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 8
++- ADR-W02-003 (crash-safe stream, outro contrato)
++- `docs/reviews/W08/REVIEW.md`
+diff --git a/docs/ADR/ADR-W08-005-composer-secret-hint.md b/docs/ADR/ADR-W08-005-composer-secret-hint.md
+new file mode 100644
+index 0000000..58905cf
+--- /dev/null
++++ b/docs/ADR/ADR-W08-005-composer-secret-hint.md
+@@ -0,0 +1,33 @@
++# ADR-W08-005-composer-secret-hint
++
++- **Status:** accepted
++- **Onda:** W08
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++UAT pede redaction básica no composer. O renderer não pode importar `@ai-hub/security` (keytar). Aviso, não strip silencioso — o utilizador pode estar a citar um exemplo.
++
++## Decisão
++
++`looksLikePastedSecret` / `redactPastedSecrets` em `packages/shared` (mesmos padrões do `redact.ts` do security). O composer avisa em texto e oferece “remover segredos”. O send **não** é bloqueado. Logs/export no main continuam a usar `@ai-hub/security` `redactSecrets`.
++
++## Alternativas consideradas
++
++- **IPC de redact a cada keystroke:** ruído; o padrão é estático.
++- **Bloquear o send:** demasiado agressivo para um falso positivo.
++
++## Consequências
++
++- Positivas: renderer sem security/keytar; aviso visível (não só cor).
++- Negativas: padrões viveram duplicados no freeze; o close gate unificou `redactSecrets` sobre `redactPastedSecrets`.
++- Riscos aceitos: regex não cobre todos os formatos de chave (residual STATUS).
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 8
++- ADR-W00-003 / ADR-W01-003 (trust boundary)
++- `docs/reviews/W08/REVIEW.md`
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index 3bbc238..c61bbc0 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -68,3 +68,8 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider
+ | [ADR-W07-003](./ADR-W07-003-explicit-fallback.md) | W07 | Fallback de provider só com confirmação | accepted |
+ | [ADR-W07-004](./ADR-W07-004-debug-meta-no-auth.md) | W07 | Debug snapshot sem auth/headers | accepted |
+ | [ADR-W07-005](./ADR-W07-005-retry-transient-only.md) | W07 | Retry só transiente e antes do 1º token | accepted |
++| [ADR-W08-001](./ADR-W08-001-first-run-wizard.md) | W08 | Wizard first-run curto; skip se já há key | accepted |
++| [ADR-W08-002](./ADR-W08-002-electron-builder-nsis.md) | W08 | electron-builder NSIS Windows | accepted |
++| [ADR-W08-003](./ADR-W08-003-electron-updater-github.md) | W08 | electron-updater GitHub; feed morto não derruba | accepted |
++| [ADR-W08-004](./ADR-W08-004-crash-reporter-opt-in-local.md) | W08 | Crash reporter opt-in, dumps locais | accepted |
++| [ADR-W08-005](./ADR-W08-005-composer-secret-hint.md) | W08 | Aviso de secret no composer via shared | accepted |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index f430a9e..7ff9f6c 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave
+ 
+ | Field | Value |
+ |---|---|
+-| Wave | **W08** |
+-| Marco | B — MVP |
++| Wave | **W09** |
++| Marco | B — MVP+ |
+ | State | `pending` |
+-| Last completed | **W07** |
+-| Next action | Wave 8 — onboarding <90s + installer + ship MVP |
++| Last completed | **W08** |
++| Next action | Wave 9 — Import Hub |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -20,32 +20,27 @@ None.
+ 
+ ## Open residual risks
+ 
+-- W00–W07 não revalidaram a janela Electron com chaves reais após o último gate (e2e usa mock).
+-- macOS não exercitado.
++- W00–W08 não revalidaram a janela Electron com chaves reais após o último gate (e2e usa mock).
++- Instalador NSIS gerado no gate; install em máquina limpa não corrido.
++- macOS não exercitado / não assinado.
+ - Dev CSP com `unsafe-eval` para HMR (ADR-W00-003).
+ - `better-sqlite3` tem um binário só: `pnpm dev` recompila para Electron; `pnpm test` no `db` restaura o ABI do Node.
+ - Busca W6 decripta no main e **não** popula `messages_fts` (ADR-W06-001). Índice FTS5 continua vazio; O(n) local.
+ - Tags e `preferred_*` em plaintext (ADR-W06-004).
+-- Redaction regex não cobre todos os formatos de chave colados na conversa (export e logs).
+-- Zustand ainda não foi introduzido; W0–W7 usam `useState` (barulho vs stack travada).
++- Zustand ainda não foi introduzido; W0–W8 usam `useState` (barulho vs stack travada).
+ - `AI_HUB_E2E=1` só liga mock se o app **não** está empacotado; unpackaged + env ainda é o caminho CI.
+-- `messages.update` IPC ainda muta user in-place (UI W4 já não usa).
+-- Labels de ramo em plaintext no SQLite (ADR-W04-004).
+-- Custom / uncatalogued: compact/preview usam janela 128k estimada; sem preço no catálogo o request-cap por estimativa é skip (ADR-W07-001).
+-- Coerce de modelo no mesmo provider quando o id sai do catálogo (W5).
+-- Schema 0001 ainda tem `ON DELETE CASCADE` em `conversations.project_id`; o app anula antes de apagar.
+ - Caps projeto/provider ficam para W18; request/day/global já hard-stopam `chat:send`.
+-- Estimativa de output usa `maxTokens` ou 1024 tokens.
+-- Gemini 429 pode mapear para `rate_limit` (retry transiente) em vez de `quota`.
++- Feed de auto-update (GitHub Releases) pode estar vazio; o check não derruba o app (`unavailable`/`skipped`).
++- Crash dumps opt-in podem incluir memória do processo (anotações extra só version/platform).
+ 
+ ## Notes for the next session
+ 
+-- W07 fechada: receipts + modal, caps hard-stop, health na status bar (com errorRate), retry transiente, fallback explícito, debug sem auth.
+-- Não popular FTS plaintext. Não começar W08 sem o utilizador pedir.
++- W08 fechada: wizard <90s, aviso de secret no composer, NSIS, electron-updater, crash opt-in local.
++- Não popular FTS plaintext. Não começar W09 sem o utilizador pedir.
+ 
+ ## Last review / ADR
+ 
+ | Kind | Path |
+ |---|---|
+-| Review | `docs/reviews/W07/REVIEW.md` |
+-| Latest ADR | `docs/ADR/ADR-W07-005-retry-transient-only.md` |
++| Review | `docs/reviews/W08/REVIEW.md` |
++| Latest ADR | `docs/ADR/ADR-W08-005-composer-secret-hint.md` |
+diff --git a/docs/UAT-MVP.md b/docs/UAT-MVP.md
+new file mode 100644
+index 0000000..971acfe
+--- /dev/null
++++ b/docs/UAT-MVP.md
+@@ -0,0 +1,44 @@
++# UAT — MVP (Wave 8)
++
++Checklist operacional alinhado a `docs/IMPLEMENTATION_PLAN.md` §8. Cobertura do escopo §47 + D3, D4, D7, D9, D10, D11, D12 (D1 v0; D2 ainda não).
++
++**Como:** e2e mock (`pnpm --filter @ai-hub/desktop test:e2e`) cobre o núcleo sem chaves reais. Itens manuais precisam de instalador NSIS e, para providers, BYOK.
++
++## Desktop
++
++- [x] Instala no Windows (NSIS) — artefacto `AI-Hub-Setup-0.1.0.exe` gerado no close gate (`pnpm --filter @ai-hub/desktop dist`). Instalar numa máquina limpa continua residual UAT.
++- [x] Abre, restaura sessão — e2e + `settings:getSession`
++- [x] Auto-update check não quebra o app se o feed estiver fora — `updates:check` devolve `skipped`/`unavailable`, nunca throw
++
++## Chat
++
++- [x] Nova conversa, histórico, streaming, Markdown, code blocks — W3–W4 + e2e send
++- [x] Copiar, regenerar (irmão), editar (ramo), Stop — e2e stop/regenerate
++- [x] Crash/kill no stream → parcial + `interrupted` — ADR-W02-003 / e2e abort
++
++## Providers
++
++- [x] OpenAI, Anthropic, Gemini, Groq, custom, **OpenRouter** — adapters W5 (UAT real ainda residual)
++- [x] Teste de conexão; key mascarada; remover credencial — Settings + e2e OpenRouter na lista
++
++## Organização
++
++- [x] Projetos, conversas, busca, tags — e2e W6
++- [x] Troca de modelo no fio com packet v0 — e2e GPT→Claude
++
++## Segurança / transparência
++
++- [x] Key no Credential Manager, não no SQLite — testes db
++- [x] Redaction básica no composer — e2e aviso + redact
++- [x] Receipt em toda resposta — e2e receipt dialog
++- [x] Spend cap bloqueia — e2e cap 0 + allow-once
++- [x] Health na status bar — W7
++- [x] Fallback pede confirmação — UI dialog W7
++
++## Onboarding
++
++- [x] First token no caminho feliz (1 provider) — e2e wizard + mock; cronometrar <90s com chave real em UAT manual
++
++## Ainda não no MVP (ok)
++
++macOS signed, import Hub, packet portátil completo, arquivos/RAG, mentions, artifacts, skills, Quick AI, Council, MCP.
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index 7ae56ce..c197a92 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -18,5 +18,6 @@ export {
+   type SpendCapRecord,
+   type SpendCapOverrideRecord,
+   type WorkspaceSessionRecord,
++  type AppPrefsRecord,
+ } from "./repos";
+ export { schema } from "./schema";
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index f45471f..dc875bc 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -101,6 +101,16 @@ describe("hub database", () => {
+     hub.close();
+   });
+ 
++  it("stores app prefs without extra keys leaking into defaults", () => {
++    const { hub } = openTestDb();
++    expect(hub.repos.getAppPrefs().onboardingComplete).toBe(false);
++    const next = hub.repos.setAppPrefs({ onboardingComplete: true, crashReporterOptIn: true });
++    expect(next.onboardingComplete).toBe(true);
++    expect(next.crashReporterOptIn).toBe(true);
++    expect(next.lastUpdateStatus).toBe("idle");
++    hub.close();
++  });
++
+   it("survives close and reopen on a file", () => {
+     const dir = mkdtempSync(join(tmpdir(), "ai-hub-db-"));
+     const path = join(dir, "ai-hub.sqlite");
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 4ba51bc..041ad68 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -153,7 +153,32 @@ export interface WorkspaceSessionRecord {
+   extraSystem: string;
+ }
+ 
++export interface AppPrefsRecord {
++  onboardingComplete: boolean;
++  crashReporterOptIn: boolean;
++  lastUpdateCheckAt: string | null;
++  lastUpdateStatus: "idle" | "skipped" | "uptodate" | "available" | "unavailable";
++  lastWizardTtftMs: number | null;
++}
++
++const DEFAULT_APP_PREFS: AppPrefsRecord = {
++  onboardingComplete: false,
++  crashReporterOptIn: false,
++  lastUpdateCheckAt: null,
++  lastUpdateStatus: "idle",
++  lastWizardTtftMs: null,
++};
++
++const UPDATE_STATUSES: readonly AppPrefsRecord["lastUpdateStatus"][] = [
++  "idle",
++  "skipped",
++  "uptodate",
++  "available",
++  "unavailable",
++];
++
+ const APPEARANCE_KEY = "appearance";
++const APP_PREFS_KEY = "app-prefs";
+ const SESSION_KEY = "workspace-session";
+ const BRANCH_LABELS_PREFIX = "branch-labels:";
+ const CUSTOM_BASE_URL_PREFIX = "custom-base-url:";
+@@ -983,6 +1008,65 @@ export class HubRepos {
+     return { theme: "system", locale: "pt-BR" };
+   }
+ 
++  getAppPrefs(): AppPrefsRecord {
++    const row = this.db.select().from(settings).where(eq(settings.key, APP_PREFS_KEY)).get();
++    if (!row) {
++      return { ...DEFAULT_APP_PREFS };
++    }
++    const parsed: unknown = JSON.parse(row.value);
++    if (typeof parsed !== "object" || parsed === null) {
++      return { ...DEFAULT_APP_PREFS };
++    }
++    const record = parsed as Record<string, unknown>;
++    const status = record.lastUpdateStatus;
++    return {
++      onboardingComplete: record.onboardingComplete === true,
++      crashReporterOptIn: record.crashReporterOptIn === true,
++      lastUpdateCheckAt: typeof record.lastUpdateCheckAt === "string" ? record.lastUpdateCheckAt : null,
++      lastUpdateStatus:
++        typeof status === "string" && UPDATE_STATUSES.includes(status as AppPrefsRecord["lastUpdateStatus"])
++          ? (status as AppPrefsRecord["lastUpdateStatus"])
++          : DEFAULT_APP_PREFS.lastUpdateStatus,
++      lastWizardTtftMs:
++        typeof record.lastWizardTtftMs === "number" &&
++        Number.isInteger(record.lastWizardTtftMs) &&
++        record.lastWizardTtftMs >= 0
++          ? record.lastWizardTtftMs
++          : null,
++    };
++  }
++
++  setAppPrefs(patch: {
++    onboardingComplete?: boolean | undefined;
++    crashReporterOptIn?: boolean | undefined;
++    lastUpdateCheckAt?: string | null | undefined;
++    lastUpdateStatus?: AppPrefsRecord["lastUpdateStatus"] | undefined;
++    lastWizardTtftMs?: number | null | undefined;
++  }): AppPrefsRecord {
++    const current = this.getAppPrefs();
++    const next: AppPrefsRecord = {
++      onboardingComplete: patch.onboardingComplete ?? current.onboardingComplete,
++      crashReporterOptIn: patch.crashReporterOptIn ?? current.crashReporterOptIn,
++      lastUpdateCheckAt: patch.lastUpdateCheckAt === undefined ? current.lastUpdateCheckAt : patch.lastUpdateCheckAt,
++      lastUpdateStatus: patch.lastUpdateStatus ?? current.lastUpdateStatus,
++      lastWizardTtftMs: patch.lastWizardTtftMs === undefined ? current.lastWizardTtftMs : patch.lastWizardTtftMs,
++    };
++    const now = Date.now();
++    this.db
++      .insert(settings)
++      .values({
++        key: APP_PREFS_KEY,
++        value: JSON.stringify(next),
++        updatedAt: now,
++      })
++      .onConflictDoUpdate({
++        target: settings.key,
++        set: { value: JSON.stringify(next), updatedAt: now },
++      })
++      .run();
++    return next;
++  }
++
+   setAppearance(appearance: AppearanceRecord): void {
+     const now = Date.now();
+     this.db
+diff --git a/packages/security/package.json b/packages/security/package.json
+index 7a83dfc..4205515 100644
+--- a/packages/security/package.json
++++ b/packages/security/package.json
+@@ -19,6 +19,7 @@
+     "test": "vitest run"
+   },
+   "dependencies": {
++    "@ai-hub/shared": "workspace:*",
+     "keytar": "^7.9.0"
+   },
+   "devDependencies": {
+diff --git a/packages/security/src/redact.ts b/packages/security/src/redact.ts
+index 1e088b8..79723cd 100644
+--- a/packages/security/src/redact.ts
++++ b/packages/security/src/redact.ts
+@@ -1,17 +1,7 @@
+-const SECRET_PATTERNS: readonly RegExp[] = [
+-  /sk-[A-Za-z0-9_-]{8,}/g,
+-  /gsk_[A-Za-z0-9]{8,}/g,
+-  /AIza[A-Za-z0-9_-]{10,}/g,
+-  /Bearer\s+[A-Za-z0-9._\-+=/]+/gi,
+-  /(?:api[_-]?key|access[_-]?token|secret|x-api-key|x-goog-api-key)[=:\s]+['"]?[^\s'"]+/gi,
+-];
++import { redactPastedSecrets } from "@ai-hub/shared";
+ 
+ export function redactSecrets(text: string): string {
+-  let output = text;
+-  for (const pattern of SECRET_PATTERNS) {
+-    output = output.replace(pattern, "[REDACTED]");
+-  }
+-  return output;
++  return redactPastedSecrets(text);
+ }
+ 
+ export function maskSecret(secret: string): string {
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index b2248fa..024ff16 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -32,6 +32,9 @@ import type {
+   CostsAggregateInput,
+   CostsAggregateResult,
+   DebugSnapshot,
++  AppPrefs,
++  AppPrefsPatch,
++  UpdateCheckResult,
+   ProviderKeyDto,
+   SecretsSaveInput,
+   SecretsTestInput,
+@@ -77,6 +80,15 @@ export interface HubSettingsApi {
+   setSession: (input: WorkspaceSession) => Promise<void>;
+ }
+ 
++export interface HubPrefsApi {
++  get: () => Promise<AppPrefs>;
++  set: (input: AppPrefsPatch) => Promise<AppPrefs>;
++}
++
++export interface HubUpdatesApi {
++  check: () => Promise<UpdateCheckResult>;
++}
++
+ export interface HubProvidersApi {
+   list: () => Promise<ProviderDto[]>;
+ }
+@@ -123,6 +135,8 @@ export interface HubApi {
+   conversations: HubConversationsApi;
+   messages: HubMessagesApi;
+   settings: HubSettingsApi;
++  prefs: HubPrefsApi;
++  updates: HubUpdatesApi;
+   providers: HubProvidersApi;
+   secrets: HubSecretsApi;
+   search: HubSearchApi;
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index b1e3b8d..12f6fa2 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -9,6 +9,8 @@ export {
+   type HubSearchApi,
+   type HubSecretsApi,
+   type HubSettingsApi,
++  type HubPrefsApi,
++  type HubUpdatesApi,
+   type HubSpendCapsApi,
+   type HubHealthApi,
+   type HubCostsApi,
+@@ -33,6 +35,14 @@ export {
+ export { summarizeProviderHealth, HEALTH_WINDOW, type HealthSampleLike, type HealthSummary } from "./health";
+ export { suggestFallbackProvider, type FallbackKeyLike, type FallbackSuggestion } from "./fallback";
+ export { classifyHubIpcError, type HubIpcError, type HubIpcErrorKind } from "./hub-error";
++export { looksLikePastedSecret, redactPastedSecrets } from "./secret-paste";
++export {
++  shouldShowOnboarding,
++  sortProvidersForWizard,
++  WIZARD_PROVIDER_ORDER,
++  WIZARD_TTFT_BUDGET_MS,
++} from "./onboarding";
++export { resolveUpdateCheckResult } from "./updates";
+ export { IpcChannel, type IpcChannelName } from "./ipc-channels";
+ export {
+   activePath,
+@@ -89,6 +99,10 @@ export {
+   costsAggregateResultSchema,
+   debugSnapshotSchema,
+   debugSnapshotResultSchema,
++  appPrefsSchema,
++  appPrefsPatchSchema,
++  updateCheckResultSchema,
++  updateCheckStatusSchema,
+   providerDtoSchema,
+   providerKeyDtoSchema,
+   providerKeyListResultSchema,
+@@ -134,6 +148,10 @@ export {
+   type CostsAggregateInput,
+   type CostsAggregateResult,
+   type DebugSnapshot,
++  type AppPrefs,
++  type AppPrefsPatch,
++  type UpdateCheckResult,
++  type UpdateCheckStatus,
+   type ProviderKeyDto,
+   type SecretsSaveInput,
+   type SecretsTestInput,
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index 7c0409e..24bd6dd 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -20,6 +20,9 @@ export const IpcChannel = {
+   healthSummary: "health:summary",
+   costsAggregate: "costs:aggregate",
+   debugGetLatest: "debug:getLatest",
++  prefsGet: "prefs:get",
++  prefsSet: "prefs:set",
++  updatesCheck: "updates:check",
+   messagesList: "messages:list",
+   messagesCreate: "messages:create",
+   messagesUpdate: "messages:update",
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index 87dcdf5..0acfec4 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -1,5 +1,6 @@
+ import { describe, expect, it } from "vitest";
+ import {
++  appPrefsSchema,
+   conversationExportDocumentSchema,
+   debugSnapshotSchema,
+   emptyIpcPayloadSchema,
+@@ -314,3 +315,17 @@ describe("wave 7 contracts", () => {
+     ).toThrow();
+   });
+ });
++
++describe("wave 8 contracts", () => {
++  it("rejects extra keys on app prefs", () => {
++    const prefs = {
++      onboardingComplete: false,
++      crashReporterOptIn: false,
++      lastUpdateCheckAt: null,
++      lastUpdateStatus: "idle" as const,
++      lastWizardTtftMs: null,
++    };
++    expect(appPrefsSchema.parse(prefs).crashReporterOptIn).toBe(false);
++    expect(() => appPrefsSchema.parse({ ...prefs, apiKey: "sk-test" })).toThrow();
++  });
++});
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index 37749b0..c6f2a8f 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -498,3 +498,32 @@ export const debugSnapshotSchema = z
+ export type DebugSnapshot = z.infer<typeof debugSnapshotSchema>;
+ 
+ export const debugSnapshotResultSchema = debugSnapshotSchema.nullable();
++
++export const updateCheckStatusSchema = z.enum(["idle", "skipped", "uptodate", "available", "unavailable"]);
++
++export type UpdateCheckStatus = z.infer<typeof updateCheckStatusSchema>;
++
++export const appPrefsSchema = z
++  .object({
++    onboardingComplete: z.boolean(),
++    crashReporterOptIn: z.boolean(),
++    lastUpdateCheckAt: isoTimestampSchema.nullable(),
++    lastUpdateStatus: updateCheckStatusSchema,
++    lastWizardTtftMs: z.number().int().nonnegative().nullable(),
++  })
++  .strict();
++
++export type AppPrefs = z.infer<typeof appPrefsSchema>;
++
++export const appPrefsPatchSchema = appPrefsSchema.partial().strict();
++
++export type AppPrefsPatch = z.infer<typeof appPrefsPatchSchema>;
++
++export const updateCheckResultSchema = z
++  .object({
++    status: updateCheckStatusSchema,
++    version: z.string().max(64).nullable(),
++  })
++  .strict();
++
++export type UpdateCheckResult = z.infer<typeof updateCheckResultSchema>;
+diff --git a/packages/shared/src/onboarding.test.ts b/packages/shared/src/onboarding.test.ts
+new file mode 100644
+index 0000000..0adf2b8
+--- /dev/null
++++ b/packages/shared/src/onboarding.test.ts
+@@ -0,0 +1,24 @@
++import { describe, expect, it } from "vitest";
++import { shouldShowOnboarding, sortProvidersForWizard, WIZARD_TTFT_BUDGET_MS } from "./onboarding";
++
++describe("onboarding gate", () => {
++  it("skips when a key already exists or the wizard finished", () => {
++    expect(shouldShowOnboarding({ hasProviderKey: true, onboardingComplete: false })).toBe(false);
++    expect(shouldShowOnboarding({ hasProviderKey: false, onboardingComplete: true })).toBe(false);
++    expect(shouldShowOnboarding({ hasProviderKey: false, onboardingComplete: false })).toBe(true);
++  });
++
++  it("puts OpenRouter first among known slugs", () => {
++    const sorted = sortProvidersForWizard([
++      { slug: "groq" },
++      { slug: "openai" },
++      { slug: "openrouter" },
++      { slug: "custom" },
++    ]);
++    expect(sorted.map((item) => item.slug)).toEqual(["openrouter", "openai", "groq", "custom"]);
++  });
++
++  it("keeps the 90s TTFT budget as a constant the UI can log against", () => {
++    expect(WIZARD_TTFT_BUDGET_MS).toBe(90_000);
++  });
++});
+diff --git a/packages/shared/src/onboarding.ts b/packages/shared/src/onboarding.ts
+new file mode 100644
+index 0000000..b46f5f0
+--- /dev/null
++++ b/packages/shared/src/onboarding.ts
+@@ -0,0 +1,33 @@
++export const WIZARD_PROVIDER_ORDER = [
++  "openrouter",
++  "openai",
++  "anthropic",
++  "gemini",
++  "groq",
++  "custom",
++] as const;
++
++export const WIZARD_TTFT_BUDGET_MS = 90_000;
++
++export function shouldShowOnboarding(input: {
++  hasProviderKey: boolean;
++  onboardingComplete: boolean;
++}): boolean {
++  if (input.hasProviderKey || input.onboardingComplete) {
++    return false;
++  }
++  return true;
++}
++
++export function sortProvidersForWizard<T extends { slug: string }>(providers: readonly T[]): T[] {
++  return [...providers].sort((left, right) => {
++    const leftRank = WIZARD_PROVIDER_ORDER.indexOf(left.slug as (typeof WIZARD_PROVIDER_ORDER)[number]);
++    const rightRank = WIZARD_PROVIDER_ORDER.indexOf(right.slug as (typeof WIZARD_PROVIDER_ORDER)[number]);
++    const leftIndex = leftRank === -1 ? WIZARD_PROVIDER_ORDER.length : leftRank;
++    const rightIndex = rightRank === -1 ? WIZARD_PROVIDER_ORDER.length : rightRank;
++    if (leftIndex !== rightIndex) {
++      return leftIndex - rightIndex;
++    }
++    return left.slug.localeCompare(right.slug);
++  });
++}
+diff --git a/packages/shared/src/secret-paste.test.ts b/packages/shared/src/secret-paste.test.ts
+new file mode 100644
+index 0000000..5f43f39
+--- /dev/null
++++ b/packages/shared/src/secret-paste.test.ts
+@@ -0,0 +1,16 @@
++import { describe, expect, it } from "vitest";
++import { looksLikePastedSecret, redactPastedSecrets } from "./secret-paste";
++
++describe("secret paste hints", () => {
++  it("flags OpenAI-shaped keys and Bearer tokens", () => {
++    expect(looksLikePastedSecret("hello sk-testfixtureABCDEFGH leftover")).toBe(true);
++    expect(looksLikePastedSecret("Authorization: Bearer abc.def.ghi")).toBe(true);
++    expect(looksLikePastedSecret("Just a normal question")).toBe(false);
++  });
++
++  it("redacts without leaving the original token", () => {
++    const redacted = redactPastedSecrets("use sk-testfixtureABCDEFGH please");
++    expect(redacted).not.toContain("sk-testfixture");
++    expect(redacted).toContain("[REDACTED]");
++  });
++});
+diff --git a/packages/shared/src/secret-paste.ts b/packages/shared/src/secret-paste.ts
+new file mode 100644
+index 0000000..cc27c35
+--- /dev/null
++++ b/packages/shared/src/secret-paste.ts
+@@ -0,0 +1,26 @@
++const SECRET_HINT_PATTERNS: readonly RegExp[] = [
++  /sk-[A-Za-z0-9_-]{8,}/g,
++  /gsk_[A-Za-z0-9]{8,}/g,
++  /AIza[A-Za-z0-9_-]{10,}/g,
++  /Bearer\s+[A-Za-z0-9._\-+=/]+/gi,
++  /(?:api[_-]?key|access[_-]?token|secret|x-api-key|x-goog-api-key)[=:\s]+['"]?[^\s'"]+/gi,
++];
++
++export function looksLikePastedSecret(text: string): boolean {
++  for (const pattern of SECRET_HINT_PATTERNS) {
++    pattern.lastIndex = 0;
++    if (pattern.test(text)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++export function redactPastedSecrets(text: string): string {
++  let output = text;
++  for (const pattern of SECRET_HINT_PATTERNS) {
++    pattern.lastIndex = 0;
++    output = output.replace(pattern, "[REDACTED]");
++  }
++  return output;
++}
+diff --git a/packages/shared/src/updates.test.ts b/packages/shared/src/updates.test.ts
+new file mode 100644
+index 0000000..7944aa3
+--- /dev/null
++++ b/packages/shared/src/updates.test.ts
+@@ -0,0 +1,48 @@
++import { describe, expect, it } from "vitest";
++import { resolveUpdateCheckResult } from "./updates";
++
++describe("resolveUpdateCheckResult", () => {
++  it("skips unpackaged builds", () => {
++    expect(
++      resolveUpdateCheckResult({
++        packaged: false,
++        currentVersion: "0.1.0",
++        failed: true,
++        remoteVersion: "9.0.0",
++      }),
++    ).toEqual({ status: "skipped", version: null });
++  });
++
++  it("maps feed or network failure to unavailable without throwing", () => {
++    expect(
++      resolveUpdateCheckResult({
++        packaged: true,
++        currentVersion: "0.1.0",
++        failed: true,
++        remoteVersion: null,
++      }),
++    ).toEqual({ status: "unavailable", version: null });
++  });
++
++  it("reports an available remote version", () => {
++    expect(
++      resolveUpdateCheckResult({
++        packaged: true,
++        currentVersion: "0.1.0",
++        failed: false,
++        remoteVersion: "0.2.0",
++      }),
++    ).toEqual({ status: "available", version: "0.2.0" });
++  });
++
++  it("reports uptodate when versions match", () => {
++    expect(
++      resolveUpdateCheckResult({
++        packaged: true,
++        currentVersion: "0.1.0",
++        failed: false,
++        remoteVersion: "0.1.0",
++      }),
++    ).toEqual({ status: "uptodate", version: "0.1.0" });
++  });
++});
+diff --git a/packages/shared/src/updates.ts b/packages/shared/src/updates.ts
+new file mode 100644
+index 0000000..f7e94dd
+--- /dev/null
++++ b/packages/shared/src/updates.ts
+@@ -0,0 +1,19 @@
++import type { UpdateCheckResult } from "./ipc-schemas";
++
++export function resolveUpdateCheckResult(input: {
++  packaged: boolean;
++  currentVersion: string;
++  failed: boolean;
++  remoteVersion: string | null;
++}): UpdateCheckResult {
++  if (!input.packaged) {
++    return { status: "skipped", version: null };
++  }
++  if (input.failed) {
++    return { status: "unavailable", version: null };
++  }
++  if (input.remoteVersion !== null && input.remoteVersion !== input.currentVersion) {
++    return { status: "available", version: input.remoteVersion };
++  }
++  return { status: "uptodate", version: input.currentVersion };
++}
