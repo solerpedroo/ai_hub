@@ -5,8 +5,10 @@ import { BrowserWindow, app, dialog, session, shell } from "electron";
 import { electronApp, is, optimizer } from "@electron-toolkit/utils";
 import { safeErrorMessage } from "@ai-hub/security";
 import { registerWindowIpc, registerWorkspaceIpc } from "./ipc";
-import { bootPersistence } from "./persistence";
+import { applyCrashReporterOptIn } from "./crash-reporter";
+import { bootPersistence, getHubDatabase } from "./persistence";
 import { isE2eMode } from "./e2e-mode";
+import { checkForAppUpdates } from "./updater";
 
 if (isE2eMode()) {
   app.setPath("userData", mkdtempSync(join(tmpdir(), "ai-hub-e2e-")));
@@ -157,6 +159,17 @@ app.whenReady().then(async () => {
     return;
   }
   registerWorkspaceIpc();
+  applyCrashReporterOptIn(getHubDatabase().repos.getAppPrefs().crashReporterOptIn);
+  void checkForAppUpdates()
+    .then((result) => {
+      getHubDatabase().repos.setAppPrefs({
+        lastUpdateCheckAt: new Date().toISOString(),
+        lastUpdateStatus: result.status,
+      });
+    })
+    .catch(() => {
+      // Feed down or unpackaged: never block boot.
+    });
 
   app.on("browser-window-created", (_event, window) => {
     optimizer.watchWindowShortcuts(window);
