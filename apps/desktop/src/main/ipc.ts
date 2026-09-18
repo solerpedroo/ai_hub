@@ -35,9 +35,19 @@ import {
   messageDtoSchema,
   messageListInputSchema,
   messageListResultSchema,
+  messagePinInputSchema,
   messageUpdateInputSchema,
   packetPreviewInputSchema,
   packetPreviewResultSchema,
+  packetsApplyInputSchema,
+  packetsClearInputSchema,
+  packetsCompileInputSchema,
+  packetsExportInputSchema,
+  packetsExportResultSchema,
+  packetsImportInputSchema,
+  packetsListInputSchema,
+  contextPacketDtoSchema,
+  contextPacketListResultSchema,
   projectCreateInputSchema,
   projectDtoSchema,
   projectListResultSchema,
@@ -64,6 +74,13 @@ import { applyCrashReporterOptIn } from "./crash-reporter";
 import { getLatestDebugSnapshot } from "./debug-snapshot";
 import { cancelImportJob, pickImportFile, startImportJob } from "./import-job";
 import { toMessageDto } from "./message-dto";
+import {
+  compileAndSavePacket,
+  exportSavedPacket,
+  importPacketFile,
+  listProjectPackets,
+  pickPacketFile,
+} from "./packet-file";
 import { previewPacket } from "./packet-preview";
 import { getHubDatabase } from "./persistence";
 import { testProviderKey } from "./provider-health";
@@ -232,6 +249,43 @@ export function registerWorkspaceIpc(): void {
   registerHandler(IpcChannel.messagesActivate, idInputSchema, ipcAckResultSchema, (input) => {
     getHubDatabase().repos.activatePathThrough(input.id);
   });
+
+  registerHandler(IpcChannel.messagesPin, messagePinInputSchema, messageDtoSchema, (input) =>
+    toMessageDto(getHubDatabase().repos.setMessagePinned(input.id, input.pinned)),
+  );
+
+  registerHandler(IpcChannel.packetsList, packetsListInputSchema, contextPacketListResultSchema, (input) =>
+    listProjectPackets(input.projectId),
+  );
+
+  registerHandler(IpcChannel.packetsCompile, packetsCompileInputSchema, contextPacketDtoSchema, (input) =>
+    compileAndSavePacket(input),
+  );
+
+  registerHandler(
+    IpcChannel.packetsExport,
+    packetsExportInputSchema,
+    packetsExportResultSchema,
+    (input, event) => exportSavedPacket(input, event.sender),
+  );
+
+  registerHandler(IpcChannel.packetsPickFile, emptyIpcPayloadSchema, importPickResultSchema, (_input, event) =>
+    pickPacketFile(event.sender),
+  );
+
+  registerHandler(IpcChannel.packetsImport, packetsImportInputSchema, contextPacketDtoSchema, (input) =>
+    importPacketFile(input),
+  );
+
+  registerHandler(IpcChannel.packetsApply, packetsApplyInputSchema, conversationDtoSchema, (input) =>
+    conversationDtoSchema.parse(
+      getHubDatabase().repos.applyContextPacket(input.conversationId, input.packetId),
+    ),
+  );
+
+  registerHandler(IpcChannel.packetsClear, packetsClearInputSchema, conversationDtoSchema, (input) =>
+    conversationDtoSchema.parse(getHubDatabase().repos.clearContextPacket(input.conversationId)),
+  );
 
   registerHandler(
     IpcChannel.settingsGetAppearance,
