@@ -19,6 +19,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@ai-hub/shared": "workspace:*",
     "keytar": "^7.9.0"
   },
   "devDependencies": {
