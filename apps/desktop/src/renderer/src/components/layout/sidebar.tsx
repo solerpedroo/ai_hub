@@ -1,5 +1,5 @@
 import { type JSX, type ReactNode, useState, type RefObject } from "react";
-import { Activity, Home, Inbox, Plus, Settings } from "lucide-react";
+import { Activity, Home, Inbox, Plus, Settings, Upload } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { ProjectDto, SearchHit } from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
@@ -12,7 +12,9 @@ export function Sidebar({
   onChange,
   projects,
   selectedProjectId,
+  importedInbox,
   onSelectProject,
+  onSelectImportedInbox,
   onCreateProject,
   projectInputRef,
   searchQuery,
@@ -25,7 +27,9 @@ export function Sidebar({
   onChange: (view: AppView) => void;
   projects: ProjectDto[];
   selectedProjectId: string | null;
+  importedInbox: boolean;
   onSelectProject: (id: string | null) => void;
+  onSelectImportedInbox: () => void;
   onCreateProject: (name: string) => Promise<void>;
   projectInputRef: RefObject<HTMLInputElement | null>;
   searchQuery: string;
@@ -70,6 +74,13 @@ export function Sidebar({
             onClick={() => onChange("debug")}
             testId="nav-debug"
           />
+          <NavButton
+            active={view === "import"}
+            icon={<Upload className="h-3.5 w-3.5" />}
+            label={t("nav.import")}
+            onClick={() => onChange("import")}
+            testId="nav-import"
+          />
         </nav>
         <div className="mt-3 px-1">
           <Input
@@ -109,7 +120,7 @@ export function Sidebar({
         <div className="mt-1 flex flex-col gap-0.5">
           <Button
             type="button"
-            variant={view === "home" && selectedProjectId === null ? "secondary" : "ghost"}
+            variant={view === "home" && selectedProjectId === null && !importedInbox ? "secondary" : "ghost"}
             className="h-8 w-full justify-start gap-2 truncate"
             data-testid="inbox-avulsas"
             onClick={() => {
@@ -119,6 +130,19 @@ export function Sidebar({
           >
             <Inbox className="h-3.5 w-3.5 shrink-0" />
             {t("workspace.inbox")}
+          </Button>
+          <Button
+            type="button"
+            variant={view === "home" && selectedProjectId === null && importedInbox ? "secondary" : "ghost"}
+            className="h-8 w-full justify-start gap-2 truncate"
+            data-testid="inbox-imported"
+            onClick={() => {
+              onSelectImportedInbox();
+              onChange("home");
+            }}
+          >
+            <Upload className="h-3.5 w-3.5 shrink-0" />
+            {t("workspace.importedInbox")}
           </Button>
           {projects.length === 0 ? (
             <p className="px-2 py-1 text-[11px] text-muted-foreground">{t("empty.body")}</p>
