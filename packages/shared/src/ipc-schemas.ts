@@ -2,6 +2,8 @@ import { z } from "zod";
 import { localeSchema, themeModeSchema } from "./appearance";
 import { gatewayErrorCodeSchema, packetV0Schema, receiptDtoSchema } from "./gateway";
 
+export const spendCapScopeSchema = z.enum(["request", "day", "global"]);
+
 export const emptyIpcPayloadSchema = z.object({}).strict();
 
 export type EmptyIpcPayload = z.infer<typeof emptyIpcPayloadSchema>;
@@ -154,6 +156,8 @@ export const packetPreviewInputSchema = z
     model: z.string().min(1).max(128),
     providerSlug: z.string().min(1).max(64),
     compact: z.boolean().optional(),
+    pendingContent: z.string().max(100_000).optional(),
+    maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
   })
   .strict();
 
@@ -166,6 +170,9 @@ export const packetPreviewResultSchema = z
     overflow: z.boolean(),
     compacted: z.boolean(),
     excludedCount: z.number().int().nonnegative(),
+    estimatedCostUsd: z.string().nullable(),
+    capWarnings: z.array(spendCapScopeSchema),
+    capBlocked: spendCapScopeSchema.nullable(),
   })
   .strict();
 
@@ -340,6 +347,9 @@ export const chatEventSchema = z.discriminatedUnion("type", [
     runId: z.string().uuid(),
     messageId: z.string().uuid(),
     code: gatewayErrorCodeSchema,
+    suggestProviderSlug: z.string().min(1).max(64).nullable(),
+    suggestKeyId: z.string().uuid().nullable(),
+    suggestModel: z.string().min(1).max(128).nullable(),
   }),
 ]);
 
@@ -412,3 +422,79 @@ export const conversationExportDocumentSchema = z
   .strict();
 
 export type ConversationExportDocument = z.infer<typeof conversationExportDocumentSchema>;
+
+export type SpendCapScopeDto = z.infer<typeof spendCapScopeSchema>;
+
+export const usdAmountSchema = z.string().regex(/^\d+(\.\d{1,6})?$/).max(20);
+
+export const spendCapDtoSchema = z
+  .object({
+    scope: spendCapScopeSchema,
+    limitUsd: usdAmountSchema.nullable(),
+  })
+  .strict();
+
+export type SpendCapDto = z.infer<typeof spendCapDtoSchema>;
+
+export const spendCapListResultSchema = z.array(spendCapDtoSchema).max(3);
+
+export const spendCapSetInputSchema = z
+  .object({
+    caps: z.array(spendCapDtoSchema).max(3),
+  })
+  .strict();
+
+export type SpendCapSetInput = z.infer<typeof spendCapSetInputSchema>;
+
+export const healthSummarySchema = z
+  .object({
+    providerSlug: z.string().min(1).max(64),
+    lastOk: z.boolean().nullable(),
+    lastLatencyMs: z.number().int().nullable(),
+    errorRate: z.number().min(0).max(1),
+    sampleCount: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export type HealthSummaryDto = z.infer<typeof healthSummarySchema>;
+
+export const healthSummaryListSchema = z.array(healthSummarySchema).max(32);
+
+export const costsAggregateInputSchema = z
+  .object({
+    conversationId: z.string().uuid().nullable(),
+    projectId: z.string().uuid().nullable(),
+  })
+  .strict();
+
+export type CostsAggregateInput = z.infer<typeof costsAggregateInputSchema>;
+
+export const costsAggregateResultSchema = z
+  .object({
+    conversationUsd: z.string().nullable(),
+    projectUsd: z.string().nullable(),
+    dayUsd: z.string(),
+    globalUsd: z.string(),
+  })
+  .strict();
+
+export type CostsAggregateResult = z.infer<typeof costsAggregateResultSchema>;
+
+export const debugSnapshotSchema = z
+  .object({
+    at: isoTimestampSchema,
+    provider: z.string().min(1).max(64),
+    model: z.string().min(1).max(128),
+    retries: z.number().int().nonnegative(),
+    lastErrorCode: gatewayErrorCodeSchema.nullable(),
+    tokenEstimate: z.number().int().nonnegative(),
+    estimatedCostUsd: z.string().nullable(),
+    capDecision: z.enum(["ok", "warn", "block", "override"]),
+    capScope: spendCapScopeSchema.nullable(),
+    overflow: z.boolean(),
+  })
+  .strict();
+
+export type DebugSnapshot = z.infer<typeof debugSnapshotSchema>;
+
+export const debugSnapshotResultSchema = debugSnapshotSchema.nullable();
