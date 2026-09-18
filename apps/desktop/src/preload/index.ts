@@ -38,9 +38,19 @@ import {
   messageDtoSchema,
   messageListInputSchema,
   messageListResultSchema,
+  messagePinInputSchema,
   messageUpdateInputSchema,
   packetPreviewInputSchema,
   packetPreviewResultSchema,
+  packetsApplyInputSchema,
+  packetsClearInputSchema,
+  packetsCompileInputSchema,
+  packetsExportInputSchema,
+  packetsExportResultSchema,
+  packetsImportInputSchema,
+  packetsListInputSchema,
+  contextPacketDtoSchema,
+  contextPacketListResultSchema,
   projectCreateInputSchema,
   projectDtoSchema,
   projectListResultSchema,
@@ -175,6 +185,7 @@ const hub: HubApi = {
     update: (input) =>
       invokeParsed(IpcChannel.messagesUpdate, input, messageUpdateInputSchema, messageDtoSchema),
     activate: (input) => invokeAckWith(IpcChannel.messagesActivate, input, idInputSchema),
+    pin: (input) => invokeParsed(IpcChannel.messagesPin, input, messagePinInputSchema, messageDtoSchema),
   },
   settings: {
     getAppearance: () =>
@@ -276,6 +287,22 @@ const hub: HubApi = {
         ipcRenderer.removeListener(IpcChannel.importEvent, wrapped);
       };
     },
+  },
+  packets: {
+    list: (input) =>
+      invokeParsed(IpcChannel.packetsList, input, packetsListInputSchema, contextPacketListResultSchema),
+    compile: (input) =>
+      invokeParsed(IpcChannel.packetsCompile, input, packetsCompileInputSchema, contextPacketDtoSchema),
+    export: (input) =>
+      invokeParsed(IpcChannel.packetsExport, input, packetsExportInputSchema, packetsExportResultSchema),
+    pickFile: () =>
+      invokeParsed(IpcChannel.packetsPickFile, empty, emptyIpcPayloadSchema, importPickResultSchema),
+    import: (input) =>
+      invokeParsed(IpcChannel.packetsImport, input, packetsImportInputSchema, contextPacketDtoSchema),
+    apply: (input) =>
+      invokeParsed(IpcChannel.packetsApply, input, packetsApplyInputSchema, conversationDtoSchema),
+    clear: (input) =>
+      invokeParsed(IpcChannel.packetsClear, input, packetsClearInputSchema, conversationDtoSchema),
   },
 };
 
