@@ -115,7 +115,7 @@ describe("hub database", () => {
       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
       applyMigrations(second.sqlite);
-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(4);
+      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(5);
       second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -498,6 +498,48 @@ describe("hub database", () => {
     expect(hits.length).toBeGreaterThan(0);
     expect(JSON.stringify(hits)).not.toContain("sk-testfixtureABCDEFGH");
     expect(hits[0]?.snippet).toContain("[REDACTED]");
+    hub.close();
+  });
+
+  it("upserts spend caps by scope and sums receipt costs", () => {
+    const { hub } = openTestDb();
+    hub.repos.upsertSpendCap("request", "1.000000");
+    hub.repos.upsertSpendCap("day", "5.000000");
+    expect(hub.repos.listSpendCaps().map((item) => item.scope).sort()).toEqual(["day", "request"]);
+    hub.repos.upsertSpendCap("request", null);
+    expect(hub.repos.listSpendCaps().map((item) => item.scope)).toEqual(["day"]);
+    const project = hub.repos.createProject("Spend");
+    const conversation = hub.repos.createConversation(project.id, "Thread");
+    const assistant = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "assistant",
+      content: "hi",
+      parentId: null,
+      branchId: null,
+    });
+    hub.repos.createReceipt({
+      messageId: assistant.id,
+      provider: "openai",
+      model: "gpt-4o-mini",
+      tokensIn: 10,
+      tokensOut: 4,
+      latencyMs: 20,
+      costUsd: "0.250000",
+      errorCode: null,
+    });
+    expect(hub.repos.sumReceiptCostUsd({ conversationId: conversation.id })).toBe("0.250000");
+    expect(hub.repos.sumReceiptCostUsd({ projectId: project.id })).toBe("0.250000");
+    expect(hub.repos.sumReceiptCostUsd({})).toBe("0.250000");
+    hub.repos.appendSpendCapOverride({
+      at: "2026-09-17T00:00:00.000Z",
+      scope: "request",
+      limitUsd: "0",
+      estimatedUsd: "0.250000",
+      conversationId: conversation.id,
+      model: "gpt-4o-mini",
+      provider: "openai",
+    });
+    expect(hub.repos.listSpendCapOverrides()).toHaveLength(1);
     hub.close();
   });
 });
