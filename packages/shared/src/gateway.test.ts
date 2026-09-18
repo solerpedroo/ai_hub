@@ -134,14 +134,34 @@ describe("chat contracts", () => {
     expect(parsed.compactHistory).toBe(true);
   });
 
-  it("parses a chunk event", () => {
+  it("accepts allowOnce on send", () => {
+    const parsed = chatSendInputSchema.parse({
+      mode: "send",
+      conversationId: "11111111-1111-4111-8111-111111111111",
+      providerKeyId: "22222222-2222-4222-8222-222222222222",
+      model: "gpt-4o-mini",
+      content: "hello",
+      allowOnce: true,
+    });
+    expect(parsed.allowOnce).toBe(true);
+  });
+
+  it("parses a chat error event with an explicit fallback suggestion and no secret", () => {
     const event = chatEventSchema.parse({
-      type: "chunk",
+      type: "error",
       runId: "11111111-1111-4111-8111-111111111111",
       messageId: "22222222-2222-4222-8222-222222222222",
-      text: "Hi",
+      code: "timeout",
+      suggestProviderSlug: "openai",
+      suggestKeyId: "33333333-3333-4333-8333-333333333333",
+      suggestModel: "gpt-4o-mini",
     });
-    expect(event.type).toBe("chunk");
+    expect(event.type).toBe("error");
+    if (event.type !== "error") {
+      return;
+    }
+    expect(event.suggestProviderSlug).toBe("openai");
+    expect("secret" in event).toBe(false);
   });
 
   it("parses a receipt without a secret field", () => {
