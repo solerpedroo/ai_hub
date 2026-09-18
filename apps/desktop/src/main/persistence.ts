@@ -38,7 +38,7 @@ export async function bootPersistence(): Promise<HubDatabase> {
   const masterKey = await loadOrCreateMasterKey(store);
   const dbPath = join(app.getPath("userData"), "ai-hub.sqlite");
   hub = openHubDatabase({ path: dbPath, masterKey, secretStore: store });
-  if (isE2eMode()) {
+  if (isE2eMode() && process.env.AI_HUB_E2E_EMPTY !== "1") {
     await seedE2eWorkspace(hub);
   }
   hub.repos.interruptOrphanStreams();
