@@ -45,6 +45,14 @@ export const IpcChannel = {
   chatAbort: "chat:abort",
   chatEvent: "chat:event",
   chatPreviewPacket: "chat:previewPacket",
+  messagesPin: "messages:pin",
+  packetsList: "packets:list",
+  packetsCompile: "packets:compile",
+  packetsExport: "packets:export",
+  packetsPickFile: "packets:pickFile",
+  packetsImport: "packets:import",
+  packetsApply: "packets:apply",
+  packetsClear: "packets:clear",
 } as const;
 
 export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
