@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, isNull, ne } from "drizzle-orm";
+import { and, desc, eq, gte, isNull, ne } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import {
   decryptUtf8,
@@ -20,6 +20,7 @@ import {
   providerKeys,
   providers,
   settings,
+  spendCaps,
   tags,
   type schema,
 } from "./schema";
@@ -115,6 +116,23 @@ export interface HealthSampleRecord {
   createdAt: string;
 }
 
+export interface SpendCapRecord {
+  id: string;
+  scope: string;
+  limitUsd: string;
+  createdAt: string;
+}
+
+export interface SpendCapOverrideRecord {
+  at: string;
+  scope: string;
+  limitUsd: string;
+  estimatedUsd: string | null;
+  conversationId: string;
+  model: string;
+  provider: string;
+}
+
 export interface ProviderSecretRecord {
   id: string;
   providerSlug: string;
@@ -139,6 +157,7 @@ const APPEARANCE_KEY = "appearance";
 const SESSION_KEY = "workspace-session";
 const BRANCH_LABELS_PREFIX = "branch-labels:";
 const CUSTOM_BASE_URL_PREFIX = "custom-base-url:";
+const SPEND_CAP_OVERRIDES_KEY = "spend-cap-overrides";
 const DEFAULT_SESSION: WorkspaceSessionRecord = {
   projectId: null,
   conversationId: null,
@@ -189,6 +208,26 @@ function endpointUrlForDto(raw: string | null): string | null {
   } catch {
     return null;
   }
+}
+
+function parseUsdMicros(value: string | null): number {
+  if (value === null || value.length === 0) {
+    return 0;
+  }
+  const match = /^(\d+)(?:\.(\d{1,6}))?$/.exec(value);
+  if (!match) {
+    return 0;
+  }
+  const whole = Number(match[1]);
+  const frac = (match[2] ?? "").padEnd(6, "0");
+  return whole * 1_000_000 + Number(frac);
+}
+
+function microsToUsdText(micros: number): string {
+  const abs = Math.abs(Math.trunc(micros));
+  const whole = Math.floor(abs / 1_000_000);
+  const frac = String(abs % 1_000_000).padStart(6, "0");
+  return `${micros < 0 ? "-" : ""}${whole}.${frac}`;
 }
 
 function iso(ms: number): string {
@@ -1090,6 +1129,145 @@ export class HubRepos {
         latencyMs: row.latencyMs,
         createdAt: iso(row.createdAt),
       }));
+  }
+
+  listRecentHealthSamples(limit = 400): HealthSampleRecord[] {
+    return this.db
+      .select()
+      .from(healthSamples)
+      .orderBy(desc(healthSamples.createdAt))
+      .limit(limit)
+      .all()
+      .map((row) => ({
+        id: row.id,
+        providerSlug: row.providerSlug,
+        ok: row.ok === 1,
+        latencyMs: row.latencyMs,
+        createdAt: iso(row.createdAt),
+      }));
+  }
+
+  listSpendCaps(): SpendCapRecord[] {
+    return this.db
+      .select()
+      .from(spendCaps)
+      .all()
+      .map((row) => ({
+        id: row.id,
+        scope: row.scope,
+        limitUsd: row.limitUsd,
+        createdAt: iso(row.createdAt),
+      }));
+  }
+
+  upsertSpendCap(scope: string, limitUsd: string | null): void {
+    const existing = this.db.select().from(spendCaps).where(eq(spendCaps.scope, scope)).get();
+    if (limitUsd === null) {
+      if (existing) {
+        this.db.delete(spendCaps).where(eq(spendCaps.id, existing.id)).run();
+      }
+      return;
+    }
+    const now = Date.now();
+    if (existing) {
+      this.db.update(spendCaps).set({ limitUsd }).where(eq(spendCaps.id, existing.id)).run();
+      return;
+    }
+    this.db
+      .insert(spendCaps)
+      .values({
+        id: randomUUID(),
+        scope,
+        limitUsd,
+        createdAt: now,
+      })
+      .run();
+  }
+
+  sumReceiptCostUsd(filter: {
+    conversationId?: string | null;
+    projectId?: string | null;
+    sinceMs?: number;
+  }): string {
+    const clauses = [];
+    if (filter.sinceMs !== undefined) {
+      clauses.push(gte(messageReceipts.createdAt, filter.sinceMs));
+    }
+    if (filter.conversationId) {
+      clauses.push(eq(messages.conversationId, filter.conversationId));
+    }
+    if (filter.projectId) {
+      clauses.push(eq(conversations.projectId, filter.projectId));
+    }
+    const query = this.db
+      .select({
+        costUsd: messageReceipts.costUsd,
+      })
+      .from(messageReceipts)
+      .innerJoin(messages, eq(messages.id, messageReceipts.messageId))
+      .innerJoin(conversations, eq(conversations.id, messages.conversationId));
+    const rows = clauses.length > 0 ? query.where(and(...clauses)).all() : query.all();
+    let micros = 0;
+    for (const row of rows) {
+      micros += parseUsdMicros(row.costUsd);
+    }
+    return microsToUsdText(micros);
+  }
+
+  listSpendCapOverrides(): SpendCapOverrideRecord[] {
+    const row = this.db.select().from(settings).where(eq(settings.key, SPEND_CAP_OVERRIDES_KEY)).get();
+    if (!row) {
+      return [];
+    }
+    try {
+      const parsed: unknown = JSON.parse(row.value);
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+      return parsed.filter((item): item is SpendCapOverrideRecord => {
+        if (typeof item !== "object" || item === null) {
+          return false;
+        }
+        const record = item as Partial<SpendCapOverrideRecord>;
+        return (
+          typeof record.at === "string" &&
+          typeof record.scope === "string" &&
+          typeof record.limitUsd === "string" &&
+          (record.estimatedUsd === null || typeof record.estimatedUsd === "string") &&
+          typeof record.conversationId === "string" &&
+          typeof record.model === "string" &&
+          typeof record.provider === "string"
+        );
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  appendSpendCapOverride(entry: SpendCapOverrideRecord): void {
+    const stripped: SpendCapOverrideRecord = {
+      at: entry.at,
+      scope: entry.scope,
+      limitUsd: entry.limitUsd,
+      estimatedUsd: entry.estimatedUsd,
+      conversationId: entry.conversationId,
+      model: entry.model,
+      provider: entry.provider,
+    };
+    const next = [stripped, ...this.listSpendCapOverrides()].slice(0, 200);
+    const now = Date.now();
+    this.db
+      .insert(settings)
+      .values({
+        key: SPEND_CAP_OVERRIDES_KEY,
+        value: JSON.stringify(next),
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: settings.key,
+        set: { value: JSON.stringify(next), updatedAt: now },
+      })
+      .run();
   }
 
   async listProviderKeys(): Promise<ProviderKeyRecord[]> {
