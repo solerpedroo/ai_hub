@@ -9,6 +9,8 @@ export {
   type HubSearchApi,
   type HubSecretsApi,
   type HubSettingsApi,
+  type HubPrefsApi,
+  type HubUpdatesApi,
   type HubSpendCapsApi,
   type HubHealthApi,
   type HubCostsApi,
@@ -33,6 +35,14 @@ export {
 export { summarizeProviderHealth, HEALTH_WINDOW, type HealthSampleLike, type HealthSummary } from "./health";
 export { suggestFallbackProvider, type FallbackKeyLike, type FallbackSuggestion } from "./fallback";
 export { classifyHubIpcError, type HubIpcError, type HubIpcErrorKind } from "./hub-error";
+export { looksLikePastedSecret, redactPastedSecrets } from "./secret-paste";
+export {
+  shouldShowOnboarding,
+  sortProvidersForWizard,
+  WIZARD_PROVIDER_ORDER,
+  WIZARD_TTFT_BUDGET_MS,
+} from "./onboarding";
+export { resolveUpdateCheckResult } from "./updates";
 export { IpcChannel, type IpcChannelName } from "./ipc-channels";
 export {
   activePath,
@@ -89,6 +99,10 @@ export {
   costsAggregateResultSchema,
   debugSnapshotSchema,
   debugSnapshotResultSchema,
+  appPrefsSchema,
+  appPrefsPatchSchema,
+  updateCheckResultSchema,
+  updateCheckStatusSchema,
   providerDtoSchema,
   providerKeyDtoSchema,
   providerKeyListResultSchema,
@@ -134,6 +148,10 @@ export {
   type CostsAggregateInput,
   type CostsAggregateResult,
   type DebugSnapshot,
+  type AppPrefs,
+  type AppPrefsPatch,
+  type UpdateCheckResult,
+  type UpdateCheckStatus,
   type ProviderKeyDto,
   type SecretsSaveInput,
   type SecretsTestInput,
