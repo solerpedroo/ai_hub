@@ -595,14 +595,14 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 
 **Sub-tasks:**
 
-- [ ] Schema `context_packets`: payload JSON versionado, token estimate, privacy mode, origem
-- [ ] Preview rico pré-envio: o que entra / o que não entra / tokens / destino
-- [ ] Compactação: sumarizar ramos inativos, cortar mensagens antigas, manter pins
-- [ ] Export packet (arquivo `.aihub-packet.json`)
-- [ ] Import packet para outro projeto
-- [ ] “Usar este packet nesta conversa” (substitui o compile ad hoc)
-- [ ] Compatibilidade: packet não contém API keys nem conteúdo de outros projetos
-- [ ] Testes de contrato do JSON (versionamento v1)
+- [x] Schema `context_packets`: payload JSON versionado, token estimate, privacy mode, origem
+- [x] Preview rico pré-envio: o que entra / o que não entra / tokens / destino
+- [x] Compactação: sumarizar ramos inativos, cortar mensagens antigas, manter pins
+- [x] Export packet (arquivo `.aihub-packet.json`)
+- [x] Import packet para outro projeto
+- [x] “Usar este packet nesta conversa” (substitui o compile ad hoc)
+- [x] Compatibilidade: packet não contém API keys nem conteúdo de outros projetos
+- [x] Testes de contrato do JSON (versionamento v1)
 
 **DoD:** exportar packet no Projeto A, importar no Projeto B, continuar a tarefa em outro modelo com preview visível.
 
