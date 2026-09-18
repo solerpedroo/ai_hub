@@ -41,6 +41,15 @@ import type {
   ImportPickResult,
   ImportStartInput,
   ImportStartResult,
+  ContextPacketDto,
+  PacketsApplyInput,
+  PacketsClearInput,
+  PacketsCompileInput,
+  PacketsExportInput,
+  PacketsExportResult,
+  PacketsImportInput,
+  PacketsListInput,
+  MessagePinInput,
   ProviderKeyDto,
   SecretsSaveInput,
   SecretsTestInput,
@@ -78,6 +87,7 @@ export interface HubMessagesApi {
   create: (input: MessageCreateInput) => Promise<MessageDto>;
   update: (input: MessageUpdateInput) => Promise<MessageDto>;
   activate: (input: IdInput) => Promise<void>;
+  pin: (input: MessagePinInput) => Promise<MessageDto>;
 }
 
 export interface HubSettingsApi {
@@ -135,6 +145,16 @@ export interface HubImportApi {
   onEvent: (listener: (event: ImportEvent) => void) => () => void;
 }
 
+export interface HubPacketsApi {
+  list: (input: PacketsListInput) => Promise<ContextPacketDto[]>;
+  compile: (input: PacketsCompileInput) => Promise<ContextPacketDto>;
+  export: (input: PacketsExportInput) => Promise<PacketsExportResult>;
+  pickFile: () => Promise<ImportPickResult>;
+  import: (input: PacketsImportInput) => Promise<ContextPacketDto>;
+  apply: (input: PacketsApplyInput) => Promise<ConversationDto>;
+  clear: (input: PacketsClearInput) => Promise<ConversationDto>;
+}
+
 export interface HubChatApi {
   send: (input: ChatSendInput) => Promise<ChatSendResult>;
   abort: (input: ChatAbortInput) => Promise<void>;
@@ -160,6 +180,7 @@ export interface HubApi {
   debug: HubDebugApi;
   chat: HubChatApi;
   import: HubImportApi;
+  packets: HubPacketsApi;
 }
 
 export type { AppLocale, ThemeMode };
