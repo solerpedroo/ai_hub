@@ -573,16 +573,16 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 
 **Sub-tasks:**
 
-- [ ] Parser ChatGPT export (ZIP/JSON `conversations.json`)
-- [ ] Parser Claude export (formato oficial disponível; senão HTML/JSON documentado)
-- [ ] Parser Gemini best-effort + nota de limitações
-- [ ] Job de import: progresso, cancelar, relatório (ok / skip / erro)
-- [ ] Idempotência por hash da conversa origem (`provider + external_id`)
-- [ ] Destino: projeto escolhido ou inbox “Importadas”
-- [ ] Mapear mensagens user/assistant; timestamps; título
-- [ ] Receipts das importadas: `source=import`, custo `null`
-- [ ] Não importar attachments binários nesta onda (placeholder “arquivo não importado”)
-- [ ] Testes com fixtures reais anonimizados (pequenos)
+- [x] Parser ChatGPT export (ZIP/JSON `conversations.json`)
+- [x] Parser Claude export (formato oficial disponível; senão HTML/JSON documentado)
+- [x] Parser Gemini best-effort + nota de limitações
+- [x] Job de import: progresso, cancelar, relatório (ok / skip / erro)
+- [x] Idempotência por hash da conversa origem (`provider + external_id`)
+- [x] Destino: projeto escolhido ou inbox “Importadas”
+- [x] Mapear mensagens user/assistant; timestamps; título
+- [x] Receipts das importadas: `source=import`, custo `null`
+- [x] Não importar attachments binários nesta onda (placeholder “arquivo não importado”)
+- [x] Testes com fixtures reais anonimizados (pequenos)
 
 **DoD:** um export real de ChatGPT vira conversas navegáveis no Hub, sem duplicar no reimport.
 
