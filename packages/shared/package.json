@@ -7,6 +7,10 @@
     ".": {
       "types": "./src/index.ts",
       "default": "./src/index.ts"
+    },
+    "./import": {
+      "types": "./src/import/index.ts",
+      "default": "./src/import/index.ts"
     }
   },
   "scripts": {
@@ -18,6 +22,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@types/node": "^22.18.1",
     "vitest": "^3.2.4"
   }
 }
