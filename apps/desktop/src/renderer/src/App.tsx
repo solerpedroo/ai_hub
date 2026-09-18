@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useRef, useState, type JSX } from "react";
 import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
 import type {
   BranchLabels,
   ChatSendInput,
   ChatSendResult,
   ConversationDto,
+  CostsAggregateResult,
+  GatewayErrorCode,
+  HealthSummaryDto,
   MessageDto,
   PacketPreviewResult,
   ProjectDto,
@@ -14,6 +18,7 @@ import type {
 } from "@ai-hub/shared";
 import {
   catalogModelsForProvider,
+  classifyHubIpcError,
   findCatalogModel,
   upsertActivated,
 } from "@ai-hub/shared";
@@ -22,8 +27,11 @@ import { Sidebar } from "@/components/layout/sidebar";
 import { StatusBar } from "@/components/layout/status-bar";
 import { HomeView } from "@/components/layout/home-view";
 import { SettingsView } from "@/components/layout/settings-view";
+import { DebugView } from "@/components/layout/debug-view";
 import { ChromeCommandPalette } from "@/components/layout/command-palette";
 import type { AppView } from "@/components/layout/types";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 function applySendResult(current: MessageDto[], result: ChatSendResult): MessageDto[] {
   let next = current;
@@ -31,6 +39,38 @@ function applySendResult(current: MessageDto[], result: ChatSendResult): Message
     next = upsertActivated(next, result.userMessage);
   }
   return upsertActivated(next, result.assistant);
+}
+
+const GATEWAY_ERROR_KEYS = new Set<GatewayErrorCode>([
+  "timeout",
+  "rate_limit",
+  "auth",
+  "context_overflow",
+  "quota",
+  "network",
+  "unknown",
+]);
+
+function workspaceErrorText(t: TFunction, error: unknown): { text: string; cap: boolean } {
+  const message = error instanceof Error ? error.message : String(error);
+  const classified = classifyHubIpcError(message);
+  if (classified.kind === "cap" && classified.scope) {
+    return { text: t("workspace.error.cap", { scope: t(`caps.scope.${classified.scope}`) }), cap: true };
+  }
+  if (classified.kind === "unknown_model") {
+    return { text: t("workspace.error.unknownModel"), cap: false };
+  }
+  if (classified.kind === "gateway" && classified.code && GATEWAY_ERROR_KEYS.has(classified.code)) {
+    return { text: t(`workspace.error.${classified.code}`), cap: false };
+  }
+  return { text: t("workspace.error.generic"), cap: false };
+}
+
+function chatEventErrorText(t: TFunction, code: GatewayErrorCode): string {
+  if (GATEWAY_ERROR_KEYS.has(code)) {
+    return t(`workspace.error.${code}`);
+  }
+  return t("workspace.error.chat", { code });
 }
 
 export function App(): JSX.Element {
@@ -59,10 +99,28 @@ export function App(): JSX.Element {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
   const [threadStartModel, setThreadStartModel] = useState<string | null>(null);
+  const [health, setHealth] = useState<HealthSummaryDto[]>([]);
+  const [costs, setCosts] = useState<CostsAggregateResult | null>(null);
+  const [showAllowOnce, setShowAllowOnce] = useState(false);
+  const [composerDraft, setComposerDraft] = useState("");
+  const [fallback, setFallback] = useState<{
+    messageId: string;
+    code: GatewayErrorCode;
+    failedProvider: string;
+    suggestProviderSlug: string;
+    suggestKeyId: string;
+    suggestModel: string;
+  } | null>(null);
+  const [fallbackPreview, setFallbackPreview] = useState<PacketPreviewResult | null>(null);
   const projectInputRef = useRef<HTMLInputElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const selectedModelRef = useRef(selectedModel);
   const searchGeneration = useRef(0);
+  const lastSendRef = useRef<ChatSendInput | null>(null);
+
+  const reportComposerDraft = useCallback((value: string): void => {
+    setComposerDraft(value);
+  }, []);
 
   const fail = useCallback((): void => {
     setError(t("workspace.error.generic"));
@@ -92,6 +150,14 @@ export function App(): JSX.Element {
     const list = await window.hub.secrets.list();
     setProviderKeys(list);
     return list;
+  }, []);
+
+  const loadHealth = useCallback(async (): Promise<void> => {
+    try {
+      setHealth(await window.hub.health.summary());
+    } catch {
+      // Status bar stays on the last successful sample set.
+    }
   }, []);
 
   useEffect(() => {
@@ -164,6 +230,24 @@ export function App(): JSX.Element {
       }
     })();
   }, [fail, loadConversations, loadKeys, loadMessages, loadProjects]);
+
+  useEffect(() => {
+    void loadHealth();
+    const handle = window.setInterval(() => {
+      void loadHealth();
+    }, 8_000);
+    return () => window.clearInterval(handle);
+  }, [loadHealth]);
+
+  useEffect(() => {
+    void window.hub.costs
+      .aggregate({
+        conversationId: selectedConversationId,
+        projectId: selectedProjectId,
+      })
+      .then(setCosts)
+      .catch(() => setCosts(null));
+  }, [messages, selectedConversationId, selectedProjectId]);
 
   useEffect(() => {
     if (!sessionReady) {
@@ -251,20 +335,28 @@ export function App(): JSX.Element {
       return;
     }
     const extra = extraSystem.trim().length > 0 ? extraSystem : undefined;
-    void window.hub.chat
-      .previewPacket({
-        conversationId: selectedConversationId,
-        model: selectedModel,
-        providerSlug: key.providerSlug,
-        compact: compactHistory,
-        ...(extra !== undefined ? { extraSystem: extra } : {}),
-      })
-      .then(setPacketPreview)
-      .catch(fail);
+    const pending = composerDraft.trim().length > 0 ? composerDraft.trim() : undefined;
+    const handle = window.setTimeout(() => {
+      void window.hub.chat
+        .previewPacket({
+          conversationId: selectedConversationId,
+          model: selectedModel,
+          providerSlug: key.providerSlug,
+          compact: compactHistory,
+          ...(extra !== undefined ? { extraSystem: extra } : {}),
+          ...(pending !== undefined ? { pendingContent: pending } : {}),
+          ...(maxTokens !== null ? { maxTokens } : {}),
+        })
+        .then(setPacketPreview)
+        .catch(fail);
+    }, 200);
+    return () => window.clearTimeout(handle);
   }, [
     compactHistory,
+    composerDraft,
     extraSystem,
     fail,
+    maxTokens,
     messages,
     providerKeys,
     selectedConversationId,
@@ -289,12 +381,27 @@ export function App(): JSX.Element {
           current.map((message) => (message.id === event.message.id ? event.message : message)),
         );
         setRun((current) => (current?.runId === event.runId ? null : current));
+        void loadHealth();
         return;
       }
       setRun((current) => (current?.runId === event.runId ? null : current));
       if (event.code !== "aborted") {
-        setError(t("workspace.error.chat", { code: event.code }));
+        setError(chatEventErrorText(t, event.code));
+        setShowAllowOnce(false);
+        if (event.suggestKeyId && event.suggestProviderSlug && event.suggestModel) {
+          const failed =
+            providerKeys.find((item) => item.id === selectedKeyId)?.providerSlug ?? event.suggestProviderSlug;
+          setFallback({
+            messageId: event.messageId,
+            code: event.code,
+            failedProvider: failed,
+            suggestProviderSlug: event.suggestProviderSlug,
+            suggestKeyId: event.suggestKeyId,
+            suggestModel: event.suggestModel,
+          });
+        }
       }
+      void loadHealth();
       setSelectedConversationId((conversationId) => {
         if (conversationId) {
           void loadMessages(conversationId).catch(fail);
@@ -303,7 +410,26 @@ export function App(): JSX.Element {
       });
     });
     return off;
-  }, [fail, loadMessages, t]);
+  }, [fail, loadHealth, loadMessages, providerKeys, selectedKeyId, t]);
+
+  useEffect(() => {
+    if (!fallback || !selectedConversationId) {
+      setFallbackPreview(null);
+      return;
+    }
+    const extra = extraSystem.trim().length > 0 ? extraSystem : undefined;
+    void window.hub.chat
+      .previewPacket({
+        conversationId: selectedConversationId,
+        model: fallback.suggestModel,
+        providerSlug: fallback.suggestProviderSlug,
+        compact: compactHistory,
+        ...(extra !== undefined ? { extraSystem: extra } : {}),
+        ...(maxTokens !== null ? { maxTokens } : {}),
+      })
+      .then(setFallbackPreview)
+      .catch(() => setFallbackPreview(null));
+  }, [compactHistory, extraSystem, fallback, maxTokens, selectedConversationId]);
 
   const applyProjectPreferences = useCallback(
     (project: ProjectDto, keys: ProviderKeyDto[]): void => {
@@ -347,18 +473,25 @@ export function App(): JSX.Element {
     }
   }, [fail, loadConversations, run, selectedProjectId, t]);
 
-  const sendToModel = async (input: ChatSendInput): Promise<void> => {
+  const sendToModel = async (input: ChatSendInput): Promise<boolean> => {
     if (!selectedConversationId || !selectedKeyId) {
-      return;
+      return false;
     }
+    lastSendRef.current = input;
     setSending(true);
     try {
       const result = await window.hub.chat.send({ ...input, compactHistory });
       setError(null);
+      setShowAllowOnce(false);
+      setFallback(null);
       setRun({ runId: result.runId, conversationId: selectedConversationId });
       setMessages((current) => applySendResult(current, result));
-    } catch {
-      fail();
+      return true;
+    } catch (error) {
+      const mapped = workspaceErrorText(t, error);
+      setError(mapped.text);
+      setShowAllowOnce(mapped.cap);
+      return false;
     } finally {
       setSending(false);
     }
@@ -510,7 +643,7 @@ export function App(): JSX.Element {
               onSelectExtraSystem={setExtraSystem}
               onSend={(content) => {
                 if (!selectedConversationId || !selectedKeyId) {
-                  return Promise.resolve();
+                  return Promise.resolve(false);
                 }
                 return sendToModel({
                   mode: "send",
@@ -549,11 +682,11 @@ export function App(): JSX.Element {
                   extraSystem,
                 });
               }}
-              onContinue={() => {
+              onContinue={async () => {
                 if (!selectedConversationId || !selectedKeyId) {
-                  return Promise.resolve();
+                  return;
                 }
-                return sendToModel({
+                await sendToModel({
                   mode: "continue",
                   conversationId: selectedConversationId,
                   providerKeyId: selectedKeyId,
@@ -686,13 +819,87 @@ export function App(): JSX.Element {
                 threadStartModel !== selectedModel &&
                 messages.length > 0
               }
+              conversationCost={costs?.conversationUsd ?? null}
+              projectCost={costs?.projectUsd ?? null}
+              showAllowOnce={showAllowOnce}
+              onAllowOnce={() => {
+                const pending = lastSendRef.current;
+                if (!pending) {
+                  return;
+                }
+                void sendToModel({ ...pending, allowOnce: true });
+              }}
+              onComposerDraft={reportComposerDraft}
             />
+          ) : view === "debug" ? (
+            <DebugView />
           ) : (
             <SettingsView />
           )}
         </main>
       </div>
-      <StatusBar />
+      <StatusBar health={health} />
+      <Dialog open={fallback !== null} onOpenChange={(open) => {
+        if (!open) {
+          setFallback(null);
+          setFallbackPreview(null);
+        }
+      }}>
+        <DialogContent data-testid="fallback-dialog">
+          <DialogHeader>
+            <DialogTitle>{t("fallback.title")}</DialogTitle>
+          </DialogHeader>
+          {fallback ? (
+            <>
+              <p className="text-[13px]">
+                {t("fallback.body", {
+                  failed: fallback.failedProvider,
+                  code: fallback.code,
+                  suggested: fallback.suggestProviderSlug,
+                })}
+              </p>
+              {fallbackPreview?.estimatedCostUsd ? (
+                <p className="text-[12px] text-muted-foreground" data-testid="fallback-estimate">
+                  {t("fallback.estimate", {
+                    usd: fallbackPreview.estimatedCostUsd,
+                    suggested: fallback.suggestProviderSlug,
+                  })}
+                </p>
+              ) : null}
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  data-testid="fallback-confirm"
+                  onClick={() => {
+                    const pending = fallback;
+                    if (!selectedConversationId) {
+                      return;
+                    }
+                    setFallback(null);
+                    setSelectedKeyId(pending.suggestKeyId);
+                    setSelectedModel(pending.suggestModel);
+                    void sendToModel({
+                      mode: "regenerate",
+                      conversationId: selectedConversationId,
+                      providerKeyId: pending.suggestKeyId,
+                      model: pending.suggestModel,
+                      messageId: pending.messageId,
+                      temperature,
+                      maxTokens,
+                      extraSystem,
+                    });
+                  }}
+                >
+                  {t("fallback.confirm", { suggested: fallback.suggestProviderSlug })}
+                </Button>
+                <Button type="button" variant="outline" onClick={() => setFallback(null)}>
+                  {t("fallback.dismiss")}
+                </Button>
+              </div>
+            </>
+          ) : null}
+        </DialogContent>
+      </Dialog>
       <ChromeCommandPalette
         onNewProject={() => {
           setView("home");
@@ -705,6 +912,7 @@ export function App(): JSX.Element {
           setView("home");
           window.setTimeout(() => searchInputRef.current?.focus(), 0);
         }}
+        onDebug={() => setView("debug")}
       />
     </div>
   );
