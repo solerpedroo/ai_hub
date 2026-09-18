@@ -158,3 +158,47 @@ test("switches from GPT to Claude on the same thread", async () => {
     await app.close();
   }
 });
+
+test("a zero request cap blocks send before an assistant bubble appears", async () => {
+  const app = await launchHub();
+  try {
+    const window = await app.firstWindow();
+    await window.getByTestId("nav-settings").click();
+    await window.getByTestId("spend-cap-request").fill("0");
+    await window.getByTestId("spend-cap-save").click();
+    await window.getByTestId("nav-home").click();
+    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
+    await window.getByTestId("chat-composer").fill("Hello");
+    await window.getByTestId("chat-send").click();
+    await expect(window.getByTestId("workspace-error")).toBeVisible({ timeout: 15_000 });
+    await expect(window.getByTestId("message-assistant")).toHaveCount(0);
+    await expect(window.getByTestId("chat-composer")).toHaveValue("Hello");
+    await window.getByTestId("cap-allow-once").click();
+    await expect(window.getByTestId("message-assistant")).toContainText("Hello from mock", {
+      timeout: 30_000,
+    });
+  } finally {
+    await app.close();
+  }
+});
+
+test("assistant receipt opens a detail dialog without treating abort as failure", async () => {
+  const app = await launchHub();
+  try {
+    const window = await app.firstWindow();
+    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
+    await window.getByTestId("chat-composer").fill("Hello");
+    await window.getByTestId("chat-send").click();
+    await expect(window.getByTestId("message-assistant")).toHaveAttribute("data-status", "complete", {
+      timeout: 30_000,
+    });
+    await window.getByTestId("receipt-open").click();
+    await expect(window.getByTestId("receipt-dialog")).toBeVisible();
+    await window.keyboard.press("Escape");
+    await expect(window.getByTestId("receipt-dialog")).toHaveCount(0);
+    await window.getByTestId("nav-debug").click();
+    await expect(window.getByTestId("debug-snapshot")).toBeVisible();
+  } finally {
+    await app.close();
+  }
+});
