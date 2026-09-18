@@ -36,11 +36,12 @@ None.
 ## Notes for the next session
 
 - W08 fechada: wizard <90s, aviso de secret no composer, NSIS, electron-updater, crash opt-in local.
-- Não popular FTS plaintext. Não começar W09 sem o utilizador pedir.
+- Plano atualizado (ADR-W09-001): duas ondas novas — **W21** run modes + HUD de tokens (D13); **W24** orquestração (D14). MCP deslocou para W22; agente único W23; marcos D/E até W31. **Não implementar isso agora.**
+- Não popular FTS plaintext. Não começar W09 sem o utilizador pedir. Não pular para agentes.
 
 ## Last review / ADR
 
 | Kind | Path |
 |---|---|
 | Review | `docs/reviews/W08/REVIEW.md` |
-| Latest ADR | `docs/ADR/ADR-W08-005-composer-secret-hint.md` |
+| Latest ADR | `docs/ADR/ADR-W09-001-run-modes-and-agent-orchestration-waves.md` |
