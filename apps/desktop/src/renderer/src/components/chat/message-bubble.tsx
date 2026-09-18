@@ -190,6 +190,15 @@ export function MessageBubble({
                 <dd>{message.receipt.latencyMs ?? "—"}</dd>
                 <dt className="text-muted-foreground">{t("debug.error")}</dt>
                 <dd>{message.receipt.errorCode ?? "—"}</dd>
+                <dt className="text-muted-foreground">{t("workspace.receipt.source")}</dt>
+                <dd
+                  data-testid="receipt-source"
+                  data-source={message.receipt.source}
+                >
+                  {message.receipt.source === "import"
+                    ? t("workspace.receipt.source.import")
+                    : t("workspace.receipt.source.chat")}
+                </dd>
               </dl>
               <p className="text-[11px] text-muted-foreground">
                 {t("workspace.receipt.created", { at: message.receipt.createdAt })}
