@@ -5,12 +5,14 @@ import type {
   BranchLabels,
   ChatSendInput,
   ChatSendResult,
+  ContextPacketDto,
   ConversationDto,
   CostsAggregateResult,
   GatewayErrorCode,
   HealthSummaryDto,
   MessageDto,
   PacketPreviewResult,
+  PacketPrivacyMode,
   ProjectDto,
   ProjectUpdateInput,
   ProviderKeyDto,
@@ -102,6 +104,8 @@ export function App(): JSX.Element {
   const [exportNotice, setExportNotice] = useState<string | null>(null);
   const [compactHistory, setCompactHistory] = useState(false);
   const [packetPreview, setPacketPreview] = useState<PacketPreviewResult | null>(null);
+  const [packets, setPackets] = useState<ContextPacketDto[]>([]);
+  const [privacyMode, setPrivacyMode] = useState<PacketPrivacyMode>("standard");
   const [searchQuery, setSearchQuery] = useState("");
   const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
   const [threadStartModel, setThreadStartModel] = useState<string | null>(null);
@@ -158,6 +162,14 @@ export function App(): JSX.Element {
     const labels = await window.hub.conversations.getBranchLabels({ conversationId });
     setBranchLabels(labels);
     return list;
+  }, []);
+
+  const loadPackets = useCallback(async (projectId: string | null): Promise<void> => {
+    try {
+      setPackets(await window.hub.packets.list({ projectId }));
+    } catch {
+      setPackets([]);
+    }
   }, []);
 
   const loadKeys = useCallback(async (): Promise<ProviderKeyDto[]> => {
@@ -278,6 +290,10 @@ export function App(): JSX.Element {
   }, [messages, selectedConversationId, selectedProjectId]);
 
   useEffect(() => {
+    void loadPackets(selectedProjectId);
+  }, [loadPackets, selectedProjectId]);
+
+  useEffect(() => {
     if (!sessionReady) {
       return;
     }
@@ -382,6 +398,7 @@ export function App(): JSX.Element {
           model: selectedModel,
           providerSlug: key.providerSlug,
           compact: compactHistory,
+          privacyMode,
           ...(extra !== undefined ? { extraSystem: extra } : {}),
           ...(pending !== undefined ? { pendingContent: pending } : {}),
           ...(maxTokens !== null ? { maxTokens } : {}),
@@ -401,6 +418,8 @@ export function App(): JSX.Element {
     selectedConversationId,
     selectedKeyId,
     selectedModel,
+    privacyMode,
+    conversations.find((item) => item.id === selectedConversationId)?.activePacketId,
   ]);
 
   useEffect(() => {
@@ -475,12 +494,13 @@ export function App(): JSX.Element {
         model: fallback.suggestModel,
         providerSlug: fallback.suggestProviderSlug,
         compact: compactHistory,
+        privacyMode,
         ...(extra !== undefined ? { extraSystem: extra } : {}),
         ...(maxTokens !== null ? { maxTokens } : {}),
       })
       .then(setFallbackPreview)
       .catch(() => setFallbackPreview(null));
-  }, [compactHistory, extraSystem, fallback, maxTokens, selectedConversationId]);
+  }, [compactHistory, extraSystem, fallback, maxTokens, privacyMode, selectedConversationId]);
 
   const applyProjectPreferences = useCallback(
     (project: ProjectDto, keys: ProviderKeyDto[]): void => {
@@ -532,7 +552,7 @@ export function App(): JSX.Element {
     lastSendRef.current = input;
     setSending(true);
     try {
-      const result = await window.hub.chat.send({ ...input, compactHistory });
+      const result = await window.hub.chat.send({ ...input, compactHistory, privacyMode });
       setError(null);
       setShowAllowOnce(false);
       setFallback(null);
@@ -966,6 +986,99 @@ export function App(): JSX.Element {
                 void sendToModel({ ...pending, allowOnce: true });
               }}
               onComposerDraft={reportComposerDraft}
+              onPin={async (id, pinned) => {
+                try {
+                  const updated = await window.hub.messages.pin({ id, pinned });
+                  setMessages((current) =>
+                    current.map((item) => (item.id === updated.id ? updated : item)),
+                  );
+                } catch {
+                  fail();
+                }
+              }}
+              packets={packets}
+              privacyMode={privacyMode}
+              onPrivacyMode={setPrivacyMode}
+              onCompilePacket={async () => {
+                if (!selectedConversationId) {
+                  return;
+                }
+                const key = providerKeys.find((item) => item.id === selectedKeyId);
+                const extra = extraSystem.trim().length > 0 ? extraSystem : undefined;
+                try {
+                  await window.hub.packets.compile({
+                    conversationId: selectedConversationId,
+                    compact: compactHistory,
+                    privacyMode,
+                    ...(key ? { model: selectedModel, providerSlug: key.providerSlug } : {}),
+                    ...(extra !== undefined ? { extraSystem: extra } : {}),
+                  });
+                  await loadPackets(selectedProjectId);
+                  setExportNotice(t("workspace.packet.savedNotice"));
+                } catch {
+                  fail();
+                }
+              }}
+              onExportPacket={async (packetId) => {
+                try {
+                  const result = await window.hub.packets.export({ packetId });
+                  setExportNotice(
+                    result.status === "saved"
+                      ? t("workspace.packet.exported")
+                      : t("workspace.packet.cancelled"),
+                  );
+                } catch {
+                  fail();
+                }
+              }}
+              onImportPacket={async () => {
+                if (!selectedProjectId) {
+                  return;
+                }
+                try {
+                  const picked = await window.hub.packets.pickFile();
+                  if (picked.status !== "picked") {
+                    setExportNotice(t("workspace.packet.cancelled"));
+                    return;
+                  }
+                  await window.hub.packets.import({ ticket: picked.ticket, projectId: selectedProjectId });
+                  await loadPackets(selectedProjectId);
+                  setExportNotice(t("workspace.packet.imported"));
+                } catch {
+                  fail();
+                }
+              }}
+              onApplyPacket={async (packetId) => {
+                if (!selectedConversationId) {
+                  return;
+                }
+                try {
+                  const updated = await window.hub.packets.apply({
+                    conversationId: selectedConversationId,
+                    packetId,
+                  });
+                  setConversations((current) =>
+                    current.map((item) => (item.id === updated.id ? updated : item)),
+                  );
+                  setExportNotice(t("workspace.packet.appliedNotice"));
+                } catch {
+                  fail();
+                }
+              }}
+              onClearPacket={async () => {
+                if (!selectedConversationId) {
+                  return;
+                }
+                try {
+                  const updated = await window.hub.packets.clear({ conversationId: selectedConversationId });
+                  setConversations((current) =>
+                    current.map((item) => (item.id === updated.id ? updated : item)),
+                  );
+                  setExportNotice(t("workspace.packet.cleared"));
+                } catch {
+                  fail();
+                }
+              }}
             />
           ) : view === "debug" ? (
             <DebugView />
