@@ -13,6 +13,7 @@ export {
   type CrashSafeStreamResult,
 } from "./crash-safe";
 export { GatewayError, GatewayStreamError, gatewayErrorCode, isGatewayError } from "./errors";
+export { isTransientGatewayCode, retryBackoffMs, sleepAbortable, withTransientRetry, TRANSIENT_GATEWAY_CODES } from "./retry";
 export { createAnthropicAdapter, type AnthropicAdapterOptions } from "./anthropic-adapter";
 export { createGeminiAdapter, type GeminiAdapterOptions } from "./gemini-adapter";
 export { createGroqAdapter, GROQ_BASE_URL } from "./groq-adapter";
