@@ -1,17 +1,7 @@
-const SECRET_PATTERNS: readonly RegExp[] = [
-  /sk-[A-Za-z0-9_-]{8,}/g,
-  /gsk_[A-Za-z0-9]{8,}/g,
-  /AIza[A-Za-z0-9_-]{10,}/g,
-  /Bearer\s+[A-Za-z0-9._\-+=/]+/gi,
-  /(?:api[_-]?key|access[_-]?token|secret|x-api-key|x-goog-api-key)[=:\s]+['"]?[^\s'"]+/gi,
-];
+import { redactPastedSecrets } from "@ai-hub/shared";
 
 export function redactSecrets(text: string): string {
-  let output = text;
-  for (const pattern of SECRET_PATTERNS) {
-    output = output.replace(pattern, "[REDACTED]");
-  }
-  return output;
+  return redactPastedSecrets(text);
 }
 
 export function maskSecret(secret: string): string {
