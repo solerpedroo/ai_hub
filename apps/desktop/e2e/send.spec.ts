@@ -84,6 +84,8 @@ test("settings lists OpenRouter as a first-class provider", async () => {
     await expect(window.getByTestId("secrets-provider")).toBeVisible();
     await expect(window.getByTestId("secrets-provider")).toContainText("OpenRouter");
     await expect(window.getByTestId("secrets-test").first()).toBeVisible();
+    await window.getByTestId("updates-check").click();
+    await expect(window.getByTestId("updates-status")).toHaveAttribute("data-status", "skipped");
   } finally {
     await app.close();
   }
@@ -198,6 +200,21 @@ test("assistant receipt opens a detail dialog without treating abort as failure"
     await expect(window.getByTestId("receipt-dialog")).toHaveCount(0);
     await window.getByTestId("nav-debug").click();
     await expect(window.getByTestId("debug-snapshot")).toBeVisible();
+  } finally {
+    await app.close();
+  }
+});
+
+test("composer warns when the draft looks like an API key", async () => {
+  const app = await launchHub();
+  try {
+    const window = await app.firstWindow();
+    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
+    await window.getByTestId("chat-composer").fill("sk-testfixtureABCDEFGH leftover");
+    await expect(window.getByTestId("composer-secret-warning")).toBeVisible();
+    await window.getByTestId("composer-secret-redact").click();
+    await expect(window.getByTestId("composer-secret-warning")).toHaveCount(0);
+    await expect(window.getByTestId("chat-composer")).toHaveValue("[REDACTED] leftover");
   } finally {
     await app.close();
   }
