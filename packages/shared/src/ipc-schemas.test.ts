@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   conversationExportDocumentSchema,
+  debugSnapshotSchema,
   emptyIpcPayloadSchema,
   ipcAckResultSchema,
   messageCreateInputSchema,
   messageDtoSchema,
   messageUpdateInputSchema,
+  packetPreviewInputSchema,
+  packetPreviewResultSchema,
   providerKeyDtoSchema,
   projectCreateInputSchema,
   projectDtoSchema,
@@ -257,5 +260,57 @@ describe("project and search contracts", () => {
     expect(searchHitSchema.parse(hit).snippet).toBe("needle");
     expect(() => searchHitSchema.parse({ ...hit, apiKey: "sk-testfixtureABCDEFGH" })).toThrow();
     expect(() => searchHitSchema.parse({ ...hit, snippet: "x".repeat(401) })).toThrow();
+  });
+});
+
+describe("wave 7 contracts", () => {
+  it("rejects secrets on a debug snapshot", () => {
+    const snapshot = {
+      at: "2026-09-17T00:00:00.000Z",
+      provider: "openai",
+      model: "gpt-4o-mini",
+      retries: 1,
+      lastErrorCode: "timeout" as const,
+      tokenEstimate: 40,
+      estimatedCostUsd: "0.000010",
+      capDecision: "ok" as const,
+      capScope: null,
+      overflow: false,
+    };
+    expect(debugSnapshotSchema.parse(snapshot).provider).toBe("openai");
+    expect(() => debugSnapshotSchema.parse({ ...snapshot, authorization: "Bearer sk-test" })).toThrow();
+  });
+
+  it("requires estimate and cap fields on packet preview", () => {
+    const parsed = packetPreviewResultSchema.parse({
+      tokenEstimate: 12,
+      contextWindow: 128000,
+      overflow: false,
+      compacted: false,
+      excludedCount: 0,
+      estimatedCostUsd: "0.000001",
+      capWarnings: ["request"],
+      capBlocked: null,
+    });
+    expect(parsed.capWarnings).toEqual(["request"]);
+    expect(() =>
+      packetPreviewResultSchema.parse({
+        tokenEstimate: 12,
+        contextWindow: 128000,
+        overflow: false,
+        compacted: false,
+        excludedCount: 0,
+      }),
+    ).toThrow();
+    expect(() =>
+      packetPreviewInputSchema.parse({
+        conversationId: "11111111-1111-4111-8111-111111111111",
+        model: "gpt-4o-mini",
+        providerSlug: "openai",
+        pendingContent: "Hello",
+        maxTokens: 256,
+        secret: "sk-testfixtureABCDEFGH",
+      }),
+    ).toThrow();
   });
 });
