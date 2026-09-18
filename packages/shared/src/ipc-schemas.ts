@@ -498,3 +498,32 @@ export const debugSnapshotSchema = z
 export type DebugSnapshot = z.infer<typeof debugSnapshotSchema>;
 
 export const debugSnapshotResultSchema = debugSnapshotSchema.nullable();
+
+export const updateCheckStatusSchema = z.enum(["idle", "skipped", "uptodate", "available", "unavailable"]);
+
+export type UpdateCheckStatus = z.infer<typeof updateCheckStatusSchema>;
+
+export const appPrefsSchema = z
+  .object({
+    onboardingComplete: z.boolean(),
+    crashReporterOptIn: z.boolean(),
+    lastUpdateCheckAt: isoTimestampSchema.nullable(),
+    lastUpdateStatus: updateCheckStatusSchema,
+    lastWizardTtftMs: z.number().int().nonnegative().nullable(),
+  })
+  .strict();
+
+export type AppPrefs = z.infer<typeof appPrefsSchema>;
+
+export const appPrefsPatchSchema = appPrefsSchema.partial().strict();
+
+export type AppPrefsPatch = z.infer<typeof appPrefsPatchSchema>;
+
+export const updateCheckResultSchema = z
+  .object({
+    status: updateCheckStatusSchema,
+    version: z.string().max(64).nullable(),
+  })
+  .strict();
+
+export type UpdateCheckResult = z.infer<typeof updateCheckResultSchema>;
