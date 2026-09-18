@@ -509,6 +509,10 @@ Agente:
 
 O usuário poderá acompanhar cada etapa.
 
+Isso é o **loop único**. Orquestração (vários especialistas com handoff) é uma camada posterior, distinta do AI Council (vários modelos na mesma pergunta, sem tools). Detalhe de ondas: `docs/IMPLEMENTATION_PLAN.md` W23 vs W24.
+
+Modos de corrida (plan / assist / agent / orchestrate), esforço e HUD de tokens — superfície tipo Claude Code — entram no plano como W21 (chat) e só desbloqueiam agent/orchestrate nas ondas donas. **Não** inclui treinar pesos (fine-tune ML) no Hub.
+
 ---
 
 # 14. MCP / Tools
@@ -1481,14 +1485,16 @@ Após validar o MVP:
 - prompt library;
 - command palette;
 - quick AI;
-- clipboard intelligence.
+- clipboard intelligence;
+- run modes (plan/assist) + esforço + HUD de tokens da sessão.
 
 ---
 
 # 49. V2
 
 - MCP;
-- agentes;
+- agentes (loop único);
+- orquestração de agentes (supervisor + especialistas);
 - terminal;
 - Git;
 - GitHub;
