@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compileActivePath, compilePacket } from "./compiler";
+import { compileActivePath, compilePacket, mergePacketWithTail } from "./compiler";
 
 describe("compilePacket", () => {
   it("joins project instructions and skips streaming messages", () => {
@@ -166,5 +166,152 @@ describe("compilePacket", () => {
     expect(gpt).toEqual(claude);
     expect(gpt.system).toBe("Project voice.");
     expect(gpt.messages.map((item) => item.content).join(" ")).not.toMatch(/summar/i);
+  });
+
+  it("summarizes inactive branches in system without adding them as turns", () => {
+    const packet = compileActivePath({
+      projectInstructions: null,
+      extraSystem: null,
+      messages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          parentId: null,
+          isActiveBranch: true,
+          createdAt: "2026-09-17T00:00:00.000Z",
+          role: "user",
+          content: "prompt",
+          status: "complete",
+        },
+        {
+          id: "22222222-2222-4222-8222-222222222222",
+          parentId: "11111111-1111-4111-8111-111111111111",
+          isActiveBranch: false,
+          createdAt: "2026-09-17T00:00:01.000Z",
+          role: "assistant",
+          content: "old",
+          status: "complete",
+        },
+        {
+          id: "33333333-3333-4333-8333-333333333333",
+          parentId: "11111111-1111-4111-8111-111111111111",
+          isActiveBranch: true,
+          createdAt: "2026-09-17T00:00:02.000Z",
+          role: "assistant",
+          content: "new",
+          status: "complete",
+        },
+      ],
+    });
+    expect(packet.messages.some((item) => item.content === "old")).toBe(false);
+    expect(packet.system).toMatch(/Inactive branches/);
+    expect(packet.system).toMatch(/old/);
+  });
+
+  it("keeps pinned turns when compacting old messages", () => {
+    const pinned = "keep-me-pinned";
+    const packet = compilePacket({
+      projectInstructions: null,
+      extraSystem: null,
+      maxTokenBudget: 20,
+      messages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          role: "user",
+          content: pinned,
+          status: "complete",
+          pinned: true,
+        },
+        {
+          id: "22222222-2222-4222-8222-222222222222",
+          role: "assistant",
+          content: "y".repeat(80),
+          status: "complete",
+        },
+        {
+          id: "33333333-3333-4333-8333-333333333333",
+          role: "user",
+          content: "fresh question",
+          status: "complete",
+        },
+      ],
+    });
+    expect(packet.messages.some((item) => item.content === pinned)).toBe(true);
+    expect(packet.excluded).toContain("22222222-2222-4222-8222-222222222222");
+  });
+
+  it("omits project instructions and inactive summaries in strict privacy", () => {
+    const packet = compileActivePath({
+      projectInstructions: "Secret project voice.",
+      extraSystem: "Be terse.",
+      privacyMode: "strict",
+      messages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          parentId: null,
+          isActiveBranch: true,
+          createdAt: "2026-09-17T00:00:00.000Z",
+          role: "user",
+          content: "prompt",
+          status: "complete",
+        },
+        {
+          id: "22222222-2222-4222-8222-222222222222",
+          parentId: "11111111-1111-4111-8111-111111111111",
+          isActiveBranch: false,
+          createdAt: "2026-09-17T00:00:01.000Z",
+          role: "assistant",
+          content: "old-secret-turn",
+          status: "complete",
+        },
+        {
+          id: "33333333-3333-4333-8333-333333333333",
+          parentId: "11111111-1111-4111-8111-111111111111",
+          isActiveBranch: true,
+          createdAt: "2026-09-17T00:00:02.000Z",
+          role: "assistant",
+          content: "new",
+          status: "complete",
+        },
+      ],
+    });
+    expect(packet.system).toBe("Be terse.");
+    expect(packet.system).not.toMatch(/Secret project voice/);
+    expect(packet.system).not.toMatch(/old-secret-turn/);
+    expect(packet.messages.map((item) => item.content)).toEqual(["prompt", "new"]);
+  });
+
+  it("merges an applied packet with only the active tail", () => {
+    const payload = compilePacket({
+      projectInstructions: "Voice.",
+      extraSystem: null,
+      messages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          role: "user",
+          content: "imported prompt",
+          status: "complete",
+        },
+      ],
+    });
+    const merged = mergePacketWithTail(payload, [
+      {
+        id: "22222222-2222-4222-8222-222222222222",
+        role: "assistant",
+        content: "inactive sibling",
+        status: "complete",
+      },
+      {
+        id: "33333333-3333-4333-8333-333333333333",
+        role: "user",
+        content: "next step",
+        status: "complete",
+      },
+    ]).packet;
+    expect(merged.system).toBe("Voice.");
+    expect(merged.messages.map((item) => item.content)).toEqual([
+      "imported prompt",
+      "inactive sibling",
+      "next step",
+    ]);
   });
 });
