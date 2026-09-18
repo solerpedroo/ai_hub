@@ -1,0 +1,2849 @@
+﻿diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts
+index b26de85..803884a 100644
+--- a/apps/desktop/src/main/chat-session.ts
++++ b/apps/desktop/src/main/chat-session.ts
+@@ -10,13 +10,14 @@ import {
+   GatewayError,
+   GatewayStreamError,
+   gatewayErrorCode,
++  mergePacketWithTail,
+   resolveAdapter,
+   withTransientRetry,
+   type CompilerGraphMessage,
+   type CompilerMessage,
+   type ProviderAdapter,
+ } from "@ai-hub/ai-gateway";
+-import type { MessageRecord } from "@ai-hub/db";
++import type { ConversationRecord, MessageRecord } from "@ai-hub/db";
+ import { redactSecrets } from "@ai-hub/security";
+ import {
+   activePath,
+@@ -25,6 +26,7 @@ import {
+   findCatalogModel,
+   IpcChannel,
+   packetV0Schema,
++  portablePacketV1Schema,
+   SpendCapError,
+   suggestFallbackProvider,
+   summarizeProviderHealth,
+@@ -122,6 +124,7 @@ function compilerMessages(rows: MessageRecord[]): CompilerMessage[] {
+     role: item.role,
+     content: item.content,
+     status: item.status,
++    ...(item.pinned ? { pinned: true } : {}),
+   }));
+ }
+ 
+@@ -134,6 +137,8 @@ function compilerGraphMessages(rows: MessageRecord[]): CompilerGraphMessage[] {
+     role: item.role,
+     content: item.content,
+     status: item.status,
++    branchId: item.branchId,
++    ...(item.pinned ? { pinned: true } : {}),
+   }));
+ }
+ 
+@@ -142,12 +147,30 @@ function compileOutgoing(
+   projectInstructions: string | null,
+   compileRows: MessageRecord[],
+   providerSlug: string,
++  conversation: ConversationRecord,
+ ): ProviderAgnosticPacket {
+   const extraSystem =
+     input.extraSystem !== undefined && input.extraSystem.trim().length > 0 ? input.extraSystem.trim() : null;
+   const catalog = findCatalogModel(input.model, providerSlug);
+   const maxTokenBudget =
+     input.compactHistory === true ? (catalog?.contextWindow ?? 128_000) : undefined;
++  if (conversation.activePacketId) {
++    const stored = getHubDatabase().repos.getContextPacket(conversation.activePacketId);
++    if (stored) {
++      const envelope = portablePacketV1Schema.parse(JSON.parse(stored.payloadJson) as unknown);
++      const appliedAt = conversation.packetAppliedAt;
++      const tail = compileRows.filter((item) => appliedAt !== null && item.createdAt > appliedAt);
++      const merged = {
++        payload: envelope.payload,
++        messages: compilerMessages(tail),
++      };
++      return mergePacketWithTail(
++        merged.payload,
++        merged.messages,
++        maxTokenBudget,
++      ).packet;
++    }
++  }
+   if (input.mode === "regenerate") {
+     const compiled = {
+       projectInstructions,
+@@ -185,6 +208,7 @@ function pendingUser(
+     status: "complete",
+     createdAt: new Date().toISOString(),
+     receipt: null,
++    pinned: false,
+   };
+ }
+ 
+@@ -311,7 +335,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+   }
+ 
+   const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
+-  const packet = compileOutgoing(input, project?.instructions ?? null, compileRows, key.providerSlug);
++  const packet = compileOutgoing(input, project?.instructions ?? null, compileRows, key.providerSlug, conversation);
+   if (packet.messages.length === 0) {
+     throw new Error("Add a user message before sending");
+   }
+diff --git a/apps/desktop/src/main/conversation-export.ts b/apps/desktop/src/main/conversation-export.ts
+index f92e274..b83bc9d 100644
+--- a/apps/desktop/src/main/conversation-export.ts
++++ b/apps/desktop/src/main/conversation-export.ts
+@@ -40,6 +40,7 @@ export function buildConversationExportDocument(input: {
+     createdAt: string;
+     updatedAt: string;
+     importSource?: "chatgpt" | "claude" | "gemini" | null;
++    activePacketId?: string | null;
+   };
+   messages: MessageDto[];
+   branchLabels: Record<string, string>;
+@@ -52,6 +53,7 @@ export function buildConversationExportDocument(input: {
+     conversation: conversationDtoSchema.parse({
+       ...input.conversation,
+       importSource: input.conversation.importSource ?? null,
++      activePacketId: input.conversation.activePacketId ?? null,
+     }),
+     branchLabels: branchLabelsSchema.parse(input.branchLabels),
+     messages: selected,
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index 1b68dcb..68da176 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -35,9 +35,19 @@ import {
+   messageDtoSchema,
+   messageListInputSchema,
+   messageListResultSchema,
++  messagePinInputSchema,
+   messageUpdateInputSchema,
+   packetPreviewInputSchema,
+   packetPreviewResultSchema,
++  packetsApplyInputSchema,
++  packetsClearInputSchema,
++  packetsCompileInputSchema,
++  packetsExportInputSchema,
++  packetsExportResultSchema,
++  packetsImportInputSchema,
++  packetsListInputSchema,
++  contextPacketDtoSchema,
++  contextPacketListResultSchema,
+   projectCreateInputSchema,
+   projectDtoSchema,
+   projectListResultSchema,
+@@ -64,6 +74,13 @@ import { applyCrashReporterOptIn } from "./crash-reporter";
+ import { getLatestDebugSnapshot } from "./debug-snapshot";
+ import { cancelImportJob, pickImportFile, startImportJob } from "./import-job";
+ import { toMessageDto } from "./message-dto";
++import {
++  compileAndSavePacket,
++  exportSavedPacket,
++  importPacketFile,
++  listProjectPackets,
++  pickPacketFile,
++} from "./packet-file";
+ import { previewPacket } from "./packet-preview";
+ import { getHubDatabase } from "./persistence";
+ import { testProviderKey } from "./provider-health";
+@@ -233,6 +250,43 @@ export function registerWorkspaceIpc(): void {
+     getHubDatabase().repos.activatePathThrough(input.id);
+   });
+ 
++  registerHandler(IpcChannel.messagesPin, messagePinInputSchema, messageDtoSchema, (input) =>
++    toMessageDto(getHubDatabase().repos.setMessagePinned(input.id, input.pinned)),
++  );
++
++  registerHandler(IpcChannel.packetsList, packetsListInputSchema, contextPacketListResultSchema, (input) =>
++    listProjectPackets(input.projectId),
++  );
++
++  registerHandler(IpcChannel.packetsCompile, packetsCompileInputSchema, contextPacketDtoSchema, (input) =>
++    compileAndSavePacket(input),
++  );
++
++  registerHandler(
++    IpcChannel.packetsExport,
++    packetsExportInputSchema,
++    packetsExportResultSchema,
++    (input, event) => exportSavedPacket(input, event.sender),
++  );
++
++  registerHandler(IpcChannel.packetsPickFile, emptyIpcPayloadSchema, importPickResultSchema, (_input, event) =>
++    pickPacketFile(event.sender),
++  );
++
++  registerHandler(IpcChannel.packetsImport, packetsImportInputSchema, contextPacketDtoSchema, (input) =>
++    importPacketFile(input),
++  );
++
++  registerHandler(IpcChannel.packetsApply, packetsApplyInputSchema, conversationDtoSchema, (input) =>
++    conversationDtoSchema.parse(
++      getHubDatabase().repos.applyContextPacket(input.conversationId, input.packetId),
++    ),
++  );
++
++  registerHandler(IpcChannel.packetsClear, packetsClearInputSchema, conversationDtoSchema, (input) =>
++    conversationDtoSchema.parse(getHubDatabase().repos.clearContextPacket(input.conversationId)),
++  );
++
+   registerHandler(
+     IpcChannel.settingsGetAppearance,
+     emptyIpcPayloadSchema,
+diff --git a/apps/desktop/src/main/message-dto.ts b/apps/desktop/src/main/message-dto.ts
+index 945e0e6..793103e 100644
+--- a/apps/desktop/src/main/message-dto.ts
++++ b/apps/desktop/src/main/message-dto.ts
+@@ -33,5 +33,6 @@ export function toMessageDto(row: MessageRecord): MessageDto {
+     status: row.status,
+     createdAt: row.createdAt,
+     receipt,
++    pinned: row.pinned,
+   });
+ }
+diff --git a/apps/desktop/src/main/packet-preview.ts b/apps/desktop/src/main/packet-preview.ts
+index 59ee075..6678d25 100644
+--- a/apps/desktop/src/main/packet-preview.ts
++++ b/apps/desktop/src/main/packet-preview.ts
+@@ -1,8 +1,9 @@
+-import { compileActivePath } from "@ai-hub/ai-gateway";
++import { compileActivePathDetailed, mergePacketWithTail } from "@ai-hub/ai-gateway";
+ import { randomUUID } from "node:crypto";
+ import {
+   findCatalogModel,
+   packetPreviewResultSchema,
++  portablePacketV1Schema,
+   type PacketPreviewInput,
+   type PacketPreviewResult,
+ } from "@ai-hub/shared";
+@@ -26,42 +27,101 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
+       ? input.pendingContent.trim()
+       : null;
+   const leaf = path.at(-1);
+-  const messages = [
+-    ...path.map((item) => ({
+-      id: item.id,
+-      parentId: item.parentId,
+-      isActiveBranch: item.isActiveBranch,
+-      createdAt: item.createdAt,
+-      role: item.role,
+-      content: item.content,
+-      status: item.status,
+-    })),
+-    ...(pending
+-      ? [
+-          {
+-            id: randomUUID(),
+-            parentId: leaf?.id ?? null,
+-            isActiveBranch: true,
+-            createdAt: new Date().toISOString(),
+-            role: "user" as const,
+-            content: pending,
+-            status: "complete" as const,
+-          },
+-        ]
+-      : []),
+-  ];
+-  const compiled = {
+-    projectInstructions: project?.instructions ?? null,
+-    extraSystem,
+-    messages,
+-  };
+-  const packet = compileActivePath(
+-    input.compact === true ? { ...compiled, maxTokenBudget: contextWindow } : compiled,
+-  );
++  const pendingRow = pending
++    ? {
++        id: randomUUID(),
++        parentId: leaf?.id ?? null,
++        isActiveBranch: true,
++        createdAt: new Date().toISOString(),
++        role: "user" as const,
++        content: pending,
++        status: "complete" as const,
++        pinned: false,
++        branchId: leaf?.branchId ?? randomUUID(),
++      }
++    : null;
++  const privacyMode = input.privacyMode ?? "standard";
++  const appliedId = conversation.activePacketId;
++  const applied = appliedId ? repos.getContextPacket(appliedId) : null;
++  const budget = input.compact === true ? contextWindow : undefined;
++
++  let tokenEstimate = 0;
++  let excludedCount = 0;
++  let included: PacketPreviewResult["included"] = [];
++  let omitted: PacketPreviewResult["omitted"] = [];
++  let resolvedPrivacy = privacyMode;
++
++  if (applied) {
++    const envelope = portablePacketV1Schema.parse(JSON.parse(applied.payloadJson) as unknown);
++    resolvedPrivacy = envelope.privacyMode;
++    const appliedAt = conversation.packetAppliedAt;
++    const tail = [
++      ...path.filter((item) => appliedAt !== null && item.createdAt > appliedAt),
++      ...(pendingRow ? [pendingRow] : []),
++    ];
++    const merged = mergePacketWithTail(
++      envelope.payload,
++      tail.map((item) => ({
++        id: item.id,
++        role: item.role,
++        content: item.content,
++        status: item.status,
++        ...("pinned" in item && item.pinned ? { pinned: true } : {}),
++      })),
++      budget,
++    );
++    tokenEstimate = merged.packet.tokenEstimate;
++    excludedCount = merged.packet.excluded.length;
++    included = merged.included;
++    omitted = merged.omitted;
++  } else {
++    const all = repos.listMessages(input.conversationId);
++    const messages = [
++      ...all.map((item) => ({
++        id: item.id,
++        parentId: item.parentId,
++        isActiveBranch: item.isActiveBranch,
++        createdAt: item.createdAt,
++        role: item.role,
++        content: item.content,
++        status: item.status,
++        branchId: item.branchId,
++        ...(item.pinned ? { pinned: true } : {}),
++      })),
++      ...(pendingRow
++        ? [
++            {
++              id: pendingRow.id,
++              parentId: pendingRow.parentId,
++              isActiveBranch: true,
++              createdAt: pendingRow.createdAt,
++              role: pendingRow.role,
++              content: pendingRow.content,
++              status: pendingRow.status,
++              branchId: pendingRow.branchId,
++            },
++          ]
++        : []),
++    ];
++    const compiled = {
++      projectInstructions: project?.instructions ?? null,
++      extraSystem,
++      messages,
++      privacyMode,
++    };
++    const detailed = compileActivePathDetailed(
++      budget !== undefined ? { ...compiled, maxTokenBudget: budget } : compiled,
++    );
++    tokenEstimate = detailed.packet.tokenEstimate;
++    excludedCount = detailed.packet.excluded.length;
++    included = detailed.included;
++    omitted = detailed.omitted;
++  }
++
+   const estimatedCostUsd = estimateOutgoingCostUsd(
+     input.model,
+     input.providerSlug,
+-    packet.tokenEstimate,
++    tokenEstimate,
+     input.maxTokens ?? null,
+   );
+   const cap = evaluateOutgoingCaps({
+@@ -71,13 +131,19 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
+     limits: spendCapLimitsFromRows(repos.listSpendCaps()),
+   });
+   return packetPreviewResultSchema.parse({
+-    tokenEstimate: packet.tokenEstimate,
++    tokenEstimate,
+     contextWindow,
+-    overflow: packet.tokenEstimate > contextWindow,
+-    compacted: input.compact === true && packet.excluded.length > 0,
+-    excludedCount: packet.excluded.length,
++    overflow: tokenEstimate > contextWindow,
++    compacted: input.compact === true && excludedCount > 0,
++    excludedCount,
+     estimatedCostUsd,
+     capWarnings: cap.warnings,
+     capBlocked: cap.blocked,
++    included,
++    omitted,
++    destinationModel: input.model,
++    destinationProvider: input.providerSlug,
++    privacyMode: resolvedPrivacy,
++    appliedPacketId: applied ? applied.id : null,
+   });
+ }
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index d6113e6..cb58cd3 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -38,9 +38,19 @@ import {
+   messageDtoSchema,
+   messageListInputSchema,
+   messageListResultSchema,
++  messagePinInputSchema,
+   messageUpdateInputSchema,
+   packetPreviewInputSchema,
+   packetPreviewResultSchema,
++  packetsApplyInputSchema,
++  packetsClearInputSchema,
++  packetsCompileInputSchema,
++  packetsExportInputSchema,
++  packetsExportResultSchema,
++  packetsImportInputSchema,
++  packetsListInputSchema,
++  contextPacketDtoSchema,
++  contextPacketListResultSchema,
+   projectCreateInputSchema,
+   projectDtoSchema,
+   projectListResultSchema,
+@@ -175,6 +185,7 @@ const hub: HubApi = {
+     update: (input) =>
+       invokeParsed(IpcChannel.messagesUpdate, input, messageUpdateInputSchema, messageDtoSchema),
+     activate: (input) => invokeAckWith(IpcChannel.messagesActivate, input, idInputSchema),
++    pin: (input) => invokeParsed(IpcChannel.messagesPin, input, messagePinInputSchema, messageDtoSchema),
+   },
+   settings: {
+     getAppearance: () =>
+@@ -277,6 +288,22 @@ const hub: HubApi = {
+       };
+     },
+   },
++  packets: {
++    list: (input) =>
++      invokeParsed(IpcChannel.packetsList, input, packetsListInputSchema, contextPacketListResultSchema),
++    compile: (input) =>
++      invokeParsed(IpcChannel.packetsCompile, input, packetsCompileInputSchema, contextPacketDtoSchema),
++    export: (input) =>
++      invokeParsed(IpcChannel.packetsExport, input, packetsExportInputSchema, packetsExportResultSchema),
++    pickFile: () =>
++      invokeParsed(IpcChannel.packetsPickFile, empty, emptyIpcPayloadSchema, importPickResultSchema),
++    import: (input) =>
++      invokeParsed(IpcChannel.packetsImport, input, packetsImportInputSchema, contextPacketDtoSchema),
++    apply: (input) =>
++      invokeParsed(IpcChannel.packetsApply, input, packetsApplyInputSchema, conversationDtoSchema),
++    clear: (input) =>
++      invokeParsed(IpcChannel.packetsClear, input, packetsClearInputSchema, conversationDtoSchema),
++  },
+ };
+ 
+ contextBridge.exposeInMainWorld("hub", hub);
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index 087fd0a..3b9169a 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -5,12 +5,14 @@ import type {
+   BranchLabels,
+   ChatSendInput,
+   ChatSendResult,
++  ContextPacketDto,
+   ConversationDto,
+   CostsAggregateResult,
+   GatewayErrorCode,
+   HealthSummaryDto,
+   MessageDto,
+   PacketPreviewResult,
++  PacketPrivacyMode,
+   ProjectDto,
+   ProjectUpdateInput,
+   ProviderKeyDto,
+@@ -102,6 +104,8 @@ export function App(): JSX.Element {
+   const [exportNotice, setExportNotice] = useState<string | null>(null);
+   const [compactHistory, setCompactHistory] = useState(false);
+   const [packetPreview, setPacketPreview] = useState<PacketPreviewResult | null>(null);
++  const [packets, setPackets] = useState<ContextPacketDto[]>([]);
++  const [privacyMode, setPrivacyMode] = useState<PacketPrivacyMode>("standard");
+   const [searchQuery, setSearchQuery] = useState("");
+   const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
+   const [threadStartModel, setThreadStartModel] = useState<string | null>(null);
+@@ -160,6 +164,14 @@ export function App(): JSX.Element {
+     return list;
+   }, []);
+ 
++  const loadPackets = useCallback(async (projectId: string | null): Promise<void> => {
++    try {
++      setPackets(await window.hub.packets.list({ projectId }));
++    } catch {
++      setPackets([]);
++    }
++  }, []);
++
+   const loadKeys = useCallback(async (): Promise<ProviderKeyDto[]> => {
+     const list = await window.hub.secrets.list();
+     setProviderKeys(list);
+@@ -277,6 +289,10 @@ export function App(): JSX.Element {
+       .catch(() => setCosts(null));
+   }, [messages, selectedConversationId, selectedProjectId]);
+ 
++  useEffect(() => {
++    void loadPackets(selectedProjectId);
++  }, [loadPackets, selectedProjectId]);
++
+   useEffect(() => {
+     if (!sessionReady) {
+       return;
+@@ -382,6 +398,7 @@ export function App(): JSX.Element {
+           model: selectedModel,
+           providerSlug: key.providerSlug,
+           compact: compactHistory,
++          privacyMode,
+           ...(extra !== undefined ? { extraSystem: extra } : {}),
+           ...(pending !== undefined ? { pendingContent: pending } : {}),
+           ...(maxTokens !== null ? { maxTokens } : {}),
+@@ -401,6 +418,7 @@ export function App(): JSX.Element {
+     selectedConversationId,
+     selectedKeyId,
+     selectedModel,
++    privacyMode,
+   ]);
+ 
+   useEffect(() => {
+@@ -475,12 +493,13 @@ export function App(): JSX.Element {
+         model: fallback.suggestModel,
+         providerSlug: fallback.suggestProviderSlug,
+         compact: compactHistory,
++        privacyMode,
+         ...(extra !== undefined ? { extraSystem: extra } : {}),
+         ...(maxTokens !== null ? { maxTokens } : {}),
+       })
+       .then(setFallbackPreview)
+       .catch(() => setFallbackPreview(null));
+-  }, [compactHistory, extraSystem, fallback, maxTokens, selectedConversationId]);
++  }, [compactHistory, extraSystem, fallback, maxTokens, privacyMode, selectedConversationId]);
+ 
+   const applyProjectPreferences = useCallback(
+     (project: ProjectDto, keys: ProviderKeyDto[]): void => {
+@@ -966,6 +985,99 @@ export function App(): JSX.Element {
+                 void sendToModel({ ...pending, allowOnce: true });
+               }}
+               onComposerDraft={reportComposerDraft}
++              onPin={async (id, pinned) => {
++                try {
++                  const updated = await window.hub.messages.pin({ id, pinned });
++                  setMessages((current) =>
++                    current.map((item) => (item.id === updated.id ? updated : item)),
++                  );
++                } catch {
++                  fail();
++                }
++              }}
++              packets={packets}
++              privacyMode={privacyMode}
++              onPrivacyMode={setPrivacyMode}
++              onCompilePacket={async () => {
++                if (!selectedConversationId) {
++                  return;
++                }
++                const key = providerKeys.find((item) => item.id === selectedKeyId);
++                const extra = extraSystem.trim().length > 0 ? extraSystem : undefined;
++                try {
++                  await window.hub.packets.compile({
++                    conversationId: selectedConversationId,
++                    compact: compactHistory,
++                    privacyMode,
++                    ...(key ? { model: selectedModel, providerSlug: key.providerSlug } : {}),
++                    ...(extra !== undefined ? { extraSystem: extra } : {}),
++                  });
++                  await loadPackets(selectedProjectId);
++                  setExportNotice(t("workspace.packet.savedNotice"));
++                } catch {
++                  fail();
++                }
++              }}
++              onExportPacket={async (packetId) => {
++                try {
++                  const result = await window.hub.packets.export({ packetId });
++                  setExportNotice(
++                    result.status === "saved"
++                      ? t("workspace.packet.exported")
++                      : t("workspace.packet.cancelled"),
++                  );
++                } catch {
++                  fail();
++                }
++              }}
++              onImportPacket={async () => {
++                if (!selectedProjectId) {
++                  return;
++                }
++                try {
++                  const picked = await window.hub.packets.pickFile();
++                  if (picked.status !== "picked") {
++                    setExportNotice(t("workspace.packet.cancelled"));
++                    return;
++                  }
++                  await window.hub.packets.import({ ticket: picked.ticket, projectId: selectedProjectId });
++                  await loadPackets(selectedProjectId);
++                  setExportNotice(t("workspace.packet.imported"));
++                } catch {
++                  fail();
++                }
++              }}
++              onApplyPacket={async (packetId) => {
++                if (!selectedConversationId) {
++                  return;
++                }
++                try {
++                  const updated = await window.hub.packets.apply({
++                    conversationId: selectedConversationId,
++                    packetId,
++                  });
++                  setConversations((current) =>
++                    current.map((item) => (item.id === updated.id ? updated : item)),
++                  );
++                  setExportNotice(t("workspace.packet.appliedNotice"));
++                } catch {
++                  fail();
++                }
++              }}
++              onClearPacket={async () => {
++                if (!selectedConversationId) {
++                  return;
++                }
++                try {
++                  const updated = await window.hub.packets.clear({ conversationId: selectedConversationId });
++                  setConversations((current) =>
++                    current.map((item) => (item.id === updated.id ? updated : item)),
++                  );
++                  setExportNotice(t("workspace.packet.cleared"));
++                } catch {
++                  fail();
++                }
++              }}
+             />
+           ) : view === "debug" ? (
+             <DebugView />
+diff --git a/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx b/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx
+index 79fcf9a..e30f9e2 100644
+--- a/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx
++++ b/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx
+@@ -16,6 +16,7 @@ export function MessageBubble({
+   onEdit,
+   onEditingChange,
+   onActivateSibling,
++  onPin,
+ }: {
+   message: MessageDto;
+   messages: MessageDto[];
+@@ -27,6 +28,7 @@ export function MessageBubble({
+   onEdit: (content: string) => Promise<void>;
+   onEditingChange?: (editing: boolean) => void;
+   onActivateSibling: (id: string) => void;
++  onPin: (pinned: boolean) => void;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const [editing, setEditing] = useState(false);
+@@ -101,6 +103,19 @@ export function MessageBubble({
+           {message.role === "assistant" && message.content.length > 0 ? (
+             <CopyResponseButton text={message.content} />
+           ) : null}
++          {message.role !== "system" && message.status !== "streaming" ? (
++            <Button
++              type="button"
++              size="sm"
++              variant={message.pinned ? "secondary" : "outline"}
++              data-testid="message-pin"
++              aria-pressed={message.pinned}
++              onClick={() => onPin(!message.pinned)}
++              disabled={busy}
++            >
++              {message.pinned ? t("workspace.unpin") : t("workspace.pin")}
++            </Button>
++          ) : null}
+         </div>
+       </div>
+       {editing ? (
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index c0404f0..f563823 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -6,9 +6,11 @@ import {
+   findCatalogModel,
+   type BranchLabels,
+   type CatalogModel,
++  type ContextPacketDto,
+   type ConversationDto,
+   type MessageDto,
+   type PacketPreviewResult,
++  type PacketPrivacyMode,
+   type ProjectDto,
+   type ProjectUpdateInput,
+   type ProviderKeyDto,
+@@ -16,6 +18,7 @@ import {
+ import { ChatComposer } from "@/components/chat/chat-composer";
+ import { ConversationTree } from "@/components/chat/conversation-tree";
+ import { MessageBubble } from "@/components/chat/message-bubble";
++import { PacketPanel } from "@/components/chat/packet-panel";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import { ScrollArea } from "@/components/ui/scroll-area";
+@@ -68,6 +71,15 @@ export function HomeView({
+   showAllowOnce,
+   onAllowOnce,
+   onComposerDraft,
++  onPin,
++  packets,
++  privacyMode,
++  onPrivacyMode,
++  onCompilePacket,
++  onExportPacket,
++  onImportPacket,
++  onApplyPacket,
++  onClearPacket,
+ }: {
+   project: ProjectDto | null;
+   importedInbox: boolean;
+@@ -114,6 +126,15 @@ export function HomeView({
+   showAllowOnce: boolean;
+   onAllowOnce: () => void;
+   onComposerDraft: (value: string) => void;
++  onPin: (id: string, pinned: boolean) => Promise<void>;
++  packets: ContextPacketDto[];
++  privacyMode: PacketPrivacyMode;
++  onPrivacyMode: (value: PacketPrivacyMode) => void;
++  onCompilePacket: () => Promise<void>;
++  onExportPacket: (packetId: string) => Promise<void>;
++  onImportPacket: () => Promise<void>;
++  onApplyPacket: (packetId: string) => Promise<void>;
++  onClearPacket: () => Promise<void>;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const [title, setTitle] = useState("");
+@@ -370,6 +391,7 @@ export function HomeView({
+             onChange={(event) => setTitle(event.target.value)}
+             placeholder={t("workspace.conversationPlaceholder")}
+             aria-label={t("workspace.conversationPlaceholder")}
++            data-testid="workspace-new-conversation-title"
+           />
+           <Button type="submit" size="sm" className="h-7" data-testid="workspace-new-conversation">
+             {t("workspace.newConversation")}
+@@ -499,6 +521,20 @@ export function HomeView({
+                     {t("workspace.packet.badge", { n: packetPreview.tokenEstimate })}
+                   </span>
+                 ) : null}
++                <PacketPanel
++                  packetPreview={packetPreview}
++                  packets={packets}
++                  projectId={project?.id ?? null}
++                  appliedPacketId={selectedConversation?.activePacketId ?? null}
++                  privacyMode={privacyMode}
++                  busy={busy}
++                  onPrivacyMode={onPrivacyMode}
++                  onCompile={onCompilePacket}
++                  onExport={onExportPacket}
++                  onImport={onImportPacket}
++                  onApply={onApplyPacket}
++                  onClear={onClearPacket}
++                />
+                 {packetPreview?.estimatedCostUsd ? (
+                   <span className="text-[11px] text-muted-foreground" data-testid="send-estimate">
+                     {t("workspace.estimate", { usd: packetPreview.estimatedCostUsd })}
+@@ -630,6 +666,9 @@ export function HomeView({
+                       onActivateSibling={(id) => {
+                         void onActivate(id);
+                       }}
++                      onPin={(pinned) => {
++                        void onPin(message.id, pinned);
++                      }}
+                     />
+                   ))}
+                 </ol>
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 0351862..11f016e 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -62,6 +62,40 @@
+   "workspace.noMessages": "No messages yet. Type below and press Enter to send.",
+   "workspace.pickConversation": "Pick or create a conversation.",
+   "workspace.packet.badge": "~{{n}} tokens",
++  "workspace.packet.open": "Packet",
++  "workspace.packet.title": "Portable context packet",
++  "workspace.packet.destination": "{{provider}} ┬À {{model}} ┬À window {{window}} ┬À ~{{n}} tokens",
++  "workspace.packet.privacy": "Privacy",
++  "workspace.packet.privacy.standard": "Standard (project + inactive branches)",
++  "workspace.packet.privacy.strict": "Strict (active path only)",
++  "workspace.packet.included": "Included",
++  "workspace.packet.omitted": "Left out",
++  "workspace.packet.empty": "None",
++  "workspace.packet.save": "Save packet",
++  "workspace.packet.export": "Export file",
++  "workspace.packet.import": "Import file",
++  "workspace.packet.apply": "Use in this chat",
++  "workspace.packet.using": "In use",
++  "workspace.packet.clear": "Stop using packet",
++  "workspace.packet.saved": "Saved packets",
++  "workspace.packet.none": "No packets in this project yet.",
++  "workspace.packet.untitled": "Untitled packet",
++  "workspace.packet.needPreview": "Open a conversation with a key to preview the packet.",
++  "workspace.packet.applied": "This chat sends the applied packet plus new turns.",
++  "workspace.packet.savedNotice": "Packet saved in this project.",
++  "workspace.packet.exported": "Packet file saved.",
++  "workspace.packet.imported": "Packet imported into this project.",
++  "workspace.packet.appliedNotice": "This chat now uses the imported packet.",
++  "workspace.packet.cleared": "This chat compiles from the local tree again.",
++  "workspace.packet.cancelled": "Packet file dialog cancelled.",
++  "workspace.packet.kind.project-instructions": "Project instructions",
++  "workspace.packet.kind.extra-system": "Extra system",
++  "workspace.packet.kind.inactive-branch": "Inactive branch",
++  "workspace.packet.kind.message": "Message",
++  "workspace.packet.kind.old-message": "Old message",
++  "workspace.packet.kind.privacy": "Privacy",
++  "workspace.pin": "Pin",
++  "workspace.unpin": "Unpin",
+   "workspace.overflow": "This thread is over the {{window}} token window (~{{estimate}} estimated). Compact drops oldest turns from the next packet; the tree stays.",
+   "workspace.compact": "Compact history",
+   "workspace.compact.on": "Next send will drop oldest turns to fit the window.",
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index f877e34..5bd49ac 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -62,6 +62,40 @@
+   "workspace.noMessages": "Nenhuma mensagem ainda. Escreva abaixo e pressione Enter para enviar.",
+   "workspace.pickConversation": "Escolha ou crie uma conversa.",
+   "workspace.packet.badge": "~{{n}} tokens",
++  "workspace.packet.open": "Packet",
++  "workspace.packet.title": "Packet de contexto port├ítil",
++  "workspace.packet.destination": "{{provider}} ┬À {{model}} ┬À janela {{window}} ┬À ~{{n}} tokens",
++  "workspace.packet.privacy": "Privacidade",
++  "workspace.packet.privacy.standard": "Padr├úo (projeto + ramos inativos)",
++  "workspace.packet.privacy.strict": "Restrito (s├│ o fio ativo)",
++  "workspace.packet.included": "Entra",
++  "workspace.packet.omitted": "Fica de fora",
++  "workspace.packet.empty": "Nada",
++  "workspace.packet.save": "Guardar packet",
++  "workspace.packet.export": "Exportar arquivo",
++  "workspace.packet.import": "Importar arquivo",
++  "workspace.packet.apply": "Usar neste chat",
++  "workspace.packet.using": "Em uso",
++  "workspace.packet.clear": "Parar de usar o packet",
++  "workspace.packet.saved": "Packets salvos",
++  "workspace.packet.none": "Ainda n├úo h├í packets neste projeto.",
++  "workspace.packet.untitled": "Packet sem t├¡tulo",
++  "workspace.packet.needPreview": "Abra uma conversa com chave para pr├®-visualizar o packet.",
++  "workspace.packet.applied": "Este chat envia o packet aplicado mais os turnos novos.",
++  "workspace.packet.savedNotice": "Packet guardado neste projeto.",
++  "workspace.packet.exported": "Arquivo do packet salvo.",
++  "workspace.packet.imported": "Packet importado neste projeto.",
++  "workspace.packet.appliedNotice": "Este chat agora usa o packet importado.",
++  "workspace.packet.cleared": "Este chat volta a compilar a ├írvore local.",
++  "workspace.packet.cancelled": "Di├ílogo do arquivo de packet cancelado.",
++  "workspace.packet.kind.project-instructions": "Instru├º├Áes do projeto",
++  "workspace.packet.kind.extra-system": "Sistema extra",
++  "workspace.packet.kind.inactive-branch": "Ramo inativo",
++  "workspace.packet.kind.message": "Mensagem",
++  "workspace.packet.kind.old-message": "Mensagem antiga",
++  "workspace.packet.kind.privacy": "Privacidade",
++  "workspace.pin": "Fixar",
++  "workspace.unpin": "Desafixar",
+   "workspace.overflow": "Este fio passa da janela de {{window}} tokens (~{{estimate}} estimados). Compactar tira os turnos antigos do pr├│ximo packet; a ├írvore permanece.",
+   "workspace.compact": "Compactar hist├│rico",
+   "workspace.compact.on": "O pr├│ximo envio descarta turnos antigos para caber na janela.",
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index e1325cc..7b8d04b 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -77,3 +77,6 @@ N├úo escrever ADR de detalhe cosm├®tica. Se mexe em seguran├ºa, custo, provider
+ | [ADR-W09-002](./ADR-W09-002-import-identity-and-receipt-source.md) | W09 | Identidade de import + receipt `source` | accepted |
+ | [ADR-W09-003](./ADR-W09-003-imported-inbox-not-sentinel-project.md) | W09 | Inbox Importadas virtual, sem projeto sentinela | accepted |
+ | [ADR-W09-004](./ADR-W09-004-vendor-parsers-and-opaque-ticket.md) | W09 | Parsers no shared; ticket opaco; Gemini best-effort | accepted |
++| [ADR-W10-001](./ADR-W10-001-portable-packet-json-v1.md) | W10 | Envelope `.aihub-packet.json` v1 | accepted |
++| [ADR-W10-002](./ADR-W10-002-context-packets-apply.md) | W10 | Persist├¬ncia, apply no chat, ticket de ficheiro | accepted |
++| [ADR-W10-003](./ADR-W10-003-deterministic-inactive-summary-and-pins.md) | W10 | Resumo de ramos inativos sem LLM; pins no compact | accepted |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 67e97f6..60f475b 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave
+ |---|---|
+ | Wave | **W10** |
+ | Marco | B ÔÇö MVP+ |
+-| State | `pending` |
++| State | `review` |
+ | Last completed | **W09** |
+-| Next action | Portable Context Packet (D1): schema + preview + export/import |
++| Next action | Wave-close gate W10 (review independente + REVIEW.md) |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -36,10 +36,10 @@ None.
+ 
+ ## Notes for the next session
+ 
+-- W09 fechada: Import Hub (D2). ChatGPT/Claude/Gemini, inbox Importadas virtual, idempot├¬ncia `import_source+external_id`, receipts `source=import`.
+-- Pr├│xima: W10 Portable Context Packet. N├úo implementar RAG, MCP, agentes, run modes, FTS plaintext.
+-- Plano W21/W24 (ADR-W09-001) continua lock de mapa, n├úo c├│digo.
+-- Parsers: `@ai-hub/shared/import` s├│ no main, nunca no barrel do renderer.
++- W10 em curso: Portable Context Packet (D1). Envelope `.aihub-packet.json` v1; persist├¬ncia `context_packets`; apply no chat substitui compile ad hoc.
++- N├úo implementar RAG, MCP, agentes, @-mentions, arquivos W12, run modes.
++- Compilar ramos inativos ├® resumo determin├¡stico (sem LLM). Pins sobrevivem ao compact.
++- Packet file: ticket opaco; sem API keys; sem conte├║do de outro projeto (apply s├│ no mesmo `projectId` da c├│pia importada).
+ 
+ ## Last review / ADR
+ 
+diff --git a/packages/ai-gateway/src/compiler.test.ts b/packages/ai-gateway/src/compiler.test.ts
+index cb1e8c8..b256557 100644
+--- a/packages/ai-gateway/src/compiler.test.ts
++++ b/packages/ai-gateway/src/compiler.test.ts
+@@ -167,4 +167,116 @@ describe("compilePacket", () => {
+     expect(gpt.system).toBe("Project voice.");
+     expect(gpt.messages.map((item) => item.content).join(" ")).not.toMatch(/summar/i);
+   });
++
++  it("summarizes inactive branches in system without adding them as turns", () => {
++    const packet = compileActivePath({
++      projectInstructions: null,
++      extraSystem: null,
++      messages: [
++        {
++          id: "11111111-1111-4111-8111-111111111111",
++          parentId: null,
++          isActiveBranch: true,
++          createdAt: "2026-09-17T00:00:00.000Z",
++          role: "user",
++          content: "prompt",
++          status: "complete",
++        },
++        {
++          id: "22222222-2222-4222-8222-222222222222",
++          parentId: "11111111-1111-4111-8111-111111111111",
++          isActiveBranch: false,
++          createdAt: "2026-09-17T00:00:01.000Z",
++          role: "assistant",
++          content: "old",
++          status: "complete",
++        },
++        {
++          id: "33333333-3333-4333-8333-333333333333",
++          parentId: "11111111-1111-4111-8111-111111111111",
++          isActiveBranch: true,
++          createdAt: "2026-09-17T00:00:02.000Z",
++          role: "assistant",
++          content: "new",
++          status: "complete",
++        },
++      ],
++    });
++    expect(packet.messages.some((item) => item.content === "old")).toBe(false);
++    expect(packet.system).toMatch(/Inactive branches/);
++    expect(packet.system).toMatch(/old/);
++  });
++
++  it("keeps pinned turns when compacting old messages", () => {
++    const pinned = "keep-me-pinned";
++    const packet = compilePacket({
++      projectInstructions: null,
++      extraSystem: null,
++      maxTokenBudget: 20,
++      messages: [
++        {
++          id: "11111111-1111-4111-8111-111111111111",
++          role: "user",
++          content: pinned,
++          status: "complete",
++          pinned: true,
++        },
++        {
++          id: "22222222-2222-4222-8222-222222222222",
++          role: "assistant",
++          content: "y".repeat(80),
++          status: "complete",
++        },
++        {
++          id: "33333333-3333-4333-8333-333333333333",
++          role: "user",
++          content: "fresh question",
++          status: "complete",
++        },
++      ],
++    });
++    expect(packet.messages.some((item) => item.content === pinned)).toBe(true);
++    expect(packet.excluded).toContain("22222222-2222-4222-8222-222222222222");
++  });
++
++  it("omits project instructions and inactive summaries in strict privacy", () => {
++    const packet = compileActivePath({
++      projectInstructions: "Secret project voice.",
++      extraSystem: "Be terse.",
++      privacyMode: "strict",
++      messages: [
++        {
++          id: "11111111-1111-4111-8111-111111111111",
++          parentId: null,
++          isActiveBranch: true,
++          createdAt: "2026-09-17T00:00:00.000Z",
++          role: "user",
++          content: "prompt",
++          status: "complete",
++        },
++        {
++          id: "22222222-2222-4222-8222-222222222222",
++          parentId: "11111111-1111-4111-8111-111111111111",
++          isActiveBranch: false,
++          createdAt: "2026-09-17T00:00:01.000Z",
++          role: "assistant",
++          content: "old-secret-turn",
++          status: "complete",
++        },
++        {
++          id: "33333333-3333-4333-8333-333333333333",
++          parentId: "11111111-1111-4111-8111-111111111111",
++          isActiveBranch: true,
++          createdAt: "2026-09-17T00:00:02.000Z",
++          role: "assistant",
++          content: "new",
++          status: "complete",
++        },
++      ],
++    });
++    expect(packet.system).toBe("Be terse.");
++    expect(packet.system).not.toMatch(/Secret project voice/);
++    expect(packet.system).not.toMatch(/old-secret-turn/);
++    expect(packet.messages.map((item) => item.content)).toEqual(["prompt", "new"]);
++  });
+ });
+diff --git a/packages/ai-gateway/src/compiler.ts b/packages/ai-gateway/src/compiler.ts
+index f405f01..e00eed6 100644
+--- a/packages/ai-gateway/src/compiler.ts
++++ b/packages/ai-gateway/src/compiler.ts
+@@ -1,11 +1,12 @@
+-import type { MessageStatus, ProviderAgnosticPacket } from "@ai-hub/shared";
+-import { activePath, packetV0Schema, type MessageGraphNode } from "@ai-hub/shared";
++import type { MessageStatus, PacketPrivacyMode, PacketSlice, ProviderAgnosticPacket } from "@ai-hub/shared";
++import { activePath, clipPacketLabel, packetV0Schema, type MessageGraphNode } from "@ai-hub/shared";
+ 
+ export interface CompilerMessage {
+   id: string;
+   role: "user" | "assistant" | "system";
+   content: string;
+   status: MessageStatus;
++  pinned?: boolean;
+ }
+ 
+ export interface CompileInput {
+@@ -13,14 +14,32 @@ export interface CompileInput {
+   extraSystem: string | null;
+   messages: CompilerMessage[];
+   maxTokenBudget?: number;
++  privacyMode?: PacketPrivacyMode;
++  inactiveSummaries?: InactiveBranchSummaries | null;
+ }
+ 
+ type PacketRow = {
+   id: string;
+   role: "user" | "assistant";
+   content: string;
++  pinned: boolean;
+ };
+ 
++export interface CompileDetailedResult {
++  packet: ProviderAgnosticPacket;
++  included: PacketSlice[];
++  omitted: PacketSlice[];
++}
++
++export interface InactiveBranchSummaries {
++  block: string;
++  slices: PacketSlice[];
++}
++
++export interface CompilerGraphMessage extends CompilerMessage, MessageGraphNode {
++  branchId?: string;
++}
++
+ function tokenEstimateFromChars(chars: number): number {
+   return Math.ceil(chars / 4);
+ }
+@@ -33,13 +52,90 @@ function estimateTokens(system: string, rows: PacketRow[]): number {
+   return tokenEstimateFromChars(chars);
+ }
+ 
+-export function compilePacket(input: CompileInput): ProviderAgnosticPacket {
++function sliceFor(kind: PacketSlice["kind"], id: string | null, text: string): PacketSlice {
++  const label = clipPacketLabel(text.length > 0 ? text : kind, 200);
++  return {
++    kind,
++    id,
++    label,
++    tokens: tokenEstimateFromChars(text.length),
++  };
++}
++
++function isPinned(message: CompilerMessage): boolean {
++  return message.pinned === true;
++}
++
++export function summarizeInactiveBranches(messages: CompilerGraphMessage[]): InactiveBranchSummaries | null {
++  const pathIds = new Set(activePath(messages).map((item) => item.id));
++  const groups = new Map<string, CompilerGraphMessage[]>();
++  const ordered = messages
++    .filter(
++      (item) =>
++        !pathIds.has(item.id) &&
++        item.status !== "streaming" &&
++        (item.role === "user" || item.role === "assistant"),
++    )
++    .slice()
++    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
++  for (const item of ordered) {
++    const key = item.branchId ?? item.parentId ?? "root";
++    const group = groups.get(key) ?? [];
++    group.push(item);
++    groups.set(key, group);
++  }
++  if (groups.size === 0) {
++    return null;
++  }
++  const lines: string[] = ["Inactive branches (not in the active path):"];
++  const slices: PacketSlice[] = [];
++  for (const group of groups.values()) {
++    const last = group[group.length - 1];
++    if (!last) {
++      continue;
++    }
++    const lastLabel = clipPacketLabel(last.content, 80);
++    const line = `${group.length} turns. Last: ${lastLabel}`;
++    lines.push(`- ${line}`);
++    slices.push(sliceFor("inactive-branch", last.id, line));
++  }
++  return { block: lines.join("\n"), slices };
++}
++
++export function compilePacketDetailed(input: CompileInput): CompileDetailedResult {
++  const privacyMode: PacketPrivacyMode = input.privacyMode ?? "standard";
++  const included: PacketSlice[] = [];
++  const omitted: PacketSlice[] = [];
+   const systemParts: string[] = [];
+-  if (input.projectInstructions && input.projectInstructions.trim().length > 0) {
+-    systemParts.push(input.projectInstructions.trim());
++
++  const project = input.projectInstructions?.trim() ?? "";
++  if (project.length > 0) {
++    const slice = sliceFor("project-instructions", null, project);
++    if (privacyMode === "strict") {
++      omitted.push({ ...slice, kind: "privacy", label: clipPacketLabel(`Project instructions omitted (${privacyMode})`, 200) });
++    } else {
++      systemParts.push(project);
++      included.push(slice);
++    }
+   }
+-  if (input.extraSystem && input.extraSystem.trim().length > 0) {
+-    systemParts.push(input.extraSystem.trim());
++
++  const extra = input.extraSystem?.trim() ?? "";
++  if (extra.length > 0) {
++    systemParts.push(extra);
++    included.push(sliceFor("extra-system", null, extra));
++  }
++
++  const inactive = input.inactiveSummaries ?? null;
++  if (inactive && inactive.block.trim().length > 0) {
++    if (privacyMode === "strict") {
++      omitted.push(
++        sliceFor("privacy", null, "Inactive branch summaries omitted (strict)"),
++        ...inactive.slices.map((item) => ({ ...item, kind: "inactive-branch" as const })),
++      );
++    } else {
++      systemParts.push(inactive.block.trim());
++      included.push(...inactive.slices);
++    }
+   }
+ 
+   const excluded: string[] = [];
+@@ -48,52 +144,145 @@ export function compilePacket(input: CompileInput): ProviderAgnosticPacket {
+   for (const message of input.messages) {
+     if (message.status === "streaming") {
+       excluded.push(message.id);
++      omitted.push(sliceFor("old-message", message.id, message.content));
+       continue;
+     }
+     if (message.role === "system") {
+       if (message.content.trim().length > 0) {
+         systemParts.push(message.content.trim());
++        included.push(sliceFor("extra-system", message.id, message.content));
+       }
+       continue;
+     }
+-    kept.push({ id: message.id, role: message.role, content: message.content });
++    kept.push({
++      id: message.id,
++      role: message.role,
++      content: message.content,
++      pinned: isPinned(message),
++    });
+   }
+ 
+-  const system = systemParts.join("\n\n");
+   const budget = input.maxTokenBudget;
+   if (budget !== undefined) {
+-    while (kept.length > 1 && estimateTokens(system, kept) > budget) {
+-      const dropped = kept.shift();
++    while (kept.length > 1 && estimateTokens(systemParts.join("\n\n"), kept) > budget) {
++      const dropIndex = kept.findIndex((row, index) => !row.pinned && index < kept.length - 1);
++      if (dropIndex < 0) {
++        break;
++      }
++      const dropped = kept.splice(dropIndex, 1)[0];
+       if (dropped) {
+         excluded.push(dropped.id);
++        omitted.push(sliceFor("old-message", dropped.id, dropped.content));
+       }
+     }
+   }
+ 
+-  return packetV0Schema.parse({
++  for (const row of kept) {
++    included.push(sliceFor("message", row.id, row.content));
++  }
++
++  const system = systemParts.join("\n\n");
++  const packet = packetV0Schema.parse({
+     version: 1,
+     system,
+     messages: kept.map((row) => ({ role: row.role, content: row.content })),
+     tokenEstimate: estimateTokens(system, kept),
+     excluded,
+   });
++  return { packet, included: included.slice(0, 200), omitted: omitted.slice(0, 200) };
+ }
+ 
+-export interface CompilerGraphMessage extends CompilerMessage, MessageGraphNode {}
++export function compilePacket(input: CompileInput): ProviderAgnosticPacket {
++  return compilePacketDetailed(input).packet;
++}
+ 
+-export function compileActivePath(input: {
++export function compileActivePathDetailed(input: {
+   projectInstructions: string | null;
+   extraSystem: string | null;
+   messages: CompilerGraphMessage[];
+   maxTokenBudget?: number;
+-}): ProviderAgnosticPacket {
++  privacyMode?: PacketPrivacyMode;
++}): CompileDetailedResult {
+   const compiled: CompileInput = {
+     projectInstructions: input.projectInstructions,
+     extraSystem: input.extraSystem,
+     messages: activePath(input.messages),
++    inactiveSummaries: summarizeInactiveBranches(input.messages),
+   };
+   if (input.maxTokenBudget !== undefined) {
+     compiled.maxTokenBudget = input.maxTokenBudget;
+   }
+-  return compilePacket(compiled);
++  if (input.privacyMode !== undefined) {
++    compiled.privacyMode = input.privacyMode;
++  }
++  return compilePacketDetailed(compiled);
++}
++
++export function compileActivePath(input: {
++  projectInstructions: string | null;
++  extraSystem: string | null;
++  messages: CompilerGraphMessage[];
++  maxTokenBudget?: number;
++  privacyMode?: PacketPrivacyMode;
++}): ProviderAgnosticPacket {
++  return compileActivePathDetailed(input).packet;
++}
++
++export function mergePacketWithTail(
++  payload: ProviderAgnosticPacket,
++  tail: CompilerMessage[],
++  maxTokenBudget?: number,
++): CompileDetailedResult {
++  const omitted: PacketSlice[] = [];
++  const excluded = [...payload.excluded];
++  const frozen: PacketRow[] = payload.messages.map((row, index) => ({
++    id: `frozen-${index}`,
++    role: row.role,
++    content: row.content,
++    pinned: true,
++  }));
++  const live: PacketRow[] = [];
++  for (const item of tail) {
++    if (item.status === "streaming") {
++      excluded.push(item.id);
++      omitted.push(sliceFor("old-message", item.id, item.content));
++      continue;
++    }
++    if (item.role === "system") {
++      continue;
++    }
++    live.push({
++      id: item.id,
++      role: item.role,
++      content: item.content,
++      pinned: isPinned(item),
++    });
++  }
++  let kept = [...frozen, ...live];
++  const system = payload.system;
++  if (maxTokenBudget !== undefined) {
++    while (kept.length > 1 && estimateTokens(system, kept) > maxTokenBudget) {
++      const dropIndex = kept.findIndex((row, index) => !row.pinned && index < kept.length - 1);
++      if (dropIndex < 0) {
++        break;
++      }
++      const dropped = kept.splice(dropIndex, 1)[0];
++      if (dropped) {
++        excluded.push(dropped.id);
++        omitted.push(sliceFor("old-message", dropped.id, dropped.content));
++      }
++    }
++  }
++  const included: PacketSlice[] = [
++    ...(system.length > 0 ? [sliceFor("extra-system", null, system)] : []),
++    ...kept.map((row) => sliceFor("message", row.id.startsWith("frozen-") ? null : row.id, row.content)),
++  ];
++  const packet = packetV0Schema.parse({
++    version: 1,
++    system,
++    messages: kept.map((row) => ({ role: row.role, content: row.content })),
++    tokenEstimate: estimateTokens(system, kept),
++    excluded,
++  });
++  return { packet, included: included.slice(0, 200), omitted: omitted.slice(0, 200) };
+ }
+diff --git a/packages/ai-gateway/src/index.ts b/packages/ai-gateway/src/index.ts
+index 9f1130a..146612c 100644
+--- a/packages/ai-gateway/src/index.ts
++++ b/packages/ai-gateway/src/index.ts
+@@ -5,7 +5,19 @@ export type {
+   ProviderAdapter,
+   ProviderCapabilities,
+ } from "./adapter";
+-export { compileActivePath, compilePacket, type CompileInput, type CompilerGraphMessage, type CompilerMessage } from "./compiler";
++export {
++  compileActivePath,
++  compileActivePathDetailed,
++  compilePacket,
++  compilePacketDetailed,
++  mergePacketWithTail,
++  summarizeInactiveBranches,
++  type CompileDetailedResult,
++  type CompileInput,
++  type CompilerGraphMessage,
++  type CompilerMessage,
++  type InactiveBranchSummaries,
++} from "./compiler";
+ export {
+   consumeCrashSafeStream,
+   STREAM_FLUSH_CHARS,
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index 7a6a918..23cce20 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -1,5 +1,5 @@
+ export { applyMigrations } from "./migrate";
+-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL } from "./migrations";
++export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL } from "./migrations";
+ export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
+ export {
+   HubRepos,
+@@ -19,5 +19,7 @@ export {
+   type SpendCapOverrideRecord,
+   type WorkspaceSessionRecord,
+   type AppPrefsRecord,
++  type ContextPacketRecord,
++  type ContextPacketStored,
+ } from "./repos";
+ export { schema } from "./schema";
+diff --git a/packages/db/src/migrations.ts b/packages/db/src/migrations.ts
+index 9a7248c..946e75c 100644
+--- a/packages/db/src/migrations.ts
++++ b/packages/db/src/migrations.ts
+@@ -153,6 +153,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS conversations_import_identity_idx
+ ALTER TABLE message_receipts ADD COLUMN source TEXT NOT NULL DEFAULT 'chat';
+ `;
+ 
++export const MIGRATION_0007_SQL = `
++ALTER TABLE context_packets ADD COLUMN privacy_mode TEXT NOT NULL DEFAULT 'standard';
++ALTER TABLE context_packets ADD COLUMN origin TEXT NOT NULL DEFAULT '{"source":"compile","projectLabel":"","conversationLabel":""}';
++ALTER TABLE context_packets ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
++ALTER TABLE conversations ADD COLUMN active_packet_id TEXT REFERENCES context_packets(id) ON DELETE SET NULL;
++ALTER TABLE conversations ADD COLUMN packet_applied_at INTEGER;
++ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
++`;
++
+ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 1, sql: MIGRATION_0001_SQL },
+   { version: 2, sql: MIGRATION_0002_SQL },
+@@ -160,4 +169,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 4, sql: MIGRATION_0004_SQL },
+   { version: 5, sql: MIGRATION_0005_SQL },
+   { version: 6, sql: MIGRATION_0006_SQL },
++  { version: 7, sql: MIGRATION_0007_SQL },
+ ];
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index f4d165a..16ad942 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -125,7 +125,7 @@ describe("hub database", () => {
+       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
+       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
+       applyMigrations(second.sqlite);
+-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(6);
++      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(7);
+       second.close();
+     } finally {
+       rmSync(dir, { recursive: true, force: true });
+@@ -598,4 +598,35 @@ describe("hub database", () => {
+     expect(hub.repos.listConversations(null, "avulsas").map((item) => item.id)).toEqual([avulsas.id]);
+     hub.close();
+   });
++
++  it("stores a context packet encrypted and applies only in the same project", () => {
++    const { hub } = openTestDb();
++    const alpha = hub.repos.createProject("Alpha");
++    const beta = hub.repos.createProject("Beta");
++    const fromA = hub.repos.createConversation(alpha.id, "A");
++    const inB = hub.repos.createConversation(beta.id, "B");
++    const packet = hub.repos.createContextPacket({
++      projectId: alpha.id,
++      privacyMode: "standard",
++      origin: { source: "compile", projectLabel: "Alpha", conversationLabel: "A" },
++      tokenEstimate: 4,
++      payloadJson: JSON.stringify({ kind: "aihub.packet", version: 1 }),
++    });
++    const dump = dumpAllText(hub.sqlite);
++    expect(dump).not.toContain("aihub.packet");
++    const applied = hub.repos.applyContextPacket(fromA.id, packet.id);
++    expect(applied.activePacketId).toBe(packet.id);
++    expect(applied.packetAppliedAt).not.toBeNull();
++    expect(() => hub.repos.applyContextPacket(inB.id, packet.id)).toThrow(/another project/);
++    const pinned = hub.repos.createMessage({
++      conversationId: fromA.id,
++      role: "user",
++      content: "pin me",
++      parentId: null,
++      branchId: null,
++    });
++    expect(pinned.pinned).toBe(false);
++    expect(hub.repos.setMessagePinned(pinned.id, true).pinned).toBe(true);
++    hub.close();
++  });
+ });
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 12ff734..553da50 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -15,6 +15,7 @@ import {
+   conversations,
+   conversationTags,
+   healthSamples,
++  contextPackets,
+   importJobs,
+   messageReceipts,
+   messages,
+@@ -55,6 +56,8 @@ export interface ConversationRecord {
+   createdAt: string;
+   updatedAt: string;
+   importSource: "chatgpt" | "claude" | "gemini" | null;
++  activePacketId: string | null;
++  packetAppliedAt: string | null;
+ }
+ 
+ export interface SearchHitRecord {
+@@ -93,6 +96,7 @@ export interface MessageRecord {
+   status: MessageStatus;
+   createdAt: string;
+   receipt: ReceiptRecord | null;
++  pinned: boolean;
+ }
+ 
+ export interface ProviderRecord {
+@@ -127,6 +131,24 @@ export interface SpendCapRecord {
+   createdAt: string;
+ }
+ 
++export interface ContextPacketRecord {
++  id: string;
++  projectId: string | null;
++  tokenEstimate: number | null;
++  privacyMode: "standard" | "strict";
++  origin: {
++    source: "compile" | "import";
++    projectLabel: string;
++    conversationLabel: string;
++  };
++  version: number;
++  createdAt: string;
++}
++
++export interface ContextPacketStored extends ContextPacketRecord {
++  payloadJson: string;
++}
++
+ export interface SpendCapOverrideRecord {
+   at: string;
+   scope: string;
+@@ -387,6 +409,8 @@ export class HubRepos {
+         row.importSource === "chatgpt" || row.importSource === "claude" || row.importSource === "gemini"
+           ? row.importSource
+           : null,
++      activePacketId: row.activePacketId ?? null,
++      packetAppliedAt: row.packetAppliedAt !== null && row.packetAppliedAt !== undefined ? iso(row.packetAppliedAt) : null,
+     };
+   }
+ 
+@@ -405,6 +429,7 @@ export class HubRepos {
+       status: asStatus(row.status),
+       createdAt: iso(row.createdAt),
+       receipt,
++      pinned: row.pinned === 1,
+     };
+   }
+ 
+@@ -547,7 +572,17 @@ export class HubRepos {
+         externalId: null,
+       })
+       .run();
+-    return { id, projectId, title, tags: [], createdAt: iso(now), updatedAt: iso(now), importSource: null };
++    return {
++      id,
++      projectId,
++      title,
++      tags: [],
++      createdAt: iso(now),
++      updatedAt: iso(now),
++      importSource: null,
++      activePacketId: null,
++      packetAppliedAt: null,
++    };
+   }
+ 
+   removeConversation(id: string): void {
+@@ -842,6 +877,7 @@ export class HubRepos {
+         contentCipher: encryptUtf8(input.content, this.masterKey),
+         status,
+         createdAt: now,
++        pinned: 0,
+       })
+       .run();
+     this.db
+@@ -1595,6 +1631,155 @@ export class HubRepos {
+     };
+   }
+ 
++  private parsePacketOrigin(raw: string): {
++    source: "compile" | "import";
++    projectLabel: string;
++    conversationLabel: string;
++  } {
++    try {
++      const parsed: unknown = JSON.parse(raw);
++      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
++        return { source: "compile", projectLabel: "", conversationLabel: "" };
++      }
++      const record = parsed as Record<string, unknown>;
++      const source = record.source === "import" ? "import" : "compile";
++      const projectLabel = typeof record.projectLabel === "string" ? record.projectLabel.slice(0, 200) : "";
++      const conversationLabel =
++        typeof record.conversationLabel === "string" ? record.conversationLabel.slice(0, 200) : "";
++      return { source, projectLabel, conversationLabel };
++    } catch {
++      return { source: "compile", projectLabel: "", conversationLabel: "" };
++    }
++  }
++
++  private toContextPacket(
++    row: typeof contextPackets.$inferSelect,
++    payloadJson: string | null,
++  ): ContextPacketRecord | ContextPacketStored {
++    const base: ContextPacketRecord = {
++      id: row.id,
++      projectId: row.projectId,
++      tokenEstimate: row.tokenEstimate,
++      privacyMode: row.privacyMode === "strict" ? "strict" : "standard",
++      origin: this.parsePacketOrigin(row.origin),
++      version: row.version,
++      createdAt: iso(row.createdAt),
++    };
++    if (payloadJson === null) {
++      return base;
++    }
++    return { ...base, payloadJson };
++  }
++
++  listContextPackets(projectId: string | null): ContextPacketRecord[] {
++    const rows =
++      projectId === null
++        ? this.db.select().from(contextPackets).where(isNull(contextPackets.projectId)).all()
++        : this.db.select().from(contextPackets).where(eq(contextPackets.projectId, projectId)).all();
++    return rows
++      .map((row) => this.toContextPacket(row, null) as ContextPacketRecord)
++      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
++  }
++
++  getContextPacket(id: string): ContextPacketStored | null {
++    const row = this.db.select().from(contextPackets).where(eq(contextPackets.id, id)).get();
++    if (!row) {
++      return null;
++    }
++    return this.toContextPacket(row, decryptUtf8(row.payloadCipher, this.masterKey)) as ContextPacketStored;
++  }
++
++  createContextPacket(input: {
++    projectId: string | null;
++    privacyMode: "standard" | "strict";
++    origin: { source: "compile" | "import"; projectLabel: string; conversationLabel: string };
++    tokenEstimate: number;
++    payloadJson: string;
++  }): ContextPacketStored {
++    if (input.projectId) {
++      const project = this.getProject(input.projectId);
++      if (!project) {
++        throw new Error("Project not found");
++      }
++    }
++    const now = Date.now();
++    const id = randomUUID();
++    this.db
++      .insert(contextPackets)
++      .values({
++        id,
++        projectId: input.projectId,
++        payloadCipher: encryptUtf8(input.payloadJson, this.masterKey),
++        tokenEstimate: input.tokenEstimate,
++        createdAt: now,
++        privacyMode: input.privacyMode,
++        origin: JSON.stringify(input.origin),
++        version: 1,
++      })
++      .run();
++    const stored = this.getContextPacket(id);
++    if (!stored) {
++      throw new Error("Packet not found");
++    }
++    return stored;
++  }
++
++  applyContextPacket(conversationId: string, packetId: string): ConversationRecord {
++    const conversation = this.getConversation(conversationId);
++    if (!conversation) {
++      throw new Error("Conversation not found");
++    }
++    const packet = this.getContextPacket(packetId);
++    if (!packet) {
++      throw new Error("Packet not found");
++    }
++    if (packet.projectId !== conversation.projectId) {
++      throw new Error("Packet belongs to another project");
++    }
++    const now = Date.now();
++    this.db
++      .update(conversations)
++      .set({ activePacketId: packetId, packetAppliedAt: now, updatedAt: now })
++      .where(eq(conversations.id, conversationId))
++      .run();
++    const updated = this.getConversation(conversationId);
++    if (!updated) {
++      throw new Error("Conversation not found");
++    }
++    return updated;
++  }
++
++  clearContextPacket(conversationId: string): ConversationRecord {
++    const conversation = this.getConversation(conversationId);
++    if (!conversation) {
++      throw new Error("Conversation not found");
++    }
++    const now = Date.now();
++    this.db
++      .update(conversations)
++      .set({ activePacketId: null, packetAppliedAt: null, updatedAt: now })
++      .where(eq(conversations.id, conversationId))
++      .run();
++    const updated = this.getConversation(conversationId);
++    if (!updated) {
++      throw new Error("Conversation not found");
++    }
++    return updated;
++  }
++
++  setMessagePinned(id: string, pinned: boolean): MessageRecord {
++    const row = this.db.select().from(messages).where(eq(messages.id, id)).get();
++    if (!row) {
++      throw new Error("Message not found");
++    }
++    this.db.update(messages).set({ pinned: pinned ? 1 : 0 }).where(eq(messages.id, id)).run();
++    const updated = this.getMessage(id);
++    if (!updated) {
++      throw new Error("Message not found");
++    }
++    return updated;
++  }
++
+   async removeProviderKey(id: string): Promise<void> {
+     const row = this.db.select().from(providerKeys).where(eq(providerKeys.id, id)).get();
+     if (!row) {
+diff --git a/packages/db/src/schema.ts b/packages/db/src/schema.ts
+index ba3d801..9e00872 100644
+--- a/packages/db/src/schema.ts
++++ b/packages/db/src/schema.ts
+@@ -19,6 +19,8 @@ export const conversations = sqliteTable("conversations", {
+   updatedAt: integer("updated_at", { mode: "number" }).notNull(),
+   importSource: text("import_source"),
+   externalId: text("external_id"),
++  activePacketId: text("active_packet_id"),
++  packetAppliedAt: integer("packet_applied_at", { mode: "number" }),
+ });
+ 
+ export const messages = sqliteTable("messages", {
+@@ -31,6 +33,7 @@ export const messages = sqliteTable("messages", {
+   contentCipher: text("content_cipher").notNull(),
+   status: text("status").notNull(),
+   createdAt: integer("created_at", { mode: "number" }).notNull(),
++  pinned: integer("pinned", { mode: "number" }).notNull().default(0),
+ });
+ 
+ export const messageReceipts = sqliteTable("message_receipts", {
+@@ -120,6 +123,9 @@ export const contextPackets = sqliteTable("context_packets", {
+   payloadCipher: text("payload_cipher").notNull(),
+   tokenEstimate: integer("token_estimate", { mode: "number" }),
+   createdAt: integer("created_at", { mode: "number" }).notNull(),
++  privacyMode: text("privacy_mode").notNull().default("standard"),
++  origin: text("origin").notNull().default('{"source":"compile","projectLabel":"","conversationLabel":""}'),
++  version: integer("version", { mode: "number" }).notNull().default(1),
+ });
+ 
+ export const schema = {
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index 366b05b..713d63d 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -41,6 +41,15 @@ import type {
+   ImportPickResult,
+   ImportStartInput,
+   ImportStartResult,
++  ContextPacketDto,
++  PacketsApplyInput,
++  PacketsClearInput,
++  PacketsCompileInput,
++  PacketsExportInput,
++  PacketsExportResult,
++  PacketsImportInput,
++  PacketsListInput,
++  MessagePinInput,
+   ProviderKeyDto,
+   SecretsSaveInput,
+   SecretsTestInput,
+@@ -78,6 +87,7 @@ export interface HubMessagesApi {
+   create: (input: MessageCreateInput) => Promise<MessageDto>;
+   update: (input: MessageUpdateInput) => Promise<MessageDto>;
+   activate: (input: IdInput) => Promise<void>;
++  pin: (input: MessagePinInput) => Promise<MessageDto>;
+ }
+ 
+ export interface HubSettingsApi {
+@@ -135,6 +145,16 @@ export interface HubImportApi {
+   onEvent: (listener: (event: ImportEvent) => void) => () => void;
+ }
+ 
++export interface HubPacketsApi {
++  list: (input: PacketsListInput) => Promise<ContextPacketDto[]>;
++  compile: (input: PacketsCompileInput) => Promise<ContextPacketDto>;
++  export: (input: PacketsExportInput) => Promise<PacketsExportResult>;
++  pickFile: () => Promise<ImportPickResult>;
++  import: (input: PacketsImportInput) => Promise<ContextPacketDto>;
++  apply: (input: PacketsApplyInput) => Promise<ConversationDto>;
++  clear: (input: PacketsClearInput) => Promise<ConversationDto>;
++}
++
+ export interface HubChatApi {
+   send: (input: ChatSendInput) => Promise<ChatSendResult>;
+   abort: (input: ChatAbortInput) => Promise<void>;
+@@ -160,6 +180,7 @@ export interface HubApi {
+   debug: HubDebugApi;
+   chat: HubChatApi;
+   import: HubImportApi;
++  packets: HubPacketsApi;
+ }
+ 
+ export type { AppLocale, ThemeMode };
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 20888b5..c0ab0f1 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -16,6 +16,7 @@ export {
+   type HubCostsApi,
+   type HubDebugApi,
+   type HubImportApi,
++  type HubPacketsApi,
+   type HubWindowApi,
+ } from "./hub-api";
+ export {
+@@ -114,6 +115,16 @@ export {
+   importReportSchema,
+   importJobDtoSchema,
+   importJobStatusSchema,
++  contextPacketDtoSchema,
++  contextPacketListResultSchema,
++  packetsListInputSchema,
++  packetsCompileInputSchema,
++  packetsExportInputSchema,
++  packetsExportResultSchema,
++  packetsImportInputSchema,
++  packetsApplyInputSchema,
++  packetsClearInputSchema,
++  messagePinInputSchema,
+   providerDtoSchema,
+   providerKeyDtoSchema,
+   providerKeyListResultSchema,
+@@ -173,6 +184,15 @@ export {
+   type ImportReport,
+   type ImportJobDto,
+   type ImportJobStatus,
++  type ContextPacketDto,
++  type PacketsListInput,
++  type PacketsCompileInput,
++  type PacketsExportInput,
++  type PacketsExportResult,
++  type PacketsImportInput,
++  type PacketsApplyInput,
++  type PacketsClearInput,
++  type MessagePinInput,
+   type ProviderKeyDto,
+   type SecretsSaveInput,
+   type SecretsTestInput,
+@@ -199,3 +219,17 @@ export {
+   type ProviderAgnosticPacket,
+   type ReceiptDto,
+ } from "./gateway";
++export {
++  clipPacketLabel,
++  packetPrivacyModeSchema,
++  packetSliceKindSchema,
++  packetSliceSchema,
++  portablePacketFromCompile,
++  portablePacketOriginSchema,
++  portablePacketV1Schema,
++  type PacketPrivacyMode,
++  type PacketSlice,
++  type PacketSliceKind,
++  type PortablePacketOrigin,
++  type PortablePacketV1,
++} from "./portable-packet";
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index 6a40e7f..4a4f0fb 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -45,6 +45,14 @@ export const IpcChannel = {
+   chatAbort: "chat:abort",
+   chatEvent: "chat:event",
+   chatPreviewPacket: "chat:previewPacket",
++  messagesPin: "messages:pin",
++  packetsList: "packets:list",
++  packetsCompile: "packets:compile",
++  packetsExport: "packets:export",
++  packetsPickFile: "packets:pickFile",
++  packetsImport: "packets:import",
++  packetsApply: "packets:apply",
++  packetsClear: "packets:clear",
+ } as const;
+ 
+ export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index 5c15f33..0ef4ccd 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -12,6 +12,7 @@ import {
+   messageUpdateInputSchema,
+   packetPreviewInputSchema,
+   packetPreviewResultSchema,
++  packetsImportInputSchema,
+   providerKeyDtoSchema,
+   projectCreateInputSchema,
+   projectDtoSchema,
+@@ -132,6 +133,7 @@ describe("messageDtoSchema", () => {
+         status: "complete",
+         createdAt: "2026-09-17T00:00:00.000Z",
+         receipt: null,
++        pinned: false,
+       }),
+     ).toThrow();
+   });
+@@ -328,8 +330,15 @@ describe("wave 7 contracts", () => {
+       estimatedCostUsd: "0.000001",
+       capWarnings: ["request"],
+       capBlocked: null,
++      included: [{ kind: "message", id: null, label: "hello", tokens: 2 }],
++      omitted: [],
++      destinationModel: "gpt-4o-mini",
++      destinationProvider: "openai",
++      privacyMode: "standard",
++      appliedPacketId: null,
+     });
+     expect(parsed.capWarnings).toEqual(["request"]);
++    expect(parsed.included).toHaveLength(1);
+     expect(() =>
+       packetPreviewResultSchema.parse({
+         tokenEstimate: 12,
+@@ -352,6 +361,18 @@ describe("wave 7 contracts", () => {
+   });
+ });
+ 
++describe("wave 10 packet contracts", () => {
++  it("rejects a filesystem path on packet import", () => {
++    expect(() =>
++      packetsImportInputSchema.parse({
++        ticket: "11111111-1111-4111-8111-111111111111",
++        projectId: "22222222-2222-4222-8222-222222222222",
++        path: "C:\\\\secrets\\\\packet.json",
++      }),
++    ).toThrow();
++  });
++});
++
+ describe("wave 8 contracts", () => {
+   it("rejects extra keys on app prefs", () => {
+     const prefs = {
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index 696686a..25c58ed 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -1,6 +1,11 @@
+ import { z } from "zod";
+ import { localeSchema, themeModeSchema } from "./appearance";
+ import { gatewayErrorCodeSchema, packetV0Schema, receiptDtoSchema } from "./gateway";
++import {
++  packetPrivacyModeSchema,
++  packetSliceSchema,
++  portablePacketOriginSchema,
++} from "./portable-packet";
+ 
+ export const spendCapScopeSchema = z.enum(["request", "day", "global"]);
+ 
+@@ -100,6 +105,7 @@ export const conversationDtoSchema = z.object({
+   createdAt: isoTimestampSchema,
+   updatedAt: isoTimestampSchema,
+   importSource: importSourceSchema.nullable(),
++  activePacketId: z.string().uuid().nullable(),
+ });
+ 
+ export type ConversationDto = z.infer<typeof conversationDtoSchema>;
+@@ -173,6 +179,7 @@ export const packetPreviewInputSchema = z
+     compact: z.boolean().optional(),
+     pendingContent: z.string().max(100_000).optional(),
+     maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
++    privacyMode: packetPrivacyModeSchema.optional(),
+   })
+   .strict();
+ 
+@@ -188,6 +195,12 @@ export const packetPreviewResultSchema = z
+     estimatedCostUsd: z.string().nullable(),
+     capWarnings: z.array(spendCapScopeSchema),
+     capBlocked: spendCapScopeSchema.nullable(),
++    included: z.array(packetSliceSchema).max(200),
++    omitted: z.array(packetSliceSchema).max(200),
++    destinationModel: z.string().min(1).max(128),
++    destinationProvider: z.string().min(1).max(64),
++    privacyMode: packetPrivacyModeSchema,
++    appliedPacketId: z.string().uuid().nullable(),
+   })
+   .strict();
+ 
+@@ -212,6 +225,7 @@ export const messageDtoSchema = z.object({
+   status: messageStatusSchema,
+   createdAt: isoTimestampSchema,
+   receipt: receiptDtoSchema.nullable(),
++  pinned: z.boolean(),
+ });
+ 
+ export type MessageDto = z.infer<typeof messageDtoSchema>;
+@@ -645,3 +659,89 @@ export const importJobDtoSchema = z
+ 
+ export type ImportJobDto = z.infer<typeof importJobDtoSchema>;
+ 
++export const contextPacketDtoSchema = z
++  .object({
++    id: z.string().uuid(),
++    projectId: z.string().uuid().nullable(),
++    tokenEstimate: z.number().int().nonnegative().nullable(),
++    privacyMode: packetPrivacyModeSchema,
++    origin: portablePacketOriginSchema,
++    createdAt: isoTimestampSchema,
++  })
++  .strict();
++
++export type ContextPacketDto = z.infer<typeof contextPacketDtoSchema>;
++
++export const contextPacketListResultSchema = z.array(contextPacketDtoSchema);
++
++export const packetsListInputSchema = z
++  .object({
++    projectId: z.string().uuid().nullable(),
++  })
++  .strict();
++
++export type PacketsListInput = z.infer<typeof packetsListInputSchema>;
++
++export const packetsCompileInputSchema = z
++  .object({
++    conversationId: z.string().uuid(),
++    extraSystem: z.string().max(20_000).optional(),
++    compact: z.boolean().optional(),
++    privacyMode: packetPrivacyModeSchema.optional(),
++    model: z.string().min(1).max(128).optional(),
++    providerSlug: z.string().min(1).max(64).optional(),
++  })
++  .strict();
++
++export type PacketsCompileInput = z.infer<typeof packetsCompileInputSchema>;
++
++export const packetsExportInputSchema = z
++  .object({
++    packetId: z.string().uuid(),
++  })
++  .strict();
++
++export type PacketsExportInput = z.infer<typeof packetsExportInputSchema>;
++
++export const packetsExportResultSchema = z.discriminatedUnion("status", [
++  z.object({ status: z.literal("saved") }).strict(),
++  z.object({ status: z.literal("cancelled") }).strict(),
++]);
++
++export type PacketsExportResult = z.infer<typeof packetsExportResultSchema>;
++
++export const packetsImportInputSchema = z
++  .object({
++    ticket: z.string().uuid(),
++    projectId: z.string().uuid(),
++  })
++  .strict();
++
++export type PacketsImportInput = z.infer<typeof packetsImportInputSchema>;
++
++export const packetsApplyInputSchema = z
++  .object({
++    conversationId: z.string().uuid(),
++    packetId: z.string().uuid(),
++  })
++  .strict();
++
++export type PacketsApplyInput = z.infer<typeof packetsApplyInputSchema>;
++
++export const packetsClearInputSchema = z
++  .object({
++    conversationId: z.string().uuid(),
++  })
++  .strict();
++
++export type PacketsClearInput = z.infer<typeof packetsClearInputSchema>;
++
++export const messagePinInputSchema = z
++  .object({
++    id: z.string().uuid(),
++    pinned: z.boolean(),
++  })
++  .strict();
++
++export type MessagePinInput = z.infer<typeof messagePinInputSchema>;
++
+
+
+diff --git a/apps/desktop/e2e/packet.spec.ts b/apps/desktop/e2e/packet.spec.ts
+new file mode 100644
+index 0000000..97bd056
+--- /dev/null
++++ b/apps/desktop/e2e/packet.spec.ts
+@@ -0,0 +1,78 @@
++import { createRequire } from "node:module";
++import { mkdtempSync } from "node:fs";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { _electron as electron, expect, test, type ElectronApplication } from "@playwright/test";
++
++const require = createRequire(import.meta.url);
++const electronBinary = require("electron") as string;
++const appRoot = path.join(fileURLToPath(new URL("..", import.meta.url)));
++
++async function launchHub(packetFile: string): Promise<ElectronApplication> {
++  return electron.launch({
++    executablePath: electronBinary,
++    args: [path.join(appRoot, "out/main/index.js")],
++    cwd: appRoot,
++    env: {
++      ...process.env,
++      AI_HUB_E2E: "1",
++      AI_HUB_E2E_PACKET_FILE: packetFile,
++      NODE_ENV: "production",
++    },
++  });
++}
++
++test("exports a packet from project A and continues in project B on another model", async () => {
++  const packetFile = path.join(mkdtempSync(path.join(tmpdir(), "ai-hub-packet-")), "task.aihub-packet.json");
++  const app = await launchHub(packetFile);
++  try {
++    const window = await app.firstWindow();
++    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
++    await window.getByTestId("chat-composer").fill("Continue the portable task");
++    await window.getByTestId("chat-send").click();
++    await expect(window.getByTestId("message-assistant")).toHaveAttribute("data-status", "complete", {
++      timeout: 30_000,
++    });
++    await expect(window.getByTestId("packet-badge")).toBeVisible();
++    await window.getByTestId("packet-open").click();
++    await expect(window.getByTestId("packet-included")).toBeVisible();
++    await expect(window.getByTestId("packet-destination")).toContainText("gpt-4o-mini");
++    await window.getByTestId("packet-compile").click();
++    await expect(window.getByTestId("packet-export")).toBeEnabled();
++    await window.getByTestId("packet-export").click();
++    await window.keyboard.press("Escape");
++
++    await window.getByTestId("workspace-new-project-name").fill("Beta");
++    await window.getByTestId("workspace-new-project").click();
++    await expect(window.getByTestId("project-item").filter({ hasText: "Beta" })).toBeVisible();
++    await window.getByTestId("project-item").filter({ hasText: "Beta" }).click();
++    await window.getByTestId("workspace-new-conversation-title").fill("Continue");
++    await window.getByTestId("workspace-new-conversation").click();
++    await expect(window.getByTestId("conversation-item").filter({ hasText: "Continue" })).toBeVisible();
++    await expect(window.getByTestId("packet-badge")).toBeVisible();
++
++    await window.getByTestId("packet-open").click();
++    await window.getByTestId("packet-import").click();
++    await expect(window.getByTestId("packet-apply")).toBeVisible();
++    await window.getByTestId("packet-apply").click();
++    await expect(window.getByTestId("packet-applied")).toBeVisible();
++    const anthropicValue = await window
++      .getByTestId("workspace-key")
++      .locator("option")
++      .filter({ hasText: "anthropic" })
++      .getAttribute("value");
++    expect(anthropicValue).toBeTruthy();
++    await window.getByTestId("workspace-key").selectOption(anthropicValue ?? "");
++    await window.getByTestId("workspace-model").selectOption("claude-sonnet-4-20250514");
++    await expect(window.getByTestId("packet-destination")).toContainText("claude-sonnet-4-20250514");
++    await window.keyboard.press("Escape");
++    await window.getByTestId("chat-composer").fill("Next step");
++    await window.getByTestId("chat-send").click();
++    await expect(window.getByTestId("message-assistant")).toHaveAttribute("data-status", "complete", {
++      timeout: 30_000,
++    });
++  } finally {
++    await app.close();
++  }
++});
+
+
+diff --git a/apps/desktop/src/main/packet-file.ts b/apps/desktop/src/main/packet-file.ts
+new file mode 100644
+index 0000000..d62407d
+--- /dev/null
++++ b/apps/desktop/src/main/packet-file.ts
+@@ -0,0 +1,204 @@
++import { randomUUID } from "node:crypto";
++import { readFile, writeFile } from "node:fs/promises";
++import { basename } from "node:path";
++import { BrowserWindow, dialog, type OpenDialogOptions, type WebContents } from "electron";
++import { compileActivePathDetailed } from "@ai-hub/ai-gateway";
++import { redactSecrets } from "@ai-hub/security";
++import {
++  contextPacketDtoSchema,
++  findCatalogModel,
++  importPickResultSchema,
++  packetsExportResultSchema,
++  portablePacketFromCompile,
++  portablePacketV1Schema,
++  type ContextPacketDto,
++  type ImportPickResult,
++  type PacketsCompileInput,
++  type PacketsExportInput,
++  type PacketsExportResult,
++  type PacketsImportInput,
++} from "@ai-hub/shared";
++import { isE2eMode } from "./e2e-mode";
++import { getHubDatabase } from "./persistence";
++
++const tickets = new Map<string, { path: string; fileName: string }>();
++const MAX_PACKET_BYTES = 2_000_000;
++
++function toPacketDto(row: {
++  id: string;
++  projectId: string | null;
++  tokenEstimate: number | null;
++  privacyMode: "standard" | "strict";
++  origin: { source: "compile" | "import"; projectLabel: string; conversationLabel: string };
++  createdAt: string;
++}): ContextPacketDto {
++  return contextPacketDtoSchema.parse({
++    id: row.id,
++    projectId: row.projectId,
++    tokenEstimate: row.tokenEstimate,
++    privacyMode: row.privacyMode,
++    origin: row.origin,
++    createdAt: row.createdAt,
++  });
++}
++
++function filePart(title: string): string {
++  const cleaned = Array.from(title)
++    .map((ch) => {
++      const code = ch.codePointAt(0) ?? 0;
++      if (code < 32 || '<>:"/\\|?*'.includes(ch)) {
++        return "_";
++      }
++      return ch;
++    })
++    .join("")
++    .trim();
++  return (cleaned.length > 0 ? cleaned : "packet").slice(0, 60);
++}
++
++export function listProjectPackets(projectId: string | null): ContextPacketDto[] {
++  return getHubDatabase().repos.listContextPackets(projectId).map((row) => toPacketDto(row));
++}
++
++export function compileAndSavePacket(input: PacketsCompileInput): ContextPacketDto {
++  const repos = getHubDatabase().repos;
++  const conversation = repos.getConversation(input.conversationId);
++  if (!conversation) {
++    throw new Error("Conversation not found");
++  }
++  const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
++  const extraSystem =
++    input.extraSystem !== undefined && input.extraSystem.trim().length > 0 ? input.extraSystem.trim() : null;
++  const privacyMode = input.privacyMode ?? "standard";
++  const catalog =
++    input.model && input.providerSlug ? findCatalogModel(input.model, input.providerSlug) : null;
++  const compiled = {
++    projectInstructions: project?.instructions ?? null,
++    extraSystem,
++    privacyMode,
++    messages: repos.listMessages(input.conversationId).map((item) => ({
++      id: item.id,
++      parentId: item.parentId,
++      isActiveBranch: item.isActiveBranch,
++      createdAt: item.createdAt,
++      role: item.role,
++      content: item.content,
++      status: item.status,
++      branchId: item.branchId,
++      ...(item.pinned ? { pinned: true } : {}),
++    })),
++  };
++  const detailed = compileActivePathDetailed(
++    input.compact === true ? { ...compiled, maxTokenBudget: catalog?.contextWindow ?? 128_000 } : compiled,
++  );
++  const envelope = portablePacketFromCompile({
++    privacyMode,
++    origin: {
++      source: "compile",
++      projectLabel: (project?.name ?? "").slice(0, 200),
++      conversationLabel: conversation.title.slice(0, 200),
++    },
++    included: detailed.included,
++    omitted: detailed.omitted,
++    payload: detailed.packet,
++  });
++  const payloadJson = redactSecrets(JSON.stringify(envelope));
++  const stored = repos.createContextPacket({
++    projectId: conversation.projectId,
++    privacyMode,
++    origin: envelope.origin,
++    tokenEstimate: envelope.payload.tokenEstimate,
++    payloadJson,
++  });
++  return toPacketDto(stored);
++}
++
++export async function exportSavedPacket(
++  input: PacketsExportInput,
++  sender: WebContents,
++): Promise<PacketsExportResult> {
++  const stored = getHubDatabase().repos.getContextPacket(input.packetId);
++  if (!stored) {
++    throw new Error("Packet not found");
++  }
++  const parsed = portablePacketV1Schema.parse(JSON.parse(stored.payloadJson) as unknown);
++  const payload = redactSecrets(JSON.stringify(parsed, null, 2));
++  const fixture = process.env.AI_HUB_E2E_PACKET_FILE;
++  if (isE2eMode() && fixture && fixture.trim().length > 0) {
++    await writeFile(fixture, payload, "utf8");
++    return packetsExportResultSchema.parse({ status: "saved" });
++  }
++  const window = BrowserWindow.fromWebContents(sender);
++  const options = {
++    defaultPath: `${filePart(stored.origin.conversationLabel || "packet")}.aihub-packet.json`,
++    filters: [{ name: "AI Hub packet", extensions: ["aihub-packet.json", "json"] }],
++  };
++  const choice = window
++    ? await dialog.showSaveDialog(window, options)
++    : await dialog.showSaveDialog(options);
++  if (choice.canceled || !choice.filePath) {
++    return packetsExportResultSchema.parse({ status: "cancelled" });
++  }
++  await writeFile(choice.filePath, payload, "utf8");
++  return packetsExportResultSchema.parse({ status: "saved" });
++}
++
++export async function pickPacketFile(sender: WebContents): Promise<ImportPickResult> {
++  const fixture = process.env.AI_HUB_E2E_PACKET_FILE;
++  if (isE2eMode() && fixture && fixture.trim().length > 0) {
++    tickets.clear();
++    const ticket = randomUUID();
++    const fileName = basename(fixture);
++    tickets.set(ticket, { path: fixture, fileName });
++    return importPickResultSchema.parse({ status: "picked", ticket, fileName });
++  }
++  const window = BrowserWindow.fromWebContents(sender);
++  const options: OpenDialogOptions = {
++    properties: ["openFile"],
++    filters: [
++      { name: "AI Hub packet", extensions: ["aihub-packet.json", "json"] },
++      { name: "JSON", extensions: ["json"] },
++    ],
++  };
++  const choice = window ? await dialog.showOpenDialog(window, options) : await dialog.showOpenDialog(options);
++  const selected = choice.filePaths[0];
++  if (choice.canceled || !selected) {
++    return importPickResultSchema.parse({ status: "cancelled" });
++  }
++  tickets.clear();
++  const ticket = randomUUID();
++  const fileName = basename(selected);
++  tickets.set(ticket, { path: selected, fileName });
++  return importPickResultSchema.parse({ status: "picked", ticket, fileName });
++}
++
++export async function importPacketFile(input: PacketsImportInput): Promise<ContextPacketDto> {
++  const ticket = tickets.get(input.ticket);
++  if (!ticket) {
++    throw new Error("Packet file is no longer available. Pick the file again.");
++  }
++  tickets.delete(input.ticket);
++  const repos = getHubDatabase().repos;
++  const project = repos.getProject(input.projectId);
++  if (!project) {
++    throw new Error("Project not found");
++  }
++  const bytes = await readFile(ticket.path);
++  if (bytes.byteLength > MAX_PACKET_BYTES) {
++    throw new Error("Packet file is too large");
++  }
++  const parsed = portablePacketV1Schema.parse(JSON.parse(bytes.toString("utf8")) as unknown);
++  const redacted = portablePacketV1Schema.parse(JSON.parse(redactSecrets(JSON.stringify(parsed))) as unknown);
++  const stored = repos.createContextPacket({
++    projectId: project.id,
++    privacyMode: redacted.privacyMode,
++    origin: {
++      source: "import",
++      projectLabel: redacted.origin.projectLabel,
++      conversationLabel: redacted.origin.conversationLabel,
++    },
++    tokenEstimate: redacted.payload.tokenEstimate,
++    payloadJson: redactSecrets(JSON.stringify(redacted)),
++  });
++  return toPacketDto(stored);
++}
+
+
+diff --git a/apps/desktop/src/renderer/src/components/chat/packet-panel.tsx b/apps/desktop/src/renderer/src/components/chat/packet-panel.tsx
+new file mode 100644
+index 0000000..f031c84
+--- /dev/null
++++ b/apps/desktop/src/renderer/src/components/chat/packet-panel.tsx
+@@ -0,0 +1,203 @@
++import { type JSX, useState } from "react";
++import { useTranslation } from "react-i18next";
++import type { ContextPacketDto, PacketPreviewResult, PacketPrivacyMode } from "@ai-hub/shared";
++import { Button } from "@/components/ui/button";
++import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
++
++export function PacketPanel({
++  packetPreview,
++  packets,
++  projectId,
++  appliedPacketId,
++  privacyMode,
++  busy,
++  onPrivacyMode,
++  onCompile,
++  onExport,
++  onImport,
++  onApply,
++  onClear,
++}: {
++  packetPreview: PacketPreviewResult | null;
++  packets: ContextPacketDto[];
++  projectId: string | null;
++  appliedPacketId: string | null;
++  privacyMode: PacketPrivacyMode;
++  busy: boolean;
++  onPrivacyMode: (value: PacketPrivacyMode) => void;
++  onCompile: () => Promise<void>;
++  onExport: (packetId: string) => Promise<void>;
++  onImport: () => Promise<void>;
++  onApply: (packetId: string) => Promise<void>;
++  onClear: () => Promise<void>;
++}): JSX.Element {
++  const { t } = useTranslation();
++  const [open, setOpen] = useState(false);
++  const canMutate = projectId !== null && !busy;
++  const latest = packets[0] ?? null;
++
++  return (
++    <>
++      <Button
++        type="button"
++        size="sm"
++        variant="outline"
++        data-testid="packet-open"
++        disabled={!packetPreview}
++        onClick={() => setOpen(true)}
++      >
++        {t("workspace.packet.open")}
++      </Button>
++      <Dialog open={open} onOpenChange={setOpen}>
++        <DialogContent data-testid="packet-dialog" className="max-h-[80vh] overflow-y-auto">
++          <DialogHeader>
++            <DialogTitle>{t("workspace.packet.title")}</DialogTitle>
++          </DialogHeader>
++          {packetPreview ? (
++            <div className="flex flex-col gap-3 text-[13px]">
++              <p data-testid="packet-destination">
++                {t("workspace.packet.destination", {
++                  provider: packetPreview.destinationProvider,
++                  model: packetPreview.destinationModel,
++                  window: packetPreview.contextWindow,
++                  n: packetPreview.tokenEstimate,
++                })}
++              </p>
++              {appliedPacketId ? (
++                <p data-testid="packet-applied" className="text-muted-foreground">
++                  {t("workspace.packet.applied")}
++                </p>
++              ) : null}
++              <label className="flex items-center gap-2">
++                <span className="text-muted-foreground">{t("workspace.packet.privacy")}</span>
++                <select
++                  className="h-8 rounded-md border bg-background px-2"
++                  value={appliedPacketId ? packetPreview.privacyMode : privacyMode}
++                  disabled={Boolean(appliedPacketId) || busy}
++                  data-testid="packet-privacy"
++                  aria-label={t("workspace.packet.privacy")}
++                  onChange={(event) => onPrivacyMode(event.target.value === "strict" ? "strict" : "standard")}
++                >
++                  <option value="standard">{t("workspace.packet.privacy.standard")}</option>
++                  <option value="strict">{t("workspace.packet.privacy.strict")}</option>
++                </select>
++              </label>
++              <section>
++                <h3 className="mb-1 text-[12px] font-medium">{t("workspace.packet.included")}</h3>
++                <ul className="flex flex-col gap-1" data-testid="packet-included">
++                  {packetPreview.included.length === 0 ? (
++                    <li className="text-muted-foreground">{t("workspace.packet.empty")}</li>
++                  ) : (
++                    packetPreview.included.map((slice, index) => (
++                      <li key={`${slice.kind}-${slice.id ?? index}`} className="rounded-md border px-2 py-1">
++                        {t(`workspace.packet.kind.${slice.kind}`)} ┬À {slice.label} ┬À ~{slice.tokens}
++                      </li>
++                    ))
++                  )}
++                </ul>
++              </section>
++              <section>
++                <h3 className="mb-1 text-[12px] font-medium">{t("workspace.packet.omitted")}</h3>
++                <ul className="flex flex-col gap-1" data-testid="packet-omitted">
++                  {packetPreview.omitted.length === 0 ? (
++                    <li className="text-muted-foreground">{t("workspace.packet.empty")}</li>
++                  ) : (
++                    packetPreview.omitted.map((slice, index) => (
++                      <li key={`${slice.kind}-${slice.id ?? index}`} className="rounded-md border px-2 py-1">
++                        {t(`workspace.packet.kind.${slice.kind}`)} ┬À {slice.label} ┬À ~{slice.tokens}
++                      </li>
++                    ))
++                  )}
++                </ul>
++              </section>
++              <div className="flex flex-wrap gap-1">
++                <Button
++                  type="button"
++                  size="sm"
++                  disabled={!canMutate}
++                  data-testid="packet-compile"
++                  onClick={() => {
++                    void onCompile();
++                  }}
++                >
++                  {t("workspace.packet.save")}
++                </Button>
++                <Button
++                  type="button"
++                  size="sm"
++                  variant="outline"
++                  disabled={!canMutate || !latest}
++                  data-testid="packet-export"
++                  onClick={() => {
++                    if (latest) {
++                      void onExport(latest.id);
++                    }
++                  }}
++                >
++                  {t("workspace.packet.export")}
++                </Button>
++                <Button
++                  type="button"
++                  size="sm"
++                  variant="outline"
++                  disabled={!canMutate}
++                  data-testid="packet-import"
++                  onClick={() => {
++                    void onImport();
++                  }}
++                >
++                  {t("workspace.packet.import")}
++                </Button>
++                {appliedPacketId ? (
++                  <Button
++                    type="button"
++                    size="sm"
++                    variant="outline"
++                    disabled={busy}
++                    data-testid="packet-clear"
++                    onClick={() => {
++                      void onClear();
++                    }}
++                  >
++                    {t("workspace.packet.clear")}
++                  </Button>
++                ) : null}
++              </div>
++              <section>
++                <h3 className="mb-1 text-[12px] font-medium">{t("workspace.packet.saved")}</h3>
++                {packets.length === 0 ? (
++                  <p className="text-muted-foreground">{t("workspace.packet.none")}</p>
++                ) : (
++                  <ul className="flex flex-col gap-1">
++                    {packets.map((packet) => (
++                      <li key={packet.id} className="flex items-center justify-between gap-2 rounded-md border px-2 py-1">
++                        <span>
++                          {packet.origin.conversationLabel || t("workspace.packet.untitled")} ┬À ~
++                          {packet.tokenEstimate ?? 0} ┬À {t(`workspace.packet.privacy.${packet.privacyMode}`)}
++                        </span>
++                        <Button
++                          type="button"
++                          size="sm"
++                          variant={appliedPacketId === packet.id ? "secondary" : "outline"}
++                          disabled={busy}
++                          data-testid="packet-apply"
++                          onClick={() => {
++                            void onApply(packet.id);
++                          }}
++                        >
++                          {appliedPacketId === packet.id ? t("workspace.packet.using") : t("workspace.packet.apply")}
++                        </Button>
++                      </li>
++                    ))}
++                  </ul>
++                )}
++              </section>
++            </div>
++          ) : (
++            <p className="text-muted-foreground">{t("workspace.packet.needPreview")}</p>
++          )}
++        </DialogContent>
++      </Dialog>
++    </>
++  );
++}
+
+
+diff --git a/docs/ADR/ADR-W10-001-portable-packet-json-v1.md b/docs/ADR/ADR-W10-001-portable-packet-json-v1.md
+new file mode 100644
+index 0000000..1cb7697
+--- /dev/null
++++ b/docs/ADR/ADR-W10-001-portable-packet-json-v1.md
+@@ -0,0 +1,44 @@
++# ADR-W10-001-portable-packet-json-v1
++
++- **Status:** accepted
++- **Onda:** W10
++- **Data:** 2026-09-18
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++O compiler v0 (ADR-W02-002) produz um packet interno `version: 1` (`system` + `messages` + `tokenEstimate` + `excluded`). A Wave 10 precisa de um **artefato de ficheiro** port├ítil entre projetos, com preview (o que entra / o que fica de fora), sem keys e sem misturar conte├║do de outros projetos.
++
++## Decis├úo
++
++Ficheiro `.aihub-packet.json` com envelope Zod `.strict()`:
++
++- `kind`: `aihub.packet`
++- `version`: `1` (vers├úo do envelope; o payload interno continua o packet v0)
++- `privacyMode`: `standard` | `strict`
++- `origin`: `{ source: compile | import, projectLabel, conversationLabel }` ÔÇö r├│tulos, n├úo ids de outro workspace
++- `included` / `omitted`: fatias curtas para preview (kind + label Ôëñ200 + tokens)
++- `payload`: `packetV0Schema` (sem `apiKey`, sem headers)
++
++Export e import passam por `redactSecrets`. Campos extra (`apiKey`, `authorization`) falham o parse.
++
++O packet **interno** de send n├úo muda de vers├úo. W13+ pode acrescentar files/memories no envelope `version: 2`.
++
++## Alternativas consideradas
++
++- **Reusar s├│ o packet v0 como ficheiro:** falta origin, privacy e manifesto de preview.
++- **Subir o payload interno para version 2 agora:** quebraria testes e o contrato W2 sem ganho.
++
++## Consequ├¬ncias
++
++- Positivas: contrato test├ível; compiler v0 intacto.
++- Negativas: dois ÔÇ£version: 1ÔÇØ (envelope vs payload) ÔÇö disambiguados por `kind`.
++- Riscos aceitos: labels de preview s├úo recortes da conversa no renderer (j├í v├¬ as mensagens).
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 10 / D1
++- `docs/ADR/ADR-W02-002-compiler-packet-v0.md`
++- `docs/reviews/W10/REVIEW.md`
+
+
+diff --git a/docs/ADR/ADR-W10-002-context-packets-apply.md b/docs/ADR/ADR-W10-002-context-packets-apply.md
+new file mode 100644
+index 0000000..35dd9fa
+--- /dev/null
++++ b/docs/ADR/ADR-W10-002-context-packets-apply.md
+@@ -0,0 +1,45 @@
++# ADR-W10-002-context-packets-apply
++
++- **Status:** accepted
++- **Onda:** W10
++- **Data:** 2026-09-18
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++A tabela `context_packets` existe desde W1 s├│ como hook (`payload_cipher`, `token_estimate`). D1 pede persistir o pacote, importar noutro projeto e ÔÇ£usar este packet nesta conversaÔÇØ no lugar do compile ad hoc.
++
++## Decis├úo
++
++Migration 7:
++
++- `context_packets.privacy_mode`, `origin`, `version`
++- `conversations.active_packet_id` (nullable)
++- `messages.pinned` (0/1)
++
++Payload no SQLite ├® o envelope port├ítil (JSON) **cifrado** (envelope AES-GCM, como o resto). DTO de lista: id, tokens, privacy, origin, labels, createdAt ÔÇö **sem** payload. Apply s├│ se `packet.projectId` ├® o mesmo da conversa (c├│pia importada para o projeto B).
++
++Send com packet aplicado: `payload.messages` + mensagens da conversa criadas **depois** do apply; o grafo local continua a gravar os turnos novos. Clear remove s├│ o ponteiro.
++
++Export/import de ficheiro: di├ílogo no main + ticket opaco (mesmo padr├úo W9). e2e: `AI_HUB_E2E_PACKET_FILE`.
++
++## Alternativas consideradas
++
++- **Packet s├│ em mem├│ria / settings:** perde-se no restart; o DoD pede artefato.
++- **Apply injeta mensagens no grafo:** duplicaria o hist├│rico e misturaria ids; rejeitado.
++- **Permitir apply cross-project:** violaria ÔÇ£sem conte├║do de outros projetosÔÇØ.
++
++## Consequ├¬ncias
++
++- Positivas: Projeto A ÔåÆ ficheiro ÔåÆ Projeto B ÔåÆ apply ÔåÆ outro modelo, sem ÔÇ£explica de novoÔÇØ.
++- Negativas: packet aplicado ignora ramos locais anteriores ao apply.
++- Riscos aceitos: um packet grande cabe na row SQLite; sem compress├úo nesta onda.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 10
++- `docs/ADR/ADR-W01-001-envelope-encryption-at-rest.md`
++- `docs/ADR/ADR-W09-004-vendor-parsers-and-opaque-ticket.md`
++- `docs/reviews/W10/REVIEW.md`
+
+
+diff --git a/docs/ADR/ADR-W10-003-deterministic-inactive-summary-and-pins.md b/docs/ADR/ADR-W10-003-deterministic-inactive-summary-and-pins.md
+new file mode 100644
+index 0000000..16e96a7
+--- /dev/null
++++ b/docs/ADR/ADR-W10-003-deterministic-inactive-summary-and-pins.md
+@@ -0,0 +1,39 @@
++# ADR-W10-003-deterministic-inactive-summary-and-pins
++
++- **Status:** accepted
++- **Onda:** W10
++- **Data:** 2026-09-18
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++W10 pede compactar: sumarizar ramos inativos, cortar mensagens antigas, manter pins. ADR-W06-003 j├í recusa resumo via LLM (custo/privacy ocultos) e recusa apagar o grafo.
++
++## Decis├úo
++
++- **Ramos inativos:** o compiler gera um bloco de texto determin├¡stico no `system` (`N turns. Last: ÔÇª` Ôëñ80 caracteres). Os turnos inativos **n├úo** entram em `payload.messages`. Sem segundo modelo.
++- **Cortar antigas:** igual W6 (`maxTokenBudget`), mas **n├úo remove mensagens com `pinned=1`**.
++- **Privacy `strict`:** omite instru├º├Áes do projeto e o resumo de ramos inativos; o path ativo permanece.
++- **Privacy `standard`:** instru├º├Áes + resumos + path ativo.
++
++Overflow continua `tokenEstimate > contextWindow`. Compactar n├úo muda o SQLite.
++
++## Alternativas consideradas
++
++- **LLM summary:** rejeitado de novo (ADR-W06-003).
++- **Incluir ramos inativos como mensagens:** mistura o fio ativo (ADR-W04-003).
++
++## Consequ├¬ncias
++
++- Positivas: preview consegue listar omitted `inactive-branch` / `old-message` / `privacy`.
++- Negativas: o ÔÇ£resumoÔÇØ ├® um recorte, n├úo uma s├¡ntese sem├óntica.
++- Riscos aceitos: chars/4; pin em plaintext no schema (flag, n├úo conte├║do).
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 10
++- `docs/ADR/ADR-W06-003-compile-trim-context-window.md`
++- `docs/ADR/ADR-W04-003-compiler-active-path.md`
++- `docs/reviews/W10/REVIEW.md`
+
+
+diff --git a/packages/shared/src/portable-packet.ts b/packages/shared/src/portable-packet.ts
+new file mode 100644
+index 0000000..1a9f2cb
+--- /dev/null
++++ b/packages/shared/src/portable-packet.ts
+@@ -0,0 +1,78 @@
++import { z } from "zod";
++import { packetV0Schema, type ProviderAgnosticPacket } from "./gateway";
++
++export const packetPrivacyModeSchema = z.enum(["standard", "strict"]);
++
++export type PacketPrivacyMode = z.infer<typeof packetPrivacyModeSchema>;
++
++export const packetSliceKindSchema = z.enum([
++  "project-instructions",
++  "extra-system",
++  "inactive-branch",
++  "message",
++  "old-message",
++  "privacy",
++]);
++
++export type PacketSliceKind = z.infer<typeof packetSliceKindSchema>;
++
++export const packetSliceSchema = z
++  .object({
++    kind: packetSliceKindSchema,
++    id: z.string().nullable(),
++    label: z.string().max(200),
++    tokens: z.number().int().nonnegative(),
++  })
++  .strict();
++
++export type PacketSlice = z.infer<typeof packetSliceSchema>;
++
++export const portablePacketOriginSchema = z
++  .object({
++    source: z.enum(["compile", "import"]),
++    projectLabel: z.string().max(200),
++    conversationLabel: z.string().max(200),
++  })
++  .strict();
++
++export type PortablePacketOrigin = z.infer<typeof portablePacketOriginSchema>;
++
++export const portablePacketV1Schema = z
++  .object({
++    kind: z.literal("aihub.packet"),
++    version: z.literal(1),
++    privacyMode: packetPrivacyModeSchema,
++    origin: portablePacketOriginSchema,
++    included: z.array(packetSliceSchema).max(200),
++    omitted: z.array(packetSliceSchema).max(200),
++    payload: packetV0Schema,
++  })
++  .strict();
++
++export type PortablePacketV1 = z.infer<typeof portablePacketV1Schema>;
++
++export function clipPacketLabel(text: string, max = 200): string {
++  const trimmed = text.replace(/\s+/g, " ").trim();
++  if (trimmed.length <= max) {
++    return trimmed;
++  }
++  return `${trimmed.slice(0, Math.max(1, max - 1))}ÔÇª`;
++}
++
++export function portablePacketFromCompile(input: {
++  privacyMode: PacketPrivacyMode;
++  origin: PortablePacketOrigin;
++  included: PacketSlice[];
++  omitted: PacketSlice[];
++  payload: ProviderAgnosticPacket;
++}): PortablePacketV1 {
++  return portablePacketV1Schema.parse({
++    kind: "aihub.packet",
++    version: 1,
++    privacyMode: input.privacyMode,
++    origin: portablePacketOriginSchema.parse(input.origin),
++    included: input.included.slice(0, 200),
++    omitted: input.omitted.slice(0, 200),
++    payload: input.payload,
++  });
++}
+
+
+diff --git a/packages/shared/src/portable-packet.test.ts b/packages/shared/src/portable-packet.test.ts
+new file mode 100644
+index 0000000..ceead0e
+--- /dev/null
++++ b/packages/shared/src/portable-packet.test.ts
+@@ -0,0 +1,46 @@
++import { describe, expect, it } from "vitest";
++import { packetV0Schema } from "./gateway";
++import { portablePacketFromCompile, portablePacketV1Schema } from "./portable-packet";
++
++const payload = packetV0Schema.parse({
++  version: 1,
++  system: "Stay brief.",
++  messages: [{ role: "user", content: "continue the task" }],
++  tokenEstimate: 8,
++  excluded: [],
++});
++
++describe("portable packet v1", () => {
++  it("accepts a version-1 envelope wrapping packet v0", () => {
++    const packet = portablePacketFromCompile({
++      privacyMode: "standard",
++      origin: { source: "compile", projectLabel: "Alpha", conversationLabel: "Kickoff" },
++      included: [{ kind: "message", id: "11111111-1111-4111-8111-111111111111", label: "continue the task", tokens: 5 }],
++      omitted: [],
++      payload,
++    });
++    expect(packet.kind).toBe("aihub.packet");
++    expect(packet.version).toBe(1);
++    expect(packet.payload.version).toBe(1);
++  });
++
++  it("rejects API keys and extra envelope fields", () => {
++    const valid = {
++      kind: "aihub.packet" as const,
++      version: 1 as const,
++      privacyMode: "strict" as const,
++      origin: { source: "import" as const, projectLabel: "B", conversationLabel: "Task" },
++      included: [],
++      omitted: [],
++      payload,
++    };
++    expect(portablePacketV1Schema.parse(valid).privacyMode).toBe("strict");
++    expect(() => portablePacketV1Schema.parse({ ...valid, apiKey: "sk-testfixtureABCDEFGH" })).toThrow();
++    expect(() =>
++      portablePacketV1Schema.parse({
++        ...valid,
++        payload: { ...payload, authorization: "Bearer sk-test" },
++      }),
++    ).toThrow();
++  });
++});
