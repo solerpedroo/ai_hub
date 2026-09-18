@@ -125,7 +125,7 @@ describe("hub database", () => {
       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
       applyMigrations(second.sqlite);
-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(6);
+      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(7);
       second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -596,6 +596,41 @@ describe("hub database", () => {
     expect(hub.repos.listConversations(null, "imported")).toHaveLength(0);
     expect(hub.repos.listConversations(project.id)[0]?.importSource).toBe("chatgpt");
     expect(hub.repos.listConversations(null, "avulsas").map((item) => item.id)).toEqual([avulsas.id]);
+    hub.close();
+  });
+
+  it("stores a context packet encrypted and applies only in the same project", () => {
+    const { hub } = openTestDb();
+    const alpha = hub.repos.createProject("Alpha");
+    const beta = hub.repos.createProject("Beta");
+    const fromA = hub.repos.createConversation(alpha.id, "A");
+    const inB = hub.repos.createConversation(beta.id, "B");
+    const packet = hub.repos.createContextPacket({
+      projectId: alpha.id,
+      privacyMode: "standard",
+      origin: { source: "compile", projectLabel: "Alpha", conversationLabel: "A" },
+      tokenEstimate: 4,
+      payloadJson: JSON.stringify({ kind: "aihub.packet", version: 1 }),
+    });
+    const dump = dumpAllText(hub.sqlite);
+    expect(dump).not.toContain("aihub.packet");
+    const applied = hub.repos.applyContextPacket(fromA.id, packet.id);
+    expect(applied.activePacketId).toBe(packet.id);
+    expect(applied.packetAppliedAt).not.toBeNull();
+    expect(() => hub.repos.applyContextPacket(inB.id, packet.id)).toThrow(/another project/);
+    const pinned = hub.repos.createMessage({
+      conversationId: fromA.id,
+      role: "user",
+      content: "pin me",
+      parentId: null,
+      branchId: null,
+    });
+    expect(pinned.pinned).toBe(false);
+    expect(hub.repos.setMessagePinned(pinned.id, true).pinned).toBe(true);
+    const moved = hub.repos.moveConversation(fromA.id, beta.id);
+    expect(moved.projectId).toBe(beta.id);
+    expect(moved.activePacketId).toBeNull();
+    expect(moved.packetAppliedAt).toBeNull();
     hub.close();
   });
 });
