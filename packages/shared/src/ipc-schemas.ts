@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { localeSchema, themeModeSchema } from "./appearance";
 import { gatewayErrorCodeSchema, packetV0Schema, receiptDtoSchema } from "./gateway";
+import {
+  packetPrivacyModeSchema,
+  packetSliceSchema,
+  portablePacketOriginSchema,
+} from "./portable-packet";
 
 export const spendCapScopeSchema = z.enum(["request", "day", "global"]);
 
@@ -100,6 +105,7 @@ export const conversationDtoSchema = z.object({
   createdAt: isoTimestampSchema,
   updatedAt: isoTimestampSchema,
   importSource: importSourceSchema.nullable(),
+  activePacketId: z.string().uuid().nullable(),
 });
 
 export type ConversationDto = z.infer<typeof conversationDtoSchema>;
@@ -173,6 +179,7 @@ export const packetPreviewInputSchema = z
     compact: z.boolean().optional(),
     pendingContent: z.string().max(100_000).optional(),
     maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
+    privacyMode: packetPrivacyModeSchema.optional(),
   })
   .strict();
 
@@ -188,6 +195,12 @@ export const packetPreviewResultSchema = z
     estimatedCostUsd: z.string().nullable(),
     capWarnings: z.array(spendCapScopeSchema),
     capBlocked: spendCapScopeSchema.nullable(),
+    included: z.array(packetSliceSchema).max(200),
+    omitted: z.array(packetSliceSchema).max(200),
+    destinationModel: z.string().min(1).max(128),
+    destinationProvider: z.string().min(1).max(64),
+    privacyMode: packetPrivacyModeSchema,
+    appliedPacketId: z.string().uuid().nullable(),
   })
   .strict();
 
@@ -212,6 +225,7 @@ export const messageDtoSchema = z.object({
   status: messageStatusSchema,
   createdAt: isoTimestampSchema,
   receipt: receiptDtoSchema.nullable(),
+  pinned: z.boolean(),
 });
 
 export type MessageDto = z.infer<typeof messageDtoSchema>;
@@ -644,4 +658,90 @@ export const importJobDtoSchema = z
   .strict();
 
 export type ImportJobDto = z.infer<typeof importJobDtoSchema>;
+
+export const contextPacketDtoSchema = z
+  .object({
+    id: z.string().uuid(),
+    projectId: z.string().uuid().nullable(),
+    tokenEstimate: z.number().int().nonnegative().nullable(),
+    privacyMode: packetPrivacyModeSchema,
+    origin: portablePacketOriginSchema,
+    createdAt: isoTimestampSchema,
+  })
+  .strict();
+
+export type ContextPacketDto = z.infer<typeof contextPacketDtoSchema>;
+
+export const contextPacketListResultSchema = z.array(contextPacketDtoSchema);
+
+export const packetsListInputSchema = z
+  .object({
+    projectId: z.string().uuid().nullable(),
+  })
+  .strict();
+
+export type PacketsListInput = z.infer<typeof packetsListInputSchema>;
+
+export const packetsCompileInputSchema = z
+  .object({
+    conversationId: z.string().uuid(),
+    extraSystem: z.string().max(20_000).optional(),
+    compact: z.boolean().optional(),
+    privacyMode: packetPrivacyModeSchema.optional(),
+    model: z.string().min(1).max(128).optional(),
+    providerSlug: z.string().min(1).max(64).optional(),
+  })
+  .strict();
+
+export type PacketsCompileInput = z.infer<typeof packetsCompileInputSchema>;
+
+export const packetsExportInputSchema = z
+  .object({
+    packetId: z.string().uuid(),
+  })
+  .strict();
+
+export type PacketsExportInput = z.infer<typeof packetsExportInputSchema>;
+
+export const packetsExportResultSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("saved") }).strict(),
+  z.object({ status: z.literal("cancelled") }).strict(),
+]);
+
+export type PacketsExportResult = z.infer<typeof packetsExportResultSchema>;
+
+export const packetsImportInputSchema = z
+  .object({
+    ticket: z.string().uuid(),
+    projectId: z.string().uuid(),
+  })
+  .strict();
+
+export type PacketsImportInput = z.infer<typeof packetsImportInputSchema>;
+
+export const packetsApplyInputSchema = z
+  .object({
+    conversationId: z.string().uuid(),
+    packetId: z.string().uuid(),
+  })
+  .strict();
+
+export type PacketsApplyInput = z.infer<typeof packetsApplyInputSchema>;
+
+export const packetsClearInputSchema = z
+  .object({
+    conversationId: z.string().uuid(),
+  })
+  .strict();
+
+export type PacketsClearInput = z.infer<typeof packetsClearInputSchema>;
+
+export const messagePinInputSchema = z
+  .object({
+    id: z.string().uuid(),
+    pinned: z.boolean(),
+  })
+  .strict();
+
+export type MessagePinInput = z.infer<typeof messagePinInputSchema>;
 
