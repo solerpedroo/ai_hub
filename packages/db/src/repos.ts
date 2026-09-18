@@ -153,7 +153,32 @@ export interface WorkspaceSessionRecord {
   extraSystem: string;
 }
 
+export interface AppPrefsRecord {
+  onboardingComplete: boolean;
+  crashReporterOptIn: boolean;
+  lastUpdateCheckAt: string | null;
+  lastUpdateStatus: "idle" | "skipped" | "uptodate" | "available" | "unavailable";
+  lastWizardTtftMs: number | null;
+}
+
+const DEFAULT_APP_PREFS: AppPrefsRecord = {
+  onboardingComplete: false,
+  crashReporterOptIn: false,
+  lastUpdateCheckAt: null,
+  lastUpdateStatus: "idle",
+  lastWizardTtftMs: null,
+};
+
+const UPDATE_STATUSES: readonly AppPrefsRecord["lastUpdateStatus"][] = [
+  "idle",
+  "skipped",
+  "uptodate",
+  "available",
+  "unavailable",
+];
+
 const APPEARANCE_KEY = "appearance";
+const APP_PREFS_KEY = "app-prefs";
 const SESSION_KEY = "workspace-session";
 const BRANCH_LABELS_PREFIX = "branch-labels:";
 const CUSTOM_BASE_URL_PREFIX = "custom-base-url:";
@@ -981,6 +1006,65 @@ export class HubRepos {
       return { theme: parsed.theme, locale: parsed.locale };
     }
     return { theme: "system", locale: "pt-BR" };
+  }
+
+  getAppPrefs(): AppPrefsRecord {
+    const row = this.db.select().from(settings).where(eq(settings.key, APP_PREFS_KEY)).get();
+    if (!row) {
+      return { ...DEFAULT_APP_PREFS };
+    }
+    const parsed: unknown = JSON.parse(row.value);
+    if (typeof parsed !== "object" || parsed === null) {
+      return { ...DEFAULT_APP_PREFS };
+    }
+    const record = parsed as Record<string, unknown>;
+    const status = record.lastUpdateStatus;
+    return {
+      onboardingComplete: record.onboardingComplete === true,
+      crashReporterOptIn: record.crashReporterOptIn === true,
+      lastUpdateCheckAt: typeof record.lastUpdateCheckAt === "string" ? record.lastUpdateCheckAt : null,
+      lastUpdateStatus:
+        typeof status === "string" && UPDATE_STATUSES.includes(status as AppPrefsRecord["lastUpdateStatus"])
+          ? (status as AppPrefsRecord["lastUpdateStatus"])
+          : DEFAULT_APP_PREFS.lastUpdateStatus,
+      lastWizardTtftMs:
+        typeof record.lastWizardTtftMs === "number" &&
+        Number.isInteger(record.lastWizardTtftMs) &&
+        record.lastWizardTtftMs >= 0
+          ? record.lastWizardTtftMs
+          : null,
+    };
+  }
+
+  setAppPrefs(patch: {
+    onboardingComplete?: boolean | undefined;
+    crashReporterOptIn?: boolean | undefined;
+    lastUpdateCheckAt?: string | null | undefined;
+    lastUpdateStatus?: AppPrefsRecord["lastUpdateStatus"] | undefined;
+    lastWizardTtftMs?: number | null | undefined;
+  }): AppPrefsRecord {
+    const current = this.getAppPrefs();
+    const next: AppPrefsRecord = {
+      onboardingComplete: patch.onboardingComplete ?? current.onboardingComplete,
+      crashReporterOptIn: patch.crashReporterOptIn ?? current.crashReporterOptIn,
+      lastUpdateCheckAt: patch.lastUpdateCheckAt === undefined ? current.lastUpdateCheckAt : patch.lastUpdateCheckAt,
+      lastUpdateStatus: patch.lastUpdateStatus ?? current.lastUpdateStatus,
+      lastWizardTtftMs: patch.lastWizardTtftMs === undefined ? current.lastWizardTtftMs : patch.lastWizardTtftMs,
+    };
+    const now = Date.now();
+    this.db
+      .insert(settings)
+      .values({
+        key: APP_PREFS_KEY,
+        value: JSON.stringify(next),
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: settings.key,
+        set: { value: JSON.stringify(next), updatedAt: now },
+      })
+      .run();
+    return next;
   }
 
   setAppearance(appearance: AppearanceRecord): void {
