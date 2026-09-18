@@ -11,6 +11,7 @@ import {
   GatewayStreamError,
   gatewayErrorCode,
   resolveAdapter,
+  withTransientRetry,
   type CompilerGraphMessage,
   type CompilerMessage,
   type ProviderAdapter,
@@ -24,15 +25,21 @@ import {
   findCatalogModel,
   IpcChannel,
   packetV0Schema,
+  SpendCapError,
+  suggestFallbackProvider,
+  summarizeProviderHealth,
   type ChatEvent,
   type ChatSendInput,
   type ChatSendResult,
+  type DebugSnapshot,
   type GatewayErrorCode,
   type ProviderAgnosticPacket,
 } from "@ai-hub/shared";
-import { getHubDatabase } from "./persistence";
+import { recordDebugSnapshot } from "./debug-snapshot";
 import { isE2eMode } from "./e2e-mode";
 import { toMessageDto } from "./message-dto";
+import { getHubDatabase } from "./persistence";
+import { estimateOutgoingCostUsd, evaluateOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
 
 interface ActiveRun {
   runId: string;
@@ -55,7 +62,7 @@ function adapterFor(slug: string, baseUrl: string | null): ProviderAdapter {
   }
   if (slug === "custom") {
     if (baseUrl === null || baseUrl.length === 0) {
-      throw new GatewayError("unknown", "Custom provider requires a base URL");
+      throw new GatewayError("unknown", "gateway:unknown");
     }
     return resolveAdapter("custom", { baseUrl });
   }
@@ -161,6 +168,39 @@ function compileOutgoing(
   );
 }
 
+function pendingUser(
+  conversationId: string,
+  content: string,
+  parentId: string | null,
+  branchId: string,
+): MessageRecord {
+  return {
+    id: randomUUID(),
+    conversationId,
+    parentId,
+    branchId,
+    isActiveBranch: true,
+    role: "user",
+    content,
+    status: "complete",
+    createdAt: new Date().toISOString(),
+    receipt: null,
+  };
+}
+
+function snapshotDecision(blocked: string | null, warnings: string[], allowOnce: boolean): DebugSnapshot["capDecision"] {
+  if (allowOnce && blocked) {
+    return "override";
+  }
+  if (blocked) {
+    return "block";
+  }
+  if (warnings.length > 0) {
+    return "warn";
+  }
+  return "ok";
+}
+
 export async function sendChat(input: ChatSendInput, sender: WebContents): Promise<ChatSendResult> {
   const repos = getHubDatabase().repos;
   if (runByConversation.has(input.conversationId)) {
@@ -174,14 +214,14 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
 
   const key = await repos.getProviderSecret(input.providerKeyId);
   if (!key) {
-    throw new GatewayError("auth", "Provider key is missing");
+    throw new GatewayError("auth", "gateway:auth");
   }
   if (key.providerSlug === "custom") {
     if (input.model.trim().length === 0) {
-      throw new Error("Unknown model");
+      throw new Error("unknown_model");
     }
   } else if (!findCatalogModel(input.model, key.providerSlug)) {
-    throw new Error("Unknown model");
+    throw new Error("unknown_model");
   }
 
   const adapter = adapterFor(key.providerSlug, repos.getCustomBaseUrl(key.id));
@@ -191,24 +231,27 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     throw new Error("A stream is already running in this conversation");
   }
 
-  let userMessage: MessageRecord | null = null;
   let compileRows: MessageRecord[] = [];
+  let persistUser: (() => MessageRecord | null) | null = null;
   let assistantParentId: string | null = null;
   let assistantBranchId: string | null = null;
 
   switch (input.mode) {
     case "send": {
       const leaf = activePath(existing).at(-1);
-      userMessage = repos.createMessage({
-        conversationId: input.conversationId,
-        role: "user",
-        content: input.content,
-        parentId: leaf?.id ?? null,
-        branchId: leaf?.branchId ?? null,
-      });
-      compileRows = repos.listActivePath(input.conversationId);
-      assistantParentId = userMessage.id;
-      assistantBranchId = userMessage.branchId;
+      const branchId = leaf?.branchId ?? randomUUID();
+      const draft = pendingUser(input.conversationId, input.content, leaf?.id ?? null, branchId);
+      compileRows = [...existing, draft];
+      persistUser = () =>
+        repos.createMessage({
+          conversationId: input.conversationId,
+          role: "user",
+          content: input.content,
+          parentId: leaf?.id ?? null,
+          branchId: leaf?.branchId ?? null,
+        });
+      assistantParentId = "pending";
+      assistantBranchId = branchId;
       break;
     }
     case "continue": {
@@ -217,6 +260,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
       if (!leaf) {
         throw new Error("Add a user message before sending");
       }
+      persistUser = () => null;
       assistantParentId = leaf.id;
       assistantBranchId = leaf.branchId;
       break;
@@ -233,6 +277,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
       const index = path.findIndex((item) => item.id === target.id);
       compileRows =
         index >= 0 ? path.slice(0, index) : ancestorsOf(existing, target.id).slice(1).reverse();
+      persistUser = () => null;
       assistantParentId = target.parentId;
       assistantBranchId = randomUUID();
       break;
@@ -242,16 +287,21 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
       if (!target || target.conversationId !== input.conversationId || target.role !== "user") {
         throw new Error("User message not found");
       }
-      userMessage = repos.createMessage({
-        conversationId: input.conversationId,
-        role: "user",
-        content: input.content,
-        parentId: target.parentId,
-        branchId: randomUUID(),
-      });
-      compileRows = repos.listActivePath(input.conversationId);
-      assistantParentId = userMessage.id;
-      assistantBranchId = userMessage.branchId;
+      const branchId = randomUUID();
+      const draft = pendingUser(input.conversationId, input.content, target.parentId, branchId);
+      compileRows = existing
+        .map((item) => (item.id === target.id ? { ...item, isActiveBranch: false } : item))
+        .concat(draft);
+      persistUser = () =>
+        repos.createMessage({
+          conversationId: input.conversationId,
+          role: "user",
+          content: input.content,
+          parentId: target.parentId,
+          branchId,
+        });
+      assistantParentId = "pending";
+      assistantBranchId = branchId;
       break;
     }
     default: {
@@ -266,8 +316,67 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     throw new Error("Add a user message before sending");
   }
 
+  const catalog = findCatalogModel(input.model, key.providerSlug);
+  const contextWindow = catalog?.contextWindow ?? 128_000;
+  const overflow = packet.tokenEstimate > contextWindow;
+  if (overflow) {
+    throw new GatewayError("context_overflow", "gateway:context_overflow");
+  }
+
+  const estimatedCostUsd = estimateOutgoingCostUsd(
+    input.model,
+    key.providerSlug,
+    packet.tokenEstimate,
+    input.maxTokens ?? null,
+  );
+  const limits = spendCapLimitsFromRows(repos.listSpendCaps());
+  const daySpentUsd = repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() });
+  const globalSpentUsd = repos.sumReceiptCostUsd({});
+  const cap = evaluateOutgoingCaps({
+    estimatedRequestUsd: estimatedCostUsd,
+    daySpentUsd,
+    globalSpentUsd,
+    limits,
+  });
+  const allowOnce = input.allowOnce === true;
+  recordDebugSnapshot({
+    at: new Date().toISOString(),
+    provider: key.providerSlug,
+    model: input.model,
+    retries: 0,
+    lastErrorCode: null,
+    tokenEstimate: packet.tokenEstimate,
+    estimatedCostUsd,
+    capDecision: snapshotDecision(cap.blocked, cap.warnings, allowOnce),
+    capScope: cap.blocked,
+    overflow,
+  });
+  if (cap.blocked && !allowOnce) {
+    throw new SpendCapError(cap.blocked);
+  }
+  if (cap.blocked && allowOnce) {
+    repos.appendSpendCapOverride({
+      at: new Date().toISOString(),
+      scope: cap.blocked,
+      limitUsd: limits[cap.blocked] ?? "0",
+      estimatedUsd: estimatedCostUsd,
+      conversationId: input.conversationId,
+      model: input.model,
+      provider: key.providerSlug,
+    });
+  }
+
   console.info("[hub:packet]", redactSecrets(JSON.stringify(packet)));
   const publicPacket = inspectablePacket(packet);
+
+  const userMessage = persistUser ? persistUser() : null;
+  if (assistantParentId === "pending") {
+    if (!userMessage) {
+      throw new Error("Add a user message before sending");
+    }
+    assistantParentId = userMessage.id;
+    assistantBranchId = userMessage.branchId;
+  }
 
   const assistant = repos.createMessage({
     conversationId: input.conversationId,
@@ -306,34 +415,77 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
 
   const secret = key.secret;
   void (async () => {
+    let retries = 0;
     try {
-      const result = await consumeCrashSafeStream({
-        stream: adapter.chatStream({
-          secret,
-          model: input.model,
-          packet,
-          signal: run.abort.signal,
-          temperature: input.temperature ?? 1,
-          maxTokens: input.maxTokens ?? null,
-        }),
-        onDelta: (text) => {
-          emit(run.sender, {
-            type: "chunk",
-            runId,
-            messageId: assistant.id,
-            text,
+      let streamed = false;
+      const result = await withTransientRetry({
+        maxAttempts: 3,
+        signal: run.abort.signal,
+        didStream: () => streamed,
+        onRetry: (nextRetries, code) => {
+          retries = nextRetries;
+          recordDebugSnapshot({
+            at: new Date().toISOString(),
+            provider: run.provider,
+            model: run.model,
+            retries,
+            lastErrorCode: code,
+            tokenEstimate: packet.tokenEstimate,
+            estimatedCostUsd,
+            capDecision: snapshotDecision(cap.blocked, cap.warnings, allowOnce),
+            capScope: cap.blocked,
+            overflow,
           });
         },
-        onFlush: (content) => {
-          repos.updateMessage(assistant.id, content, "streaming");
+        run: async () => {
+          streamed = false;
+          return consumeCrashSafeStream({
+            stream: adapter.chatStream({
+              secret,
+              model: input.model,
+              packet,
+              signal: run.abort.signal,
+              temperature: input.temperature ?? 1,
+              maxTokens: input.maxTokens ?? null,
+            }),
+            onDelta: (text) => {
+              streamed = true;
+              emit(run.sender, {
+                type: "chunk",
+                runId,
+                messageId: assistant.id,
+                text,
+              });
+            },
+            onFlush: (content) => {
+              repos.updateMessage(assistant.id, content, "streaming");
+            },
+          });
         },
       });
       repos.updateMessage(assistant.id, result.content, "complete");
       writeReceipt(assistant.id, run, result.tokensIn, result.tokensOut, result.content.length, null, result.costUsd);
+      repos.recordHealthSample({
+        providerSlug: run.provider,
+        ok: true,
+        latencyMs: Math.max(0, Date.now() - run.startedAt),
+      });
       const stored = repos.getMessage(assistant.id);
       if (!stored) {
         throw new Error("Message not found");
       }
+      recordDebugSnapshot({
+        at: new Date().toISOString(),
+        provider: run.provider,
+        model: run.model,
+        retries,
+        lastErrorCode: null,
+        tokenEstimate: packet.tokenEstimate,
+        estimatedCostUsd,
+        capDecision: snapshotDecision(cap.blocked, cap.warnings, allowOnce),
+        capScope: cap.blocked,
+        overflow,
+      });
       emit(run.sender, {
         type: "done",
         runId,
@@ -358,11 +510,42 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
         code,
         streamed?.costUsd ?? null,
       );
+      if (code !== "aborted") {
+        repos.recordHealthSample({
+          providerSlug: run.provider,
+          ok: false,
+          latencyMs: Math.max(0, Date.now() - run.startedAt),
+        });
+      }
+      const keys = await repos.listProviderKeys();
+      const suggestion =
+        code === "aborted"
+          ? null
+          : suggestFallbackProvider({
+              failedProvider: run.provider,
+              keys,
+              summaries: summarizeProviderHealth(repos.listRecentHealthSamples()),
+            });
+      recordDebugSnapshot({
+        at: new Date().toISOString(),
+        provider: run.provider,
+        model: run.model,
+        retries,
+        lastErrorCode: code,
+        tokenEstimate: packet.tokenEstimate,
+        estimatedCostUsd,
+        capDecision: snapshotDecision(cap.blocked, cap.warnings, allowOnce),
+        capScope: cap.blocked,
+        overflow,
+      });
       emit(run.sender, {
         type: "error",
         runId,
         messageId: assistant.id,
         code,
+        suggestProviderSlug: suggestion?.providerSlug ?? null,
+        suggestKeyId: suggestion?.keyId ?? null,
+        suggestModel: suggestion?.model ?? null,
       });
     } finally {
       runs.delete(runId);
