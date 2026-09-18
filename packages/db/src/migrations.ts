@@ -153,6 +153,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS conversations_import_identity_idx
 ALTER TABLE message_receipts ADD COLUMN source TEXT NOT NULL DEFAULT 'chat';
 `;
 
+export const MIGRATION_0007_SQL = `
+ALTER TABLE context_packets ADD COLUMN privacy_mode TEXT NOT NULL DEFAULT 'standard';
+ALTER TABLE context_packets ADD COLUMN origin TEXT NOT NULL DEFAULT '{"source":"compile","projectLabel":"","conversationLabel":""}';
+ALTER TABLE context_packets ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE conversations ADD COLUMN active_packet_id TEXT REFERENCES context_packets(id) ON DELETE SET NULL;
+ALTER TABLE conversations ADD COLUMN packet_applied_at INTEGER;
+ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
@@ -160,4 +169,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 4, sql: MIGRATION_0004_SQL },
   { version: 5, sql: MIGRATION_0005_SQL },
   { version: 6, sql: MIGRATION_0006_SQL },
+  { version: 7, sql: MIGRATION_0007_SQL },
 ];
