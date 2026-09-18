@@ -16,6 +16,7 @@ export function MessageBubble({
   onEdit,
   onEditingChange,
   onActivateSibling,
+  onPin,
 }: {
   message: MessageDto;
   messages: MessageDto[];
@@ -27,6 +28,7 @@ export function MessageBubble({
   onEdit: (content: string) => Promise<void>;
   onEditingChange?: (editing: boolean) => void;
   onActivateSibling: (id: string) => void;
+  onPin: (pinned: boolean) => void;
 }): JSX.Element {
   const { t } = useTranslation();
   const [editing, setEditing] = useState(false);
@@ -100,6 +102,19 @@ export function MessageBubble({
           ) : null}
           {message.role === "assistant" && message.content.length > 0 ? (
             <CopyResponseButton text={message.content} />
+          ) : null}
+          {message.role !== "system" && message.status !== "streaming" ? (
+            <Button
+              type="button"
+              size="sm"
+              variant={message.pinned ? "secondary" : "outline"}
+              data-testid="message-pin"
+              aria-pressed={message.pinned}
+              onClick={() => onPin(!message.pinned)}
+              disabled={busy}
+            >
+              {message.pinned ? t("workspace.unpin") : t("workspace.pin")}
+            </Button>
           ) : null}
         </div>
       </div>
