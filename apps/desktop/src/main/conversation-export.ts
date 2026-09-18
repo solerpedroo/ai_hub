@@ -40,6 +40,7 @@ export function buildConversationExportDocument(input: {
     createdAt: string;
     updatedAt: string;
     importSource?: "chatgpt" | "claude" | "gemini" | null;
+    activePacketId?: string | null;
   };
   messages: MessageDto[];
   branchLabels: Record<string, string>;
@@ -52,6 +53,7 @@ export function buildConversationExportDocument(input: {
     conversation: conversationDtoSchema.parse({
       ...input.conversation,
       importSource: input.conversation.importSource ?? null,
+      activePacketId: input.conversation.activePacketId ?? null,
     }),
     branchLabels: branchLabelsSchema.parse(input.branchLabels),
     messages: selected,
