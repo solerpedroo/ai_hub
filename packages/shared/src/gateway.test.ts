@@ -176,8 +176,10 @@ describe("chat contracts", () => {
       costUsd: "0.000001",
       errorCode: null,
       createdAt: "2026-09-16T00:00:00.000Z",
+      source: "chat",
     });
     expect(receipt.provider).toBe("openai");
+    expect(receipt.source).toBe("chat");
     expect("secret" in receipt).toBe(false);
   });
 });
