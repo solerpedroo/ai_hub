@@ -6,6 +6,7 @@
     "types": ["electron-vite/node", "node"],
     "baseUrl": ".",
     "paths": {
+      "@ai-hub/shared/import": ["../../packages/shared/src/import/index.ts"],
       "@ai-hub/shared": ["../../packages/shared/src/index.ts"],
       "@ai-hub/db": ["../../packages/db/src/index.ts"],
       "@ai-hub/ai-gateway": ["../../packages/ai-gateway/src/index.ts"],
