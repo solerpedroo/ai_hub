@@ -39,6 +39,7 @@ export function buildConversationExportDocument(input: {
     tags: string[];
     createdAt: string;
     updatedAt: string;
+    importSource?: "chatgpt" | "claude" | "gemini" | null;
   };
   messages: MessageDto[];
   branchLabels: Record<string, string>;
@@ -48,7 +49,10 @@ export function buildConversationExportDocument(input: {
     version: 1,
     mode: input.mode,
     exportedAt: input.exportedAt,
-    conversation: conversationDtoSchema.parse(input.conversation),
+    conversation: conversationDtoSchema.parse({
+      ...input.conversation,
+      importSource: input.conversation.importSource ?? null,
+    }),
     branchLabels: branchLabelsSchema.parse(input.branchLabels),
     messages: selected,
   });
