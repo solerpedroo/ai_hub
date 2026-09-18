@@ -33,5 +33,6 @@ export function toMessageDto(row: MessageRecord): MessageDto {
     status: row.status,
     createdAt: row.createdAt,
     receipt,
+    pinned: row.pinned,
   });
 }
