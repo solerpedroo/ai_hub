@@ -24,6 +24,8 @@ const PROJECT_COLORS = ["#64748b", "#2563eb", "#7c3aed", "#db2777", "#dc2626", "
 
 export function HomeView({
   project,
+  importedInbox,
+  projects,
   conversations,
   selectedConversationId,
   messages,
@@ -53,6 +55,7 @@ export function HomeView({
   onActivate,
   onRenameBranch,
   onExport,
+  onMoveConversation,
   onSaveProject,
   onRemoveProject,
   onSetTags,
@@ -67,6 +70,8 @@ export function HomeView({
   onComposerDraft,
 }: {
   project: ProjectDto | null;
+  importedInbox: boolean;
+  projects: ProjectDto[];
   conversations: ConversationDto[];
   selectedConversationId: string | null;
   messages: MessageDto[];
@@ -96,6 +101,7 @@ export function HomeView({
   onActivate: (id: string) => Promise<void>;
   onRenameBranch: (branchId: string, label: string) => Promise<void>;
   onExport: (mode: "active" | "tree") => Promise<void>;
+  onMoveConversation: (projectId: string | null) => Promise<void>;
   onSaveProject: (input: Omit<ProjectUpdateInput, "id">) => Promise<void>;
   onRemoveProject: () => Promise<void>;
   onSetTags: (names: string[]) => Promise<void>;
@@ -155,16 +161,24 @@ export function HomeView({
       <section className="flex w-64 shrink-0 flex-col border-r">
         <div className="border-b p-3">
           <h1 className="truncate text-sm font-semibold">
-            {project ? project.name : t("workspace.inbox")}
+            {project ? project.name : importedInbox ? t("workspace.importedInbox") : t("workspace.inbox")}
           </h1>
           <p className="text-muted-foreground">
-            {project ? t("workspace.conversations") : t("workspace.inboxHint")}
+            {project
+              ? t("workspace.conversations")
+              : importedInbox
+                ? t("workspace.importedInboxHint")
+                : t("workspace.inboxHint")}
           </p>
         </div>
         <ScrollArea className="flex-1 p-2">
           {conversations.length === 0 ? (
             <p className="px-2 text-muted-foreground">
-              {project ? t("workspace.noConversations") : t("workspace.noConversationsInbox")}
+              {project
+                ? t("workspace.noConversations")
+                : importedInbox
+                  ? t("workspace.noConversationsImported")
+                  : t("workspace.noConversationsInbox")}
             </p>
           ) : (
             <div className="flex flex-col gap-0.5">
@@ -174,6 +188,7 @@ export function HomeView({
                   type="button"
                   variant={selectedConversationId === conversation.id ? "secondary" : "ghost"}
                   className="h-8 w-full justify-start truncate"
+                  data-testid="conversation-item"
                   aria-current={selectedConversationId === conversation.id ? "true" : undefined}
                   onClick={() => onSelectConversation(conversation.id)}
                 >
@@ -338,6 +353,7 @@ export function HomeView({
             </form>
           ) : null}
         </ScrollArea>
+        {importedInbox ? null : (
         <form
           className="flex flex-col gap-1 border-t p-2"
           onSubmit={(event) => {
@@ -359,6 +375,7 @@ export function HomeView({
             {t("workspace.newConversation")}
           </Button>
         </form>
+        )}
       </section>
       <section className="flex min-w-0 flex-1 flex-col">
         {selectedConversationId ? (
@@ -521,6 +538,28 @@ export function HomeView({
                 >
                   {t("workspace.export.tree")}
                 </Button>
+                {selectedConversation?.importSource ? (
+                  <label className="flex items-center gap-1">
+                    <span className="text-muted-foreground">{t("workspace.moveTo")}</span>
+                    <select
+                      className="h-8 max-w-48 rounded-md border bg-background px-2 text-sm"
+                      value={selectedConversation.projectId ?? ""}
+                      data-testid="import-move"
+                      aria-label={t("workspace.moveTo")}
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        void onMoveConversation(value.length > 0 ? value : null);
+                      }}
+                    >
+                      <option value="">{t("workspace.moveInbox")}</option>
+                      {projects.map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : null}
               </div>
             </header>
             {modelSwitchNotice ? (
