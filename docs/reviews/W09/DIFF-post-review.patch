@@ -1,0 +1,1530 @@
+﻿diff --git a/apps/desktop/src/main/import-job.ts b/apps/desktop/src/main/import-job.ts
+new file mode 100644
+index 0000000..afc2cc8
+--- /dev/null
++++ b/apps/desktop/src/main/import-job.ts
+@@ -0,0 +1,175 @@
++import { randomUUID } from "node:crypto";
++import { readFile } from "node:fs/promises";
++import { basename } from "node:path";
++import { BrowserWindow, dialog, type OpenDialogOptions, type WebContents } from "electron";
++import {
++  IpcChannel,
++  importEventSchema,
++  importPickResultSchema,
++  importReportSchema,
++  type ImportEvent,
++  type ImportPickResult,
++  type ImportReport,
++  type ImportStartInput,
++  type ImportStartResult,
++} from "@ai-hub/shared";
++import { ImportParseError, parseImportBytes } from "@ai-hub/shared/import";
++import { isE2eMode } from "./e2e-mode";
++import { getHubDatabase } from "./persistence";
++
++const tickets = new Map<string, { path: string; fileName: string }>();
++const controllers = new Map<string, AbortController>();
++
++function emit(sender: WebContents, event: ImportEvent): void {
++  if (sender.isDestroyed()) {
++    return;
++  }
++  sender.send(IpcChannel.importEvent, importEventSchema.parse(event));
++}
++
++function emptyReport(total: number): ImportReport {
++  return importReportSchema.parse({
++    ok: 0,
++    skipped: 0,
++    errors: [],
++    attachmentsSkipped: 0,
++    total,
++  });
++}
++
++export async function pickImportFile(sender: WebContents): Promise<ImportPickResult> {
++  const fixture = process.env.AI_HUB_E2E_IMPORT_FIXTURE;
++  if (isE2eMode() && fixture && fixture.trim().length > 0) {
++    tickets.clear();
++    const ticket = randomUUID();
++    const fileName = basename(fixture);
++    tickets.set(ticket, { path: fixture, fileName });
++    return importPickResultSchema.parse({ status: "picked", ticket, fileName });
++  }
++  const window = BrowserWindow.fromWebContents(sender);
++  const options: OpenDialogOptions = {
++    properties: ["openFile"],
++    filters: [
++      { name: "Exports", extensions: ["json", "zip"] },
++      { name: "JSON", extensions: ["json"] },
++      { name: "ZIP", extensions: ["zip"] },
++    ],
++  };
++  const choice = window ? await dialog.showOpenDialog(window, options) : await dialog.showOpenDialog(options);
++  const selected = choice.filePaths[0];
++  if (choice.canceled || !selected) {
++    return importPickResultSchema.parse({ status: "cancelled" });
++  }
++  tickets.clear();
++  const ticket = randomUUID();
++  const fileName = basename(selected);
++  tickets.set(ticket, { path: selected, fileName });
++  return importPickResultSchema.parse({ status: "picked", ticket, fileName });
++}
++
++export function startImportJob(input: ImportStartInput, sender: WebContents): ImportStartResult {
++  const ticket = tickets.get(input.ticket);
++  if (!ticket) {
++    throw new Error("Import file is no longer available. Pick the file again.");
++  }
++  const repos = getHubDatabase().repos;
++  if (input.projectId && !repos.getProject(input.projectId)) {
++    throw new Error("Project not found");
++  }
++  tickets.delete(input.ticket);
++  const job = repos.createImportJob(input.source);
++  const controller = new AbortController();
++  controllers.set(job.id, controller);
++  repos.updateImportJob(job.id, "running", null);
++  void runImport({
++    jobId: job.id,
++    path: ticket.path,
++    source: input.source,
++    projectId: input.projectId,
++    sender,
++    signal: controller.signal,
++  });
++  return { jobId: job.id };
++}
++
++export function cancelImportJob(jobId: string): void {
++  controllers.get(jobId)?.abort();
++}
++
++async function runImport(input: {
++  jobId: string;
++  path: string;
++  source: ImportStartInput["source"];
++  projectId: string | null;
++  sender: WebContents;
++  signal: AbortSignal;
++}): Promise<void> {
++  const repos = getHubDatabase().repos;
++  try {
++    const bytes = new Uint8Array(await readFile(input.path));
++    if (input.signal.aborted) {
++      persist(input.jobId, "cancelled", emptyReport(0));
++      emit(input.sender, { type: "done", jobId: input.jobId, status: "cancelled", report: emptyReport(0) });
++      return;
++    }
++    const conversations = parseImportBytes(input.source, bytes);
++    const report = emptyReport(conversations.length);
++    for (const [index, conversation] of conversations.entries()) {
++      if (input.signal.aborted) {
++        persist(input.jobId, "cancelled", report);
++        emit(input.sender, { type: "done", jobId: input.jobId, status: "cancelled", report });
++        return;
++      }
++      const attachments = conversation.messages.filter((message) => message.skippedAttachment).length;
++      try {
++        const result = repos.importConversation({
++          projectId: input.projectId,
++          source: conversation.source,
++          externalId: conversation.externalId,
++          title: conversation.title,
++          createdAtMs: conversation.createdAtMs,
++          updatedAtMs: conversation.updatedAtMs,
++          messages: conversation.messages.map((message) => ({
++            role: message.role,
++            content: message.content,
++            createdAtMs: message.createdAtMs,
++          })),
++        });
++        if (result.outcome === "created") {
++          report.ok += 1;
++          report.attachmentsSkipped += attachments;
++        } else if (result.outcome === "skipped") {
++          report.skipped += 1;
++        } else {
++          report.errors.push({ reason: "empty" });
++        }
++      } catch {
++        report.errors.push({ reason: "failed" });
++      }
++      emit(input.sender, {
++        type: "progress",
++        jobId: input.jobId,
++        processed: index + 1,
++        total: report.total,
++        ok: report.ok,
++        skipped: report.skipped,
++      });
++    }
++    persist(input.jobId, "complete", report);
++    emit(input.sender, { type: "done", jobId: input.jobId, status: "complete", report });
++  } catch (error) {
++    const code =
++      error instanceof ImportParseError
++        ? error.code
++        : "generic";
++    const failed = emptyReport(0);
++    persist(input.jobId, "failed", failed);
++    emit(input.sender, { type: "error", jobId: input.jobId, code });
++  } finally {
++    controllers.delete(input.jobId);
++  }
++}
++
++function persist(jobId: string, status: "complete" | "cancelled" | "failed", report: ImportReport): void {
++  getHubDatabase().repos.updateImportJob(jobId, status, JSON.stringify(importReportSchema.parse(report)));
++}
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index d773f19..087fd0a 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -30,6 +30,7 @@ import { StatusBar } from "@/components/layout/status-bar";
+ import { HomeView } from "@/components/layout/home-view";
+ import { SettingsView } from "@/components/layout/settings-view";
+ import { DebugView } from "@/components/layout/debug-view";
++import { ImportView } from "@/components/layout/import-view";
+ import { OnboardingView } from "@/components/layout/onboarding-view";
+ import { ChromeCommandPalette } from "@/components/layout/command-palette";
+ import type { AppView } from "@/components/layout/types";
+@@ -81,6 +82,7 @@ export function App(): JSX.Element {
+   const [view, setView] = useState<AppView>("home");
+   const [projects, setProjects] = useState<ProjectDto[]>([]);
+   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
++  const [importedInbox, setImportedInbox] = useState(false);
+   const [conversations, setConversations] = useState<ConversationDto[]>([]);
+   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
+   const [messages, setMessages] = useState<MessageDto[]>([]);
+@@ -137,11 +139,18 @@ export function App(): JSX.Element {
+     return list;
+   }, []);
+ 
+-  const loadConversations = useCallback(async (projectId: string | null): Promise<ConversationDto[]> => {
+-    const list = await window.hub.conversations.list({ projectId });
+-    setConversations(list);
+-    return list;
+-  }, []);
++  const loadConversations = useCallback(
++    async (projectId: string | null, inboxImported = false): Promise<ConversationDto[]> => {
++      const list = await window.hub.conversations.list(
++        projectId === null
++          ? { projectId: null, inbox: inboxImported ? "imported" : "avulsas" }
++          : { projectId },
++      );
++      setConversations(list);
++      return list;
++    },
++    [],
++  );
+ 
+   const loadMessages = useCallback(async (conversationId: string): Promise<MessageDto[]> => {
+     const list = await window.hub.messages.list({ conversationId });
+@@ -209,7 +218,8 @@ export function App(): JSX.Element {
+           const project = projectList.find((item) => item.id === session.projectId) ?? null;
+           if (!project) {
+             setSelectedProjectId(null);
+-            const convos = await loadConversations(null);
++            setImportedInbox(false);
++            const convos = await loadConversations(null, false);
+             const conversation =
+               convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
+             if (conversation) {
+@@ -220,7 +230,8 @@ export function App(): JSX.Element {
+             return;
+           }
+           setSelectedProjectId(project.id);
+-          const convos = await loadConversations(project.id);
++          setImportedInbox(false);
++          const convos = await loadConversations(project.id, false);
+           const conversation =
+             convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
+           if (conversation) {
+@@ -229,7 +240,9 @@ export function App(): JSX.Element {
+           }
+         } else {
+           setSelectedProjectId(null);
+-          const convos = await loadConversations(null);
++          const imported = session.importedInbox === true;
++          setImportedInbox(imported);
++          const convos = await loadConversations(null, imported);
+           const conversation =
+             convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
+           if (conversation) {
+@@ -276,9 +289,20 @@ export function App(): JSX.Element {
+         temperature,
+         maxTokens,
+         extraSystem,
++        importedInbox,
+       })
+       .catch(fail);
+-  }, [extraSystem, fail, maxTokens, selectedConversationId, selectedModel, selectedProjectId, sessionReady, temperature]);
++  }, [
++    extraSystem,
++    fail,
++    importedInbox,
++    maxTokens,
++    selectedConversationId,
++    selectedModel,
++    selectedProjectId,
++    sessionReady,
++    temperature,
++  ]);
+ 
+   useEffect(() => {
+     if (view !== "home") {
+@@ -487,7 +511,8 @@ export function App(): JSX.Element {
+         title: t("workspace.untitledChat"),
+       });
+       setError(null);
+-      await loadConversations(selectedProjectId);
++      setImportedInbox(false);
++      await loadConversations(selectedProjectId, false);
+       setSelectedConversationId(created.id);
+       setMessages([]);
+       setBranchLabels({});
+@@ -599,9 +624,11 @@ export function App(): JSX.Element {
+           }}
+           projects={projects}
+           selectedProjectId={selectedProjectId}
++          importedInbox={importedInbox}
+           onSelectProject={(id) => {
+             abortIfLeaving(null);
+             setSelectedProjectId(id);
++            setImportedInbox(false);
+             setSelectedConversationId(null);
+             setMessages([]);
+             setBranchLabels({});
+@@ -611,7 +638,16 @@ export function App(): JSX.Element {
+                 applyProjectPreferences(next, providerKeys);
+               }
+             }
+-            void loadConversations(id).catch(fail);
++            void loadConversations(id, false).catch(fail);
++          }}
++          onSelectImportedInbox={() => {
++            abortIfLeaving(null);
++            setSelectedProjectId(null);
++            setImportedInbox(true);
++            setSelectedConversationId(null);
++            setMessages([]);
++            setBranchLabels({});
++            void loadConversations(null, true).catch(fail);
+           }}
+           onCreateProject={async (name) => {
+             try {
+@@ -620,11 +656,12 @@ export function App(): JSX.Element {
+               const list = await loadProjects();
+               const next = list.find((item) => item.id === created.id) ?? created;
+               setSelectedProjectId(next.id);
++              setImportedInbox(false);
+               setSelectedConversationId(null);
+               setMessages([]);
+               setBranchLabels({});
+               abortIfLeaving(null);
+-              await loadConversations(next.id);
++              await loadConversations(next.id, false);
+               setView("home");
+             } catch {
+               fail();
+@@ -641,7 +678,13 @@ export function App(): JSX.Element {
+             setView("home");
+             void (async () => {
+               try {
+-                await loadConversations(hit.projectId);
++                let convos = await loadConversations(hit.projectId, false);
++                let imported = false;
++                if (hit.projectId === null && !convos.some((item) => item.id === hit.conversationId)) {
++                  convos = await loadConversations(null, true);
++                  imported = true;
++                }
++                setImportedInbox(imported);
+                 setSelectedConversationId(hit.conversationId);
+                 await loadMessages(hit.conversationId);
+                 if (hit.messageId) {
+@@ -660,6 +703,8 @@ export function App(): JSX.Element {
+           {view === "home" ? (
+             <HomeView
+               project={selectedProject}
++              importedInbox={importedInbox}
++              projects={projects}
+               conversations={conversations}
+               selectedConversationId={selectedConversationId}
+               messages={messages}
+@@ -686,7 +731,7 @@ export function App(): JSX.Element {
+                     title,
+                   });
+                   setError(null);
+-                  await loadConversations(selectedProjectId);
++                  await loadConversations(selectedProjectId, importedInbox);
+                   setSelectedConversationId(created.id);
+                   setMessages([]);
+                   setBranchLabels({});
+@@ -823,6 +868,35 @@ export function App(): JSX.Element {
+                   fail();
+                 }
+               }}
++              onMoveConversation={async (projectId) => {
++                if (!selectedConversationId) {
++                  return;
++                }
++                try {
++                  const moved = await window.hub.conversations.move({
++                    conversationId: selectedConversationId,
++                    projectId,
++                  });
++                  setError(null);
++                  if (projectId) {
++                    setSelectedProjectId(projectId);
++                    setImportedInbox(false);
++                    await loadConversations(projectId, false);
++                  } else {
++                    setSelectedProjectId(null);
++                    setImportedInbox(true);
++                    await loadConversations(null, true);
++                  }
++                  setConversations((current) => {
++                    if (current.some((item) => item.id === moved.id)) {
++                      return current.map((item) => (item.id === moved.id ? moved : item));
++                    }
++                    return current;
++                  });
++                } catch {
++                  fail();
++                }
++              }}
+               onSaveProject={async (input: Omit<ProjectUpdateInput, "id">) => {
+                 if (!selectedProjectId) {
+                   return;
+@@ -840,16 +914,19 @@ export function App(): JSX.Element {
+                 if (!selectedProjectId) {
+                   return;
+                 }
++                const leaving = conversations.find((item) => item.id === selectedConversationId);
++                const imported = leaving?.importSource != null;
+                 try {
+                   abortIfLeaving(null);
+                   await window.hub.projects.remove({ id: selectedProjectId });
+                   setError(null);
+                   await loadProjects();
+                   setSelectedProjectId(null);
++                  setImportedInbox(imported);
+                   setSelectedConversationId(null);
+                   setMessages([]);
+                   setBranchLabels({});
+-                  await loadConversations(null);
++                  await loadConversations(null, imported);
+                 } catch {
+                   fail();
+                 }
+@@ -892,6 +969,27 @@ export function App(): JSX.Element {
+             />
+           ) : view === "debug" ? (
+             <DebugView />
++          ) : view === "import" ? (
++            <ImportView
++              projects={projects}
++              onImported={(destination) => {
++                setSelectedProjectId(destination.projectId);
++                setImportedInbox(destination.importedInbox);
++                setView("home");
++                void loadConversations(destination.projectId, destination.importedInbox)
++                  .then(async (list) => {
++                    const first = list[0];
++                    if (!first) {
++                      setSelectedConversationId(null);
++                      setMessages([]);
++                      return;
++                    }
++                    setSelectedConversationId(first.id);
++                    await loadMessages(first.id);
++                  })
++                  .catch(fail);
++              }}
++            />
+           ) : (
+             <SettingsView />
+           )}
+@@ -972,6 +1070,7 @@ export function App(): JSX.Element {
+           window.setTimeout(() => searchInputRef.current?.focus(), 0);
+         }}
+         onDebug={() => setView("debug")}
++        onImport={() => setView("import")}
+       />
+     </div>
+   );
+diff --git a/apps/desktop/src/renderer/src/components/layout/import-view.tsx b/apps/desktop/src/renderer/src/components/layout/import-view.tsx
+new file mode 100644
+index 0000000..fec56f1
+--- /dev/null
++++ b/apps/desktop/src/renderer/src/components/layout/import-view.tsx
+@@ -0,0 +1,202 @@
++import { type JSX, useEffect, useRef, useState } from "react";
++import { useTranslation } from "react-i18next";
++import type { ImportEvent, ImportReport, ImportSourceDto, ProjectDto } from "@ai-hub/shared";
++import { Button } from "@/components/ui/button";
++
++export function ImportView({
++  projects,
++  onImported,
++}: {
++  projects: ProjectDto[];
++  onImported: (destination: { projectId: string | null; importedInbox: boolean }) => void;
++}): JSX.Element {
++  const { t } = useTranslation();
++  const [source, setSource] = useState<ImportSourceDto>("chatgpt");
++  const [projectId, setProjectId] = useState<string>("inbox");
++  const [ticket, setTicket] = useState<string | null>(null);
++  const [fileName, setFileName] = useState<string | null>(null);
++  const [jobId, setJobId] = useState<string | null>(null);
++  const [progress, setProgress] = useState<{ processed: number; total: number; ok: number; skipped: number } | null>(
++    null,
++  );
++  const [report, setReport] = useState<ImportReport | null>(null);
++  const [errorKey, setErrorKey] = useState<string | null>(null);
++  const [busy, setBusy] = useState(false);
++  const jobIdRef = useRef<string | null>(null);
++
++  useEffect(() => {
++    return window.hub.import.onEvent((event: ImportEvent) => {
++      if (jobIdRef.current && event.jobId && event.jobId !== jobIdRef.current) {
++        return;
++      }
++      if (event.type === "progress") {
++        setProgress({
++          processed: event.processed,
++          total: event.total,
++          ok: event.ok,
++          skipped: event.skipped,
++        });
++        return;
++      }
++      if (event.type === "done") {
++        setReport(event.report);
++        setBusy(false);
++        setJobId(null);
++        jobIdRef.current = null;
++        setProgress(null);
++        return;
++      }
++      setErrorKey(`import.error.${event.code}`);
++      setBusy(false);
++      setJobId(null);
++      jobIdRef.current = null;
++    });
++  }, []);
++
++  const pickFile = async (): Promise<void> => {
++    setErrorKey(null);
++    setReport(null);
++    try {
++      const result = await window.hub.import.pickFile();
++      if (result.status === "cancelled") {
++        return;
++      }
++      setTicket(result.ticket);
++      setFileName(result.fileName);
++    } catch {
++      setErrorKey("import.error.generic");
++    }
++  };
++
++  const start = async (): Promise<void> => {
++    if (!ticket) {
++      return;
++    }
++    setBusy(true);
++    setReport(null);
++    setProgress(null);
++    setErrorKey(null);
++    try {
++      const started = await window.hub.import.start({
++        ticket,
++        source,
++        projectId: projectId === "inbox" ? null : projectId,
++      });
++      jobIdRef.current = started.jobId;
++      setJobId(started.jobId);
++      setTicket(null);
++    } catch {
++      setBusy(false);
++      setErrorKey("import.error.generic");
++    }
++  };
++
++  const cancel = async (): Promise<void> => {
++    if (!jobId) {
++      return;
++    }
++    try {
++      await window.hub.import.cancel({ jobId });
++    } catch {
++      setErrorKey("import.error.generic");
++    }
++  };
++
++  return (
++    <div className="mx-auto flex w-full max-w-lg flex-col gap-4 p-6">
++      <div>
++        <h1 className="text-base font-semibold">{t("import.title")}</h1>
++        <p className="mt-1 text-muted-foreground">{t("import.hint")}</p>
++      </div>
++      <label className="flex flex-col gap-1 text-[12px] font-medium">
++        {t("import.source")}
++        <select
++          className="h-8 rounded-md border bg-background px-2 text-[13px] font-normal"
++          value={source}
++          data-testid="import-source"
++          onChange={(event) => setSource(event.target.value as ImportSourceDto)}
++        >
++          <option value="chatgpt">{t("import.source.chatgpt")}</option>
++          <option value="claude">{t("import.source.claude")}</option>
++          <option value="gemini">{t("import.source.gemini")}</option>
++        </select>
++      </label>
++      {source === "gemini" ? <p className="text-[12px] text-muted-foreground">{t("import.geminiLimits")}</p> : null}
++      <label className="flex flex-col gap-1 text-[12px] font-medium">
++        {t("import.destination")}
++        <select
++          className="h-8 rounded-md border bg-background px-2 text-[13px] font-normal"
++          value={projectId}
++          data-testid="import-destination"
++          onChange={(event) => setProjectId(event.target.value)}
++        >
++          <option value="inbox">{t("import.destination.inbox")}</option>
++          {projects.map((project) => (
++            <option key={project.id} value={project.id}>
++              {project.name}
++            </option>
++          ))}
++        </select>
++      </label>
++      <div className="flex flex-wrap gap-2">
++        <Button type="button" variant="outline" onClick={() => void pickFile()} disabled={busy} data-testid="import-pick-file">
++          {t("import.pickFile")}
++        </Button>
++        <Button type="button" disabled={!ticket || busy} onClick={() => void start()} data-testid="import-start">
++          {t("import.start")}
++        </Button>
++        <Button type="button" variant="outline" disabled={!jobId} onClick={() => void cancel()} data-testid="import-cancel">
++          {t("import.cancel")}
++        </Button>
++      </div>
++      {fileName ? (
++        <p className="text-[12px] text-muted-foreground" data-testid="import-file-name">
++          {t("import.fileName", { name: fileName })}
++        </p>
++      ) : (
++        <p className="text-[12px] text-muted-foreground">{t("import.empty")}</p>
++      )}
++      {progress ? (
++        <p className="text-[12px]" data-testid="import-progress" data-status="running">
++          {t("import.progress", { current: progress.processed, total: progress.total })}
++        </p>
++      ) : null}
++      {report ? (
++        <div className="rounded-md border p-3 text-[13px]" data-testid="import-report" data-ok={report.ok} data-skipped={report.skipped}>
++          <p className="font-medium">{t("import.report.title")}</p>
++          <p>{t("import.report.ok", { count: report.ok })}</p>
++          <p>{t("import.report.skipped", { count: report.skipped })}</p>
++          <p>{t("import.report.errors", { count: report.errors.length })}</p>
++          {report.errors.length > 0 ? (
++            <ul className="mt-1 list-disc pl-4 text-muted-foreground">
++              {[...new Set(report.errors.map((item) => item.reason))].map((reason) => (
++                <li key={reason}>{t(`import.report.error.${reason}`)}</li>
++              ))}
++            </ul>
++          ) : null}
++          {report.attachmentsSkipped > 0 ? (
++            <p>{t("import.report.attachments", { count: report.attachmentsSkipped })}</p>
++          ) : null}
++          <Button
++            type="button"
++            className="mt-2"
++            data-testid="import-open-destination"
++            onClick={() =>
++              onImported({
++                projectId: projectId === "inbox" ? null : projectId,
++                importedInbox: projectId === "inbox",
++              })
++            }
++          >
++            {t("import.openDestination")}
++          </Button>
++        </div>
++      ) : null}
++      {errorKey ? (
++        <p className="text-destructive" role="alert" data-testid="import-error">
++          {t(errorKey)}
++        </p>
++      ) : null}
++    </div>
++  );
++}
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 326e97e..0351862 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -3,6 +3,7 @@
+   "nav.home": "Home",
+   "nav.settings": "Settings",
+   "nav.debug": "Debug",
++  "nav.import": "Import",
+   "status.ready": "Ready",
+   "status.theme": "Theme: {{theme}}",
+   "status.health.empty": "No provider health yet",
+@@ -30,6 +31,11 @@
+   "workspace.projects": "Projects",
+   "workspace.inbox": "Inbox",
+   "workspace.inboxHint": "Unfiled chats",
++  "workspace.importedInbox": "Imported",
++  "workspace.importedInboxHint": "Chats brought from ChatGPT, Claude, or Gemini",
++  "workspace.noConversationsImported": "No imported chats here. Open Import Hub to bring an export.",
++  "workspace.moveTo": "Move to project",
++  "workspace.moveInbox": "Keep in Imported",
+   "workspace.projectPlaceholder": "Project name",
+   "workspace.newProject": "New project",
+   "workspace.projectColor": "Color",
+@@ -112,6 +118,9 @@
+   "workspace.receipt.created": "Recorded {{at}}",
+   "workspace.receipt.tokens": "in / out",
+   "workspace.receipt.latency": "Latency",
++  "workspace.receipt.source": "Source",
++  "workspace.receipt.source.import": "Imported",
++  "workspace.receipt.source.chat": "Chat",
+   "workspace.cost.conversation": "Thread ${{usd}}",
+   "workspace.cost.project": "Project ${{usd}}",
+   "workspace.estimate": "Est. ${{usd}} this send",
+@@ -146,6 +155,7 @@
+   "fallback.dismiss": "Keep this provider",
+   "fallback.estimate": "Estimated ${{usd}} on {{suggested}}",
+   "command.debug": "Open debug",
++  "command.import": "Open Import Hub",
+   "workspace.sibling.prev": "Previous alternative",
+   "workspace.sibling.next": "Next alternative",
+   "workspace.sibling.count": "{{current}} / {{total}}",
+@@ -202,5 +212,33 @@
+   "updates.status.skipped": "Skipped (development build)",
+   "updates.status.uptodate": "Up to date",
+   "updates.status.available": "Update available ({{version}})",
+-  "updates.status.unavailable": "Update feed unavailable ÔÇö the app keeps running"
++  "updates.status.unavailable": "Update feed unavailable ÔÇö the app keeps running",
++  "import.title": "Import Hub",
++  "import.hint": "Bring official ChatGPT, Claude, or Gemini exports. Re-importing the same chat is skipped. Binary files stay out.",
++  "import.source": "Export source",
++  "import.source.chatgpt": "ChatGPT (ZIP or conversations.json)",
++  "import.source.claude": "Claude (conversations.json)",
++  "import.source.gemini": "Gemini (MyActivity.json, best effort)",
++  "import.geminiLimits": "Gemini Takeout is an activity log, not a full archive. Use JSON (not HTML). Threads are grouped by chat URL; images are skipped. Some turns may be missing.",
++  "import.destination": "Destination",
++  "import.destination.inbox": "Imported inbox",
++  "import.pickFile": "Choose export file",
++  "import.start": "Start import",
++  "import.cancel": "Cancel",
++  "import.fileName": "Selected: {{name}}",
++  "import.empty": "No file selected yet.",
++  "import.progress": "Importing {{current}} / {{total}}",
++  "import.report.title": "Import report",
++  "import.report.ok": "{{count}} conversations imported",
++  "import.report.skipped": "{{count}} skipped (already imported)",
++  "import.report.errors": "{{count}} errors",
++  "import.report.error.empty": "A conversation had no messages and was skipped.",
++  "import.report.error.failed": "A conversation could not be saved.",
++  "import.report.attachments": "{{count}} file placeholders (binaries not imported)",
++  "import.openDestination": "Open imported chats",
++  "import.error.generic": "The import could not be completed.",
++  "import.error.invalid_json": "That file is not valid JSON.",
++  "import.error.unrecognized": "No conversations were recognized in that file.",
++  "import.error.gemini_html": "HTML Takeout is not supported. Export Gemini Apps activity as JSON.",
++  "import.error.empty": "No conversations were found in that export."
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index 0e4930e..f877e34 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -3,6 +3,7 @@
+   "nav.home": "In├¡cio",
+   "nav.settings": "Configura├º├Áes",
+   "nav.debug": "Debug",
++  "nav.import": "Importar",
+   "status.ready": "Pronto",
+   "status.theme": "Tema: {{theme}}",
+   "status.health.empty": "Ainda sem pulso de provedor",
+@@ -30,6 +31,11 @@
+   "workspace.projects": "Projetos",
+   "workspace.inbox": "Avulsas",
+   "workspace.inboxHint": "Chats sem projeto",
++  "workspace.importedInbox": "Importadas",
++  "workspace.importedInboxHint": "Chats trazidos do ChatGPT, Claude ou Gemini",
++  "workspace.noConversationsImported": "Nenhum chat importado aqui. Abra o Import Hub para trazer um export.",
++  "workspace.moveTo": "Mover para projeto",
++  "workspace.moveInbox": "Manter em Importadas",
+   "workspace.projectPlaceholder": "Nome do projeto",
+   "workspace.newProject": "Novo projeto",
+   "workspace.projectColor": "Cor",
+@@ -112,6 +118,9 @@
+   "workspace.receipt.created": "Registado {{at}}",
+   "workspace.receipt.tokens": "entrada / sa├¡da",
+   "workspace.receipt.latency": "Lat├¬ncia",
++  "workspace.receipt.source": "Origem",
++  "workspace.receipt.source.import": "Importado",
++  "workspace.receipt.source.chat": "Chat",
+   "workspace.cost.conversation": "Fio ${{usd}}",
+   "workspace.cost.project": "Projeto ${{usd}}",
+   "workspace.estimate": "Est. ${{usd}} neste envio",
+@@ -146,6 +155,7 @@
+   "fallback.dismiss": "Manter este provedor",
+   "fallback.estimate": "Estimado ${{usd}} em {{suggested}}",
+   "command.debug": "Abrir debug",
++  "command.import": "Abrir Import Hub",
+   "workspace.sibling.prev": "Alternativa anterior",
+   "workspace.sibling.next": "Pr├│xima alternativa",
+   "workspace.sibling.count": "{{current}} / {{total}}",
+@@ -202,5 +212,33 @@
+   "updates.status.skipped": "Ignorado (build de desenvolvimento)",
+   "updates.status.uptodate": "J├í est├í atualizado",
+   "updates.status.available": "Atualiza├º├úo dispon├¡vel ({{version}})",
+-  "updates.status.unavailable": "Feed de update indispon├¡vel ÔÇö o app continua"
++  "updates.status.unavailable": "Feed de update indispon├¡vel ÔÇö o app continua",
++  "import.title": "Import Hub",
++  "import.hint": "Traga exports oficiais do ChatGPT, Claude ou Gemini. Reimportar o mesmo chat ├® ignorado. Ficheiros bin├írios ficam de fora.",
++  "import.source": "Origem do export",
++  "import.source.chatgpt": "ChatGPT (ZIP ou conversations.json)",
++  "import.source.claude": "Claude (conversations.json)",
++  "import.source.gemini": "Gemini (MyActivity.json, melhor esfor├ºo)",
++  "import.geminiLimits": "O Takeout do Gemini ├® um log de atividade, n├úo um arquivo completo. Use JSON (n├úo HTML). Conversas agrupam-se pelo URL; imagens s├úo ignoradas. Alguns turnos podem faltar.",
++  "import.destination": "Destino",
++  "import.destination.inbox": "Inbox Importadas",
++  "import.pickFile": "Escolher ficheiro",
++  "import.start": "Iniciar importa├º├úo",
++  "import.cancel": "Cancelar",
++  "import.fileName": "Selecionado: {{name}}",
++  "import.empty": "Ainda sem ficheiro.",
++  "import.progress": "A importar {{current}} / {{total}}",
++  "import.report.title": "Relat├│rio de importa├º├úo",
++  "import.report.ok": "{{count}} conversas importadas",
++  "import.report.skipped": "{{count}} ignoradas (j├í importadas)",
++  "import.report.errors": "{{count}} erros",
++  "import.report.error.empty": "Uma conversa n├úo tinha mensagens e foi ignorada.",
++  "import.report.error.failed": "Uma conversa n├úo p├┤de ser gravada.",
++  "import.report.attachments": "{{count}} placeholders de ficheiro (bin├írios n├úo importados)",
++  "import.openDestination": "Abrir chats importados",
++  "import.error.generic": "A importa├º├úo n├úo p├┤de ser conclu├¡da.",
++  "import.error.invalid_json": "Esse ficheiro n├úo ├® JSON v├ílido.",
++  "import.error.unrecognized": "Nenhuma conversa foi reconhecida nesse ficheiro.",
++  "import.error.gemini_html": "Takeout em HTML n├úo ├® suportado. Exporte a atividade do Gemini Apps em JSON.",
++  "import.error.empty": "Nenhuma conversa foi encontrada nesse export."
+ }
+diff --git a/docs/IMPLEMENTATION_PLAN.md b/docs/IMPLEMENTATION_PLAN.md
+index 4af1f70..4f31c6e 100644
+--- a/docs/IMPLEMENTATION_PLAN.md
++++ b/docs/IMPLEMENTATION_PLAN.md
+@@ -573,16 +573,16 @@ O que **n├úo** entra no MVP (W0ÔÇôW8), mesmo sendo tentador: RAG, Council, MCP,
+ 
+ **Sub-tasks:**
+ 
+-- [ ] Parser ChatGPT export (ZIP/JSON `conversations.json`)
+-- [ ] Parser Claude export (formato oficial dispon├¡vel; sen├úo HTML/JSON documentado)
+-- [ ] Parser Gemini best-effort + nota de limita├º├Áes
+-- [ ] Job de import: progresso, cancelar, relat├│rio (ok / skip / erro)
+-- [ ] Idempot├¬ncia por hash da conversa origem (`provider + external_id`)
+-- [ ] Destino: projeto escolhido ou inbox ÔÇ£ImportadasÔÇØ
+-- [ ] Mapear mensagens user/assistant; timestamps; t├¡tulo
+-- [ ] Receipts das importadas: `source=import`, custo `null`
+-- [ ] N├úo importar attachments bin├írios nesta onda (placeholder ÔÇ£arquivo n├úo importadoÔÇØ)
+-- [ ] Testes com fixtures reais anonimizados (pequenos)
++- [x] Parser ChatGPT export (ZIP/JSON `conversations.json`)
++- [x] Parser Claude export (formato oficial dispon├¡vel; sen├úo HTML/JSON documentado)
++- [x] Parser Gemini best-effort + nota de limita├º├Áes
++- [x] Job de import: progresso, cancelar, relat├│rio (ok / skip / erro)
++- [x] Idempot├¬ncia por hash da conversa origem (`provider + external_id`)
++- [x] Destino: projeto escolhido ou inbox ÔÇ£ImportadasÔÇØ
++- [x] Mapear mensagens user/assistant; timestamps; t├¡tulo
++- [x] Receipts das importadas: `source=import`, custo `null`
++- [x] N├úo importar attachments bin├írios nesta onda (placeholder ÔÇ£arquivo n├úo importadoÔÇØ)
++- [x] Testes com fixtures reais anonimizados (pequenos)
+ 
+ **DoD:** um export real de ChatGPT vira conversas naveg├íveis no Hub, sem duplicar no reimport.
+ 
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 9415d5a..9beecd6 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave
+ |---|---|
+ | Wave | **W09** |
+ | Marco | B ÔÇö MVP+ |
+-| State | `pending` |
++| State | `review` |
+ | Last completed | **W08** |
+-| Next action | Wave 9 ÔÇö Import Hub |
++| Next action | Wave-close W09: independent review + persist `docs/reviews/W09/` |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -36,12 +36,13 @@ None.
+ ## Notes for the next session
+ 
+ - W08 fechada: wizard <90s, aviso de secret no composer, NSIS, electron-updater, crash opt-in local.
+-- Plano atualizado (ADR-W09-001): duas ondas novas ÔÇö **W21** run modes + HUD de tokens (D13); **W24** orquestra├º├úo (D14). MCP deslocou para W22; agente ├║nico W23; marcos D/E at├® W31. **N├úo implementar isso agora.**
+-- N├úo popular FTS plaintext. N├úo come├ºar W09 sem o utilizador pedir. N├úo pular para agentes.
++- W09 em curso: Import Hub (D2). N├úo implementar packet W10, RAG, MCP, agentes, run modes.
++- Plano W21/W24 (ADR-W09-001) continua lock de mapa, n├úo c├│digo.
++- N├úo popular FTS plaintext.
+ 
+ ## Last review / ADR
+ 
+ | Kind | Path |
+ |---|---|
+ | Review | `docs/reviews/W08/REVIEW.md` |
+-| Latest ADR | `docs/ADR/ADR-W09-001-run-modes-and-agent-orchestration-waves.md` |
++| Latest ADR | `docs/ADR/ADR-W09-004-vendor-parsers-and-opaque-ticket.md` |
+diff --git a/packages/shared/src/import/claude.ts b/packages/shared/src/import/claude.ts
+new file mode 100644
+index 0000000..d5a2b89
+--- /dev/null
++++ b/packages/shared/src/import/claude.ts
+@@ -0,0 +1,114 @@
++import { IMPORT_ATTACHMENT_PLACEHOLDER, asRecord, asString, unixToMs, type NormalizedImportConversation } from "./types";
++
++function textFromBlocks(value: unknown): { text: string; skippedAttachment: boolean } {
++  if (typeof value === "string") {
++    return { text: value, skippedAttachment: false };
++  }
++  if (!Array.isArray(value)) {
++    return { text: "", skippedAttachment: false };
++  }
++  const chunks: string[] = [];
++  let skippedAttachment = false;
++  for (const block of value) {
++    const record = asRecord(block);
++    if (!record) {
++      continue;
++    }
++    const type = asString(record.type);
++    if (type === "text" && typeof record.text === "string") {
++      chunks.push(record.text);
++      continue;
++    }
++    if (type === "thinking" || type === "tool_use" || type === "tool_result") {
++      continue;
++    }
++    if (type && type !== "text") {
++      skippedAttachment = true;
++    }
++  }
++  return { text: chunks.join("\n"), skippedAttachment };
++}
++
++function asClaudeList(payload: unknown): unknown[] | null {
++  if (Array.isArray(payload)) {
++    return payload;
++  }
++  const record = asRecord(payload);
++  if (!record) {
++    return null;
++  }
++  if (Array.isArray(record.conversations)) {
++    return record.conversations;
++  }
++  if (Array.isArray(record.chat_messages) || asString(record.uuid) || asString(record.id)) {
++    return [record];
++  }
++  return null;
++}
++
++export function parseClaudeConversations(payload: unknown): NormalizedImportConversation[] {
++  const list = asClaudeList(payload);
++  if (!list) {
++    return [];
++  }
++  const now = Date.now();
++  const result: NormalizedImportConversation[] = [];
++  for (const item of list) {
++    const conversation = asRecord(item);
++    if (!conversation) {
++      continue;
++    }
++    const externalId = asString(conversation.uuid) ?? asString(conversation.id);
++    if (!externalId) {
++      continue;
++    }
++    const createdAtMs = unixToMs(conversation.created_at, now);
++    const updatedAtMs = unixToMs(conversation.updated_at, createdAtMs);
++    const title = asString(conversation.name)?.slice(0, 200) ?? asString(conversation.title)?.slice(0, 200) ?? "Imported chat";
++    const rawMessages = Array.isArray(conversation.chat_messages) ? conversation.chat_messages : [];
++    const messages: NormalizedImportConversation["messages"] = [];
++    for (const raw of rawMessages) {
++      const message = asRecord(raw);
++      if (!message) {
++        continue;
++      }
++      const sender = asString(message.sender);
++      const role = sender === "assistant" ? "assistant" : sender === "human" || sender === "user" ? "user" : null;
++      if (!role) {
++        continue;
++      }
++      const fromText = typeof message.text === "string" ? message.text : "";
++      const fromBlocks = textFromBlocks(message.content);
++      let text = fromText.trim().length > 0 ? fromText : fromBlocks.text;
++      const hasFiles =
++        (Array.isArray(message.attachments) && message.attachments.length > 0) ||
++        (Array.isArray(message.files) && message.files.length > 0) ||
++        (Array.isArray(message.files_v2) && message.files_v2.length > 0);
++      const skippedAttachment = fromBlocks.skippedAttachment || hasFiles;
++      if (skippedAttachment) {
++        text = text.length > 0 ? `${text}\n\n${IMPORT_ATTACHMENT_PLACEHOLDER}` : IMPORT_ATTACHMENT_PLACEHOLDER;
++      }
++      if (text.trim().length === 0) {
++        continue;
++      }
++      messages.push({
++        role,
++        content: text,
++        createdAtMs: unixToMs(message.created_at, createdAtMs),
++        skippedAttachment,
++      });
++    }
++    if (messages.length === 0) {
++      continue;
++    }
++    result.push({
++      source: "claude",
++      externalId,
++      title,
++      createdAtMs,
++      updatedAtMs,
++      messages,
++    });
++  }
++  return result;
++}
+diff --git a/packages/shared/src/import/parse.test.ts b/packages/shared/src/import/parse.test.ts
+new file mode 100644
+index 0000000..2e54c60
+--- /dev/null
++++ b/packages/shared/src/import/parse.test.ts
+@@ -0,0 +1,236 @@
++import { deflateRawSync } from "node:zlib";
++import { describe, expect, it } from "vitest";
++import { parseImportBytes } from "./parse";
++import { IMPORT_ATTACHMENT_PLACEHOLDER } from "./types";
++import { unzipUtf8Files } from "./zip";
++
++function zipStore(name: string, text: string): Uint8Array {
++  const payload = Buffer.from(text, "utf8");
++  const compressed = deflateRawSync(payload);
++  const nameBytes = Buffer.from(name, "utf8");
++  const header = Buffer.alloc(30);
++  header.writeUInt32LE(0x04034b50, 0);
++  header.writeUInt16LE(20, 4);
++  header.writeUInt16LE(0, 6);
++  header.writeUInt16LE(8, 8);
++  header.writeUInt32LE(0, 14);
++  header.writeUInt32LE(compressed.length, 18);
++  header.writeUInt32LE(payload.length, 22);
++  header.writeUInt16LE(nameBytes.length, 26);
++  header.writeUInt16LE(0, 28);
++  return Buffer.concat([header, nameBytes, compressed]);
++}
++
++const chatgptFixture = [
++  {
++    id: "conv-1",
++    title: "Alpha thread",
++    create_time: 1_700_000_000,
++    update_time: 1_700_000_100,
++    current_node: "n3",
++    mapping: {
++      n0: { id: "n0", parent: null, message: null },
++      n1: {
++        id: "n1",
++        parent: "n0",
++        message: {
++          author: { role: "user" },
++          create_time: 1_700_000_000,
++          content: { content_type: "text", parts: ["Hello from ChatGPT"] },
++        },
++      },
++      n2: {
++        id: "n2",
++        parent: "n1",
++        message: {
++          author: { role: "assistant" },
++          create_time: 1_700_000_010,
++          content: { content_type: "text", parts: ["Hi there"] },
++        },
++      },
++      n3: {
++        id: "n3",
++        parent: "n2",
++        message: {
++          author: { role: "user" },
++          create_time: 1_700_000_020,
++          content: {
++            content_type: "text",
++            parts: ["See this", { content_type: "image_asset_pointer", asset_pointer: "file-1" }],
++          },
++        },
++      },
++    },
++  },
++];
++
++const claudeFixture = [
++  {
++    uuid: "claude-1",
++    name: "Claude thread",
++    created_at: "2024-01-01T00:00:00.000Z",
++    updated_at: "2024-01-01T00:01:00.000Z",
++    chat_messages: [
++      {
++        uuid: "m1",
++        sender: "human",
++        text: "Review this",
++        created_at: "2024-01-01T00:00:00.000Z",
++        attachments: [{ name: "spec.pdf" }],
++      },
++      {
++        uuid: "m2",
++        sender: "assistant",
++        content: [
++          { type: "thinking", thinking: "secret chain" },
++          { type: "text", text: "Looks good" },
++        ],
++        created_at: "2024-01-01T00:00:30.000Z",
++      },
++    ],
++  },
++];
++
++const geminiFixture = [
++  {
++    header: "Gemini",
++    title: "What is TypeScript?",
++    titleUrl: "https://gemini.google.com/app/abc123",
++    time: "2024-06-01T12:00:00.000Z",
++    products: ["Gemini Apps"],
++    subtitles: [{ name: "A typed superset of JavaScript." }],
++  },
++  {
++    header: "Gemini",
++    title: "And Java?",
++    titleUrl: "https://gemini.google.com/app/abc123",
++    time: "2024-06-01T12:01:00.000Z",
++    products: ["Gemini Apps"],
++    subtitles: [{ name: "A different language." }],
++  },
++];
++
++describe("vendor import parsers", () => {
++  it("walks the ChatGPT active path and placeholders attachments", () => {
++    const parsed = parseImportBytes("chatgpt", Buffer.from(JSON.stringify(chatgptFixture), "utf8"));
++    expect(parsed).toHaveLength(1);
++    expect(parsed[0]?.externalId).toBe("conv-1");
++    expect(parsed[0]?.messages.map((item) => item.role)).toEqual(["user", "assistant", "user"]);
++    expect(parsed[0]?.messages[2]?.content).toContain(IMPORT_ATTACHMENT_PLACEHOLDER);
++    expect(parsed[0]?.messages[2]?.skippedAttachment).toBe(true);
++  });
++
++  it("parses Claude chat_messages and skips thinking blocks", () => {
++    const parsed = parseImportBytes("claude", Buffer.from(JSON.stringify(claudeFixture), "utf8"));
++    expect(parsed[0]?.messages).toHaveLength(2);
++    expect(parsed[0]?.messages[1]?.content).toBe("Looks good");
++    expect(parsed[0]?.messages[0]?.content).toContain(IMPORT_ATTACHMENT_PLACEHOLDER);
++  });
++
++  it("groups Gemini activity rows by titleUrl", () => {
++    const parsed = parseImportBytes("gemini", Buffer.from(JSON.stringify(geminiFixture), "utf8"));
++    expect(parsed).toHaveLength(1);
++    expect(parsed[0]?.externalId).toBe("abc123");
++    expect(parsed[0]?.messages).toHaveLength(4);
++  });
++
++  it("reads conversations.json from a deflated zip", () => {
++    const archive = zipStore("conversations.json", JSON.stringify(chatgptFixture));
++    expect(unzipUtf8Files(archive)[0]?.name).toBe("conversations.json");
++    const parsed = parseImportBytes("chatgpt", archive);
++    expect(parsed[0]?.title).toBe("Alpha thread");
++  });
++
++  it("rejects HTML takeout", () => {
++    expect(() => parseImportBytes("gemini", Buffer.from("<!DOCTYPE html><html></html>", "utf8"))).toThrow(
++      /HTML Takeout/,
++    );
++  });
++
++  it("walks ChatGPT mapping without current_node by picking a leaf", () => {
++    const parsed = parseImportBytes(
++      "chatgpt",
++      Buffer.from(
++        JSON.stringify([
++          {
++            id: "conv-leaf",
++            title: "No current node",
++            mapping: {
++              root: { id: "root", parent: null, message: null },
++              leaf: {
++                id: "leaf",
++                parent: "root",
++                message: {
++                  author: { role: "user" },
++                  create_time: 1_700_000_000,
++                  content: { content_type: "text", parts: ["Fallback path"] },
++                },
++              },
++            },
++          },
++        ]),
++        "utf8",
++      ),
++    );
++    expect(parsed[0]?.messages[0]?.content).toBe("Fallback path");
++  });
++
++  it("parses JSON with a UTF-8 BOM", () => {
++    const json = JSON.stringify(chatgptFixture);
++    const parsed = parseImportBytes("chatgpt", Buffer.from(`\uFEFF${json}`, "utf8"));
++    expect(parsed[0]?.externalId).toBe("conv-1");
++  });
++
++  it("keeps only the ChatGPT current_node branch when siblings exist", () => {
++    const parsed = parseImportBytes(
++      "chatgpt",
++      Buffer.from(
++        JSON.stringify([
++          {
++            id: "branched",
++            title: "Branched",
++            current_node: "keep",
++            mapping: {
++              root: { id: "root", parent: null, message: null },
++              user: {
++                id: "user",
++                parent: "root",
++                message: {
++                  author: { role: "user" },
++                  create_time: 1_700_000_000,
++                  content: { content_type: "text", parts: ["Choose"] },
++                },
++              },
++              drop: {
++                id: "drop",
++                parent: "user",
++                message: {
++                  author: { role: "assistant" },
++                  create_time: 1_700_000_001,
++                  content: { content_type: "text", parts: ["Inactive sibling"] },
++                },
++              },
++              keep: {
++                id: "keep",
++                parent: "user",
++                message: {
++                  author: { role: "assistant" },
++                  create_time: 1_700_000_002,
++                  content: { content_type: "text", parts: ["Active sibling"] },
++                },
++              },
++            },
++          },
++        ]),
++        "utf8",
++      ),
++    );
++    expect(parsed[0]?.messages.map((item) => item.content)).toEqual(["Choose", "Active sibling"]);
++  });
++
++  it("parses a single Claude conversation object", () => {
++    const parsed = parseImportBytes("claude", Buffer.from(JSON.stringify(claudeFixture[0]), "utf8"));
++    expect(parsed).toHaveLength(1);
++    expect(parsed[0]?.externalId).toBe("claude-1");
++  });
++});
+diff --git a/packages/shared/src/import/zip.ts b/packages/shared/src/import/zip.ts
+new file mode 100644
+index 0000000..bf48f74
+--- /dev/null
++++ b/packages/shared/src/import/zip.ts
+@@ -0,0 +1,63 @@
++import { inflateRawSync } from "node:zlib";
++
++const MAX_ZIP_ENTRIES = 256;
++const MAX_UNCOMPRESSED_BYTES = 32 * 1024 * 1024;
++
++function readU16(buffer: Buffer, offset: number): number {
++  return buffer.readUInt16LE(offset);
++}
++
++function readU32(buffer: Buffer, offset: number): number {
++  return buffer.readUInt32LE(offset);
++}
++
++export function isZipBuffer(bytes: Uint8Array): boolean {
++  return bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04;
++}
++
++export function unzipUtf8Files(bytes: Uint8Array): Array<{ name: string; text: string }> {
++  const buffer = Buffer.from(bytes);
++  const files: Array<{ name: string; text: string }> = [];
++  let offset = 0;
++  while (offset + 30 <= buffer.length) {
++    const signature = readU32(buffer, offset);
++    if (signature === 0x02014b50 || signature === 0x06054b50) {
++      break;
++    }
++    if (signature !== 0x04034b50) {
++      break;
++    }
++    const flags = readU16(buffer, offset + 6);
++    const method = readU16(buffer, offset + 8);
++    const compressedSize = readU32(buffer, offset + 18);
++    const nameLength = readU16(buffer, offset + 26);
++    const extraLength = readU16(buffer, offset + 28);
++    if (flags & 0x8) {
++      throw new Error("Unsupported ZIP (streaming data descriptor)");
++    }
++    if (files.length >= MAX_ZIP_ENTRIES) {
++      throw new Error("ZIP has too many entries");
++    }
++    const nameStart = offset + 30;
++    const name = buffer.subarray(nameStart, nameStart + nameLength).toString("utf8").replaceAll("\\", "/");
++    const dataStart = nameStart + nameLength + extraLength;
++    const compressed = buffer.subarray(dataStart, dataStart + compressedSize);
++    offset = dataStart + compressedSize;
++    if (name.endsWith("/")) {
++      continue;
++    }
++    let raw: Buffer;
++    if (method === 0) {
++      if (compressed.length > MAX_UNCOMPRESSED_BYTES) {
++        throw new Error("ZIP entry is too large");
++      }
++      raw = Buffer.from(compressed);
++    } else if (method === 8) {
++      raw = inflateRawSync(compressed, { maxOutputLength: MAX_UNCOMPRESSED_BYTES });
++    } else {
++      continue;
++    }
++    files.push({ name, text: raw.toString("utf8") });
++  }
++  return files;
++}
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index 0acfec4..5c15f33 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -4,6 +4,8 @@ import {
+   conversationExportDocumentSchema,
+   debugSnapshotSchema,
+   emptyIpcPayloadSchema,
++  importReportSchema,
++  importStartInputSchema,
+   ipcAckResultSchema,
+   messageCreateInputSchema,
+   messageDtoSchema,
+@@ -264,6 +266,40 @@ describe("project and search contracts", () => {
+   });
+ });
+ 
++describe("import start payload", () => {
++  it("rejects a filesystem path piggybacked on start", () => {
++    expect(() =>
++      importStartInputSchema.parse({
++        ticket: "11111111-1111-4111-8111-111111111111",
++        source: "chatgpt",
++        projectId: null,
++        path: "C:\\\\secrets\\\\export.json",
++      }),
++    ).toThrow();
++  });
++
++  it("rejects conversation titles and vendor ids on import reports", () => {
++    expect(() =>
++      importReportSchema.parse({
++        ok: 0,
++        skipped: 0,
++        errors: [{ reason: "failed", title: "sk-live", externalId: "conv-1" }],
++        attachmentsSkipped: 0,
++        total: 1,
++      }),
++    ).toThrow();
++    expect(
++      importReportSchema.parse({
++        ok: 0,
++        skipped: 0,
++        errors: [{ reason: "empty" }],
++        attachmentsSkipped: 0,
++        total: 1,
++      }).errors,
++    ).toEqual([{ reason: "empty" }]);
++  });
++});
++
+ describe("wave 7 contracts", () => {
+   it("rejects secrets on a debug snapshot", () => {
+     const snapshot = {
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index c6f2a8f..696686a 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -88,6 +88,10 @@ export type IdInput = z.infer<typeof idInputSchema>;
+ 
+ export const tagNameSchema = z.string().trim().min(1).max(40);
+ 
++export const importSourceSchema = z.enum(["chatgpt", "claude", "gemini"]);
++
++export type ImportSourceDto = z.infer<typeof importSourceSchema>;
++
+ export const conversationDtoSchema = z.object({
+   id: z.string().uuid(),
+   projectId: z.string().uuid().nullable(),
+@@ -95,6 +99,7 @@ export const conversationDtoSchema = z.object({
+   tags: z.array(tagNameSchema),
+   createdAt: isoTimestampSchema,
+   updatedAt: isoTimestampSchema,
++  importSource: importSourceSchema.nullable(),
+ });
+ 
+ export type ConversationDto = z.infer<typeof conversationDtoSchema>;
+@@ -104,6 +109,7 @@ export const conversationListResultSchema = z.array(conversationDtoSchema);
+ export const conversationListInputSchema = z
+   .object({
+     projectId: z.string().uuid().nullable(),
++    inbox: z.enum(["avulsas", "imported"]).optional(),
+   })
+   .strict();
+ 
+@@ -127,6 +133,15 @@ export const conversationTagsSetInputSchema = z
+ 
+ export type ConversationTagsSetInput = z.infer<typeof conversationTagsSetInputSchema>;
+ 
++export const conversationMoveInputSchema = z
++  .object({
++    conversationId: z.string().uuid(),
++    projectId: z.string().uuid().nullable(),
++  })
++  .strict();
++
++export type ConversationMoveInput = z.infer<typeof conversationMoveInputSchema>;
++
+ export const searchInputSchema = z
+   .object({
+     query: z.string().trim().min(1).max(200),
+@@ -240,6 +255,7 @@ export const workspaceSessionSchema = z
+     temperature: z.number().min(0).max(2).optional(),
+     maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
+     extraSystem: z.string().max(20_000).optional(),
++    importedInbox: z.boolean().optional(),
+   })
+   .strict();
+ 
+@@ -527,3 +543,105 @@ export const updateCheckResultSchema = z
+   .strict();
+ 
+ export type UpdateCheckResult = z.infer<typeof updateCheckResultSchema>;
++
++export const importJobStatusSchema = z.enum(["queued", "running", "complete", "cancelled", "failed"]);
++
++export type ImportJobStatus = z.infer<typeof importJobStatusSchema>;
++
++export const importPickResultSchema = z.discriminatedUnion("status", [
++  z
++    .object({
++      status: z.literal("picked"),
++      ticket: z.string().uuid(),
++      fileName: z.string().min(1).max(260),
++    })
++    .strict(),
++  z.object({ status: z.literal("cancelled") }).strict(),
++]);
++
++export type ImportPickResult = z.infer<typeof importPickResultSchema>;
++
++export const importStartInputSchema = z
++  .object({
++    ticket: z.string().uuid(),
++    source: importSourceSchema,
++    projectId: z.string().uuid().nullable(),
++  })
++  .strict();
++
++export type ImportStartInput = z.infer<typeof importStartInputSchema>;
++
++export const importStartResultSchema = z
++  .object({
++    jobId: z.string().uuid(),
++  })
++  .strict();
++
++export type ImportStartResult = z.infer<typeof importStartResultSchema>;
++
++export const importCancelInputSchema = z.object({ jobId: z.string().uuid() }).strict();
++
++export type ImportCancelInput = z.infer<typeof importCancelInputSchema>;
++
++export const importItemErrorSchema = z
++  .object({
++    reason: z.enum(["empty", "failed"]),
++  })
++  .strict();
++
++export type ImportItemError = z.infer<typeof importItemErrorSchema>;
++
++export const importReportSchema = z
++  .object({
++    ok: z.number().int().nonnegative(),
++    skipped: z.number().int().nonnegative(),
++    errors: z.array(importItemErrorSchema).max(200),
++    attachmentsSkipped: z.number().int().nonnegative(),
++    total: z.number().int().nonnegative(),
++  })
++  .strict();
++
++export type ImportReport = z.infer<typeof importReportSchema>;
++
++export const importEventSchema = z.discriminatedUnion("type", [
++  z
++    .object({
++      type: z.literal("progress"),
++      jobId: z.string().uuid(),
++      processed: z.number().int().nonnegative(),
++      total: z.number().int().nonnegative(),
++      ok: z.number().int().nonnegative(),
++      skipped: z.number().int().nonnegative(),
++    })
++    .strict(),
++  z
++    .object({
++      type: z.literal("done"),
++      jobId: z.string().uuid(),
++      status: z.enum(["complete", "cancelled", "failed"]),
++      report: importReportSchema,
++    })
++    .strict(),
++  z
++    .object({
++      type: z.literal("error"),
++      jobId: z.string().uuid().nullable(),
++      code: z.enum(["invalid_json", "unrecognized", "gemini_html", "empty", "generic"]),
++    })
++    .strict(),
++]);
++
++export type ImportEvent = z.infer<typeof importEventSchema>;
++
++export const importJobDtoSchema = z
++  .object({
++    id: z.string().uuid(),
++    source: importSourceSchema,
++    status: importJobStatusSchema,
++    report: importReportSchema.nullable(),
++    createdAt: isoTimestampSchema,
++  })
++  .strict();
++
++export type ImportJobDto = z.infer<typeof importJobDtoSchema>;
++
