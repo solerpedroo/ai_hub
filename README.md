@@ -18,11 +18,22 @@ Outros scripts na raiz:
 - `pnpm typecheck` — TypeScript em `apps/desktop` e `packages/*`
 - `pnpm lint` — ESLint
 - `pnpm test` — Vitest (sem chaves reais)
-- `pnpm build` — bundle Electron (sem instalador; isso é Wave 8)
+- `pnpm build` — bundle Electron
+- `pnpm --filter @ai-hub/desktop dist` — instalador NSIS em `apps/desktop/release/`
 
 Após o install, `pnpm dev` recompila nativos para o Electron. `pnpm test` no pacote `db` restaura o ABI do Node se o binário estiver no ABI do Electron.
 
-A janela é frameless. Projetos e conversas ficam no SQLite local (campos sensíveis em envelope AES-GCM). Tema/idioma persistem em `settings`. Chaves de API vão para o Credential Manager. `Ctrl+K` abre um command palette de chrome (tema).
+A janela é frameless. Projetos e conversas ficam no SQLite local (campos sensíveis em envelope AES-GCM). Tema/idioma persistem em `settings`. Chaves de API vão para o Credential Manager. `Ctrl+K` abre um command palette de chrome (tema). First-run: idioma → um provider (OpenRouter em destaque) → teste → composer.
+
+## Limitações do MVP
+
+- Windows first. **Sem build macOS assinado.**
+- Sem RAG, MCP, agentes, import Hub, packet portátil completo, artifacts, skills, @-mentions, sync ou team.
+- Auto-update consulta GitHub Releases; feed vazio/fora **não** fecha o app.
+- Crash dumps são **opt-in** e só locais (sem upload, sem conversa).
+- e2e de CI usa adapter mock (`AI_HUB_E2E=1`), não chaves reais.
+
+UAT: [`docs/UAT-MVP.md`](docs/UAT-MVP.md).
 
 ## Docs
 
@@ -31,6 +42,7 @@ A janela é frameless. Projetos e conversas ficam no SQLite local (campos sensí
 | [Escopo](docs/AI_Hub_Desktop_Escopo.md) | Produto |
 | [Implementation plan](docs/IMPLEMENTATION_PLAN.md) | Ondas, DoD, diferenciais |
 | [STATUS](docs/STATUS.md) | Onde a implementação está agora |
+| [UAT MVP](docs/UAT-MVP.md) | Checklist da Wave 8 |
 | [ADRs](docs/ADR/README.md) | Decisões (`ADR-WXX-NNN-…`) |
 | [Reviews](docs/reviews/README.md) | Close gate por onda |
 
