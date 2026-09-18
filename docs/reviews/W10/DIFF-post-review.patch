@@ -1,0 +1,993 @@
+﻿diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts
+index b26de85..9c711fe 100644
+--- a/apps/desktop/src/main/chat-session.ts
++++ b/apps/desktop/src/main/chat-session.ts
+@@ -10,13 +10,14 @@ import {
+   GatewayError,
+   GatewayStreamError,
+   gatewayErrorCode,
++  mergePacketWithTail,
+   resolveAdapter,
+   withTransientRetry,
+   type CompilerGraphMessage,
+   type CompilerMessage,
+   type ProviderAdapter,
+ } from "@ai-hub/ai-gateway";
+-import type { MessageRecord } from "@ai-hub/db";
++import type { ConversationRecord, MessageRecord } from "@ai-hub/db";
+ import { redactSecrets } from "@ai-hub/security";
+ import {
+   activePath,
+@@ -25,6 +26,7 @@ import {
+   findCatalogModel,
+   IpcChannel,
+   packetV0Schema,
++  portablePacketV1Schema,
+   SpendCapError,
+   suggestFallbackProvider,
+   summarizeProviderHealth,
+@@ -122,6 +124,7 @@ function compilerMessages(rows: MessageRecord[]): CompilerMessage[] {
+     role: item.role,
+     content: item.content,
+     status: item.status,
++    ...(item.pinned ? { pinned: true } : {}),
+   }));
+ }
+ 
+@@ -134,6 +137,8 @@ function compilerGraphMessages(rows: MessageRecord[]): CompilerGraphMessage[] {
+     role: item.role,
+     content: item.content,
+     status: item.status,
++    branchId: item.branchId,
++    ...(item.pinned ? { pinned: true } : {}),
+   }));
+ }
+ 
+@@ -142,16 +147,30 @@ function compileOutgoing(
+   projectInstructions: string | null,
+   compileRows: MessageRecord[],
+   providerSlug: string,
++  conversation: ConversationRecord,
+ ): ProviderAgnosticPacket {
+   const extraSystem =
+     input.extraSystem !== undefined && input.extraSystem.trim().length > 0 ? input.extraSystem.trim() : null;
+   const catalog = findCatalogModel(input.model, providerSlug);
+   const maxTokenBudget =
+     input.compactHistory === true ? (catalog?.contextWindow ?? 128_000) : undefined;
++  const privacyMode = input.privacyMode ?? "standard";
++  if (conversation.activePacketId) {
++    const stored = getHubDatabase().repos.getContextPacket(conversation.activePacketId);
++    if (stored && stored.projectId === conversation.projectId) {
++      const envelope = portablePacketV1Schema.parse(JSON.parse(stored.payloadJson) as unknown);
++      const appliedAt = conversation.packetAppliedAt;
++      const tail = activePath(compileRows).filter(
++        (item) => appliedAt !== null && item.createdAt >= appliedAt,
++      );
++      return mergePacketWithTail(envelope.payload, compilerMessages(tail), maxTokenBudget).packet;
++    }
++  }
+   if (input.mode === "regenerate") {
+     const compiled = {
+       projectInstructions,
+       extraSystem,
++      privacyMode,
+       messages: compilerMessages(compileRows),
+     };
+     return compilePacket(
+@@ -161,6 +180,7 @@ function compileOutgoing(
+   const compiled = {
+     projectInstructions,
+     extraSystem,
++    privacyMode,
+     messages: compilerGraphMessages(compileRows),
+   };
+   return compileActivePath(
+@@ -185,6 +205,7 @@ function pendingUser(
+     status: "complete",
+     createdAt: new Date().toISOString(),
+     receipt: null,
++    pinned: false,
+   };
+ }
+ 
+@@ -311,7 +332,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+   }
+ 
+   const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
+-  const packet = compileOutgoing(input, project?.instructions ?? null, compileRows, key.providerSlug);
++  const packet = compileOutgoing(input, project?.instructions ?? null, compileRows, key.providerSlug, conversation);
+   if (packet.messages.length === 0) {
+     throw new Error("Add a user message before sending");
+   }
+diff --git a/apps/desktop/src/main/packet-preview.ts b/apps/desktop/src/main/packet-preview.ts
+index 59ee075..68f8d81 100644
+--- a/apps/desktop/src/main/packet-preview.ts
++++ b/apps/desktop/src/main/packet-preview.ts
+@@ -1,8 +1,9 @@
+-import { compileActivePath } from "@ai-hub/ai-gateway";
++import { compileActivePathDetailed, mergePacketWithTail } from "@ai-hub/ai-gateway";
+ import { randomUUID } from "node:crypto";
+ import {
+   findCatalogModel,
+   packetPreviewResultSchema,
++  portablePacketV1Schema,
+   type PacketPreviewInput,
+   type PacketPreviewResult,
+ } from "@ai-hub/shared";
+@@ -26,42 +27,101 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
+       ? input.pendingContent.trim()
+       : null;
+   const leaf = path.at(-1);
+-  const messages = [
+-    ...path.map((item) => ({
+-      id: item.id,
+-      parentId: item.parentId,
+-      isActiveBranch: item.isActiveBranch,
+-      createdAt: item.createdAt,
+-      role: item.role,
+-      content: item.content,
+-      status: item.status,
+-    })),
+-    ...(pending
+-      ? [
+-          {
+-            id: randomUUID(),
+-            parentId: leaf?.id ?? null,
+-            isActiveBranch: true,
+-            createdAt: new Date().toISOString(),
+-            role: "user" as const,
+-            content: pending,
+-            status: "complete" as const,
+-          },
+-        ]
+-      : []),
+-  ];
+-  const compiled = {
+-    projectInstructions: project?.instructions ?? null,
+-    extraSystem,
+-    messages,
+-  };
+-  const packet = compileActivePath(
+-    input.compact === true ? { ...compiled, maxTokenBudget: contextWindow } : compiled,
+-  );
++  const pendingRow = pending
++    ? {
++        id: randomUUID(),
++        parentId: leaf?.id ?? null,
++        isActiveBranch: true,
++        createdAt: new Date().toISOString(),
++        role: "user" as const,
++        content: pending,
++        status: "complete" as const,
++        pinned: false,
++        branchId: leaf?.branchId ?? randomUUID(),
++      }
++    : null;
++  const privacyMode = input.privacyMode ?? "standard";
++  const appliedId = conversation.activePacketId;
++  const applied = appliedId ? repos.getContextPacket(appliedId) : null;
++  const budget = input.compact === true ? contextWindow : undefined;
++
++  let tokenEstimate = 0;
++  let excludedCount = 0;
++  let included: PacketPreviewResult["included"] = [];
++  let omitted: PacketPreviewResult["omitted"] = [];
++  let resolvedPrivacy = privacyMode;
++
++  if (applied && applied.projectId === conversation.projectId) {
++    const envelope = portablePacketV1Schema.parse(JSON.parse(applied.payloadJson) as unknown);
++    resolvedPrivacy = envelope.privacyMode;
++    const appliedAt = conversation.packetAppliedAt;
++    const tail = [
++      ...path.filter((item) => appliedAt !== null && item.createdAt >= appliedAt),
++      ...(pendingRow ? [pendingRow] : []),
++    ];
++    const merged = mergePacketWithTail(
++      envelope.payload,
++      tail.map((item) => ({
++        id: item.id,
++        role: item.role,
++        content: item.content,
++        status: item.status,
++        ...("pinned" in item && item.pinned ? { pinned: true } : {}),
++      })),
++      budget,
++    );
++    tokenEstimate = merged.packet.tokenEstimate;
++    excludedCount = merged.packet.excluded.length;
++    included = merged.included;
++    omitted = merged.omitted;
++  } else {
++    const all = repos.listMessages(input.conversationId);
++    const messages = [
++      ...all.map((item) => ({
++        id: item.id,
++        parentId: item.parentId,
++        isActiveBranch: item.isActiveBranch,
++        createdAt: item.createdAt,
++        role: item.role,
++        content: item.content,
++        status: item.status,
++        branchId: item.branchId,
++        ...(item.pinned ? { pinned: true } : {}),
++      })),
++      ...(pendingRow
++        ? [
++            {
++              id: pendingRow.id,
++              parentId: pendingRow.parentId,
++              isActiveBranch: true,
++              createdAt: pendingRow.createdAt,
++              role: pendingRow.role,
++              content: pendingRow.content,
++              status: pendingRow.status,
++              branchId: pendingRow.branchId,
++            },
++          ]
++        : []),
++    ];
++    const compiled = {
++      projectInstructions: project?.instructions ?? null,
++      extraSystem,
++      messages,
++      privacyMode,
++    };
++    const detailed = compileActivePathDetailed(
++      budget !== undefined ? { ...compiled, maxTokenBudget: budget } : compiled,
++    );
++    tokenEstimate = detailed.packet.tokenEstimate;
++    excludedCount = detailed.packet.excluded.length;
++    included = detailed.included;
++    omitted = detailed.omitted;
++  }
++
+   const estimatedCostUsd = estimateOutgoingCostUsd(
+     input.model,
+     input.providerSlug,
+-    packet.tokenEstimate,
++    tokenEstimate,
+     input.maxTokens ?? null,
+   );
+   const cap = evaluateOutgoingCaps({
+@@ -71,13 +131,19 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
+     limits: spendCapLimitsFromRows(repos.listSpendCaps()),
+   });
+   return packetPreviewResultSchema.parse({
+-    tokenEstimate: packet.tokenEstimate,
++    tokenEstimate,
+     contextWindow,
+-    overflow: packet.tokenEstimate > contextWindow,
+-    compacted: input.compact === true && packet.excluded.length > 0,
+-    excludedCount: packet.excluded.length,
++    overflow: tokenEstimate > contextWindow,
++    compacted: input.compact === true && excludedCount > 0,
++    excludedCount,
+     estimatedCostUsd,
+     capWarnings: cap.warnings,
+     capBlocked: cap.blocked,
++    included,
++    omitted,
++    destinationModel: input.model,
++    destinationProvider: input.providerSlug,
++    privacyMode: resolvedPrivacy,
++    appliedPacketId: applied && applied.projectId === conversation.projectId ? applied.id : null,
+   });
+ }
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index 087fd0a..45d2e17 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -5,12 +5,14 @@ import type {
+   BranchLabels,
+   ChatSendInput,
+   ChatSendResult,
++  ContextPacketDto,
+   ConversationDto,
+   CostsAggregateResult,
+   GatewayErrorCode,
+   HealthSummaryDto,
+   MessageDto,
+   PacketPreviewResult,
++  PacketPrivacyMode,
+   ProjectDto,
+   ProjectUpdateInput,
+   ProviderKeyDto,
+@@ -102,6 +104,8 @@ export function App(): JSX.Element {
+   const [exportNotice, setExportNotice] = useState<string | null>(null);
+   const [compactHistory, setCompactHistory] = useState(false);
+   const [packetPreview, setPacketPreview] = useState<PacketPreviewResult | null>(null);
++  const [packets, setPackets] = useState<ContextPacketDto[]>([]);
++  const [privacyMode, setPrivacyMode] = useState<PacketPrivacyMode>("standard");
+   const [searchQuery, setSearchQuery] = useState("");
+   const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
+   const [threadStartModel, setThreadStartModel] = useState<string | null>(null);
+@@ -160,6 +164,14 @@ export function App(): JSX.Element {
+     return list;
+   }, []);
+ 
++  const loadPackets = useCallback(async (projectId: string | null): Promise<void> => {
++    try {
++      setPackets(await window.hub.packets.list({ projectId }));
++    } catch {
++      setPackets([]);
++    }
++  }, []);
++
+   const loadKeys = useCallback(async (): Promise<ProviderKeyDto[]> => {
+     const list = await window.hub.secrets.list();
+     setProviderKeys(list);
+@@ -277,6 +289,10 @@ export function App(): JSX.Element {
+       .catch(() => setCosts(null));
+   }, [messages, selectedConversationId, selectedProjectId]);
+ 
++  useEffect(() => {
++    void loadPackets(selectedProjectId);
++  }, [loadPackets, selectedProjectId]);
++
+   useEffect(() => {
+     if (!sessionReady) {
+       return;
+@@ -382,6 +398,7 @@ export function App(): JSX.Element {
+           model: selectedModel,
+           providerSlug: key.providerSlug,
+           compact: compactHistory,
++          privacyMode,
+           ...(extra !== undefined ? { extraSystem: extra } : {}),
+           ...(pending !== undefined ? { pendingContent: pending } : {}),
+           ...(maxTokens !== null ? { maxTokens } : {}),
+@@ -401,6 +418,8 @@ export function App(): JSX.Element {
+     selectedConversationId,
+     selectedKeyId,
+     selectedModel,
++    privacyMode,
++    conversations.find((item) => item.id === selectedConversationId)?.activePacketId,
+   ]);
+ 
+   useEffect(() => {
+@@ -475,12 +494,13 @@ export function App(): JSX.Element {
+         model: fallback.suggestModel,
+         providerSlug: fallback.suggestProviderSlug,
+         compact: compactHistory,
++        privacyMode,
+         ...(extra !== undefined ? { extraSystem: extra } : {}),
+         ...(maxTokens !== null ? { maxTokens } : {}),
+       })
+       .then(setFallbackPreview)
+       .catch(() => setFallbackPreview(null));
+-  }, [compactHistory, extraSystem, fallback, maxTokens, selectedConversationId]);
++  }, [compactHistory, extraSystem, fallback, maxTokens, privacyMode, selectedConversationId]);
+ 
+   const applyProjectPreferences = useCallback(
+     (project: ProjectDto, keys: ProviderKeyDto[]): void => {
+@@ -532,7 +552,7 @@ export function App(): JSX.Element {
+     lastSendRef.current = input;
+     setSending(true);
+     try {
+-      const result = await window.hub.chat.send({ ...input, compactHistory });
++      const result = await window.hub.chat.send({ ...input, compactHistory, privacyMode });
+       setError(null);
+       setShowAllowOnce(false);
+       setFallback(null);
+@@ -966,6 +986,99 @@ export function App(): JSX.Element {
+                 void sendToModel({ ...pending, allowOnce: true });
+               }}
+               onComposerDraft={reportComposerDraft}
++              onPin={async (id, pinned) => {
++                try {
++                  const updated = await window.hub.messages.pin({ id, pinned });
++                  setMessages((current) =>
++                    current.map((item) => (item.id === updated.id ? updated : item)),
++                  );
++                } catch {
++                  fail();
++                }
++              }}
++              packets={packets}
++              privacyMode={privacyMode}
++              onPrivacyMode={setPrivacyMode}
++              onCompilePacket={async () => {
++                if (!selectedConversationId) {
++                  return;
++                }
++                const key = providerKeys.find((item) => item.id === selectedKeyId);
++                const extra = extraSystem.trim().length > 0 ? extraSystem : undefined;
++                try {
++                  await window.hub.packets.compile({
++                    conversationId: selectedConversationId,
++                    compact: compactHistory,
++                    privacyMode,
++                    ...(key ? { model: selectedModel, providerSlug: key.providerSlug } : {}),
++                    ...(extra !== undefined ? { extraSystem: extra } : {}),
++                  });
++                  await loadPackets(selectedProjectId);
++                  setExportNotice(t("workspace.packet.savedNotice"));
++                } catch {
++                  fail();
++                }
++              }}
++              onExportPacket={async (packetId) => {
++                try {
++                  const result = await window.hub.packets.export({ packetId });
++                  setExportNotice(
++                    result.status === "saved"
++                      ? t("workspace.packet.exported")
++                      : t("workspace.packet.cancelled"),
++                  );
++                } catch {
++                  fail();
++                }
++              }}
++              onImportPacket={async () => {
++                if (!selectedProjectId) {
++                  return;
++                }
++                try {
++                  const picked = await window.hub.packets.pickFile();
++                  if (picked.status !== "picked") {
++                    setExportNotice(t("workspace.packet.cancelled"));
++                    return;
++                  }
++                  await window.hub.packets.import({ ticket: picked.ticket, projectId: selectedProjectId });
++                  await loadPackets(selectedProjectId);
++                  setExportNotice(t("workspace.packet.imported"));
++                } catch {
++                  fail();
++                }
++              }}
++              onApplyPacket={async (packetId) => {
++                if (!selectedConversationId) {
++                  return;
++                }
++                try {
++                  const updated = await window.hub.packets.apply({
++                    conversationId: selectedConversationId,
++                    packetId,
++                  });
++                  setConversations((current) =>
++                    current.map((item) => (item.id === updated.id ? updated : item)),
++                  );
++                  setExportNotice(t("workspace.packet.appliedNotice"));
++                } catch {
++                  fail();
++                }
++              }}
++              onClearPacket={async () => {
++                if (!selectedConversationId) {
++                  return;
++                }
++                try {
++                  const updated = await window.hub.packets.clear({ conversationId: selectedConversationId });
++                  setConversations((current) =>
++                    current.map((item) => (item.id === updated.id ? updated : item)),
++                  );
++                  setExportNotice(t("workspace.packet.cleared"));
++                } catch {
++                  fail();
++                }
++              }}
+             />
+           ) : view === "debug" ? (
+             <DebugView />
+diff --git a/packages/ai-gateway/src/compiler.test.ts b/packages/ai-gateway/src/compiler.test.ts
+index cb1e8c8..b8d2448 100644
+--- a/packages/ai-gateway/src/compiler.test.ts
++++ b/packages/ai-gateway/src/compiler.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it } from "vitest";
+-import { compileActivePath, compilePacket } from "./compiler";
++import { compileActivePath, compilePacket, mergePacketWithTail } from "./compiler";
+ 
+ describe("compilePacket", () => {
+   it("joins project instructions and skips streaming messages", () => {
+@@ -167,4 +167,151 @@ describe("compilePacket", () => {
+     expect(gpt.system).toBe("Project voice.");
+     expect(gpt.messages.map((item) => item.content).join(" ")).not.toMatch(/summar/i);
+   });
++
++  it("summarizes inactive branches in system without adding them as turns", () => {
++    const packet = compileActivePath({
++      projectInstructions: null,
++      extraSystem: null,
++      messages: [
++        {
++          id: "11111111-1111-4111-8111-111111111111",
++          parentId: null,
++          isActiveBranch: true,
++          createdAt: "2026-09-17T00:00:00.000Z",
++          role: "user",
++          content: "prompt",
++          status: "complete",
++        },
++        {
++          id: "22222222-2222-4222-8222-222222222222",
++          parentId: "11111111-1111-4111-8111-111111111111",
++          isActiveBranch: false,
++          createdAt: "2026-09-17T00:00:01.000Z",
++          role: "assistant",
++          content: "old",
++          status: "complete",
++        },
++        {
++          id: "33333333-3333-4333-8333-333333333333",
++          parentId: "11111111-1111-4111-8111-111111111111",
++          isActiveBranch: true,
++          createdAt: "2026-09-17T00:00:02.000Z",
++          role: "assistant",
++          content: "new",
++          status: "complete",
++        },
++      ],
++    });
++    expect(packet.messages.some((item) => item.content === "old")).toBe(false);
++    expect(packet.system).toMatch(/Inactive branches/);
++    expect(packet.system).toMatch(/old/);
++  });
++
++  it("keeps pinned turns when compacting old messages", () => {
++    const pinned = "keep-me-pinned";
++    const packet = compilePacket({
++      projectInstructions: null,
++      extraSystem: null,
++      maxTokenBudget: 20,
++      messages: [
++        {
++          id: "11111111-1111-4111-8111-111111111111",
++          role: "user",
++          content: pinned,
++          status: "complete",
++          pinned: true,
++        },
++        {
++          id: "22222222-2222-4222-8222-222222222222",
++          role: "assistant",
++          content: "y".repeat(80),
++          status: "complete",
++        },
++        {
++          id: "33333333-3333-4333-8333-333333333333",
++          role: "user",
++          content: "fresh question",
++          status: "complete",
++        },
++      ],
++    });
++    expect(packet.messages.some((item) => item.content === pinned)).toBe(true);
++    expect(packet.excluded).toContain("22222222-2222-4222-8222-222222222222");
++  });
++
++  it("omits project instructions and inactive summaries in strict privacy", () => {
++    const packet = compileActivePath({
++      projectInstructions: "Secret project voice.",
++      extraSystem: "Be terse.",
++      privacyMode: "strict",
++      messages: [
++        {
++          id: "11111111-1111-4111-8111-111111111111",
++          parentId: null,
++          isActiveBranch: true,
++          createdAt: "2026-09-17T00:00:00.000Z",
++          role: "user",
++          content: "prompt",
++          status: "complete",
++        },
++        {
++          id: "22222222-2222-4222-8222-222222222222",
++          parentId: "11111111-1111-4111-8111-111111111111",
++          isActiveBranch: false,
++          createdAt: "2026-09-17T00:00:01.000Z",
++          role: "assistant",
++          content: "old-secret-turn",
++          status: "complete",
++        },
++        {
++          id: "33333333-3333-4333-8333-333333333333",
++          parentId: "11111111-1111-4111-8111-111111111111",
++          isActiveBranch: true,
++          createdAt: "2026-09-17T00:00:02.000Z",
++          role: "assistant",
++          content: "new",
++          status: "complete",
++        },
++      ],
++    });
++    expect(packet.system).toBe("Be terse.");
++    expect(packet.system).not.toMatch(/Secret project voice/);
++    expect(packet.system).not.toMatch(/old-secret-turn/);
++    expect(packet.messages.map((item) => item.content)).toEqual(["prompt", "new"]);
++  });
++
++  it("merges an applied packet with only the active tail", () => {
++    const payload = compilePacket({
++      projectInstructions: "Voice.",
++      extraSystem: null,
++      messages: [
++        {
++          id: "11111111-1111-4111-8111-111111111111",
++          role: "user",
++          content: "imported prompt",
++          status: "complete",
++        },
++      ],
++    });
++    const merged = mergePacketWithTail(payload, [
++      {
++        id: "22222222-2222-4222-8222-222222222222",
++        role: "assistant",
++        content: "inactive sibling",
++        status: "complete",
++      },
++      {
++        id: "33333333-3333-4333-8333-333333333333",
++        role: "user",
++        content: "next step",
++        status: "complete",
++      },
++    ]).packet;
++    expect(merged.system).toBe("Voice.");
++    expect(merged.messages.map((item) => item.content)).toEqual([
++      "imported prompt",
++      "inactive sibling",
++      "next step",
++    ]);
++  });
+ });
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index f4d165a..865bc37 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -125,7 +125,7 @@ describe("hub database", () => {
+       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
+       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
+       applyMigrations(second.sqlite);
+-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(6);
++      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(7);
+       second.close();
+     } finally {
+       rmSync(dir, { recursive: true, force: true });
+@@ -598,4 +598,39 @@ describe("hub database", () => {
+     expect(hub.repos.listConversations(null, "avulsas").map((item) => item.id)).toEqual([avulsas.id]);
+     hub.close();
+   });
++
++  it("stores a context packet encrypted and applies only in the same project", () => {
++    const { hub } = openTestDb();
++    const alpha = hub.repos.createProject("Alpha");
++    const beta = hub.repos.createProject("Beta");
++    const fromA = hub.repos.createConversation(alpha.id, "A");
++    const inB = hub.repos.createConversation(beta.id, "B");
++    const packet = hub.repos.createContextPacket({
++      projectId: alpha.id,
++      privacyMode: "standard",
++      origin: { source: "compile", projectLabel: "Alpha", conversationLabel: "A" },
++      tokenEstimate: 4,
++      payloadJson: JSON.stringify({ kind: "aihub.packet", version: 1 }),
++    });
++    const dump = dumpAllText(hub.sqlite);
++    expect(dump).not.toContain("aihub.packet");
++    const applied = hub.repos.applyContextPacket(fromA.id, packet.id);
++    expect(applied.activePacketId).toBe(packet.id);
++    expect(applied.packetAppliedAt).not.toBeNull();
++    expect(() => hub.repos.applyContextPacket(inB.id, packet.id)).toThrow(/another project/);
++    const pinned = hub.repos.createMessage({
++      conversationId: fromA.id,
++      role: "user",
++      content: "pin me",
++      parentId: null,
++      branchId: null,
++    });
++    expect(pinned.pinned).toBe(false);
++    expect(hub.repos.setMessagePinned(pinned.id, true).pinned).toBe(true);
++    const moved = hub.repos.moveConversation(fromA.id, beta.id);
++    expect(moved.projectId).toBe(beta.id);
++    expect(moved.activePacketId).toBeNull();
++    expect(moved.packetAppliedAt).toBeNull();
++    hub.close();
++  });
+ });
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 12ff734..8c1270f 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -15,6 +15,7 @@ import {
+   conversations,
+   conversationTags,
+   healthSamples,
++  contextPackets,
+   importJobs,
+   messageReceipts,
+   messages,
+@@ -55,6 +56,8 @@ export interface ConversationRecord {
+   createdAt: string;
+   updatedAt: string;
+   importSource: "chatgpt" | "claude" | "gemini" | null;
++  activePacketId: string | null;
++  packetAppliedAt: string | null;
+ }
+ 
+ export interface SearchHitRecord {
+@@ -93,6 +96,7 @@ export interface MessageRecord {
+   status: MessageStatus;
+   createdAt: string;
+   receipt: ReceiptRecord | null;
++  pinned: boolean;
+ }
+ 
+ export interface ProviderRecord {
+@@ -127,6 +131,24 @@ export interface SpendCapRecord {
+   createdAt: string;
+ }
+ 
++export interface ContextPacketRecord {
++  id: string;
++  projectId: string | null;
++  tokenEstimate: number | null;
++  privacyMode: "standard" | "strict";
++  origin: {
++    source: "compile" | "import";
++    projectLabel: string;
++    conversationLabel: string;
++  };
++  version: number;
++  createdAt: string;
++}
++
++export interface ContextPacketStored extends ContextPacketRecord {
++  payloadJson: string;
++}
++
+ export interface SpendCapOverrideRecord {
+   at: string;
+   scope: string;
+@@ -387,6 +409,8 @@ export class HubRepos {
+         row.importSource === "chatgpt" || row.importSource === "claude" || row.importSource === "gemini"
+           ? row.importSource
+           : null,
++      activePacketId: row.activePacketId ?? null,
++      packetAppliedAt: row.packetAppliedAt !== null && row.packetAppliedAt !== undefined ? iso(row.packetAppliedAt) : null,
+     };
+   }
+ 
+@@ -405,6 +429,7 @@ export class HubRepos {
+       status: asStatus(row.status),
+       createdAt: iso(row.createdAt),
+       receipt,
++      pinned: row.pinned === 1,
+     };
+   }
+ 
+@@ -547,7 +572,17 @@ export class HubRepos {
+         externalId: null,
+       })
+       .run();
+-    return { id, projectId, title, tags: [], createdAt: iso(now), updatedAt: iso(now), importSource: null };
++    return {
++      id,
++      projectId,
++      title,
++      tags: [],
++      createdAt: iso(now),
++      updatedAt: iso(now),
++      importSource: null,
++      activePacketId: null,
++      packetAppliedAt: null,
++    };
+   }
+ 
+   removeConversation(id: string): void {
+@@ -567,7 +602,16 @@ export class HubRepos {
+       }
+     }
+     const now = Date.now();
+-    this.db.update(conversations).set({ projectId, updatedAt: now }).where(eq(conversations.id, id)).run();
++    this.db
++      .update(conversations)
++      .set({
++        projectId,
++        updatedAt: now,
++        activePacketId: null,
++        packetAppliedAt: null,
++      })
++      .where(eq(conversations.id, id))
++      .run();
+     const moved = this.getConversation(id);
+     if (!moved) {
+       throw new Error("Conversation not found");
+@@ -842,6 +886,7 @@ export class HubRepos {
+         contentCipher: encryptUtf8(input.content, this.masterKey),
+         status,
+         createdAt: now,
++        pinned: 0,
+       })
+       .run();
+     this.db
+@@ -1595,6 +1640,155 @@ export class HubRepos {
+     };
+   }
+ 
++  private parsePacketOrigin(raw: string): {
++    source: "compile" | "import";
++    projectLabel: string;
++    conversationLabel: string;
++  } {
++    try {
++      const parsed: unknown = JSON.parse(raw);
++      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
++        return { source: "compile", projectLabel: "", conversationLabel: "" };
++      }
++      const record = parsed as Record<string, unknown>;
++      const source = record.source === "import" ? "import" : "compile";
++      const projectLabel = typeof record.projectLabel === "string" ? record.projectLabel.slice(0, 200) : "";
++      const conversationLabel =
++        typeof record.conversationLabel === "string" ? record.conversationLabel.slice(0, 200) : "";
++      return { source, projectLabel, conversationLabel };
++    } catch {
++      return { source: "compile", projectLabel: "", conversationLabel: "" };
++    }
++  }
++
++  private toContextPacket(
++    row: typeof contextPackets.$inferSelect,
++    payloadJson: string | null,
++  ): ContextPacketRecord | ContextPacketStored {
++    const base: ContextPacketRecord = {
++      id: row.id,
++      projectId: row.projectId,
++      tokenEstimate: row.tokenEstimate,
++      privacyMode: row.privacyMode === "strict" ? "strict" : "standard",
++      origin: this.parsePacketOrigin(row.origin),
++      version: row.version,
++      createdAt: iso(row.createdAt),
++    };
++    if (payloadJson === null) {
++      return base;
++    }
++    return { ...base, payloadJson };
++  }
++
++  listContextPackets(projectId: string | null): ContextPacketRecord[] {
++    const rows =
++      projectId === null
++        ? this.db.select().from(contextPackets).where(isNull(contextPackets.projectId)).all()
++        : this.db.select().from(contextPackets).where(eq(contextPackets.projectId, projectId)).all();
++    return rows
++      .map((row) => this.toContextPacket(row, null) as ContextPacketRecord)
++      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
++  }
++
++  getContextPacket(id: string): ContextPacketStored | null {
++    const row = this.db.select().from(contextPackets).where(eq(contextPackets.id, id)).get();
++    if (!row) {
++      return null;
++    }
++    return this.toContextPacket(row, decryptUtf8(row.payloadCipher, this.masterKey)) as ContextPacketStored;
++  }
++
++  createContextPacket(input: {
++    projectId: string | null;
++    privacyMode: "standard" | "strict";
++    origin: { source: "compile" | "import"; projectLabel: string; conversationLabel: string };
++    tokenEstimate: number;
++    payloadJson: string;
++  }): ContextPacketStored {
++    if (input.projectId) {
++      const project = this.getProject(input.projectId);
++      if (!project) {
++        throw new Error("Project not found");
++      }
++    }
++    const now = Date.now();
++    const id = randomUUID();
++    this.db
++      .insert(contextPackets)
++      .values({
++        id,
++        projectId: input.projectId,
++        payloadCipher: encryptUtf8(input.payloadJson, this.masterKey),
++        tokenEstimate: input.tokenEstimate,
++        createdAt: now,
++        privacyMode: input.privacyMode,
++        origin: JSON.stringify(input.origin),
++        version: 1,
++      })
++      .run();
++    const stored = this.getContextPacket(id);
++    if (!stored) {
++      throw new Error("Packet not found");
++    }
++    return stored;
++  }
++
++  applyContextPacket(conversationId: string, packetId: string): ConversationRecord {
++    const conversation = this.getConversation(conversationId);
++    if (!conversation) {
++      throw new Error("Conversation not found");
++    }
++    const packet = this.getContextPacket(packetId);
++    if (!packet) {
++      throw new Error("Packet not found");
++    }
++    if (packet.projectId !== conversation.projectId) {
++      throw new Error("Packet belongs to another project");
++    }
++    const now = Date.now();
++    this.db
++      .update(conversations)
++      .set({ activePacketId: packetId, packetAppliedAt: now, updatedAt: now })
++      .where(eq(conversations.id, conversationId))
++      .run();
++    const updated = this.getConversation(conversationId);
++    if (!updated) {
++      throw new Error("Conversation not found");
++    }
++    return updated;
++  }
++
++  clearContextPacket(conversationId: string): ConversationRecord {
++    const conversation = this.getConversation(conversationId);
++    if (!conversation) {
++      throw new Error("Conversation not found");
++    }
++    const now = Date.now();
++    this.db
++      .update(conversations)
++      .set({ activePacketId: null, packetAppliedAt: null, updatedAt: now })
++      .where(eq(conversations.id, conversationId))
++      .run();
++    const updated = this.getConversation(conversationId);
++    if (!updated) {
++      throw new Error("Conversation not found");
++    }
++    return updated;
++  }
++
++  setMessagePinned(id: string, pinned: boolean): MessageRecord {
++    const row = this.db.select().from(messages).where(eq(messages.id, id)).get();
++    if (!row) {
++      throw new Error("Message not found");
++    }
++    this.db.update(messages).set({ pinned: pinned ? 1 : 0 }).where(eq(messages.id, id)).run();
++    const updated = this.getMessage(id);
++    if (!updated) {
++      throw new Error("Message not found");
++    }
++    return updated;
++  }
++
+   async removeProviderKey(id: string): Promise<void> {
+     const row = this.db.select().from(providerKeys).where(eq(providerKeys.id, id)).get();
+     if (!row) {
+diff --git a/packages/shared/src/gateway.test.ts b/packages/shared/src/gateway.test.ts
+index 790d054..ab9e92e 100644
+--- a/packages/shared/src/gateway.test.ts
++++ b/packages/shared/src/gateway.test.ts
+@@ -134,6 +134,18 @@ describe("chat contracts", () => {
+     expect(parsed.compactHistory).toBe(true);
+   });
+ 
++  it("accepts privacyMode on send", () => {
++    const parsed = chatSendInputSchema.parse({
++      mode: "send",
++      conversationId: "11111111-1111-4111-8111-111111111111",
++      providerKeyId: "22222222-2222-4222-8222-222222222222",
++      model: "gpt-4o-mini",
++      content: "hello",
++      privacyMode: "strict",
++    });
++    expect(parsed.privacyMode).toBe("strict");
++  });
++
+   it("accepts allowOnce on send", () => {
+     const parsed = chatSendInputSchema.parse({
+       mode: "send",
+diff --git a/packages/shared/src/gateway.ts b/packages/shared/src/gateway.ts
+index 76aadd1..2ed568c 100644
+--- a/packages/shared/src/gateway.ts
++++ b/packages/shared/src/gateway.ts
+@@ -67,6 +67,7 @@ const chatSendBaseSchema = z.object({
+   extraSystem: z.string().max(20_000).optional(),
+   compactHistory: z.boolean().optional(),
+   allowOnce: z.boolean().optional(),
++  privacyMode: z.enum(["standard", "strict"]).optional(),
+ });
+ 
+ export const chatSendInputSchema = z.discriminatedUnion("mode", [
