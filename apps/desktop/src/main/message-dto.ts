@@ -19,6 +19,7 @@ export function toMessageDto(row: MessageRecord): MessageDto {
         costUsd: row.receipt.costUsd,
         errorCode: row.receipt.errorCode ? gatewayErrorCodeSchema.parse(row.receipt.errorCode) : null,
         createdAt: row.receipt.createdAt,
+        source: row.receipt.source,
       })
     : null;
   return messageDtoSchema.parse({
