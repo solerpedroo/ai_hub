@@ -19,6 +19,8 @@ export const conversations = sqliteTable("conversations", {
   updatedAt: integer("updated_at", { mode: "number" }).notNull(),
   importSource: text("import_source"),
   externalId: text("external_id"),
+  activePacketId: text("active_packet_id"),
+  packetAppliedAt: integer("packet_applied_at", { mode: "number" }),
 });
 
 export const messages = sqliteTable("messages", {
@@ -31,6 +33,7 @@ export const messages = sqliteTable("messages", {
   contentCipher: text("content_cipher").notNull(),
   status: text("status").notNull(),
   createdAt: integer("created_at", { mode: "number" }).notNull(),
+  pinned: integer("pinned", { mode: "number" }).notNull().default(0),
 });
 
 export const messageReceipts = sqliteTable("message_receipts", {
@@ -120,6 +123,9 @@ export const contextPackets = sqliteTable("context_packets", {
   payloadCipher: text("payload_cipher").notNull(),
   tokenEstimate: integer("token_estimate", { mode: "number" }),
   createdAt: integer("created_at", { mode: "number" }).notNull(),
+  privacyMode: text("privacy_mode").notNull().default("standard"),
+  origin: text("origin").notNull().default('{"source":"compile","projectLabel":"","conversationLabel":""}'),
+  version: integer("version", { mode: "number" }).notNull().default(1),
 });
 
 export const schema = {
