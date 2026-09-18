@@ -9,6 +9,7 @@ const securityIndex = resolve(__dirname, "../../packages/security/src/index.ts")
 const securityKeytar = resolve(__dirname, "../../packages/security/src/keytar-store.ts");
 
 const mainAliases = {
+  "@ai-hub/shared/import": resolve(__dirname, "../../packages/shared/src/import/index.ts"),
   "@ai-hub/shared": shared,
   "@ai-hub/db": db,
   "@ai-hub/ai-gateway": gateway,
