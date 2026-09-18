@@ -26,6 +26,12 @@ import type {
   ProviderDto,
   SearchHit,
   SearchInput,
+  SpendCapDto,
+  SpendCapSetInput,
+  HealthSummaryDto,
+  CostsAggregateInput,
+  CostsAggregateResult,
+  DebugSnapshot,
   ProviderKeyDto,
   SecretsSaveInput,
   SecretsTestInput,
@@ -86,6 +92,23 @@ export interface HubSearchApi {
   query: (input: SearchInput) => Promise<SearchHit[]>;
 }
 
+export interface HubSpendCapsApi {
+  get: () => Promise<SpendCapDto[]>;
+  set: (input: SpendCapSetInput) => Promise<SpendCapDto[]>;
+}
+
+export interface HubHealthApi {
+  summary: () => Promise<HealthSummaryDto[]>;
+}
+
+export interface HubCostsApi {
+  aggregate: (input: CostsAggregateInput) => Promise<CostsAggregateResult>;
+}
+
+export interface HubDebugApi {
+  getLatest: () => Promise<DebugSnapshot | null>;
+}
+
 export interface HubChatApi {
   send: (input: ChatSendInput) => Promise<ChatSendResult>;
   abort: (input: ChatAbortInput) => Promise<void>;
@@ -103,6 +126,10 @@ export interface HubApi {
   providers: HubProvidersApi;
   secrets: HubSecretsApi;
   search: HubSearchApi;
+  spendCaps: HubSpendCapsApi;
+  health: HubHealthApi;
+  costs: HubCostsApi;
+  debug: HubDebugApi;
   chat: HubChatApi;
 }
 
