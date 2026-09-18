@@ -27,6 +27,7 @@ async function seedE2eWorkspace(database: HubDatabase): Promise<void> {
     temperature: 1,
     maxTokens: null,
     extraSystem: "",
+    importedInbox: false,
   });
 }
 
