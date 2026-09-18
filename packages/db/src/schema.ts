@@ -17,6 +17,8 @@ export const conversations = sqliteTable("conversations", {
   titleCipher: text("title_cipher").notNull(),
   createdAt: integer("created_at", { mode: "number" }).notNull(),
   updatedAt: integer("updated_at", { mode: "number" }).notNull(),
+  importSource: text("import_source"),
+  externalId: text("external_id"),
 });
 
 export const messages = sqliteTable("messages", {
@@ -41,6 +43,7 @@ export const messageReceipts = sqliteTable("message_receipts", {
   latencyMs: integer("latency_ms", { mode: "number" }),
   costUsd: text("cost_usd"),
   errorCode: text("error_code"),
+  source: text("source").notNull().default("chat"),
   createdAt: integer("created_at", { mode: "number" }).notNull(),
 });
 
