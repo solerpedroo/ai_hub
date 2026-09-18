@@ -44,7 +44,7 @@ OpenAI | Anthropic | Gemini | Groq | OpenRouter | Custom | Ollama
 
 ## 3. Decisões de arquitetura (travadas)
 
-Estas decisões evitam retrabalho nas ondas 0–8.
+Estas decisões evitam retrabalho nas ondas 0–8. As três últimas linhas da tabela travam o mapa **pós-MVP** (W21–W24): não inverter Council / loop único / orquestração, nem tratar esforço como fine-tune de pesos.
 
 | Decisão | Escolha | Por quê |
 |---|---|---|
@@ -61,6 +61,9 @@ Estas decisões evitam retrabalho nas ondas 0–8.
 | i18n | i18next, pt-BR + en desde a Wave 0 | Mercado local + produto global |
 | Ship | electron-builder + electron-updater | NSIS no MVP; macOS assinado depois |
 | Testes | Vitest nos pacotes; Playwright nos fluxos críticos; fixtures de stream | Sem keys reais no CI |
+| Run modes | `plan` / `assist` / `agent` / `orchestrate` + esforço | Superfície tipo Claude Code; modo avança só quando a onda existir; sem troca silenciosa de modelo |
+| Agentes | Loop único (W23) ≠ orquestração (W24) ≠ Council (W20) | Tools só com MCP + Permission Center; sem filesystem irrestrito |
+| Fine-tune | Esforço + thinking + HUD de tokens | **Não** treinar pesos / jobs de fine-tune no Hub |
 
 Estrutura alvo no MVP:
 
@@ -81,7 +84,7 @@ Pacotes `memory`, `files`, `tools`, `ui` só nascem quando a onda precisar.
 
 ## 4. Diferenciais outlier — requisitos de produto
 
-Estes 12 itens **não são ideias**. São features com onda, DoD e aceite. O escopo original continua válido; isto **soma** e, em alguns casos, antecipa o que o escopo deixava para V1/V2.
+Estes 14 itens **não são ideias**. São features com onda, DoD e aceite. O escopo original continua válido; isto **soma** e, em alguns casos, antecipa o que o escopo deixava para V1/V2.
 
 ### D1. Context Compiler + Portable Context Packet
 
@@ -217,7 +220,7 @@ Skill: "Revisar PR"
 - CRUD de skills; pastas; variáveis `{{project}}`, `{{language}}`, `{{goal}}`.
 - Rodar skill a partir da palette, do composer (`/skill`) ou de um atalho.
 - Skills de fábrica: Code Review, Resumir PDF, Preparar reunião, Explicar erro, Escrever RFC.
-- Na era de agentes (Wave 22), skill pode orquestrar tools — o contrato da skill já prevê `steps`.
+- Na era de agentes (Wave 23), skill pode orquestrar tools — o contrato da skill já prevê `steps`. Orquestração multi-agente é a Wave 24.
 
 **Onda:** 17.
 
@@ -277,6 +280,37 @@ Skill: "Revisar PR"
 
 **Ondas:** 2 (engine), 7 (UI).
 
+### D13. Run modes + HUD de tokens
+
+**Problema:** chat com receipt por mensagem ainda não se sente como uma sessão de trabalho (Claude Code, Cursor): não dá para escolher esforço, ver a janela de contexto encher, nem planejar sem executar.  
+**Solução:** modos de corrida explícitos + medidor ao vivo. **Não** é fine-tune de pesos (treino de modelo fica fora do Hub; BYOK usa o modelo que o provider já expõe).
+
+**Aceite:**
+
+- Modos `plan` | `assist` no composer (V1). Modo `agent` só na Wave 23; `orchestrate` só na Wave 24. Chips desabilitados até lá, com tooltip — não fingir a feature.
+- Esforço `low` | `medium` | `high` | `max`: orçamento de thinking / max tokens / banda de temperatura. **Nunca** troca o modelo em silêncio.
+- Thinking estendido só se o adapter declarar capability; senão a UI diz que o provider não suporta.
+- HUD (status bar + rodapé do composer): tokens in/out/thinking/cache deste turno, contexto usado vs janela, custo da sessão. Não só cor.
+- Estimativa pré-envio sobe com o esforço; spend cap continua hard-stop.
+- Último modo/esforço persiste por conversa.
+
+**Onda:** 21.
+
+### D14. Orquestração de agentes
+
+**Problema:** um loop único (Wave 23) não cobre “vários especialistas com handoff”. Council (Wave 20) é N modelos na mesma pergunta, sem tools nem estado compartilhado — não é orquestração.  
+**Solução:** grafo supervisor + especialistas, permissões e orçamento visíveis.
+
+**Aceite:**
+
+- Supervisor declara o plano; especialistas executam papéis; handoff é mensagem inspecionável, não mágica.
+- Paralelo limitado (N estimado × custo **antes** de disparar); cap compartilhado ou partilhado — os dois hard-stopam.
+- Filho só usa outro modelo se o usuário confirmar (mesmo contrato de fallback da W7).
+- Filesystem continua scoped ao projeto via Permission Center (W22). Sem agente com disco irrestrito.
+- Abort/pause cancelam o grafo inteiro; estado persiste.
+
+**Onda:** 24.
+
 ---
 
 ## 5. Mapa de marcos e ondas
@@ -284,9 +318,9 @@ Skill: "Revisar PR"
 ```text
 Marco A  Foundation          W0 — W2
 Marco B  MVP + MVP+          W3 — W10     ← ship Windows em W8; W9–W10 fecham diferenciais de troca
-Marco C  V1 workspace        W11 — W20
-Marco D  V2 agents + local   W21 — W24
-Marco E  V3 ecosystem        W25 — W29
+Marco C  V1 workspace        W11 — W21     ← W21 = run modes + HUD (D13); não pular W9–W21
+Marco D  V2 agents + local   W22 — W26     ← W23 loop único; W24 orquestração (D14)
+Marco E  V3 ecosystem        W27 — W31
 ```
 
 | Wave | Nome | Marco | Diferenciais |
@@ -312,19 +346,21 @@ Marco E  V3 ecosystem        W25 — W29
 | 18 | Privacy Center + Firewall + Cost Tracker | C | D7 polido |
 | 19 | Superpoderes desktop | C | — |
 | 20 | Multi-modelo, Council, Router | C | — |
-| 21 | MCP + Permission Center | D | — |
-| 22 | Agentes | D | skills orquestram tools |
-| 23 | Developer mode | D | — |
-| 24 | Ollama + offline | D | — |
-| 25 | Research, Study, Notes, Tasks | E | — |
-| 26 | Voice Mode | E | — |
-| 27 | Plugins + marketplace | E | — |
-| 28 | Sync opcional | E | — |
-| 29 | Team / Enterprise | E | — |
+| 21 | Run modes + HUD de tokens | C | D13 |
+| 22 | MCP + Permission Center | D | — |
+| 23 | Agentes (loop único) | D | D8 tools |
+| 24 | Orquestração de agentes | D | D14 |
+| 25 | Developer mode | D | — |
+| 26 | Ollama + offline | D | — |
+| 27 | Research, Study, Notes, Tasks | E | — |
+| 28 | Voice Mode | E | — |
+| 29 | Plugins + marketplace | E | — |
+| 30 | Sync opcional | E | — |
+| 31 | Team / Enterprise | E | — |
 
 **Gate de produto após Wave 8:** só avançar pesado em V1 se a hipótese for verdadeira no uso real (você + 2–3 pessoas). Waves 9–10 ainda assim entram: import e pacote portátil são o que torna a troca irreversível.
 
-O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, agentes, terminal, sync, team, voice, marketplace, artifacts, skills, @-mentions. Arquitetura deixa gancho; código não.
+O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, agentes, orquestração, run modes/HUD tipo Claude Code, terminal, sync, team, voice, marketplace, artifacts, skills, @-mentions. Arquitetura deixa gancho; código não. **Não pular W9–W21** para “chegar nos agentes”.
 
 ---
 
@@ -682,7 +718,7 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 
 ### Wave 17 — Skills / workflows
 
-**Objetivo:** D8 completo (tools entram na W22).  
+**Objetivo:** D8 completo (tools entram na W23; orquestração na W24).  
 **Depende de:** Waves 11, 15, 13.
 
 **Sub-tasks:**
@@ -749,54 +785,108 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 
 **DoD:** uma pergunta gera debate visível + síntese; router explica “por que Claude” e o usuário pode recusar.
 
-**DoD V1:** escopo §48 + D1–D12. Workspace de verdade.
+Council **não** é orquestração de agentes: N modelos, um packet, sem tools. Orquestração é a Wave 24.
+
+---
+
+### Wave 21 — Run modes + HUD de tokens
+
+**Objetivo:** D13. Superfície de sessão tipo Claude Code: modo, esforço, thinking, tokens ao vivo. Chat continua chat — ainda sem tools.  
+**Depende de:** Waves 2, 7, 18.
+
+**Sub-tasks:**
+
+- [ ] Contrato `RunMode`: `plan` | `assist` | `agent` | `orchestrate` em `packages/shared` (Zod). Só `plan` e `assist` executam nesta onda; `agent`/`orchestrate` renderizam desabilitados com tooltip da onda dona
+- [ ] Contrato `EffortLevel`: `low` | `medium` | `high` | `max` → thinking budget / `max_output_tokens` / banda de temperatura no adapter. **Proibido** mapear esforço para outro `modelId` sem confirmação (mesmo contrato da W7)
+- [ ] Capability `thinking` no adapter: se o provider não expõe, a UI diz isso; não simular “thinking” com um segundo request oculto
+- [ ] HUD na status bar + rodapé do composer: tokens in / out / thinking / cache deste turno; contexto usado vs janela do Compiler; custo da sessão e do turno. Texto + número, não só cor
+- [ ] Stream atualiza o HUD a partir do receipt incremental (já existe na W2/W7); sem segundo canal sem Zod
+- [ ] Modo `plan`: o modelo devolve um plano inspecionável; **não** chama tools (ainda não existem) e **não** escreve filesystem. Confirmar plano não dispara agente — isso é W23
+- [ ] Estimativa pré-envio cresce com o esforço; spend cap hard-stop inalterado; overlay da W19 (já shippada nesta altura) respeita o mesmo modo/cap
+- [ ] Persistir `runMode` + `effortLevel` por conversa (settings da conversa, não React-only)
+- [ ] Vitest: mapeamento esforço → params; provider sem thinking; HUD DTO sem secrets/headers
+- [ ] i18n pt-BR + en para modos, esforço, HUD e “provider não suporta thinking”
+- [ ] **Fora desta onda:** jobs de fine-tune / treino de pesos, upload de datasets para o provider, LoRA local. Quem quiser um modelo fine-tunado usa o id já hospedado (OpenRouter/custom) na Wave 5
+
+**DoD:** no chat, o usuário troca Plan/Assist e Low→Max, vê tokens e janela de contexto ao vivo durante o stream, e um provider sem thinking não mente. Caps ainda bloqueiam. Nenhum modo `agent` executa tool.
+
+**DoD V1:** escopo §48 + D1–D13. Workspace de verdade com sessão transparente. D14 fica no Marco D.
 
 ---
 
 ## Marco D — V2 (agentes e local)
 
-### Wave 21 — MCP + Permission Center
+### Wave 22 — MCP + Permission Center
 
-**Depende de:** Waves 17–18.
+**Depende de:** Waves 17–18, 21 (HUD mostra tool calls redigidos).
 
 **Sub-tasks:**
 
+- [ ] Pacote `packages/tools` nasce aqui (não antes)
 - [ ] Tool Router interno; MCP client (stdio / sse)
 - [ ] Permissões: uma vez / sempre neste projeto / negar
 - [ ] Confirmação extra para destrutivo (delete, overwrite em massa)
 - [ ] Conectores iniciais: filesystem **scoped ao projeto**, 1 MCP de referência
-- [ ] Tool calls na observabilidade (nome, args redigidos, resultado truncado)
+- [ ] Tool calls na observabilidade e no HUD da W21 (nome, args redigidos, resultado truncado)
 - [ ] Skills podem declarar tools permitidas (contrato da W17)
 
-**DoD:** agente/chat lê arquivo do projeto via MCP só depois de “Permitir uma vez”; negar funciona.
+**DoD:** chat lê arquivo do projeto via MCP só depois de “Permitir uma vez”; negar funciona. Renderer jamais fala stdio/MCP direto.
 
 ---
 
-### Wave 22 — Agentes
+### Wave 23 — Agentes (loop único)
 
-**Depende de:** Wave 21.
+**Objetivo:** um agente, um plano, tools da W22. Ainda **não** é orquestração multi-agente.  
+**Depende de:** Waves 21–22.
 
 **Sub-tasks:**
 
-- [ ] Plano de etapas visível; pause / cancel / max steps / budget (liga no spend cap)
+- [ ] Desbloquear modo `agent` (W21): tools permitidas pelo Permission Center; Plan mode do agente = produzir plano **sem** tools até o usuário confirmar
+- [ ] Plano de etapas visível; pause / cancel / max steps / budget (liga no spend cap + HUD)
 - [ ] Agente de fábrica: “analisar este projeto” (ler → mapear → report em artifact)
 - [ ] Loop infinito impossível: teto de steps + teto de custo + teto de tempo
-- [ ] Cada step é inspecionável; falha de tool não engole o plano
+- [ ] Cada step é inspecionável; falha de tool não engole o plano; tokens por step no HUD
 - [ ] Skill com `steps[]` passa a executar tools de verdade quando declaradas
+- [ ] Schema `agent_runs` / `agent_steps` (migration nesta onda, não ad-hoc)
 
-**DoD:** usuário acompanha 6 passos num relatório, cancela no 3, estado persiste.
+**DoD:** usuário acompanha 6 passos num relatório, cancela no 3, estado persiste; modo Assist não dispara tools.
 
 ---
 
-### Wave 23 — Developer mode
+### Wave 24 — Orquestração de agentes
 
-**Depende de:** Waves 12, 21–22.
+**Objetivo:** D14. Supervisor + especialistas com handoff explícito. Uma onda só para isso — não inflar a W23.  
+**Depende de:** Wave 23.
+
+**Sub-tasks:**
+
+- [ ] Desbloquear modo `orchestrate`. Grafo versionado: supervisor, nós (agente/skill/tool), arestas de handoff, join sequencial ou paralelo limitado
+- [ ] Especialistas de fábrica: Explorer (ler/mapear), Reviewer (riscos), Writer (artifact). O usuário vê quem está ativo
+- [ ] Handoff = mensagem de sistema inspecionável + subset do packet; **não** reenviar o projeto inteiro em silêncio
+- [ ] Modelo/esforço por nó: default = do supervisor; desvio **pede confirmação** (custo/privacidade mudam)
+- [ ] Orçamento: cap da corrida compartilhado (default) ou partilhado por nó; hard-stop no grafo inteiro; estimar N× no paralelo **antes** de disparar
+- [ ] Permission Center: cada tool de cada especialista pede permissão; “permitir sempre neste projeto” não vaza para outro projeto nem para o supervisor fazer delete
+- [ ] Abort/pause cancela filhos; persistir grafo (`agent_runs.parent_run_id` / `kind: orchestrated`)
+- [ ] Distinguir na UI: Council (W20) vs um agente (W23) vs orquestração (esta onda)
+- [ ] Vitest: halt em cap, deny de permissão, abort, paralelo limitado, sem fallback de modelo silencioso
+- [ ] Debug/observabilidade: sem keys, sem headers, args de tool redigidos
+- [ ] i18n pt-BR + en
+
+**DoD:** “analise este projeto” corre supervisor + 2 especialistas, o usuário vê tokens e papéis, cancela no meio, e negar filesystem num especialista não derruba o grafo inteiro sem estado persistido. Filesystem continua scoped.
+
+**Não fazer nesta onda:** filesystem irrestrito, swarm autónomo na internet, marketplace de agentes, treino de pesos.
+
+---
+
+### Wave 25 — Developer mode
+
+**Depende de:** Waves 12, 22–24.
 
 **Sub-tasks:**
 
 - [ ] Explorer, terminal integrado, Git status/diff
 - [ ] AI Code Review no diff (bug, security, perf, smell, manutenibilidade)
-- [ ] Geração de testes / explicação de arquitetura via skills + tools
+- [ ] Geração de testes / explicação de arquitetura via skills + tools (pode usar orquestração Reviewer+Writer)
 - [ ] Terminal e git passam pelo Permission Center
 - [ ] Review vira artifact + opcionalmente comentários por arquivo
 
@@ -804,7 +894,7 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 
 ---
 
-### Wave 24 — Ollama + offline
+### Wave 26 — Ollama + offline
 
 **Depende de:** Waves 5, 14.
 
@@ -814,19 +904,19 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 - [ ] Embeddings locais para RAG offline
 - [ ] Modo offline explícito: o que funciona / o que não (badge)
 - [ ] Fallback local quando a internet cai — **com aviso** (nunca silencioso)
-- [ ] Receipts de modelos locais: custo `0`, latency real
+- [ ] Receipts de modelos locais: custo `0`, latency real; HUD da W21 continua honesto
 
 **DoD:** desligar Wi-Fi, conversar com Llama local, RAG do projeto continua nos PDFs já indexados.
 
-**DoD V2:** escopo §49 menos sync (Wave 28). MCP + um agente confiável + Git/terminal + Ollama.
+**DoD V2:** escopo §49 menos sync (Wave 30). MCP + um agente confiável + orquestração + Git/terminal + Ollama.
 
 ---
 
 ## Marco E — V3 (ecossistema)
 
-### Wave 25 — Research, Study, Notes, Tasks
+### Wave 27 — Research, Study, Notes, Tasks
 
-**Depende de:** Waves 14, 16, 20.
+**Depende de:** Waves 14, 16, 20, 24 (research pode reusar o grafo; não reimplementar orquestração).
 
 **Sub-tasks:**
 
@@ -840,9 +930,9 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 
 ---
 
-### Wave 26 — Voice Mode
+### Wave 28 — Voice Mode
 
-**Depende de:** Wave 8. Prioridade **depois** de W25. Diferencial menor que Compiler/Packet.
+**Depende de:** Wave 8. Prioridade **depois** de W27. Diferencial menor que Compiler/Packet.
 
 **Sub-tasks:**
 
@@ -855,9 +945,9 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 
 ---
 
-### Wave 27 — Plugins + marketplace
+### Wave 29 — Plugins + marketplace
 
-**Depende de:** Wave 21.
+**Depende de:** Wave 22.
 
 **Sub-tasks:**
 
@@ -866,12 +956,13 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 - [ ] Custom OpenAI-compatible como “adicione qualquer endpoint”
 - [ ] Plugin não acessa keytar direto; só APIs do core
 - [ ] Um plugin interno real (ex.: GitHub MCP pack) antes de abrir a terceiros
+- [ ] Agentes de terceiros **não** entram antes de um pack interno real e do Permission Center
 
 **DoD:** instalar um pack MCP pelo marketplace interno e usar no projeto com Permission Center.
 
 ---
 
-### Wave 28 — Sync opcional
+### Wave 30 — Sync opcional
 
 **Depende de:** Waves 10, 8. **Nunca** antes de export/import local confiável (W9–W10).
 
@@ -887,14 +978,14 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 
 ---
 
-### Wave 29 — Team / Enterprise
+### Wave 31 — Team / Enterprise
 
-**Depende de:** Waves 18, 21, 28.
+**Depende de:** Waves 18, 22, 30.
 
 **Sub-tasks:**
 
 - [ ] Orgs, projetos compartilhados, providers centralizados
-- [ ] Governance: allowlist de modelos, bloqueio de PII, tool policy
+- [ ] Governance: allowlist de modelos, bloqueio de PII, tool policy (inclui orquestração)
 - [ ] Audit log; cost limits por time
 - [ ] Analytics agregado (opt-in)
 - [ ] Billing **somente** se o negócio sair de BYOK puro — não assumir no código agora
@@ -922,12 +1013,16 @@ Não é feature isolada. Recusar PR que quebre isto.
 - Conta cloud obrigatória
 - Chat “bonito” antes do vault de keys
 - Agentes com filesystem irrestrito
+- Orquestração antes de MCP + Permission Center + um loop único confiável (W22–W23)
+- Pular W9–W21 para “chegar nos agentes”
+- Jobs de fine-tune / treino de pesos no Hub (esforço ≠ treino)
+- Council (W20) tratado como orquestração de agentes
 - Split de 8 pacotes vazios
 - Marketplace antes de 1 plugin interno real
 - Sync antes de export/import local confiável (W9–W10)
 - Voice como prioridade (custo alto, diferencial baixo vs Compiler/Packet)
-- Troca **silenciosa** de modelo (viola custo e privacidade)
-- Esconder receipt ou custo
+- Troca **silenciosa** de modelo (viola custo e privacidade) — inclusive via “esforço alto”
+- Esconder receipt, custo ou HUD de tokens
 - Tratar OpenRouter como “custom URL” escondida em vez de provider de primeira classe
 - Apagar ramo antigo no regenerate
 - Import que duplica conversas
@@ -973,15 +1068,15 @@ Cobertura do escopo §47 + diferenciais D3, D4, D7, D9, D10, D11, D12 (D1 v0, D2
 
 - [ ] First token &lt; 90s no caminho feliz (1 provider)
 
-**Ainda não no MVP (ok):** macOS signed, import Hub, packet portátil completo, arquivos/RAG, mentions, artifacts, skills, Quick AI, Council, MCP.
+**Ainda não no MVP (ok):** macOS signed, import Hub, packet portátil completo, arquivos/RAG, mentions, artifacts, skills, Quick AI, Council, run modes/HUD (W21), MCP, agentes, orquestração.
 
 UAT extra **MVP+ (W9–W10):** import ChatGPT real; export/import de packet entre projetos.
 
 ---
 
-## 9. Checklist UAT — V1 (Wave 20)
+## 9. Checklist UAT — V1 (Wave 21)
 
-Escopo §48 + D1–D12 fechados.
+Escopo §48 + D1–D13 fechados (D14 = W24).
 
 - [ ] Arquivos, PDF, vision, pasta → resumo
 - [ ] RAG com citações; memória editável
@@ -994,6 +1089,8 @@ Escopo §48 + D1–D12 fechados.
 - [ ] Command Palette + Quick AI + clipboard
 - [ ] Comparação + Council + Router com confirmação
 - [ ] Import Hub + Portable Packet
+- [ ] Run modes Plan/Assist + esforço; HUD de tokens/contexto ao vivo; thinking só se o provider suportar
+- [ ] Chips Agent/Orchestrate visíveis mas desabilitados (não fingir W23/W24)
 
 ---
 
@@ -1004,6 +1101,7 @@ User (local)
  ├── Projects
  │    ├── Conversations → Messages (grafo: parent_id, branch_id)
  │    │                      └── Receipts
+ │    ├── Agent runs → Steps (W23); parent_run_id para orquestração (W24)
  │    ├── Files → Chunks / Embeddings
  │    ├── Memories
  │    ├── Instructions
@@ -1047,7 +1145,7 @@ Do escopo §55, mais as dos diferenciais:
 5. Transparent AI (modelo, custo, dados enviados, tools)  
 6. Model independence (trocar modelo sem perder o projeto)  
 7. **Contexto explícito** (menções e preview do packet; nada de magia opaca)  
-8. **Nunca silencioso** em custo, fallback, privacidade ou execução de tool  
+8. **Nunca silencioso** em custo, fallback, privacidade, execução de tool, esforço ou handoff de agente  
 
 ---
 
@@ -1060,7 +1158,8 @@ Do escopo §55, mais as dos diferenciais:
 5. Teclado, arquivos, @, RAG, memória.  
 6. Prompts, artifacts, skills — o Hub vira ferramenta de trabalho.  
 7. Privacy, custo, overlay desktop, council/router.  
-8. MCP, agentes, Git/terminal, Ollama.  
-9. Modos (research/study), voice, plugins, sync, team.
+8. Run modes + HUD de tokens (tipo Claude Code) — ainda chat, sem tools.  
+9. MCP, um agente confiável, **depois** orquestração, Git/terminal, Ollama.  
+10. Modos (research/study), voice, plugins, sync, team.
 
 A visão final continua a do escopo §58: o usuário não pergunta “qual site de IA eu abro?”. Pergunta “o que eu preciso fazer?”. O AI Hub é a camada que resolve isso — com o modelo como peça trocável, o contexto como artefato, e o custo/privacidade sempre visíveis.
