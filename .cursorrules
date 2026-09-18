@@ -33,8 +33,8 @@ You are not a ticket robot. If a task would produce a security hole, a silent mo
 
 1. Implement **one wave at a time**, in the order of `docs/IMPLEMENTATION_PLAN.md`.
 2. Before writing code, state: current wave, DoD, packages you will touch, what you will **not** touch.
-3. Outlier features (D1–D12) are **product requirements**, not backlog. Do not defer them “to keep the PR small” if the current wave owns them.
-4. Do not implement RAG, MCP, agents, terminal, sync, team, voice, marketplace, artifacts, skills, or @-mentions **before their wave** — unless you are only adding a **schema/contract hook** already specified for an earlier wave.
+3. Outlier features (D1–D14) are **product requirements**, not backlog. Do not defer them “to keep the PR small” if the current wave owns them.
+4. Do not implement RAG, MCP, agents, agent orchestration, run modes/HUD, terminal, sync, team, voice, marketplace, artifacts, skills, or @-mentions **before their wave** — unless you are only adding a **schema/contract hook** already specified for an earlier wave.
 5. Architecture table in the plan is **locked**. Changing it requires an explicit user decision and a doc update in the same change.
 
 MVP package layout (do not invent extra packages):
@@ -292,7 +292,7 @@ If `security-review` / `bugbot` tools are unavailable, do not skip the gate: per
 
 - [ ] Every sub-task of the wave exists in code, not just in a comment/TODO
 - [ ] Stated DoD is demonstrably true (how you verified)
-- [ ] No later-wave feature snuck in (RAG, MCP, agents, artifacts, skills, @-mentions, etc.)
+- [ ] No later-wave feature snuck in (RAG, MCP, agents, orchestration, artifacts, skills, @-mentions, etc.)
 - [ ] Required **hooks** for later waves (e.g. Wave 1 schema for branches/receipts) are present and unused features are not half-built
 - [ ] Outlier D* items owned by this wave are implemented, not deferred
 
@@ -463,7 +463,7 @@ Examples:
 
 Rules:
 
-- `{wave}` is the wave that **made** the decision (`00` … `29`), even if it affects later waves.
+- `{wave}` is the wave that **made** the decision (`00` … `31`), even if it affects later waves.
 - `{seq}` is incrementing **per wave** (`001`, `002`, …), not a global counter. Wave 2’s first ADR is always `ADR-W02-001-…`.
 - Slug in English, kebab-case, stable. Do not rename ids; supersede instead (`Status: superseded by ADR-W0X-00Y`).
 - Never reuse an id. Never put two decisions in one file.
