@@ -125,7 +125,7 @@ describe("hub database", () => {
       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
       applyMigrations(second.sqlite);
-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(5);
+      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(6);
       second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -286,6 +286,7 @@ describe("hub database", () => {
       temperature: 0.4,
       maxTokens: 256,
       extraSystem: "Be terse.",
+      importedInbox: false,
     });
     expect(hub.repos.getWorkspaceSession()).toEqual({
       projectId: project.id,
@@ -294,6 +295,7 @@ describe("hub database", () => {
       temperature: 0.4,
       maxTokens: 256,
       extraSystem: "Be terse.",
+      importedInbox: false,
     });
     hub.close();
   });
@@ -550,6 +552,50 @@ describe("hub database", () => {
       provider: "openai",
     });
     expect(hub.repos.listSpendCapOverrides()).toHaveLength(1);
+    hub.close();
+  });
+
+  it("imports conversations idempotently into the Importadas inbox", () => {
+    const { hub } = openTestDb();
+    const first = hub.repos.importConversation({
+      projectId: null,
+      source: "chatgpt",
+      externalId: "conv-1",
+      title: "Imported alpha",
+      createdAtMs: 1_700_000_000_000,
+      updatedAtMs: 1_700_000_100_000,
+      messages: [
+        { role: "user", content: "hello import", createdAtMs: 1_700_000_000_000 },
+        { role: "assistant", content: "hi import", createdAtMs: 1_700_000_010_000 },
+      ],
+    });
+    expect(first.outcome).toBe("created");
+    const avulsas = hub.repos.createConversation(null, "Loose note");
+    expect(hub.repos.listConversations(null, "avulsas").map((item) => item.title)).toEqual(["Loose note"]);
+    expect(hub.repos.listConversations(null, "imported").map((item) => item.title)).toEqual(["Imported alpha"]);
+    const again = hub.repos.importConversation({
+      projectId: null,
+      source: "chatgpt",
+      externalId: "conv-1",
+      title: "Imported alpha again",
+      createdAtMs: 1_700_000_000_000,
+      updatedAtMs: 1_700_000_100_000,
+      messages: [{ role: "user", content: "hello import", createdAtMs: 1_700_000_000_000 }],
+    });
+    expect(again.outcome).toBe("skipped");
+    expect(again.conversationId).toBe(first.conversationId);
+    const messages = hub.repos.listMessages(first.conversationId ?? "");
+    expect(messages).toHaveLength(2);
+    expect(messages[0]?.receipt).toBeNull();
+    expect(messages[1]?.receipt?.source).toBe("import");
+    expect(messages[1]?.receipt?.costUsd).toBeNull();
+    expect(messages[1]?.receipt?.provider).toBe("chatgpt");
+    const project = hub.repos.createProject("Dest");
+    const moved = hub.repos.moveConversation(first.conversationId ?? "", project.id);
+    expect(moved.projectId).toBe(project.id);
+    expect(hub.repos.listConversations(null, "imported")).toHaveLength(0);
+    expect(hub.repos.listConversations(project.id)[0]?.importSource).toBe("chatgpt");
+    expect(hub.repos.listConversations(null, "avulsas").map((item) => item.id)).toEqual([avulsas.id]);
     hub.close();
   });
 });
