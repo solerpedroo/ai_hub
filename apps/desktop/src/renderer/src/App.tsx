@@ -30,6 +30,7 @@ import { StatusBar } from "@/components/layout/status-bar";
 import { HomeView } from "@/components/layout/home-view";
 import { SettingsView } from "@/components/layout/settings-view";
 import { DebugView } from "@/components/layout/debug-view";
+import { ImportView } from "@/components/layout/import-view";
 import { OnboardingView } from "@/components/layout/onboarding-view";
 import { ChromeCommandPalette } from "@/components/layout/command-palette";
 import type { AppView } from "@/components/layout/types";
@@ -81,6 +82,7 @@ export function App(): JSX.Element {
   const [view, setView] = useState<AppView>("home");
   const [projects, setProjects] = useState<ProjectDto[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [importedInbox, setImportedInbox] = useState(false);
   const [conversations, setConversations] = useState<ConversationDto[]>([]);
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<MessageDto[]>([]);
@@ -137,11 +139,18 @@ export function App(): JSX.Element {
     return list;
   }, []);
 
-  const loadConversations = useCallback(async (projectId: string | null): Promise<ConversationDto[]> => {
-    const list = await window.hub.conversations.list({ projectId });
-    setConversations(list);
-    return list;
-  }, []);
+  const loadConversations = useCallback(
+    async (projectId: string | null, inboxImported = false): Promise<ConversationDto[]> => {
+      const list = await window.hub.conversations.list(
+        projectId === null
+          ? { projectId: null, inbox: inboxImported ? "imported" : "avulsas" }
+          : { projectId },
+      );
+      setConversations(list);
+      return list;
+    },
+    [],
+  );
 
   const loadMessages = useCallback(async (conversationId: string): Promise<MessageDto[]> => {
     const list = await window.hub.messages.list({ conversationId });
@@ -209,7 +218,8 @@ export function App(): JSX.Element {
           const project = projectList.find((item) => item.id === session.projectId) ?? null;
           if (!project) {
             setSelectedProjectId(null);
-            const convos = await loadConversations(null);
+            setImportedInbox(false);
+            const convos = await loadConversations(null, false);
             const conversation =
               convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
             if (conversation) {
@@ -220,7 +230,8 @@ export function App(): JSX.Element {
             return;
           }
           setSelectedProjectId(project.id);
-          const convos = await loadConversations(project.id);
+          setImportedInbox(false);
+          const convos = await loadConversations(project.id, false);
           const conversation =
             convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
           if (conversation) {
@@ -229,7 +240,9 @@ export function App(): JSX.Element {
           }
         } else {
           setSelectedProjectId(null);
-          const convos = await loadConversations(null);
+          const imported = session.importedInbox === true;
+          setImportedInbox(imported);
+          const convos = await loadConversations(null, imported);
           const conversation =
             convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
           if (conversation) {
@@ -276,9 +289,20 @@ export function App(): JSX.Element {
         temperature,
         maxTokens,
         extraSystem,
+        importedInbox,
       })
       .catch(fail);
-  }, [extraSystem, fail, maxTokens, selectedConversationId, selectedModel, selectedProjectId, sessionReady, temperature]);
+  }, [
+    extraSystem,
+    fail,
+    importedInbox,
+    maxTokens,
+    selectedConversationId,
+    selectedModel,
+    selectedProjectId,
+    sessionReady,
+    temperature,
+  ]);
 
   useEffect(() => {
     if (view !== "home") {
@@ -487,7 +511,8 @@ export function App(): JSX.Element {
         title: t("workspace.untitledChat"),
       });
       setError(null);
-      await loadConversations(selectedProjectId);
+      setImportedInbox(false);
+      await loadConversations(selectedProjectId, false);
       setSelectedConversationId(created.id);
       setMessages([]);
       setBranchLabels({});
@@ -599,9 +624,11 @@ export function App(): JSX.Element {
           }}
           projects={projects}
           selectedProjectId={selectedProjectId}
+          importedInbox={importedInbox}
           onSelectProject={(id) => {
             abortIfLeaving(null);
             setSelectedProjectId(id);
+            setImportedInbox(false);
             setSelectedConversationId(null);
             setMessages([]);
             setBranchLabels({});
@@ -611,7 +638,16 @@ export function App(): JSX.Element {
                 applyProjectPreferences(next, providerKeys);
               }
             }
-            void loadConversations(id).catch(fail);
+            void loadConversations(id, false).catch(fail);
+          }}
+          onSelectImportedInbox={() => {
+            abortIfLeaving(null);
+            setSelectedProjectId(null);
+            setImportedInbox(true);
+            setSelectedConversationId(null);
+            setMessages([]);
+            setBranchLabels({});
+            void loadConversations(null, true).catch(fail);
           }}
           onCreateProject={async (name) => {
             try {
@@ -620,11 +656,12 @@ export function App(): JSX.Element {
               const list = await loadProjects();
               const next = list.find((item) => item.id === created.id) ?? created;
               setSelectedProjectId(next.id);
+              setImportedInbox(false);
               setSelectedConversationId(null);
               setMessages([]);
               setBranchLabels({});
               abortIfLeaving(null);
-              await loadConversations(next.id);
+              await loadConversations(next.id, false);
               setView("home");
             } catch {
               fail();
@@ -641,7 +678,13 @@ export function App(): JSX.Element {
             setView("home");
             void (async () => {
               try {
-                await loadConversations(hit.projectId);
+                let convos = await loadConversations(hit.projectId, false);
+                let imported = false;
+                if (hit.projectId === null && !convos.some((item) => item.id === hit.conversationId)) {
+                  convos = await loadConversations(null, true);
+                  imported = true;
+                }
+                setImportedInbox(imported);
                 setSelectedConversationId(hit.conversationId);
                 await loadMessages(hit.conversationId);
                 if (hit.messageId) {
@@ -660,6 +703,8 @@ export function App(): JSX.Element {
           {view === "home" ? (
             <HomeView
               project={selectedProject}
+              importedInbox={importedInbox}
+              projects={projects}
               conversations={conversations}
               selectedConversationId={selectedConversationId}
               messages={messages}
@@ -686,7 +731,7 @@ export function App(): JSX.Element {
                     title,
                   });
                   setError(null);
-                  await loadConversations(selectedProjectId);
+                  await loadConversations(selectedProjectId, importedInbox);
                   setSelectedConversationId(created.id);
                   setMessages([]);
                   setBranchLabels({});
@@ -823,6 +868,35 @@ export function App(): JSX.Element {
                   fail();
                 }
               }}
+              onMoveConversation={async (projectId) => {
+                if (!selectedConversationId) {
+                  return;
+                }
+                try {
+                  const moved = await window.hub.conversations.move({
+                    conversationId: selectedConversationId,
+                    projectId,
+                  });
+                  setError(null);
+                  if (projectId) {
+                    setSelectedProjectId(projectId);
+                    setImportedInbox(false);
+                    await loadConversations(projectId, false);
+                  } else {
+                    setSelectedProjectId(null);
+                    setImportedInbox(true);
+                    await loadConversations(null, true);
+                  }
+                  setConversations((current) => {
+                    if (current.some((item) => item.id === moved.id)) {
+                      return current.map((item) => (item.id === moved.id ? moved : item));
+                    }
+                    return current;
+                  });
+                } catch {
+                  fail();
+                }
+              }}
               onSaveProject={async (input: Omit<ProjectUpdateInput, "id">) => {
                 if (!selectedProjectId) {
                   return;
@@ -840,16 +914,19 @@ export function App(): JSX.Element {
                 if (!selectedProjectId) {
                   return;
                 }
+                const leaving = conversations.find((item) => item.id === selectedConversationId);
+                const imported = leaving?.importSource != null;
                 try {
                   abortIfLeaving(null);
                   await window.hub.projects.remove({ id: selectedProjectId });
                   setError(null);
                   await loadProjects();
                   setSelectedProjectId(null);
+                  setImportedInbox(imported);
                   setSelectedConversationId(null);
                   setMessages([]);
                   setBranchLabels({});
-                  await loadConversations(null);
+                  await loadConversations(null, imported);
                 } catch {
                   fail();
                 }
@@ -892,6 +969,27 @@ export function App(): JSX.Element {
             />
           ) : view === "debug" ? (
             <DebugView />
+          ) : view === "import" ? (
+            <ImportView
+              projects={projects}
+              onImported={(destination) => {
+                setSelectedProjectId(destination.projectId);
+                setImportedInbox(destination.importedInbox);
+                setView("home");
+                void loadConversations(destination.projectId, destination.importedInbox)
+                  .then(async (list) => {
+                    const first = list[0];
+                    if (!first) {
+                      setSelectedConversationId(null);
+                      setMessages([]);
+                      return;
+                    }
+                    setSelectedConversationId(first.id);
+                    await loadMessages(first.id);
+                  })
+                  .catch(fail);
+              }}
+            />
           ) : (
             <SettingsView />
           )}
@@ -972,6 +1070,7 @@ export function App(): JSX.Element {
           window.setTimeout(() => searchInputRef.current?.focus(), 0);
         }}
         onDebug={() => setView("debug")}
+        onImport={() => setView("import")}
       />
     </div>
   );
