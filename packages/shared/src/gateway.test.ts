@@ -134,6 +134,18 @@ describe("chat contracts", () => {
     expect(parsed.compactHistory).toBe(true);
   });
 
+  it("accepts privacyMode on send", () => {
+    const parsed = chatSendInputSchema.parse({
+      mode: "send",
+      conversationId: "11111111-1111-4111-8111-111111111111",
+      providerKeyId: "22222222-2222-4222-8222-222222222222",
+      model: "gpt-4o-mini",
+      content: "hello",
+      privacyMode: "strict",
+    });
+    expect(parsed.privacyMode).toBe("strict");
+  });
+
   it("accepts allowOnce on send", () => {
     const parsed = chatSendInputSchema.parse({
       mode: "send",
