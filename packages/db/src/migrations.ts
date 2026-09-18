@@ -140,9 +140,14 @@ ALTER TABLE projects ADD COLUMN preferred_provider TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS conversation_tags_pk ON conversation_tags(conversation_id, tag_id);
 `;
 
+export const MIGRATION_0005_SQL = `
+CREATE UNIQUE INDEX IF NOT EXISTS spend_caps_scope_idx ON spend_caps(scope);
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
   { version: 3, sql: MIGRATION_0003_SQL },
   { version: 4, sql: MIGRATION_0004_SQL },
+  { version: 5, sql: MIGRATION_0005_SQL },
 ];
