@@ -63,3 +63,8 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W06-003](./ADR-W06-003-compile-trim-context-window.md) | W06 | Compactar histórico só no packet | accepted |
 | [ADR-W06-004](./ADR-W06-004-plaintext-conversation-tags.md) | W06 | Nomes de tags em plaintext | accepted |
 | [ADR-W06-005](./ADR-W06-005-model-switch-via-compiler.md) | W06 | Troca de modelo no mesmo fio via Compiler | accepted |
+| [ADR-W07-001](./ADR-W07-001-spend-caps-hard-stop.md) | W07 | Spend caps hard-stop request/day/global | accepted |
+| [ADR-W07-002](./ADR-W07-002-health-from-chat.md) | W07 | Health samples a partir do chat | accepted |
+| [ADR-W07-003](./ADR-W07-003-explicit-fallback.md) | W07 | Fallback de provider só com confirmação | accepted |
+| [ADR-W07-004](./ADR-W07-004-debug-meta-no-auth.md) | W07 | Debug snapshot sem auth/headers | accepted |
+| [ADR-W07-005](./ADR-W07-005-retry-transient-only.md) | W07 | Retry só transiente e antes do 1º token | accepted |
