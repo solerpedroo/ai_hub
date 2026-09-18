@@ -21,6 +21,9 @@ import {
   debugSnapshotResultSchema,
   emptyIpcPayloadSchema,
   healthSummaryListSchema,
+  appPrefsSchema,
+  appPrefsPatchSchema,
+  updateCheckResultSchema,
   idInputSchema,
   ipcAckResultSchema,
   messageCreateInputSchema,
@@ -52,12 +55,14 @@ import {
 import { safeErrorMessage } from "@ai-hub/security";
 import { abortChat, sendChat } from "./chat-session";
 import { exportConversation } from "./conversation-export";
+import { applyCrashReporterOptIn } from "./crash-reporter";
 import { getLatestDebugSnapshot } from "./debug-snapshot";
 import { toMessageDto } from "./message-dto";
 import { previewPacket } from "./packet-preview";
 import { getHubDatabase } from "./persistence";
 import { testProviderKey } from "./provider-health";
 import { localDayStartMs } from "./spend-guard";
+import { checkForAppUpdates } from "./updater";
 
 function registerHandler<TIn, TOut>(
   channel: string,
@@ -349,6 +354,25 @@ export function registerWorkspaceIpc(): void {
   registerHandler(IpcChannel.debugGetLatest, emptyIpcPayloadSchema, debugSnapshotResultSchema, () =>
     getLatestDebugSnapshot(),
   );
+
+  registerHandler(IpcChannel.prefsGet, emptyIpcPayloadSchema, appPrefsSchema, () =>
+    appPrefsSchema.parse(getHubDatabase().repos.getAppPrefs()),
+  );
+
+  registerHandler(IpcChannel.prefsSet, appPrefsPatchSchema, appPrefsSchema, (input) => {
+    const next = appPrefsSchema.parse(getHubDatabase().repos.setAppPrefs(input));
+    applyCrashReporterOptIn(next.crashReporterOptIn);
+    return next;
+  });
+
+  registerHandler(IpcChannel.updatesCheck, emptyIpcPayloadSchema, updateCheckResultSchema, async () => {
+    const result = await checkForAppUpdates();
+    getHubDatabase().repos.setAppPrefs({
+      lastUpdateCheckAt: new Date().toISOString(),
+      lastUpdateStatus: result.status,
+    });
+    return result;
+  });
 }
 
 export function registerWindowIpc(
