@@ -101,6 +101,16 @@ describe("hub database", () => {
     hub.close();
   });
 
+  it("stores app prefs without extra keys leaking into defaults", () => {
+    const { hub } = openTestDb();
+    expect(hub.repos.getAppPrefs().onboardingComplete).toBe(false);
+    const next = hub.repos.setAppPrefs({ onboardingComplete: true, crashReporterOptIn: true });
+    expect(next.onboardingComplete).toBe(true);
+    expect(next.crashReporterOptIn).toBe(true);
+    expect(next.lastUpdateStatus).toBe("idle");
+    hub.close();
+  });
+
   it("survives close and reopen on a file", () => {
     const dir = mkdtempSync(join(tmpdir(), "ai-hub-db-"));
     const path = join(dir, "ai-hub.sqlite");
