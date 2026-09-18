@@ -23,6 +23,9 @@ import {
   debugSnapshotResultSchema,
   emptyIpcPayloadSchema,
   healthSummaryListSchema,
+  appPrefsSchema,
+  appPrefsPatchSchema,
+  updateCheckResultSchema,
   idInputSchema,
   ipcAckResultSchema,
   messageCreateInputSchema,
@@ -183,6 +186,13 @@ const hub: HubApi = {
         workspaceSessionSchema,
       ),
     setSession: (input) => invokeAckWith(IpcChannel.settingsSetSession, input, workspaceSessionSchema),
+  },
+  prefs: {
+    get: () => invokeParsed(IpcChannel.prefsGet, empty, emptyIpcPayloadSchema, appPrefsSchema),
+    set: (input) => invokeParsed(IpcChannel.prefsSet, input, appPrefsPatchSchema, appPrefsSchema),
+  },
+  updates: {
+    check: () => invokeParsed(IpcChannel.updatesCheck, empty, emptyIpcPayloadSchema, updateCheckResultSchema),
   },
   providers: {
     list: () => invokeParsed(IpcChannel.providersList, empty, emptyIpcPayloadSchema, providerListResultSchema),
