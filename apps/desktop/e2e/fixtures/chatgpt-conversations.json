@@ -1,0 +1,42 @@
+[
+  {
+    "id": "conv-1",
+    "title": "Alpha thread",
+    "create_time": 1700000000,
+    "update_time": 1700000100,
+    "current_node": "n3",
+    "mapping": {
+      "n0": { "id": "n0", "parent": null, "message": null },
+      "n1": {
+        "id": "n1",
+        "parent": "n0",
+        "message": {
+          "author": { "role": "user" },
+          "create_time": 1700000000,
+          "content": { "content_type": "text", "parts": ["Hello from ChatGPT"] }
+        }
+      },
+      "n2": {
+        "id": "n2",
+        "parent": "n1",
+        "message": {
+          "author": { "role": "assistant" },
+          "create_time": 1700000010,
+          "content": { "content_type": "text", "parts": ["Hi there"] }
+        }
+      },
+      "n3": {
+        "id": "n3",
+        "parent": "n2",
+        "message": {
+          "author": { "role": "user" },
+          "create_time": 1700000020,
+          "content": {
+            "content_type": "text",
+            "parts": ["See this", { "content_type": "image_asset_pointer", "asset_pointer": "file-1" }]
+          }
+        }
+      }
+    }
+  }
+]
