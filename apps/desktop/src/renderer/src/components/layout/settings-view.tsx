@@ -1,6 +1,6 @@
 import { type FormEvent, type JSX, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { AppLocale, ProviderDto, ProviderKeyDto, SecretsTestResult, ThemeMode } from "@ai-hub/shared";
+import type { AppLocale, ProviderDto, ProviderKeyDto, SecretsTestResult, SpendCapDto, ThemeMode } from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { persistLocale } from "@/lib/i18n";
@@ -18,6 +18,12 @@ export function SettingsView(): JSX.Element {
   const [error, setError] = useState<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, SecretsTestResult>>({});
+  const [caps, setCaps] = useState<Record<SpendCapDto["scope"], string>>({
+    request: "",
+    day: "",
+    global: "",
+  });
+  const [capsNotice, setCapsNotice] = useState<string | null>(null);
 
   const reloadKeys = (): void => {
     void window.hub.secrets
@@ -53,6 +59,23 @@ export function SettingsView(): JSX.Element {
         if (!cancelled) {
           setKeys(list);
         }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setError(t("workspace.error.generic"));
+        }
+      });
+    void window.hub.spendCaps
+      .get()
+      .then((list) => {
+        if (cancelled) {
+          return;
+        }
+        setCaps({
+          request: list.find((item) => item.scope === "request")?.limitUsd ?? "",
+          day: list.find((item) => item.scope === "day")?.limitUsd ?? "",
+          global: list.find((item) => item.scope === "global")?.limitUsd ?? "",
+        });
       })
       .catch(() => {
         if (!cancelled) {
@@ -231,6 +254,63 @@ export function SettingsView(): JSX.Element {
         {error ? (
           <p className="text-destructive" role="alert">
             {error}
+          </p>
+        ) : null}
+      </section>
+      <section className="flex flex-col gap-2">
+        <h2 className="text-[12px] font-medium">{t("caps.title")}</h2>
+        <p className="text-muted-foreground">{t("caps.hint")}</p>
+        <form
+          className="flex flex-col gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const nextCaps = (["request", "day", "global"] as const).map((scope) => {
+              const raw = caps[scope].trim();
+              return { scope, limitUsd: raw.length === 0 ? null : raw };
+            });
+            if (
+              nextCaps.some(
+                (item) => item.limitUsd !== null && !/^\d+(\.\d{1,6})?$/.test(item.limitUsd),
+              )
+            ) {
+              setError(t("workspace.error.generic"));
+              return;
+            }
+            void window.hub.spendCaps
+              .set({
+                caps: nextCaps,
+              })
+              .then((list) => {
+                setCaps({
+                  request: list.find((item) => item.scope === "request")?.limitUsd ?? "",
+                  day: list.find((item) => item.scope === "day")?.limitUsd ?? "",
+                  global: list.find((item) => item.scope === "global")?.limitUsd ?? "",
+                });
+                setCapsNotice(t("caps.saved"));
+                setError(null);
+              })
+              .catch(() => setError(t("workspace.error.generic")));
+          }}
+        >
+          {(["request", "day", "global"] as const).map((scope) => (
+            <label key={scope} className="flex flex-col gap-1 text-[12px]">
+              {t(`caps.scope.${scope}`)}
+              <Input
+                value={caps[scope]}
+                placeholder={t("caps.unlimited")}
+                onChange={(event) => setCaps((current) => ({ ...current, [scope]: event.target.value }))}
+                data-testid={`spend-cap-${scope}`}
+                inputMode="decimal"
+              />
+            </label>
+          ))}
+          <Button type="submit" data-testid="spend-cap-save">
+            {t("caps.save")}
+          </Button>
+        </form>
+        {capsNotice ? (
+          <p className="text-[11px] text-muted-foreground" role="status">
+            {capsNotice}
           </p>
         ) : null}
       </section>
