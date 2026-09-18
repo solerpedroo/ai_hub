@@ -10,13 +10,14 @@ import {
   GatewayError,
   GatewayStreamError,
   gatewayErrorCode,
+  mergePacketWithTail,
   resolveAdapter,
   withTransientRetry,
   type CompilerGraphMessage,
   type CompilerMessage,
   type ProviderAdapter,
 } from "@ai-hub/ai-gateway";
-import type { MessageRecord } from "@ai-hub/db";
+import type { ConversationRecord, MessageRecord } from "@ai-hub/db";
 import { redactSecrets } from "@ai-hub/security";
 import {
   activePath,
@@ -25,6 +26,7 @@ import {
   findCatalogModel,
   IpcChannel,
   packetV0Schema,
+  portablePacketV1Schema,
   SpendCapError,
   suggestFallbackProvider,
   summarizeProviderHealth,
@@ -122,6 +124,7 @@ function compilerMessages(rows: MessageRecord[]): CompilerMessage[] {
     role: item.role,
     content: item.content,
     status: item.status,
+    ...(item.pinned ? { pinned: true } : {}),
   }));
 }
 
@@ -134,6 +137,8 @@ function compilerGraphMessages(rows: MessageRecord[]): CompilerGraphMessage[] {
     role: item.role,
     content: item.content,
     status: item.status,
+    branchId: item.branchId,
+    ...(item.pinned ? { pinned: true } : {}),
   }));
 }
 
@@ -142,16 +147,30 @@ function compileOutgoing(
   projectInstructions: string | null,
   compileRows: MessageRecord[],
   providerSlug: string,
+  conversation: ConversationRecord,
 ): ProviderAgnosticPacket {
   const extraSystem =
     input.extraSystem !== undefined && input.extraSystem.trim().length > 0 ? input.extraSystem.trim() : null;
   const catalog = findCatalogModel(input.model, providerSlug);
   const maxTokenBudget =
     input.compactHistory === true ? (catalog?.contextWindow ?? 128_000) : undefined;
+  const privacyMode = input.privacyMode ?? "standard";
+  if (conversation.activePacketId) {
+    const stored = getHubDatabase().repos.getContextPacket(conversation.activePacketId);
+    if (stored && stored.projectId === conversation.projectId) {
+      const envelope = portablePacketV1Schema.parse(JSON.parse(stored.payloadJson) as unknown);
+      const appliedAt = conversation.packetAppliedAt;
+      const tail = activePath(compileRows).filter(
+        (item) => appliedAt !== null && item.createdAt >= appliedAt,
+      );
+      return mergePacketWithTail(envelope.payload, compilerMessages(tail), maxTokenBudget).packet;
+    }
+  }
   if (input.mode === "regenerate") {
     const compiled = {
       projectInstructions,
       extraSystem,
+      privacyMode,
       messages: compilerMessages(compileRows),
     };
     return compilePacket(
@@ -161,6 +180,7 @@ function compileOutgoing(
   const compiled = {
     projectInstructions,
     extraSystem,
+    privacyMode,
     messages: compilerGraphMessages(compileRows),
   };
   return compileActivePath(
@@ -185,6 +205,7 @@ function pendingUser(
     status: "complete",
     createdAt: new Date().toISOString(),
     receipt: null,
+    pinned: false,
   };
 }
 
@@ -311,7 +332,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
   }
 
   const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
-  const packet = compileOutgoing(input, project?.instructions ?? null, compileRows, key.providerSlug);
+  const packet = compileOutgoing(input, project?.instructions ?? null, compileRows, key.providerSlug, conversation);
   if (packet.messages.length === 0) {
     throw new Error("Add a user message before sending");
   }
