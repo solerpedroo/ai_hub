@@ -20,7 +20,9 @@ import {
   catalogModelsForProvider,
   classifyHubIpcError,
   findCatalogModel,
+  shouldShowOnboarding,
   upsertActivated,
+  WIZARD_TTFT_BUDGET_MS,
 } from "@ai-hub/shared";
 import { TitleBar } from "@/components/layout/title-bar";
 import { Sidebar } from "@/components/layout/sidebar";
@@ -28,6 +30,7 @@ import { StatusBar } from "@/components/layout/status-bar";
 import { HomeView } from "@/components/layout/home-view";
 import { SettingsView } from "@/components/layout/settings-view";
 import { DebugView } from "@/components/layout/debug-view";
+import { OnboardingView } from "@/components/layout/onboarding-view";
 import { ChromeCommandPalette } from "@/components/layout/command-palette";
 import type { AppView } from "@/components/layout/types";
 import { Button } from "@/components/ui/button";
@@ -91,6 +94,7 @@ export function App(): JSX.Element {
   const [sending, setSending] = useState(false);
   const [activating, setActivating] = useState(false);
   const [sessionReady, setSessionReady] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [branchLabels, setBranchLabels] = useState<BranchLabels>({});
   const [exportNotice, setExportNotice] = useState<string | null>(null);
@@ -117,6 +121,7 @@ export function App(): JSX.Element {
   const selectedModelRef = useRef(selectedModel);
   const searchGeneration = useRef(0);
   const lastSendRef = useRef<ChatSendInput | null>(null);
+  const wizardStartedAt = useRef<number | null>(null);
 
   const reportComposerDraft = useCallback((value: string): void => {
     setComposerDraft(value);
@@ -163,10 +168,11 @@ export function App(): JSX.Element {
   useEffect(() => {
     void (async () => {
       try {
-        const [projectList, keys, session] = await Promise.all([
+        const [projectList, keys, session, prefs] = await Promise.all([
           loadProjects(),
           loadKeys(),
           window.hub.settings.getSession(),
+          window.hub.prefs.get(),
         ]);
         const matchingKey =
           keys.find(
@@ -190,6 +196,14 @@ export function App(): JSX.Element {
         }
         if (session.extraSystem !== undefined) {
           setExtraSystem(session.extraSystem);
+        }
+        const showWizard = shouldShowOnboarding({
+          hasProviderKey: keys.length > 0,
+          onboardingComplete: prefs.onboardingComplete,
+        });
+        setShowOnboarding(showWizard);
+        if (showWizard) {
+          wizardStartedAt.current = Date.now();
         }
         if (session.projectId) {
           const project = projectList.find((item) => item.id === session.projectId) ?? null;
@@ -226,6 +240,7 @@ export function App(): JSX.Element {
         setSessionReady(true);
       } catch {
         fail();
+        setShowOnboarding(false);
         setSessionReady(true);
       }
     })();
@@ -367,6 +382,18 @@ export function App(): JSX.Element {
   useEffect(() => {
     const off = window.hub.chat.onEvent((event) => {
       if (event.type === "chunk") {
+        if (wizardStartedAt.current !== null) {
+          const elapsed = Date.now() - wizardStartedAt.current;
+          wizardStartedAt.current = null;
+          void window.hub.prefs.set({ lastWizardTtftMs: elapsed }).catch(() => {
+            // Prefs are best-effort telemetry for the 90s budget.
+          });
+          if (elapsed > WIZARD_TTFT_BUDGET_MS) {
+            console.warn("[hub:wizard-ttft]", elapsed);
+          } else {
+            console.info("[hub:wizard-ttft]", elapsed);
+          }
+        }
         setMessages((current) =>
           current.map((message) =>
             message.id === event.messageId
@@ -525,6 +552,38 @@ export function App(): JSX.Element {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [createUntitledChat]);
+
+  if (showOnboarding === null) {
+    return (
+      <div className="flex h-full flex-col overflow-hidden">
+        <TitleBar />
+      </div>
+    );
+  }
+
+  if (showOnboarding) {
+    return (
+      <div className="flex h-full flex-col overflow-hidden">
+        <TitleBar />
+        <OnboardingView
+          onComplete={(key) => {
+            const models = catalogModelsForProvider(key.providerSlug);
+            const nextModel = models[0]?.id ?? selectedModel;
+            setSelectedKeyId(key.id);
+            setSelectedModel(nextModel);
+            void window.hub.prefs
+              .set({ onboardingComplete: true })
+              .then(async () => {
+                await loadKeys();
+                setShowOnboarding(false);
+                await createUntitledChat();
+              })
+              .catch(fail);
+          }}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
