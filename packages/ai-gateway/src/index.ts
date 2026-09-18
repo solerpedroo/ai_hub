@@ -5,7 +5,19 @@ export type {
   ProviderAdapter,
   ProviderCapabilities,
 } from "./adapter";
-export { compileActivePath, compilePacket, type CompileInput, type CompilerGraphMessage, type CompilerMessage } from "./compiler";
+export {
+  compileActivePath,
+  compileActivePathDetailed,
+  compilePacket,
+  compilePacketDetailed,
+  mergePacketWithTail,
+  summarizeInactiveBranches,
+  type CompileDetailedResult,
+  type CompileInput,
+  type CompilerGraphMessage,
+  type CompilerMessage,
+  type InactiveBranchSummaries,
+} from "./compiler";
 export {
   consumeCrashSafeStream,
   STREAM_FLUSH_CHARS,
