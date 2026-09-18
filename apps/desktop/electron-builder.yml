@@ -1,0 +1,31 @@
+appId: com.aihub.desktop
+productName: AI Hub
+copyright: Copyright © AI Hub
+directories:
+  output: release
+  buildResources: resources
+files:
+  - out/**/*
+  - package.json
+asar: true
+asarUnpack:
+  - "**/{better-sqlite3,keytar}/**/*"
+win:
+  icon: resources/icon.png
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  shortcutName: AI Hub
+  uninstallDisplayName: AI Hub
+  artifactName: AI-Hub-Setup-${version}.${ext}
+publish:
+  provider: github
+  owner: solerpedroo
+  repo: ai_hub
+electronLanguages:
+  - en-US
+  - pt-BR
