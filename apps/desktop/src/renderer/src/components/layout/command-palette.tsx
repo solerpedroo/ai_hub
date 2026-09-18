@@ -16,11 +16,13 @@ export function ChromeCommandPalette({
   onNewChat,
   onSearch,
   onDebug,
+  onImport,
 }: {
   onNewProject: () => void;
   onNewChat: () => void;
   onSearch: () => void;
   onDebug: () => void;
+  onImport: () => void;
 }): JSX.Element {
   const { t } = useTranslation();
   const { setTheme } = useTheme();
@@ -84,6 +86,14 @@ export function ChromeCommandPalette({
               }}
             >
               {t("command.debug")}
+            </CommandItem>
+            <CommandItem
+              onSelect={() => {
+                onImport();
+                setOpen(false);
+              }}
+            >
+              {t("command.import")}
             </CommandItem>
             <CommandItem onSelect={() => applyTheme("light")}>
               {t("command.theme")}: {t("theme.light")}
