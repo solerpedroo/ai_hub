@@ -2,6 +2,7 @@ import { type JSX, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { siblingsOf, type MessageDto } from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { CopyResponseButton, MessageMarkdown } from "@/components/chat/message-markdown";
 
 export function MessageBubble({
@@ -30,6 +31,7 @@ export function MessageBubble({
   const { t } = useTranslation();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(message.content);
+  const [receiptOpen, setReceiptOpen] = useState(false);
   const statusLabel =
     message.status === "complete" ? null : t(`workspace.status.${message.status}`);
   const canContinue =
@@ -147,18 +149,54 @@ export function MessageBubble({
         <p className="whitespace-pre-wrap">{message.content}</p>
       )}
       {message.receipt ? (
-        <p className="mt-1 text-[11px] text-muted-foreground">
-          {t("workspace.receipt", {
-            model: message.receipt.model ?? "—",
-            tokensIn: message.receipt.tokensIn ?? "—",
-            tokensOut: message.receipt.tokensOut ?? "—",
-            cost: message.receipt.costUsd ?? "—",
-            latency: message.receipt.latencyMs ?? "—",
-          })}
-          {message.receipt.errorCode
-            ? ` · ${t("workspace.receipt.error", { code: message.receipt.errorCode })}`
-            : ""}
-        </p>
+        <div className="mt-1">
+          <button
+            type="button"
+            className="text-left text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+            data-testid="receipt-open"
+            aria-label={t("workspace.receipt.open")}
+            onClick={() => setReceiptOpen(true)}
+          >
+            {t("workspace.receipt", {
+              provider: message.receipt.provider ?? "—",
+              model: message.receipt.model ?? "—",
+              tokensIn: message.receipt.tokensIn ?? "—",
+              tokensOut: message.receipt.tokensOut ?? "—",
+              cost: message.receipt.costUsd ?? "—",
+              latency: message.receipt.latencyMs ?? "—",
+              at: message.receipt.createdAt,
+            })}
+            {message.receipt.errorCode
+              ? ` · ${t("workspace.receipt.error", { code: message.receipt.errorCode })}`
+              : ""}
+          </button>
+          <Dialog open={receiptOpen} onOpenChange={setReceiptOpen}>
+            <DialogContent data-testid="receipt-dialog">
+              <DialogHeader>
+                <DialogTitle>{t("workspace.receipt.title")}</DialogTitle>
+              </DialogHeader>
+              <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[12px]">
+                <dt className="text-muted-foreground">{t("debug.provider")}</dt>
+                <dd>{message.receipt.provider ?? "—"}</dd>
+                <dt className="text-muted-foreground">{t("debug.model")}</dt>
+                <dd>{message.receipt.model ?? "—"}</dd>
+                <dt className="text-muted-foreground">{t("workspace.receipt.tokens")}</dt>
+                <dd>
+                  {message.receipt.tokensIn ?? "—"} / {message.receipt.tokensOut ?? "—"}
+                </dd>
+                <dt className="text-muted-foreground">{t("debug.cost")}</dt>
+                <dd>{message.receipt.costUsd ?? "—"}</dd>
+                <dt className="text-muted-foreground">{t("workspace.receipt.latency")}</dt>
+                <dd>{message.receipt.latencyMs ?? "—"}</dd>
+                <dt className="text-muted-foreground">{t("debug.error")}</dt>
+                <dd>{message.receipt.errorCode ?? "—"}</dd>
+              </dl>
+              <p className="text-[11px] text-muted-foreground">
+                {t("workspace.receipt.created", { at: message.receipt.createdAt })}
+              </p>
+            </DialogContent>
+          </Dialog>
+        </div>
       ) : null}
       {canEdit || canRegenerate || canContinue ? (
         <div className="mt-1.5 flex flex-wrap gap-1">
