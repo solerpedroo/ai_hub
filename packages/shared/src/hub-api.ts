@@ -32,6 +32,9 @@ import type {
   CostsAggregateInput,
   CostsAggregateResult,
   DebugSnapshot,
+  AppPrefs,
+  AppPrefsPatch,
+  UpdateCheckResult,
   ProviderKeyDto,
   SecretsSaveInput,
   SecretsTestInput,
@@ -75,6 +78,15 @@ export interface HubSettingsApi {
   setAppearance: (input: AppearanceSettings) => Promise<void>;
   getSession: () => Promise<WorkspaceSession>;
   setSession: (input: WorkspaceSession) => Promise<void>;
+}
+
+export interface HubPrefsApi {
+  get: () => Promise<AppPrefs>;
+  set: (input: AppPrefsPatch) => Promise<AppPrefs>;
+}
+
+export interface HubUpdatesApi {
+  check: () => Promise<UpdateCheckResult>;
 }
 
 export interface HubProvidersApi {
@@ -123,6 +135,8 @@ export interface HubApi {
   conversations: HubConversationsApi;
   messages: HubMessagesApi;
   settings: HubSettingsApi;
+  prefs: HubPrefsApi;
+  updates: HubUpdatesApi;
   providers: HubProvidersApi;
   secrets: HubSecretsApi;
   search: HubSearchApi;
