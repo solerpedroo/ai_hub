@@ -1,1 +1,1 @@
-export type AppView = "home" | "settings" | "debug";
+export type AppView = "home" | "settings" | "debug" | "import";
