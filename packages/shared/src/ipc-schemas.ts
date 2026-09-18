@@ -88,6 +88,10 @@ export type IdInput = z.infer<typeof idInputSchema>;
 
 export const tagNameSchema = z.string().trim().min(1).max(40);
 
+export const importSourceSchema = z.enum(["chatgpt", "claude", "gemini"]);
+
+export type ImportSourceDto = z.infer<typeof importSourceSchema>;
+
 export const conversationDtoSchema = z.object({
   id: z.string().uuid(),
   projectId: z.string().uuid().nullable(),
@@ -95,6 +99,7 @@ export const conversationDtoSchema = z.object({
   tags: z.array(tagNameSchema),
   createdAt: isoTimestampSchema,
   updatedAt: isoTimestampSchema,
+  importSource: importSourceSchema.nullable(),
 });
 
 export type ConversationDto = z.infer<typeof conversationDtoSchema>;
@@ -104,6 +109,7 @@ export const conversationListResultSchema = z.array(conversationDtoSchema);
 export const conversationListInputSchema = z
   .object({
     projectId: z.string().uuid().nullable(),
+    inbox: z.enum(["avulsas", "imported"]).optional(),
   })
   .strict();
 
@@ -126,6 +132,15 @@ export const conversationTagsSetInputSchema = z
   .strict();
 
 export type ConversationTagsSetInput = z.infer<typeof conversationTagsSetInputSchema>;
+
+export const conversationMoveInputSchema = z
+  .object({
+    conversationId: z.string().uuid(),
+    projectId: z.string().uuid().nullable(),
+  })
+  .strict();
+
+export type ConversationMoveInput = z.infer<typeof conversationMoveInputSchema>;
 
 export const searchInputSchema = z
   .object({
@@ -240,6 +255,7 @@ export const workspaceSessionSchema = z
     temperature: z.number().min(0).max(2).optional(),
     maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
     extraSystem: z.string().max(20_000).optional(),
+    importedInbox: z.boolean().optional(),
   })
   .strict();
 
@@ -527,3 +543,105 @@ export const updateCheckResultSchema = z
   .strict();
 
 export type UpdateCheckResult = z.infer<typeof updateCheckResultSchema>;
+
+export const importJobStatusSchema = z.enum(["queued", "running", "complete", "cancelled", "failed"]);
+
+export type ImportJobStatus = z.infer<typeof importJobStatusSchema>;
+
+export const importPickResultSchema = z.discriminatedUnion("status", [
+  z
+    .object({
+      status: z.literal("picked"),
+      ticket: z.string().uuid(),
+      fileName: z.string().min(1).max(260),
+    })
+    .strict(),
+  z.object({ status: z.literal("cancelled") }).strict(),
+]);
+
+export type ImportPickResult = z.infer<typeof importPickResultSchema>;
+
+export const importStartInputSchema = z
+  .object({
+    ticket: z.string().uuid(),
+    source: importSourceSchema,
+    projectId: z.string().uuid().nullable(),
+  })
+  .strict();
+
+export type ImportStartInput = z.infer<typeof importStartInputSchema>;
+
+export const importStartResultSchema = z
+  .object({
+    jobId: z.string().uuid(),
+  })
+  .strict();
+
+export type ImportStartResult = z.infer<typeof importStartResultSchema>;
+
+export const importCancelInputSchema = z.object({ jobId: z.string().uuid() }).strict();
+
+export type ImportCancelInput = z.infer<typeof importCancelInputSchema>;
+
+export const importItemErrorSchema = z
+  .object({
+    reason: z.enum(["empty", "failed"]),
+  })
+  .strict();
+
+export type ImportItemError = z.infer<typeof importItemErrorSchema>;
+
+export const importReportSchema = z
+  .object({
+    ok: z.number().int().nonnegative(),
+    skipped: z.number().int().nonnegative(),
+    errors: z.array(importItemErrorSchema).max(200),
+    attachmentsSkipped: z.number().int().nonnegative(),
+    total: z.number().int().nonnegative(),
+  })
+  .strict();
+
+export type ImportReport = z.infer<typeof importReportSchema>;
+
+export const importEventSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("progress"),
+      jobId: z.string().uuid(),
+      processed: z.number().int().nonnegative(),
+      total: z.number().int().nonnegative(),
+      ok: z.number().int().nonnegative(),
+      skipped: z.number().int().nonnegative(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("done"),
+      jobId: z.string().uuid(),
+      status: z.enum(["complete", "cancelled", "failed"]),
+      report: importReportSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("error"),
+      jobId: z.string().uuid().nullable(),
+      code: z.enum(["invalid_json", "unrecognized", "gemini_html", "empty", "generic"]),
+    })
+    .strict(),
+]);
+
+export type ImportEvent = z.infer<typeof importEventSchema>;
+
+export const importJobDtoSchema = z
+  .object({
+    id: z.string().uuid(),
+    source: importSourceSchema,
+    status: importJobStatusSchema,
+    report: importReportSchema.nullable(),
+    createdAt: isoTimestampSchema,
+  })
+  .strict();
+
+export type ImportJobDto = z.infer<typeof importJobDtoSchema>;
+
