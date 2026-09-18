@@ -15,6 +15,7 @@ import {
   conversations,
   conversationTags,
   healthSamples,
+  contextPackets,
   importJobs,
   messageReceipts,
   messages,
@@ -55,6 +56,8 @@ export interface ConversationRecord {
   createdAt: string;
   updatedAt: string;
   importSource: "chatgpt" | "claude" | "gemini" | null;
+  activePacketId: string | null;
+  packetAppliedAt: string | null;
 }
 
 export interface SearchHitRecord {
@@ -93,6 +96,7 @@ export interface MessageRecord {
   status: MessageStatus;
   createdAt: string;
   receipt: ReceiptRecord | null;
+  pinned: boolean;
 }
 
 export interface ProviderRecord {
@@ -125,6 +129,24 @@ export interface SpendCapRecord {
   scope: string;
   limitUsd: string;
   createdAt: string;
+}
+
+export interface ContextPacketRecord {
+  id: string;
+  projectId: string | null;
+  tokenEstimate: number | null;
+  privacyMode: "standard" | "strict";
+  origin: {
+    source: "compile" | "import";
+    projectLabel: string;
+    conversationLabel: string;
+  };
+  version: number;
+  createdAt: string;
+}
+
+export interface ContextPacketStored extends ContextPacketRecord {
+  payloadJson: string;
 }
 
 export interface SpendCapOverrideRecord {
@@ -387,6 +409,8 @@ export class HubRepos {
         row.importSource === "chatgpt" || row.importSource === "claude" || row.importSource === "gemini"
           ? row.importSource
           : null,
+      activePacketId: row.activePacketId ?? null,
+      packetAppliedAt: row.packetAppliedAt !== null && row.packetAppliedAt !== undefined ? iso(row.packetAppliedAt) : null,
     };
   }
 
@@ -405,6 +429,7 @@ export class HubRepos {
       status: asStatus(row.status),
       createdAt: iso(row.createdAt),
       receipt,
+      pinned: row.pinned === 1,
     };
   }
 
@@ -547,7 +572,17 @@ export class HubRepos {
         externalId: null,
       })
       .run();
-    return { id, projectId, title, tags: [], createdAt: iso(now), updatedAt: iso(now), importSource: null };
+    return {
+      id,
+      projectId,
+      title,
+      tags: [],
+      createdAt: iso(now),
+      updatedAt: iso(now),
+      importSource: null,
+      activePacketId: null,
+      packetAppliedAt: null,
+    };
   }
 
   removeConversation(id: string): void {
@@ -567,7 +602,16 @@ export class HubRepos {
       }
     }
     const now = Date.now();
-    this.db.update(conversations).set({ projectId, updatedAt: now }).where(eq(conversations.id, id)).run();
+    this.db
+      .update(conversations)
+      .set({
+        projectId,
+        updatedAt: now,
+        activePacketId: null,
+        packetAppliedAt: null,
+      })
+      .where(eq(conversations.id, id))
+      .run();
     const moved = this.getConversation(id);
     if (!moved) {
       throw new Error("Conversation not found");
@@ -842,6 +886,7 @@ export class HubRepos {
         contentCipher: encryptUtf8(input.content, this.masterKey),
         status,
         createdAt: now,
+        pinned: 0,
       })
       .run();
     this.db
@@ -1593,6 +1638,155 @@ export class HubRepos {
       endpointUrl: input.providerSlug === "custom" ? this.getCustomBaseUrl(id) : null,
       createdAt: iso(now),
     };
+  }
+
+  private parsePacketOrigin(raw: string): {
+    source: "compile" | "import";
+    projectLabel: string;
+    conversationLabel: string;
+  } {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        return { source: "compile", projectLabel: "", conversationLabel: "" };
+      }
+      const record = parsed as Record<string, unknown>;
+      const source = record.source === "import" ? "import" : "compile";
+      const projectLabel = typeof record.projectLabel === "string" ? record.projectLabel.slice(0, 200) : "";
+      const conversationLabel =
+        typeof record.conversationLabel === "string" ? record.conversationLabel.slice(0, 200) : "";
+      return { source, projectLabel, conversationLabel };
+    } catch {
+      return { source: "compile", projectLabel: "", conversationLabel: "" };
+    }
+  }
+
+  private toContextPacket(
+    row: typeof contextPackets.$inferSelect,
+    payloadJson: string | null,
+  ): ContextPacketRecord | ContextPacketStored {
+    const base: ContextPacketRecord = {
+      id: row.id,
+      projectId: row.projectId,
+      tokenEstimate: row.tokenEstimate,
+      privacyMode: row.privacyMode === "strict" ? "strict" : "standard",
+      origin: this.parsePacketOrigin(row.origin),
+      version: row.version,
+      createdAt: iso(row.createdAt),
+    };
+    if (payloadJson === null) {
+      return base;
+    }
+    return { ...base, payloadJson };
+  }
+
+  listContextPackets(projectId: string | null): ContextPacketRecord[] {
+    const rows =
+      projectId === null
+        ? this.db.select().from(contextPackets).where(isNull(contextPackets.projectId)).all()
+        : this.db.select().from(contextPackets).where(eq(contextPackets.projectId, projectId)).all();
+    return rows
+      .map((row) => this.toContextPacket(row, null) as ContextPacketRecord)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  getContextPacket(id: string): ContextPacketStored | null {
+    const row = this.db.select().from(contextPackets).where(eq(contextPackets.id, id)).get();
+    if (!row) {
+      return null;
+    }
+    return this.toContextPacket(row, decryptUtf8(row.payloadCipher, this.masterKey)) as ContextPacketStored;
+  }
+
+  createContextPacket(input: {
+    projectId: string | null;
+    privacyMode: "standard" | "strict";
+    origin: { source: "compile" | "import"; projectLabel: string; conversationLabel: string };
+    tokenEstimate: number;
+    payloadJson: string;
+  }): ContextPacketStored {
+    if (input.projectId) {
+      const project = this.getProject(input.projectId);
+      if (!project) {
+        throw new Error("Project not found");
+      }
+    }
+    const now = Date.now();
+    const id = randomUUID();
+    this.db
+      .insert(contextPackets)
+      .values({
+        id,
+        projectId: input.projectId,
+        payloadCipher: encryptUtf8(input.payloadJson, this.masterKey),
+        tokenEstimate: input.tokenEstimate,
+        createdAt: now,
+        privacyMode: input.privacyMode,
+        origin: JSON.stringify(input.origin),
+        version: 1,
+      })
+      .run();
+    const stored = this.getContextPacket(id);
+    if (!stored) {
+      throw new Error("Packet not found");
+    }
+    return stored;
+  }
+
+  applyContextPacket(conversationId: string, packetId: string): ConversationRecord {
+    const conversation = this.getConversation(conversationId);
+    if (!conversation) {
+      throw new Error("Conversation not found");
+    }
+    const packet = this.getContextPacket(packetId);
+    if (!packet) {
+      throw new Error("Packet not found");
+    }
+    if (packet.projectId !== conversation.projectId) {
+      throw new Error("Packet belongs to another project");
+    }
+    const now = Date.now();
+    this.db
+      .update(conversations)
+      .set({ activePacketId: packetId, packetAppliedAt: now, updatedAt: now })
+      .where(eq(conversations.id, conversationId))
+      .run();
+    const updated = this.getConversation(conversationId);
+    if (!updated) {
+      throw new Error("Conversation not found");
+    }
+    return updated;
+  }
+
+  clearContextPacket(conversationId: string): ConversationRecord {
+    const conversation = this.getConversation(conversationId);
+    if (!conversation) {
+      throw new Error("Conversation not found");
+    }
+    const now = Date.now();
+    this.db
+      .update(conversations)
+      .set({ activePacketId: null, packetAppliedAt: null, updatedAt: now })
+      .where(eq(conversations.id, conversationId))
+      .run();
+    const updated = this.getConversation(conversationId);
+    if (!updated) {
+      throw new Error("Conversation not found");
+    }
+    return updated;
+  }
+
+  setMessagePinned(id: string, pinned: boolean): MessageRecord {
+    const row = this.db.select().from(messages).where(eq(messages.id, id)).get();
+    if (!row) {
+      throw new Error("Message not found");
+    }
+    this.db.update(messages).set({ pinned: pinned ? 1 : 0 }).where(eq(messages.id, id)).run();
+    const updated = this.getMessage(id);
+    if (!updated) {
+      throw new Error("Message not found");
+    }
+    return updated;
   }
 
   async removeProviderKey(id: string): Promise<void> {
