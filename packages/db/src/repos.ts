@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, gte, isNull, ne } from "drizzle-orm";
+import { and, desc, eq, gte, isNotNull, isNull, ne } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
+import type Database from "better-sqlite3";
 import {
   decryptUtf8,
   encryptUtf8,
@@ -14,6 +15,7 @@ import {
   conversations,
   conversationTags,
   healthSamples,
+  importJobs,
   messageReceipts,
   messages,
   projects,
@@ -52,6 +54,7 @@ export interface ConversationRecord {
   tags: string[];
   createdAt: string;
   updatedAt: string;
+  importSource: "chatgpt" | "claude" | "gemini" | null;
 }
 
 export interface SearchHitRecord {
@@ -75,6 +78,7 @@ export interface ReceiptRecord {
   latencyMs: number | null;
   costUsd: string | null;
   errorCode: string | null;
+  source: "chat" | "import";
   createdAt: string;
 }
 
@@ -151,6 +155,7 @@ export interface WorkspaceSessionRecord {
   temperature: number;
   maxTokens: number | null;
   extraSystem: string;
+  importedInbox: boolean;
 }
 
 export interface AppPrefsRecord {
@@ -190,6 +195,7 @@ const DEFAULT_SESSION: WorkspaceSessionRecord = {
   temperature: 1,
   maxTokens: null,
   extraSystem: "",
+  importedInbox: false,
 };
 
 function maskListedKey(last4: string, slug: string): string {
@@ -333,6 +339,7 @@ function asStatus(value: string): MessageStatus {
 export class HubRepos {
   constructor(
     private readonly db: HubDrizzle,
+    private readonly sqlite: Database.Database,
     private readonly masterKey: Buffer,
     private readonly secrets: SecretStore,
   ) {}
@@ -348,6 +355,7 @@ export class HubRepos {
       latencyMs: row.latencyMs,
       costUsd: row.costUsd,
       errorCode: row.errorCode,
+      source: row.source === "import" ? "import" : "chat",
       createdAt: iso(row.createdAt),
     };
   }
@@ -375,6 +383,10 @@ export class HubRepos {
       tags: this.listConversationTagNames(row.id),
       createdAt: iso(row.createdAt),
       updatedAt: iso(row.updatedAt),
+      importSource:
+        row.importSource === "chatgpt" || row.importSource === "claude" || row.importSource === "gemini"
+          ? row.importSource
+          : null,
     };
   }
 
@@ -495,10 +507,20 @@ export class HubRepos {
     this.db.delete(projects).where(eq(projects.id, id)).run();
   }
 
-  listConversations(projectId: string | null): ConversationRecord[] {
+  listConversations(projectId: string | null, inbox: "avulsas" | "imported" = "avulsas"): ConversationRecord[] {
     const rows =
       projectId === null
-        ? this.db.select().from(conversations).where(isNull(conversations.projectId)).all()
+        ? inbox === "imported"
+          ? this.db
+              .select()
+              .from(conversations)
+              .where(and(isNull(conversations.projectId), isNotNull(conversations.importSource)))
+              .all()
+          : this.db
+              .select()
+              .from(conversations)
+              .where(and(isNull(conversations.projectId), isNull(conversations.importSource)))
+              .all()
         : this.db.select().from(conversations).where(eq(conversations.projectId, projectId)).all();
     return rows
       .map((row) => this.toConversation(row))
@@ -521,14 +543,139 @@ export class HubRepos {
         titleCipher: encryptUtf8(title, this.masterKey),
         createdAt: now,
         updatedAt: now,
+        importSource: null,
+        externalId: null,
       })
       .run();
-    return { id, projectId, title, tags: [], createdAt: iso(now), updatedAt: iso(now) };
+    return { id, projectId, title, tags: [], createdAt: iso(now), updatedAt: iso(now), importSource: null };
   }
 
   removeConversation(id: string): void {
     this.db.delete(conversationTags).where(eq(conversationTags.conversationId, id)).run();
     this.db.delete(conversations).where(eq(conversations.id, id)).run();
+  }
+
+  moveConversation(id: string, projectId: string | null): ConversationRecord {
+    const existing = this.getConversation(id);
+    if (!existing) {
+      throw new Error("Conversation not found");
+    }
+    if (projectId) {
+      const project = this.getProject(projectId);
+      if (!project) {
+        throw new Error("Project not found");
+      }
+    }
+    const now = Date.now();
+    this.db.update(conversations).set({ projectId, updatedAt: now }).where(eq(conversations.id, id)).run();
+    const moved = this.getConversation(id);
+    if (!moved) {
+      throw new Error("Conversation not found");
+    }
+    return moved;
+  }
+
+  findConversationByImportIdentity(
+    source: "chatgpt" | "claude" | "gemini",
+    externalId: string,
+  ): ConversationRecord | null {
+    const row = this.db
+      .select()
+      .from(conversations)
+      .where(and(eq(conversations.importSource, source), eq(conversations.externalId, externalId)))
+      .get();
+    return row ? this.toConversation(row) : null;
+  }
+
+  importConversation(input: {
+    projectId: string | null;
+    source: "chatgpt" | "claude" | "gemini";
+    externalId: string;
+    title: string;
+    createdAtMs: number;
+    updatedAtMs: number;
+    messages: Array<{ role: MessageRole; content: string; createdAtMs: number }>;
+  }): { outcome: "created" | "skipped" | "empty"; conversationId: string | null } {
+    if (input.messages.length === 0) {
+      return { outcome: "empty", conversationId: null };
+    }
+    const existing = this.findConversationByImportIdentity(input.source, input.externalId);
+    if (existing) {
+      return { outcome: "skipped", conversationId: existing.id };
+    }
+    const title = redactSecrets(input.title).slice(0, 200) || "Imported chat";
+    const id = randomUUID();
+    const createdAt = input.createdAtMs;
+    const updatedAt = input.updatedAtMs;
+    this.sqlite.transaction(() => {
+      this.db
+        .insert(conversations)
+        .values({
+          id,
+          projectId: input.projectId,
+          titleCipher: encryptUtf8(title, this.masterKey),
+          createdAt,
+          updatedAt,
+          importSource: input.source,
+          externalId: input.externalId,
+        })
+        .run();
+      let parentId: string | null = null;
+      let branchId: string | null = null;
+      for (const message of input.messages) {
+        const stored = this.createMessage({
+          conversationId: id,
+          role: message.role,
+          content: redactSecrets(message.content),
+          parentId,
+          branchId,
+          status: "complete",
+          createdAtMs: message.createdAtMs,
+        });
+        parentId = stored.id;
+        branchId = stored.branchId;
+        if (message.role !== "assistant") {
+          continue;
+        }
+        this.createReceipt({
+          messageId: stored.id,
+          provider: input.source,
+          model: null,
+          tokensIn: null,
+          tokensOut: null,
+          latencyMs: null,
+          costUsd: null,
+          errorCode: null,
+          source: "import",
+        });
+      }
+      this.db.update(conversations).set({ updatedAt }).where(eq(conversations.id, id)).run();
+    })();
+    return { outcome: "created", conversationId: id };
+  }
+
+  createImportJob(source: "chatgpt" | "claude" | "gemini"): { id: string; createdAt: string } {
+    const id = randomUUID();
+    const now = Date.now();
+    this.db
+      .insert(importJobs)
+      .values({
+        id,
+        source,
+        status: "queued",
+        reportJson: null,
+        createdAt: now,
+      })
+      .run();
+    return { id, createdAt: iso(now) };
+  }
+
+  updateImportJob(
+    id: string,
+    status: "queued" | "running" | "complete" | "cancelled" | "failed",
+    reportJson: string | null,
+  ): void {
+    this.db.update(importJobs).set({ status, reportJson }).where(eq(importJobs.id, id)).run();
   }
 
   listConversationTagNames(conversationId: string): string[] {
@@ -659,6 +806,7 @@ export class HubRepos {
     parentId: string | null;
     branchId: string | null;
     status?: MessageStatus;
+    createdAtMs?: number;
   }): MessageRecord {
     const conversation = this.db
       .select()
@@ -679,7 +827,7 @@ export class HubRepos {
     }
     branchId = branchId ?? randomUUID();
 
-    const now = Date.now();
+    const now = input.createdAtMs ?? Date.now();
     const id = randomUUID();
     const status = input.status ?? "complete";
     this.db
@@ -888,12 +1036,14 @@ export class HubRepos {
     latencyMs: number | null;
     costUsd: string | null;
     errorCode: string | null;
+    source?: "chat" | "import";
   }): ReceiptRecord {
     const message = this.db.select().from(messages).where(eq(messages.id, input.messageId)).get();
     if (!message) {
       throw new Error("Message not found");
     }
     const existing = this.getReceipt(input.messageId);
+    const source = input.source ?? "chat";
     if (existing) {
       this.db
         .update(messageReceipts)
@@ -905,6 +1055,7 @@ export class HubRepos {
           latencyMs: input.latencyMs,
           costUsd: input.costUsd,
           errorCode: input.errorCode,
+          source,
         })
         .where(eq(messageReceipts.id, existing.id))
         .run();
@@ -917,6 +1068,7 @@ export class HubRepos {
         latencyMs: input.latencyMs,
         costUsd: input.costUsd,
         errorCode: input.errorCode,
+        source,
       };
     }
     const now = Date.now();
@@ -933,6 +1085,7 @@ export class HubRepos {
         latencyMs: input.latencyMs,
         costUsd: input.costUsd,
         errorCode: input.errorCode,
+        source,
         createdAt: now,
       })
       .run();
@@ -946,6 +1099,7 @@ export class HubRepos {
       latencyMs: input.latencyMs,
       costUsd: input.costUsd,
       errorCode: input.errorCode,
+      source,
       createdAt: iso(now),
     };
   }
@@ -1123,6 +1277,7 @@ export class HubRepos {
           temperature,
           maxTokens,
           extraSystem,
+          importedInbox: "importedInbox" in parsed && parsed.importedInbox === true,
         };
       }
     }
