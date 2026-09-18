@@ -53,6 +53,7 @@ export const receiptDtoSchema = z.object({
   costUsd: z.string().nullable(),
   errorCode: gatewayErrorCodeSchema.nullable(),
   createdAt: z.string().min(1),
+  source: z.enum(["chat", "import"]),
 });
 
 export type ReceiptDto = z.infer<typeof receiptDtoSchema>;
