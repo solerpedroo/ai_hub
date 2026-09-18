@@ -12,6 +12,7 @@ import {
   messageUpdateInputSchema,
   packetPreviewInputSchema,
   packetPreviewResultSchema,
+  packetsImportInputSchema,
   providerKeyDtoSchema,
   projectCreateInputSchema,
   projectDtoSchema,
@@ -132,6 +133,7 @@ describe("messageDtoSchema", () => {
         status: "complete",
         createdAt: "2026-09-17T00:00:00.000Z",
         receipt: null,
+        pinned: false,
       }),
     ).toThrow();
   });
@@ -328,8 +330,15 @@ describe("wave 7 contracts", () => {
       estimatedCostUsd: "0.000001",
       capWarnings: ["request"],
       capBlocked: null,
+      included: [{ kind: "message", id: null, label: "hello", tokens: 2 }],
+      omitted: [],
+      destinationModel: "gpt-4o-mini",
+      destinationProvider: "openai",
+      privacyMode: "standard",
+      appliedPacketId: null,
     });
     expect(parsed.capWarnings).toEqual(["request"]);
+    expect(parsed.included).toHaveLength(1);
     expect(() =>
       packetPreviewResultSchema.parse({
         tokenEstimate: 12,
@@ -347,6 +356,18 @@ describe("wave 7 contracts", () => {
         pendingContent: "Hello",
         maxTokens: 256,
         secret: "sk-testfixtureABCDEFGH",
+      }),
+    ).toThrow();
+  });
+});
+
+describe("wave 10 packet contracts", () => {
+  it("rejects a filesystem path on packet import", () => {
+    expect(() =>
+      packetsImportInputSchema.parse({
+        ticket: "11111111-1111-4111-8111-111111111111",
+        projectId: "22222222-2222-4222-8222-222222222222",
+        path: "C:\\\\secrets\\\\packet.json",
       }),
     ).toThrow();
   });
