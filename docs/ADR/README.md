@@ -68,3 +68,8 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W07-003](./ADR-W07-003-explicit-fallback.md) | W07 | Fallback de provider só com confirmação | accepted |
 | [ADR-W07-004](./ADR-W07-004-debug-meta-no-auth.md) | W07 | Debug snapshot sem auth/headers | accepted |
 | [ADR-W07-005](./ADR-W07-005-retry-transient-only.md) | W07 | Retry só transiente e antes do 1º token | accepted |
+| [ADR-W08-001](./ADR-W08-001-first-run-wizard.md) | W08 | Wizard first-run curto; skip se já há key | accepted |
+| [ADR-W08-002](./ADR-W08-002-electron-builder-nsis.md) | W08 | electron-builder NSIS Windows | accepted |
+| [ADR-W08-003](./ADR-W08-003-electron-updater-github.md) | W08 | electron-updater GitHub; feed morto não derruba | accepted |
+| [ADR-W08-004](./ADR-W08-004-crash-reporter-opt-in-local.md) | W08 | Crash reporter opt-in, dumps locais | accepted |
+| [ADR-W08-005](./ADR-W08-005-composer-secret-hint.md) | W08 | Aviso de secret no composer via shared | accepted |
