@@ -60,6 +60,11 @@ export function HomeView({
   onToggleCompact,
   packetPreview,
   modelSwitchNotice,
+  conversationCost,
+  projectCost,
+  showAllowOnce,
+  onAllowOnce,
+  onComposerDraft,
 }: {
   project: ProjectDto | null;
   conversations: ConversationDto[];
@@ -83,7 +88,7 @@ export function HomeView({
   onSelectTemperature: (value: number) => void;
   onSelectMaxTokens: (value: number | null) => void;
   onSelectExtraSystem: (value: string) => void;
-  onSend: (content: string) => Promise<void>;
+  onSend: (content: string) => Promise<boolean>;
   onAbort: () => Promise<void>;
   onRegenerate: (messageId: string) => Promise<void>;
   onContinue: () => Promise<void>;
@@ -98,6 +103,11 @@ export function HomeView({
   onToggleCompact: (value: boolean) => void;
   packetPreview: PacketPreviewResult | null;
   modelSwitchNotice: boolean;
+  conversationCost: string | null;
+  projectCost: string | null;
+  showAllowOnce: boolean;
+  onAllowOnce: () => void;
+  onComposerDraft: (value: string) => void;
 }): JSX.Element {
   const { t } = useTranslation();
   const [title, setTitle] = useState("");
@@ -128,7 +138,9 @@ export function HomeView({
     setEditing(false);
     setTreeOpen(false);
     setTagDraft("");
-  }, [selectedConversationId]);
+    setDraft("");
+    onComposerDraft("");
+  }, [onComposerDraft, selectedConversationId]);
 
   useEffect(() => {
     setProjectName(project?.name ?? "");
@@ -452,6 +464,16 @@ export function HomeView({
                 </>
               )}
               <div className="ml-auto flex flex-wrap items-center gap-1">
+                {conversationCost ? (
+                  <span className="text-[11px] text-muted-foreground" data-testid="cost-conversation">
+                    {t("workspace.cost.conversation", { usd: conversationCost })}
+                  </span>
+                ) : null}
+                {projectCost ? (
+                  <span className="text-[11px] text-muted-foreground" data-testid="cost-project">
+                    {t("workspace.cost.project", { usd: projectCost })}
+                  </span>
+                ) : null}
                 {packetPreview ? (
                   <span
                     className="rounded-md border px-2 py-1 text-[11px] text-muted-foreground"
@@ -459,6 +481,13 @@ export function HomeView({
                   >
                     {t("workspace.packet.badge", { n: packetPreview.tokenEstimate })}
                   </span>
+                ) : null}
+                {packetPreview?.estimatedCostUsd ? (
+                  <span className="text-[11px] text-muted-foreground" data-testid="send-estimate">
+                    {t("workspace.estimate", { usd: packetPreview.estimatedCostUsd })}
+                  </span>
+                ) : packetPreview && selectedCatalog === null ? (
+                  <span className="text-[11px] text-muted-foreground">{t("workspace.estimate.none")}</span>
                 ) : null}
                 <Button
                   type="button"
@@ -520,6 +549,15 @@ export function HomeView({
             ) : compactHistory ? (
               <p className="border-b px-3 py-1 text-[11px] text-muted-foreground">{t("workspace.compact.on")}</p>
             ) : null}
+            {packetPreview?.capBlocked ? (
+              <p className="border-b px-3 py-1 text-[12px] text-destructive" role="status" data-testid="cap-block">
+                {t("workspace.cap.block", { scope: t(`caps.scope.${packetPreview.capBlocked}`) })}
+              </p>
+            ) : packetPreview && packetPreview.capWarnings.length > 0 ? (
+              <p className="border-b px-3 py-1 text-[12px]" role="status" data-testid="cap-warn">
+                {t("workspace.cap.warn", { scope: t(`caps.scope.${packetPreview.capWarnings[0]}`) })}
+              </p>
+            ) : null}
             {exportNotice ? (
               <p className="border-b px-3 py-1 text-[11px] text-muted-foreground" role="status">
                 {exportNotice}
@@ -570,7 +608,10 @@ export function HomeView({
             <ChatComposer
               key={selectedConversationId}
               value={draft}
-              onChange={setDraft}
+              onChange={(value) => {
+                setDraft(value);
+                onComposerDraft(value);
+              }}
               streaming={streaming}
               sending={sending}
               disabled={!hasKey || editing}
@@ -579,7 +620,12 @@ export function HomeView({
                 if (!next) {
                   return;
                 }
-                void onSend(next).then(() => setDraft(""));
+                void onSend(next).then((ok) => {
+                  if (ok) {
+                    setDraft("");
+                    onComposerDraft("");
+                  }
+                });
               }}
               onAbort={() => {
                 void onAbort();
@@ -607,9 +653,16 @@ export function HomeView({
           </div>
         )}
         {error ? (
-          <p className="border-t px-3 py-2 text-destructive" role="alert" data-testid="workspace-error">
-            {error}
-          </p>
+          <div className="flex flex-wrap items-center gap-2 border-t px-3 py-2">
+            <p className="text-destructive" role="alert" data-testid="workspace-error">
+              {error}
+            </p>
+            {showAllowOnce ? (
+              <Button type="button" size="sm" data-testid="cap-allow-once" onClick={onAllowOnce} disabled={busy}>
+                {t("workspace.cap.allowOnce")}
+              </Button>
+            ) : null}
+          </div>
         ) : null}
       </section>
     </div>
