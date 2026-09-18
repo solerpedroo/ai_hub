@@ -1,0 +1,3288 @@
+﻿diff --git a/README.md b/README.md
+index b4ca634..15fe299 100644
+--- a/README.md
++++ b/README.md
+@@ -28,7 +28,8 @@ A janela ├® frameless. Projetos e conversas ficam no SQLite local (campos sens├¡
+ ## Limita├º├Áes do MVP
+ 
+ - Windows first. **Sem build macOS assinado.**
+-- Sem RAG, MCP, agentes, import Hub, packet port├ítil completo, artifacts, skills, @-mentions, sync ou team.
++- Sem RAG, MCP, agentes, packet port├ítil completo, artifacts, skills, @-mentions, sync ou team.
++- Import Hub: ChatGPT (ZIP/JSON), Claude JSON e Gemini `MyActivity.json` (best-effort). Takeout HTML do Gemini n├úo ├® suportado. Anexos bin├írios viram placeholder. Reimport do mesmo `external_id` n├úo duplica.
+ - Auto-update consulta GitHub Releases; feed vazio/fora **n├úo** fecha o app.
+ - Crash dumps s├úo **opt-in** e s├│ locais (sem upload, sem conversa).
+ - e2e de CI usa adapter mock (`AI_HUB_E2E=1`), n├úo chaves reais.
+diff --git a/apps/desktop/e2e/fixtures/chatgpt-conversations.json b/apps/desktop/e2e/fixtures/chatgpt-conversations.json
+new file mode 100644
+index 0000000..c1c6e74
+--- /dev/null
++++ b/apps/desktop/e2e/fixtures/chatgpt-conversations.json
+@@ -0,0 +1,42 @@
++[
++  {
++    "id": "conv-1",
++    "title": "Alpha thread",
++    "create_time": 1700000000,
++    "update_time": 1700000100,
++    "current_node": "n3",
++    "mapping": {
++      "n0": { "id": "n0", "parent": null, "message": null },
++      "n1": {
++        "id": "n1",
++        "parent": "n0",
++        "message": {
++          "author": { "role": "user" },
++          "create_time": 1700000000,
++          "content": { "content_type": "text", "parts": ["Hello from ChatGPT"] }
++        }
++      },
++      "n2": {
++        "id": "n2",
++        "parent": "n1",
++        "message": {
++          "author": { "role": "assistant" },
++          "create_time": 1700000010,
++          "content": { "content_type": "text", "parts": ["Hi there"] }
++        }
++      },
++      "n3": {
++        "id": "n3",
++        "parent": "n2",
++        "message": {
++          "author": { "role": "user" },
++          "create_time": 1700000020,
++          "content": {
++            "content_type": "text",
++            "parts": ["See this", { "content_type": "image_asset_pointer", "asset_pointer": "file-1" }]
++          }
++        }
++      }
++    }
++  }
++]
+diff --git a/apps/desktop/e2e/import.spec.ts b/apps/desktop/e2e/import.spec.ts
+new file mode 100644
+index 0000000..e730647
+--- /dev/null
++++ b/apps/desktop/e2e/import.spec.ts
+@@ -0,0 +1,53 @@
++import { createRequire } from "node:module";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { _electron as electron, expect, test, type ElectronApplication } from "@playwright/test";
++
++const require = createRequire(import.meta.url);
++const electronBinary = require("electron") as string;
++const appRoot = path.join(fileURLToPath(new URL("..", import.meta.url)));
++const fixturePath = path.join(appRoot, "e2e/fixtures/chatgpt-conversations.json");
++
++async function launchHub(): Promise<ElectronApplication> {
++  return electron.launch({
++    executablePath: electronBinary,
++    args: [path.join(appRoot, "out/main/index.js")],
++    cwd: appRoot,
++    env: {
++      ...process.env,
++      AI_HUB_E2E: "1",
++      AI_HUB_E2E_IMPORT_FIXTURE: fixturePath,
++      NODE_ENV: "production",
++    },
++  });
++}
++
++test("imports a ChatGPT export into Importadas and skips the same id on reimport", async () => {
++  const app = await launchHub();
++  try {
++    const window = await app.firstWindow();
++    await window.getByTestId("nav-import").waitFor({ state: "visible", timeout: 30_000 });
++    await window.getByTestId("nav-import").click();
++    await window.getByTestId("import-pick-file").click();
++    await expect(window.getByTestId("import-file-name")).toContainText("chatgpt-conversations.json");
++    await window.getByTestId("import-start").click();
++    const report = window.getByTestId("import-report");
++    await expect(report).toHaveAttribute("data-ok", "1", { timeout: 30_000 });
++    await expect(report).toHaveAttribute("data-skipped", "0");
++
++    await window.getByTestId("import-pick-file").click();
++    await window.getByTestId("import-start").click();
++    await expect(report).toHaveAttribute("data-ok", "0", { timeout: 30_000 });
++    await expect(report).toHaveAttribute("data-skipped", "1");
++
++    await window.getByTestId("import-open-destination").click();
++    await expect(window.getByTestId("conversation-item")).toContainText("Alpha thread");
++    await expect(window.getByTestId("message-user").first()).toContainText("Hello from ChatGPT");
++    await expect(window.getByTestId("message-assistant")).toContainText("Hi there");
++    await expect(window.getByTestId("message-user").last()).toContainText("[file not imported]");
++    await window.getByTestId("receipt-open").click();
++    await expect(window.getByTestId("receipt-source")).toHaveAttribute("data-source", "import");
++  } finally {
++    await app.close();
++  }
++});
+diff --git a/apps/desktop/electron.vite.config.ts b/apps/desktop/electron.vite.config.ts
+index 0ebf257..4475bc0 100644
+--- a/apps/desktop/electron.vite.config.ts
++++ b/apps/desktop/electron.vite.config.ts
+@@ -9,6 +9,7 @@ const securityIndex = resolve(__dirname, "../../packages/security/src/index.ts")
+ const securityKeytar = resolve(__dirname, "../../packages/security/src/keytar-store.ts");
+ 
+ const mainAliases = {
++  "@ai-hub/shared/import": resolve(__dirname, "../../packages/shared/src/import/index.ts"),
+   "@ai-hub/shared": shared,
+   "@ai-hub/db": db,
+   "@ai-hub/ai-gateway": gateway,
+diff --git a/apps/desktop/src/main/conversation-export.ts b/apps/desktop/src/main/conversation-export.ts
+index 659ab94..f92e274 100644
+--- a/apps/desktop/src/main/conversation-export.ts
++++ b/apps/desktop/src/main/conversation-export.ts
+@@ -39,6 +39,7 @@ export function buildConversationExportDocument(input: {
+     tags: string[];
+     createdAt: string;
+     updatedAt: string;
++    importSource?: "chatgpt" | "claude" | "gemini" | null;
+   };
+   messages: MessageDto[];
+   branchLabels: Record<string, string>;
+@@ -48,7 +49,10 @@ export function buildConversationExportDocument(input: {
+     version: 1,
+     mode: input.mode,
+     exportedAt: input.exportedAt,
+-    conversation: conversationDtoSchema.parse(input.conversation),
++    conversation: conversationDtoSchema.parse({
++      ...input.conversation,
++      importSource: input.conversation.importSource ?? null,
++    }),
+     branchLabels: branchLabelsSchema.parse(input.branchLabels),
+     messages: selected,
+   });
+diff --git a/apps/desktop/src/main/import-job.ts b/apps/desktop/src/main/import-job.ts
+new file mode 100644
+index 0000000..b622ec8
+--- /dev/null
++++ b/apps/desktop/src/main/import-job.ts
+@@ -0,0 +1,177 @@
++import { randomUUID } from "node:crypto";
++import { readFile } from "node:fs/promises";
++import { basename } from "node:path";
++import { BrowserWindow, dialog, type OpenDialogOptions, type WebContents } from "electron";
++import { redactSecrets } from "@ai-hub/security";
++import {
++  IpcChannel,
++  importEventSchema,
++  importPickResultSchema,
++  importReportSchema,
++  type ImportEvent,
++  type ImportPickResult,
++  type ImportReport,
++  type ImportStartInput,
++  type ImportStartResult,
++} from "@ai-hub/shared";
++import { ImportParseError, parseImportBytes } from "@ai-hub/shared/import";
++import { isE2eMode } from "./e2e-mode";
++import { getHubDatabase } from "./persistence";
++
++const tickets = new Map<string, { path: string; fileName: string }>();
++const controllers = new Map<string, AbortController>();
++
++function emit(sender: WebContents, event: ImportEvent): void {
++  if (sender.isDestroyed()) {
++    return;
++  }
++  sender.send(IpcChannel.importEvent, importEventSchema.parse(event));
++}
++
++function emptyReport(total: number): ImportReport {
++  return importReportSchema.parse({
++    ok: 0,
++    skipped: 0,
++    errors: [],
++    attachmentsSkipped: 0,
++    total,
++  });
++}
++
++export async function pickImportFile(sender: WebContents): Promise<ImportPickResult> {
++  const fixture = process.env.AI_HUB_E2E_IMPORT_FIXTURE;
++  if (isE2eMode() && fixture && fixture.trim().length > 0) {
++    const ticket = randomUUID();
++    const fileName = basename(fixture);
++    tickets.set(ticket, { path: fixture, fileName });
++    return importPickResultSchema.parse({ status: "picked", ticket, fileName });
++  }
++  const window = BrowserWindow.fromWebContents(sender);
++  const options: OpenDialogOptions = {
++    properties: ["openFile"],
++    filters: [
++      { name: "Exports", extensions: ["json", "zip"] },
++      { name: "JSON", extensions: ["json"] },
++      { name: "ZIP", extensions: ["zip"] },
++    ],
++  };
++  const choice = window ? await dialog.showOpenDialog(window, options) : await dialog.showOpenDialog(options);
++  const selected = choice.filePaths[0];
++  if (choice.canceled || !selected) {
++    return importPickResultSchema.parse({ status: "cancelled" });
++  }
++  const ticket = randomUUID();
++  const fileName = basename(selected);
++  tickets.set(ticket, { path: selected, fileName });
++  return importPickResultSchema.parse({ status: "picked", ticket, fileName });
++}
++
++export function startImportJob(input: ImportStartInput, sender: WebContents): ImportStartResult {
++  const ticket = tickets.get(input.ticket);
++  if (!ticket) {
++    throw new Error("Import file is no longer available. Pick the file again.");
++  }
++  const repos = getHubDatabase().repos;
++  if (input.projectId && !repos.getProject(input.projectId)) {
++    throw new Error("Project not found");
++  }
++  tickets.delete(input.ticket);
++  const job = repos.createImportJob(input.source);
++  const controller = new AbortController();
++  controllers.set(job.id, controller);
++  repos.updateImportJob(job.id, "running", null);
++  void runImport({
++    jobId: job.id,
++    path: ticket.path,
++    source: input.source,
++    projectId: input.projectId,
++    sender,
++    signal: controller.signal,
++  });
++  return { jobId: job.id };
++}
++
++export function cancelImportJob(jobId: string): void {
++  controllers.get(jobId)?.abort();
++}
++
++async function runImport(input: {
++  jobId: string;
++  path: string;
++  source: ImportStartInput["source"];
++  projectId: string | null;
++  sender: WebContents;
++  signal: AbortSignal;
++}): Promise<void> {
++  const repos = getHubDatabase().repos;
++  try {
++    const bytes = new Uint8Array(await readFile(input.path));
++    const conversations = parseImportBytes(input.source, bytes);
++    const report = emptyReport(conversations.length);
++    for (const [index, conversation] of conversations.entries()) {
++      if (input.signal.aborted) {
++        persist(input.jobId, "cancelled", report);
++        emit(input.sender, { type: "done", jobId: input.jobId, status: "cancelled", report });
++        return;
++      }
++      const attachments = conversation.messages.filter((message) => message.skippedAttachment).length;
++      try {
++        const result = repos.importConversation({
++          projectId: input.projectId,
++          source: conversation.source,
++          externalId: conversation.externalId,
++          title: conversation.title,
++          createdAtMs: conversation.createdAtMs,
++          updatedAtMs: conversation.updatedAtMs,
++          messages: conversation.messages.map((message) => ({
++            role: message.role,
++            content: message.content,
++            createdAtMs: message.createdAtMs,
++          })),
++        });
++        if (result.outcome === "created") {
++          report.ok += 1;
++          report.attachmentsSkipped += attachments;
++        } else if (result.outcome === "skipped") {
++          report.skipped += 1;
++        } else {
++          report.errors.push({
++            externalId: conversation.externalId,
++            title: conversation.title.slice(0, 200),
++            reason: "empty",
++          });
++        }
++      } catch (error) {
++        report.errors.push({
++          externalId: conversation.externalId,
++          title: conversation.title.slice(0, 200),
++          reason: redactSecrets(error instanceof Error ? error.message : "unknown").slice(0, 200),
++        });
++      }
++      emit(input.sender, {
++        type: "progress",
++        jobId: input.jobId,
++        processed: index + 1,
++        total: report.total,
++        ok: report.ok,
++        skipped: report.skipped,
++      });
++    }
++    persist(input.jobId, "complete", report);
++    emit(input.sender, { type: "done", jobId: input.jobId, status: "complete", report });
++  } catch (error) {
++    const code =
++      error instanceof ImportParseError
++        ? error.code
++        : "generic";
++    const failed = emptyReport(0);
++    persist(input.jobId, "failed", failed);
++    emit(input.sender, { type: "error", jobId: input.jobId, code });
++  } finally {
++    controllers.delete(input.jobId);
++  }
++}
++
++function persist(jobId: string, status: "complete" | "cancelled" | "failed", report: ImportReport): void {
++  getHubDatabase().repos.updateImportJob(jobId, status, JSON.stringify(importReportSchema.parse(report)));
++}
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index 234a059..1b68dcb 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -15,6 +15,7 @@ import {
+   conversationExportResultSchema,
+   conversationListInputSchema,
+   conversationListResultSchema,
++  conversationMoveInputSchema,
+   conversationTagsSetInputSchema,
+   costsAggregateInputSchema,
+   costsAggregateResultSchema,
+@@ -25,6 +26,10 @@ import {
+   appPrefsPatchSchema,
+   updateCheckResultSchema,
+   idInputSchema,
++  importCancelInputSchema,
++  importPickResultSchema,
++  importStartInputSchema,
++  importStartResultSchema,
+   ipcAckResultSchema,
+   messageCreateInputSchema,
+   messageDtoSchema,
+@@ -57,6 +62,7 @@ import { abortChat, sendChat } from "./chat-session";
+ import { exportConversation } from "./conversation-export";
+ import { applyCrashReporterOptIn } from "./crash-reporter";
+ import { getLatestDebugSnapshot } from "./debug-snapshot";
++import { cancelImportJob, pickImportFile, startImportJob } from "./import-job";
+ import { toMessageDto } from "./message-dto";
+ import { previewPacket } from "./packet-preview";
+ import { getHubDatabase } from "./persistence";
+@@ -121,7 +127,7 @@ export function registerWorkspaceIpc(): void {
+     conversationListResultSchema,
+     (input) =>
+       getHubDatabase()
+-        .repos.listConversations(input.projectId)
++        .repos.listConversations(input.projectId, input.inbox ?? "avulsas")
+         .map((row) => conversationDtoSchema.parse(row)),
+   );
+ 
+@@ -174,6 +180,25 @@ export function registerWorkspaceIpc(): void {
+       ),
+   );
+ 
++  registerHandler(
++    IpcChannel.conversationsMove,
++    conversationMoveInputSchema,
++    conversationDtoSchema,
++    (input) => conversationDtoSchema.parse(getHubDatabase().repos.moveConversation(input.conversationId, input.projectId)),
++  );
++
++  registerHandler(IpcChannel.importPickFile, emptyIpcPayloadSchema, importPickResultSchema, (_input, event) =>
++    pickImportFile(event.sender),
++  );
++
++  registerHandler(IpcChannel.importStart, importStartInputSchema, importStartResultSchema, (input, event) =>
++    startImportJob(input, event.sender),
++  );
++
++  registerHandler(IpcChannel.importCancel, importCancelInputSchema, ipcAckResultSchema, (input) => {
++    cancelImportJob(input.jobId);
++  });
++
+   registerHandler(IpcChannel.searchQuery, searchInputSchema, searchResultSchema, (input) =>
+     getHubDatabase().repos.searchWorkspace(input.query),
+   );
+@@ -249,6 +274,7 @@ export function registerWorkspaceIpc(): void {
+         temperature: input.temperature ?? 1,
+         maxTokens: input.maxTokens ?? null,
+         extraSystem: input.extraSystem ?? "",
++        importedInbox: input.importedInbox === true,
+       });
+     },
+   );
+diff --git a/apps/desktop/src/main/message-dto.ts b/apps/desktop/src/main/message-dto.ts
+index a20bea8..945e0e6 100644
+--- a/apps/desktop/src/main/message-dto.ts
++++ b/apps/desktop/src/main/message-dto.ts
+@@ -19,6 +19,7 @@ export function toMessageDto(row: MessageRecord): MessageDto {
+         costUsd: row.receipt.costUsd,
+         errorCode: row.receipt.errorCode ? gatewayErrorCodeSchema.parse(row.receipt.errorCode) : null,
+         createdAt: row.receipt.createdAt,
++        source: row.receipt.source,
+       })
+     : null;
+   return messageDtoSchema.parse({
+diff --git a/apps/desktop/src/main/persistence.ts b/apps/desktop/src/main/persistence.ts
+index 6791aa5..62e6dd1 100644
+--- a/apps/desktop/src/main/persistence.ts
++++ b/apps/desktop/src/main/persistence.ts
+@@ -27,6 +27,7 @@ async function seedE2eWorkspace(database: HubDatabase): Promise<void> {
+     temperature: 1,
+     maxTokens: null,
+     extraSystem: "",
++    importedInbox: false,
+   });
+ }
+ 
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index f5f166f..d6113e6 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -14,6 +14,7 @@ import {
+   conversationCreateInputSchema,
+   conversationListInputSchema,
+   conversationListResultSchema,
++  conversationMoveInputSchema,
+   conversationDtoSchema,
+   conversationExportInputSchema,
+   conversationExportResultSchema,
+@@ -23,6 +24,11 @@ import {
+   debugSnapshotResultSchema,
+   emptyIpcPayloadSchema,
+   healthSummaryListSchema,
++  importCancelInputSchema,
++  importEventSchema,
++  importPickResultSchema,
++  importStartInputSchema,
++  importStartResultSchema,
+   appPrefsSchema,
+   appPrefsPatchSchema,
+   updateCheckResultSchema,
+@@ -158,6 +164,8 @@ const hub: HubApi = {
+         conversationTagsSetInputSchema,
+         conversationDtoSchema,
+       ),
++    move: (input) =>
++      invokeParsed(IpcChannel.conversationsMove, input, conversationMoveInputSchema, conversationDtoSchema),
+   },
+   messages: {
+     list: (input) =>
+@@ -249,6 +257,26 @@ const hub: HubApi = {
+       };
+     },
+   },
++  import: {
++    pickFile: () =>
++      invokeParsed(IpcChannel.importPickFile, empty, emptyIpcPayloadSchema, importPickResultSchema),
++    start: (input) =>
++      invokeParsed(IpcChannel.importStart, input, importStartInputSchema, importStartResultSchema),
++    cancel: (input) => invokeAckWith(IpcChannel.importCancel, input, importCancelInputSchema),
++    onEvent: (listener) => {
++      const wrapped = (_event: unknown, payload: unknown): void => {
++        try {
++          listener(importEventSchema.parse(payload));
++        } catch (error) {
++          rethrowIpcError(error);
++        }
++      };
++      ipcRenderer.on(IpcChannel.importEvent, wrapped);
++      return () => {
++        ipcRenderer.removeListener(IpcChannel.importEvent, wrapped);
++      };
++    },
++  },
+ };
+ 
+ contextBridge.exposeInMainWorld("hub", hub);
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index d773f19..a815a67 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -30,6 +30,7 @@ import { StatusBar } from "@/components/layout/status-bar";
+ import { HomeView } from "@/components/layout/home-view";
+ import { SettingsView } from "@/components/layout/settings-view";
+ import { DebugView } from "@/components/layout/debug-view";
++import { ImportView } from "@/components/layout/import-view";
+ import { OnboardingView } from "@/components/layout/onboarding-view";
+ import { ChromeCommandPalette } from "@/components/layout/command-palette";
+ import type { AppView } from "@/components/layout/types";
+@@ -81,6 +82,7 @@ export function App(): JSX.Element {
+   const [view, setView] = useState<AppView>("home");
+   const [projects, setProjects] = useState<ProjectDto[]>([]);
+   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
++  const [importedInbox, setImportedInbox] = useState(false);
+   const [conversations, setConversations] = useState<ConversationDto[]>([]);
+   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
+   const [messages, setMessages] = useState<MessageDto[]>([]);
+@@ -137,11 +139,18 @@ export function App(): JSX.Element {
+     return list;
+   }, []);
+ 
+-  const loadConversations = useCallback(async (projectId: string | null): Promise<ConversationDto[]> => {
+-    const list = await window.hub.conversations.list({ projectId });
+-    setConversations(list);
+-    return list;
+-  }, []);
++  const loadConversations = useCallback(
++    async (projectId: string | null, inboxImported = false): Promise<ConversationDto[]> => {
++      const list = await window.hub.conversations.list(
++        projectId === null
++          ? { projectId: null, inbox: inboxImported ? "imported" : "avulsas" }
++          : { projectId },
++      );
++      setConversations(list);
++      return list;
++    },
++    [],
++  );
+ 
+   const loadMessages = useCallback(async (conversationId: string): Promise<MessageDto[]> => {
+     const list = await window.hub.messages.list({ conversationId });
+@@ -209,7 +218,8 @@ export function App(): JSX.Element {
+           const project = projectList.find((item) => item.id === session.projectId) ?? null;
+           if (!project) {
+             setSelectedProjectId(null);
+-            const convos = await loadConversations(null);
++            setImportedInbox(false);
++            const convos = await loadConversations(null, false);
+             const conversation =
+               convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
+             if (conversation) {
+@@ -220,7 +230,8 @@ export function App(): JSX.Element {
+             return;
+           }
+           setSelectedProjectId(project.id);
+-          const convos = await loadConversations(project.id);
++          setImportedInbox(false);
++          const convos = await loadConversations(project.id, false);
+           const conversation =
+             convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
+           if (conversation) {
+@@ -229,7 +240,9 @@ export function App(): JSX.Element {
+           }
+         } else {
+           setSelectedProjectId(null);
+-          const convos = await loadConversations(null);
++          const imported = session.importedInbox === true;
++          setImportedInbox(imported);
++          const convos = await loadConversations(null, imported);
+           const conversation =
+             convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
+           if (conversation) {
+@@ -276,9 +289,20 @@ export function App(): JSX.Element {
+         temperature,
+         maxTokens,
+         extraSystem,
++        importedInbox,
+       })
+       .catch(fail);
+-  }, [extraSystem, fail, maxTokens, selectedConversationId, selectedModel, selectedProjectId, sessionReady, temperature]);
++  }, [
++    extraSystem,
++    fail,
++    importedInbox,
++    maxTokens,
++    selectedConversationId,
++    selectedModel,
++    selectedProjectId,
++    sessionReady,
++    temperature,
++  ]);
+ 
+   useEffect(() => {
+     if (view !== "home") {
+@@ -487,7 +511,8 @@ export function App(): JSX.Element {
+         title: t("workspace.untitledChat"),
+       });
+       setError(null);
+-      await loadConversations(selectedProjectId);
++      setImportedInbox(false);
++      await loadConversations(selectedProjectId, false);
+       setSelectedConversationId(created.id);
+       setMessages([]);
+       setBranchLabels({});
+@@ -599,9 +624,11 @@ export function App(): JSX.Element {
+           }}
+           projects={projects}
+           selectedProjectId={selectedProjectId}
++          importedInbox={importedInbox}
+           onSelectProject={(id) => {
+             abortIfLeaving(null);
+             setSelectedProjectId(id);
++            setImportedInbox(false);
+             setSelectedConversationId(null);
+             setMessages([]);
+             setBranchLabels({});
+@@ -611,7 +638,16 @@ export function App(): JSX.Element {
+                 applyProjectPreferences(next, providerKeys);
+               }
+             }
+-            void loadConversations(id).catch(fail);
++            void loadConversations(id, false).catch(fail);
++          }}
++          onSelectImportedInbox={() => {
++            abortIfLeaving(null);
++            setSelectedProjectId(null);
++            setImportedInbox(true);
++            setSelectedConversationId(null);
++            setMessages([]);
++            setBranchLabels({});
++            void loadConversations(null, true).catch(fail);
+           }}
+           onCreateProject={async (name) => {
+             try {
+@@ -620,11 +656,12 @@ export function App(): JSX.Element {
+               const list = await loadProjects();
+               const next = list.find((item) => item.id === created.id) ?? created;
+               setSelectedProjectId(next.id);
++              setImportedInbox(false);
+               setSelectedConversationId(null);
+               setMessages([]);
+               setBranchLabels({});
+               abortIfLeaving(null);
+-              await loadConversations(next.id);
++              await loadConversations(next.id, false);
+               setView("home");
+             } catch {
+               fail();
+@@ -641,7 +678,13 @@ export function App(): JSX.Element {
+             setView("home");
+             void (async () => {
+               try {
+-                await loadConversations(hit.projectId);
++                let convos = await loadConversations(hit.projectId, false);
++                let imported = false;
++                if (hit.projectId === null && !convos.some((item) => item.id === hit.conversationId)) {
++                  convos = await loadConversations(null, true);
++                  imported = true;
++                }
++                setImportedInbox(imported);
+                 setSelectedConversationId(hit.conversationId);
+                 await loadMessages(hit.conversationId);
+                 if (hit.messageId) {
+@@ -660,6 +703,8 @@ export function App(): JSX.Element {
+           {view === "home" ? (
+             <HomeView
+               project={selectedProject}
++              importedInbox={importedInbox}
++              projects={projects}
+               conversations={conversations}
+               selectedConversationId={selectedConversationId}
+               messages={messages}
+@@ -686,7 +731,7 @@ export function App(): JSX.Element {
+                     title,
+                   });
+                   setError(null);
+-                  await loadConversations(selectedProjectId);
++                  await loadConversations(selectedProjectId, importedInbox);
+                   setSelectedConversationId(created.id);
+                   setMessages([]);
+                   setBranchLabels({});
+@@ -823,6 +868,35 @@ export function App(): JSX.Element {
+                   fail();
+                 }
+               }}
++              onMoveConversation={async (projectId) => {
++                if (!selectedConversationId) {
++                  return;
++                }
++                try {
++                  const moved = await window.hub.conversations.move({
++                    conversationId: selectedConversationId,
++                    projectId,
++                  });
++                  setError(null);
++                  if (projectId) {
++                    setSelectedProjectId(projectId);
++                    setImportedInbox(false);
++                    await loadConversations(projectId, false);
++                  } else {
++                    setSelectedProjectId(null);
++                    setImportedInbox(true);
++                    await loadConversations(null, true);
++                  }
++                  setConversations((current) => {
++                    if (current.some((item) => item.id === moved.id)) {
++                      return current.map((item) => (item.id === moved.id ? moved : item));
++                    }
++                    return current;
++                  });
++                } catch {
++                  fail();
++                }
++              }}
+               onSaveProject={async (input: Omit<ProjectUpdateInput, "id">) => {
+                 if (!selectedProjectId) {
+                   return;
+@@ -846,10 +920,11 @@ export function App(): JSX.Element {
+                   setError(null);
+                   await loadProjects();
+                   setSelectedProjectId(null);
++                  setImportedInbox(false);
+                   setSelectedConversationId(null);
+                   setMessages([]);
+                   setBranchLabels({});
+-                  await loadConversations(null);
++                  await loadConversations(null, false);
+                 } catch {
+                   fail();
+                 }
+@@ -892,6 +967,27 @@ export function App(): JSX.Element {
+             />
+           ) : view === "debug" ? (
+             <DebugView />
++          ) : view === "import" ? (
++            <ImportView
++              projects={projects}
++              onImported={(destination) => {
++                setSelectedProjectId(destination.projectId);
++                setImportedInbox(destination.importedInbox);
++                setView("home");
++                void loadConversations(destination.projectId, destination.importedInbox)
++                  .then(async (list) => {
++                    const first = list[0];
++                    if (!first) {
++                      setSelectedConversationId(null);
++                      setMessages([]);
++                      return;
++                    }
++                    setSelectedConversationId(first.id);
++                    await loadMessages(first.id);
++                  })
++                  .catch(fail);
++              }}
++            />
+           ) : (
+             <SettingsView />
+           )}
+@@ -972,6 +1068,7 @@ export function App(): JSX.Element {
+           window.setTimeout(() => searchInputRef.current?.focus(), 0);
+         }}
+         onDebug={() => setView("debug")}
++        onImport={() => setView("import")}
+       />
+     </div>
+   );
+diff --git a/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx b/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx
+index 3c9c984..79fcf9a 100644
+--- a/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx
++++ b/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx
+@@ -190,6 +190,15 @@ export function MessageBubble({
+                 <dd>{message.receipt.latencyMs ?? "ÔÇö"}</dd>
+                 <dt className="text-muted-foreground">{t("debug.error")}</dt>
+                 <dd>{message.receipt.errorCode ?? "ÔÇö"}</dd>
++                <dt className="text-muted-foreground">{t("workspace.receipt.source")}</dt>
++                <dd
++                  data-testid="receipt-source"
++                  data-source={message.receipt.source}
++                >
++                  {message.receipt.source === "import"
++                    ? t("workspace.receipt.source.import")
++                    : t("workspace.receipt.source.chat")}
++                </dd>
+               </dl>
+               <p className="text-[11px] text-muted-foreground">
+                 {t("workspace.receipt.created", { at: message.receipt.createdAt })}
+diff --git a/apps/desktop/src/renderer/src/components/layout/command-palette.tsx b/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
+index f01a96d..dcb4e96 100644
+--- a/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
+@@ -16,11 +16,13 @@ export function ChromeCommandPalette({
+   onNewChat,
+   onSearch,
+   onDebug,
++  onImport,
+ }: {
+   onNewProject: () => void;
+   onNewChat: () => void;
+   onSearch: () => void;
+   onDebug: () => void;
++  onImport: () => void;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const { setTheme } = useTheme();
+@@ -85,6 +87,14 @@ export function ChromeCommandPalette({
+             >
+               {t("command.debug")}
+             </CommandItem>
++            <CommandItem
++              onSelect={() => {
++                onImport();
++                setOpen(false);
++              }}
++            >
++              {t("command.import")}
++            </CommandItem>
+             <CommandItem onSelect={() => applyTheme("light")}>
+               {t("command.theme")}: {t("theme.light")}
+             </CommandItem>
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index a3f45f6..c0404f0 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -24,6 +24,8 @@ const PROJECT_COLORS = ["#64748b", "#2563eb", "#7c3aed", "#db2777", "#dc2626", "
+ 
+ export function HomeView({
+   project,
++  importedInbox,
++  projects,
+   conversations,
+   selectedConversationId,
+   messages,
+@@ -53,6 +55,7 @@ export function HomeView({
+   onActivate,
+   onRenameBranch,
+   onExport,
++  onMoveConversation,
+   onSaveProject,
+   onRemoveProject,
+   onSetTags,
+@@ -67,6 +70,8 @@ export function HomeView({
+   onComposerDraft,
+ }: {
+   project: ProjectDto | null;
++  importedInbox: boolean;
++  projects: ProjectDto[];
+   conversations: ConversationDto[];
+   selectedConversationId: string | null;
+   messages: MessageDto[];
+@@ -96,6 +101,7 @@ export function HomeView({
+   onActivate: (id: string) => Promise<void>;
+   onRenameBranch: (branchId: string, label: string) => Promise<void>;
+   onExport: (mode: "active" | "tree") => Promise<void>;
++  onMoveConversation: (projectId: string | null) => Promise<void>;
+   onSaveProject: (input: Omit<ProjectUpdateInput, "id">) => Promise<void>;
+   onRemoveProject: () => Promise<void>;
+   onSetTags: (names: string[]) => Promise<void>;
+@@ -155,16 +161,24 @@ export function HomeView({
+       <section className="flex w-64 shrink-0 flex-col border-r">
+         <div className="border-b p-3">
+           <h1 className="truncate text-sm font-semibold">
+-            {project ? project.name : t("workspace.inbox")}
++            {project ? project.name : importedInbox ? t("workspace.importedInbox") : t("workspace.inbox")}
+           </h1>
+           <p className="text-muted-foreground">
+-            {project ? t("workspace.conversations") : t("workspace.inboxHint")}
++            {project
++              ? t("workspace.conversations")
++              : importedInbox
++                ? t("workspace.importedInboxHint")
++                : t("workspace.inboxHint")}
+           </p>
+         </div>
+         <ScrollArea className="flex-1 p-2">
+           {conversations.length === 0 ? (
+             <p className="px-2 text-muted-foreground">
+-              {project ? t("workspace.noConversations") : t("workspace.noConversationsInbox")}
++              {project
++                ? t("workspace.noConversations")
++                : importedInbox
++                  ? t("workspace.noConversationsImported")
++                  : t("workspace.noConversationsInbox")}
+             </p>
+           ) : (
+             <div className="flex flex-col gap-0.5">
+@@ -174,6 +188,7 @@ export function HomeView({
+                   type="button"
+                   variant={selectedConversationId === conversation.id ? "secondary" : "ghost"}
+                   className="h-8 w-full justify-start truncate"
++                  data-testid="conversation-item"
+                   aria-current={selectedConversationId === conversation.id ? "true" : undefined}
+                   onClick={() => onSelectConversation(conversation.id)}
+                 >
+@@ -338,6 +353,7 @@ export function HomeView({
+             </form>
+           ) : null}
+         </ScrollArea>
++        {importedInbox ? null : (
+         <form
+           className="flex flex-col gap-1 border-t p-2"
+           onSubmit={(event) => {
+@@ -359,6 +375,7 @@ export function HomeView({
+             {t("workspace.newConversation")}
+           </Button>
+         </form>
++        )}
+       </section>
+       <section className="flex min-w-0 flex-1 flex-col">
+         {selectedConversationId ? (
+@@ -521,6 +538,28 @@ export function HomeView({
+                 >
+                   {t("workspace.export.tree")}
+                 </Button>
++                {selectedConversation?.importSource ? (
++                  <label className="flex items-center gap-1">
++                    <span className="text-muted-foreground">{t("workspace.moveTo")}</span>
++                    <select
++                      className="h-8 max-w-48 rounded-md border bg-background px-2 text-sm"
++                      value={selectedConversation.projectId ?? ""}
++                      data-testid="import-move"
++                      aria-label={t("workspace.moveTo")}
++                      onChange={(event) => {
++                        const value = event.target.value;
++                        void onMoveConversation(value.length > 0 ? value : null);
++                      }}
++                    >
++                      <option value="">{t("workspace.moveInbox")}</option>
++                      {projects.map((item) => (
++                        <option key={item.id} value={item.id}>
++                          {item.name}
++                        </option>
++                      ))}
++                    </select>
++                  </label>
++                ) : null}
+               </div>
+             </header>
+             {modelSwitchNotice ? (
+diff --git a/apps/desktop/src/renderer/src/components/layout/import-view.tsx b/apps/desktop/src/renderer/src/components/layout/import-view.tsx
+new file mode 100644
+index 0000000..2730569
+--- /dev/null
++++ b/apps/desktop/src/renderer/src/components/layout/import-view.tsx
+@@ -0,0 +1,195 @@
++import { type JSX, useEffect, useRef, useState } from "react";
++import { useTranslation } from "react-i18next";
++import type { ImportEvent, ImportReport, ImportSourceDto, ProjectDto } from "@ai-hub/shared";
++import { Button } from "@/components/ui/button";
++
++export function ImportView({
++  projects,
++  onImported,
++}: {
++  projects: ProjectDto[];
++  onImported: (destination: { projectId: string | null; importedInbox: boolean }) => void;
++}): JSX.Element {
++  const { t } = useTranslation();
++  const [source, setSource] = useState<ImportSourceDto>("chatgpt");
++  const [projectId, setProjectId] = useState<string>("inbox");
++  const [ticket, setTicket] = useState<string | null>(null);
++  const [fileName, setFileName] = useState<string | null>(null);
++  const [jobId, setJobId] = useState<string | null>(null);
++  const [progress, setProgress] = useState<{ processed: number; total: number; ok: number; skipped: number } | null>(
++    null,
++  );
++  const [report, setReport] = useState<ImportReport | null>(null);
++  const [errorKey, setErrorKey] = useState<string | null>(null);
++  const [busy, setBusy] = useState(false);
++  const jobIdRef = useRef<string | null>(null);
++
++  useEffect(() => {
++    return window.hub.import.onEvent((event: ImportEvent) => {
++      if (jobIdRef.current && event.jobId && event.jobId !== jobIdRef.current) {
++        return;
++      }
++      if (event.type === "progress") {
++        setProgress({
++          processed: event.processed,
++          total: event.total,
++          ok: event.ok,
++          skipped: event.skipped,
++        });
++        return;
++      }
++      if (event.type === "done") {
++        setReport(event.report);
++        setBusy(false);
++        setJobId(null);
++        jobIdRef.current = null;
++        setProgress(null);
++        return;
++      }
++      setErrorKey(`import.error.${event.code}`);
++      setBusy(false);
++      setJobId(null);
++      jobIdRef.current = null;
++    });
++  }, []);
++
++  const pickFile = async (): Promise<void> => {
++    setErrorKey(null);
++    setReport(null);
++    try {
++      const result = await window.hub.import.pickFile();
++      if (result.status === "cancelled") {
++        return;
++      }
++      setTicket(result.ticket);
++      setFileName(result.fileName);
++    } catch {
++      setErrorKey("import.error.generic");
++    }
++  };
++
++  const start = async (): Promise<void> => {
++    if (!ticket) {
++      return;
++    }
++    setBusy(true);
++    setReport(null);
++    setProgress(null);
++    setErrorKey(null);
++    try {
++      const started = await window.hub.import.start({
++        ticket,
++        source,
++        projectId: projectId === "inbox" ? null : projectId,
++      });
++      jobIdRef.current = started.jobId;
++      setJobId(started.jobId);
++      setTicket(null);
++    } catch {
++      setBusy(false);
++      setErrorKey("import.error.generic");
++    }
++  };
++
++  const cancel = async (): Promise<void> => {
++    if (!jobId) {
++      return;
++    }
++    try {
++      await window.hub.import.cancel({ jobId });
++    } catch {
++      setErrorKey("import.error.generic");
++    }
++  };
++
++  return (
++    <div className="mx-auto flex w-full max-w-lg flex-col gap-4 p-6">
++      <div>
++        <h1 className="text-base font-semibold">{t("import.title")}</h1>
++        <p className="mt-1 text-muted-foreground">{t("import.hint")}</p>
++      </div>
++      <label className="flex flex-col gap-1 text-[12px] font-medium">
++        {t("import.source")}
++        <select
++          className="h-8 rounded-md border bg-background px-2 text-[13px] font-normal"
++          value={source}
++          data-testid="import-source"
++          onChange={(event) => setSource(event.target.value as ImportSourceDto)}
++        >
++          <option value="chatgpt">{t("import.source.chatgpt")}</option>
++          <option value="claude">{t("import.source.claude")}</option>
++          <option value="gemini">{t("import.source.gemini")}</option>
++        </select>
++      </label>
++      {source === "gemini" ? <p className="text-[12px] text-muted-foreground">{t("import.geminiLimits")}</p> : null}
++      <label className="flex flex-col gap-1 text-[12px] font-medium">
++        {t("import.destination")}
++        <select
++          className="h-8 rounded-md border bg-background px-2 text-[13px] font-normal"
++          value={projectId}
++          data-testid="import-destination"
++          onChange={(event) => setProjectId(event.target.value)}
++        >
++          <option value="inbox">{t("import.destination.inbox")}</option>
++          {projects.map((project) => (
++            <option key={project.id} value={project.id}>
++              {project.name}
++            </option>
++          ))}
++        </select>
++      </label>
++      <div className="flex flex-wrap gap-2">
++        <Button type="button" variant="outline" onClick={() => void pickFile()} disabled={busy} data-testid="import-pick-file">
++          {t("import.pickFile")}
++        </Button>
++        <Button type="button" disabled={!ticket || busy} onClick={() => void start()} data-testid="import-start">
++          {t("import.start")}
++        </Button>
++        <Button type="button" variant="outline" disabled={!jobId} onClick={() => void cancel()} data-testid="import-cancel">
++          {t("import.cancel")}
++        </Button>
++      </div>
++      {fileName ? (
++        <p className="text-[12px] text-muted-foreground" data-testid="import-file-name">
++          {t("import.fileName", { name: fileName })}
++        </p>
++      ) : (
++        <p className="text-[12px] text-muted-foreground">{t("import.empty")}</p>
++      )}
++      {progress ? (
++        <p className="text-[12px]" data-testid="import-progress" data-status="running">
++          {t("import.progress", { current: progress.processed, total: progress.total })}
++        </p>
++      ) : null}
++      {report ? (
++        <div className="rounded-md border p-3 text-[13px]" data-testid="import-report" data-ok={report.ok} data-skipped={report.skipped}>
++          <p className="font-medium">{t("import.report.title")}</p>
++          <p>{t("import.report.ok", { count: report.ok })}</p>
++          <p>{t("import.report.skipped", { count: report.skipped })}</p>
++          <p>{t("import.report.errors", { count: report.errors.length })}</p>
++          {report.attachmentsSkipped > 0 ? (
++            <p>{t("import.report.attachments", { count: report.attachmentsSkipped })}</p>
++          ) : null}
++          <Button
++            type="button"
++            className="mt-2"
++            data-testid="import-open-destination"
++            onClick={() =>
++              onImported({
++                projectId: projectId === "inbox" ? null : projectId,
++                importedInbox: projectId === "inbox",
++              })
++            }
++          >
++            {t("import.openDestination")}
++          </Button>
++        </div>
++      ) : null}
++      {errorKey ? (
++        <p className="text-destructive" role="alert" data-testid="import-error">
++          {t(errorKey)}
++        </p>
++      ) : null}
++    </div>
++  );
++}
+diff --git a/apps/desktop/src/renderer/src/components/layout/sidebar.tsx b/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
+index ea33135..2cec7c8 100644
+--- a/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
+@@ -1,5 +1,5 @@
+ import { type JSX, type ReactNode, useState, type RefObject } from "react";
+-import { Activity, Home, Inbox, Plus, Settings } from "lucide-react";
++import { Activity, Home, Inbox, Plus, Settings, Upload } from "lucide-react";
+ import { useTranslation } from "react-i18next";
+ import type { ProjectDto, SearchHit } from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
+@@ -12,7 +12,9 @@ export function Sidebar({
+   onChange,
+   projects,
+   selectedProjectId,
++  importedInbox,
+   onSelectProject,
++  onSelectImportedInbox,
+   onCreateProject,
+   projectInputRef,
+   searchQuery,
+@@ -25,7 +27,9 @@ export function Sidebar({
+   onChange: (view: AppView) => void;
+   projects: ProjectDto[];
+   selectedProjectId: string | null;
++  importedInbox: boolean;
+   onSelectProject: (id: string | null) => void;
++  onSelectImportedInbox: () => void;
+   onCreateProject: (name: string) => Promise<void>;
+   projectInputRef: RefObject<HTMLInputElement | null>;
+   searchQuery: string;
+@@ -70,6 +74,13 @@ export function Sidebar({
+             onClick={() => onChange("debug")}
+             testId="nav-debug"
+           />
++          <NavButton
++            active={view === "import"}
++            icon={<Upload className="h-3.5 w-3.5" />}
++            label={t("nav.import")}
++            onClick={() => onChange("import")}
++            testId="nav-import"
++          />
+         </nav>
+         <div className="mt-3 px-1">
+           <Input
+@@ -109,7 +120,7 @@ export function Sidebar({
+         <div className="mt-1 flex flex-col gap-0.5">
+           <Button
+             type="button"
+-            variant={view === "home" && selectedProjectId === null ? "secondary" : "ghost"}
++            variant={view === "home" && selectedProjectId === null && !importedInbox ? "secondary" : "ghost"}
+             className="h-8 w-full justify-start gap-2 truncate"
+             data-testid="inbox-avulsas"
+             onClick={() => {
+@@ -120,6 +131,19 @@ export function Sidebar({
+             <Inbox className="h-3.5 w-3.5 shrink-0" />
+             {t("workspace.inbox")}
+           </Button>
++          <Button
++            type="button"
++            variant={view === "home" && selectedProjectId === null && importedInbox ? "secondary" : "ghost"}
++            className="h-8 w-full justify-start gap-2 truncate"
++            data-testid="inbox-imported"
++            onClick={() => {
++              onSelectImportedInbox();
++              onChange("home");
++            }}
++          >
++            <Upload className="h-3.5 w-3.5 shrink-0" />
++            {t("workspace.importedInbox")}
++          </Button>
+           {projects.length === 0 ? (
+             <p className="px-2 py-1 text-[11px] text-muted-foreground">{t("empty.body")}</p>
+           ) : null}
+diff --git a/apps/desktop/src/renderer/src/components/layout/types.ts b/apps/desktop/src/renderer/src/components/layout/types.ts
+index 2aa2766..4a0e23c 100644
+--- a/apps/desktop/src/renderer/src/components/layout/types.ts
++++ b/apps/desktop/src/renderer/src/components/layout/types.ts
+@@ -1 +1 @@
+-export type AppView = "home" | "settings" | "debug";
++export type AppView = "home" | "settings" | "debug" | "import";
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 326e97e..04730d8 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -3,6 +3,7 @@
+   "nav.home": "Home",
+   "nav.settings": "Settings",
+   "nav.debug": "Debug",
++  "nav.import": "Import",
+   "status.ready": "Ready",
+   "status.theme": "Theme: {{theme}}",
+   "status.health.empty": "No provider health yet",
+@@ -30,6 +31,11 @@
+   "workspace.projects": "Projects",
+   "workspace.inbox": "Inbox",
+   "workspace.inboxHint": "Unfiled chats",
++  "workspace.importedInbox": "Imported",
++  "workspace.importedInboxHint": "Chats brought from ChatGPT, Claude, or Gemini",
++  "workspace.noConversationsImported": "No imported chats here. Open Import Hub to bring an export.",
++  "workspace.moveTo": "Move to project",
++  "workspace.moveInbox": "Keep in Imported",
+   "workspace.projectPlaceholder": "Project name",
+   "workspace.newProject": "New project",
+   "workspace.projectColor": "Color",
+@@ -112,6 +118,9 @@
+   "workspace.receipt.created": "Recorded {{at}}",
+   "workspace.receipt.tokens": "in / out",
+   "workspace.receipt.latency": "Latency",
++  "workspace.receipt.source": "Source",
++  "workspace.receipt.source.import": "Imported",
++  "workspace.receipt.source.chat": "Chat",
+   "workspace.cost.conversation": "Thread ${{usd}}",
+   "workspace.cost.project": "Project ${{usd}}",
+   "workspace.estimate": "Est. ${{usd}} this send",
+@@ -146,6 +155,7 @@
+   "fallback.dismiss": "Keep this provider",
+   "fallback.estimate": "Estimated ${{usd}} on {{suggested}}",
+   "command.debug": "Open debug",
++  "command.import": "Open Import Hub",
+   "workspace.sibling.prev": "Previous alternative",
+   "workspace.sibling.next": "Next alternative",
+   "workspace.sibling.count": "{{current}} / {{total}}",
+@@ -202,5 +212,31 @@
+   "updates.status.skipped": "Skipped (development build)",
+   "updates.status.uptodate": "Up to date",
+   "updates.status.available": "Update available ({{version}})",
+-  "updates.status.unavailable": "Update feed unavailable ÔÇö the app keeps running"
++  "updates.status.unavailable": "Update feed unavailable ÔÇö the app keeps running",
++  "import.title": "Import Hub",
++  "import.hint": "Bring official ChatGPT, Claude, or Gemini exports. Re-importing the same chat is skipped. Binary files stay out.",
++  "import.source": "Export source",
++  "import.source.chatgpt": "ChatGPT (ZIP or conversations.json)",
++  "import.source.claude": "Claude (conversations.json)",
++  "import.source.gemini": "Gemini (MyActivity.json, best effort)",
++  "import.geminiLimits": "Gemini Takeout is an activity log, not a full archive. Use JSON (not HTML). Threads are grouped by chat URL; images are skipped. Some turns may be missing.",
++  "import.destination": "Destination",
++  "import.destination.inbox": "Imported inbox",
++  "import.pickFile": "Choose export file",
++  "import.start": "Start import",
++  "import.cancel": "Cancel",
++  "import.fileName": "Selected: {{name}}",
++  "import.empty": "No file selected yet.",
++  "import.progress": "Importing {{current}} / {{total}}",
++  "import.report.title": "Import report",
++  "import.report.ok": "{{count}} conversations imported",
++  "import.report.skipped": "{{count}} skipped (already imported)",
++  "import.report.errors": "{{count}} errors",
++  "import.report.attachments": "{{count}} file placeholders (binaries not imported)",
++  "import.openDestination": "Open imported chats",
++  "import.error.generic": "The import could not be completed.",
++  "import.error.invalid_json": "That file is not valid JSON.",
++  "import.error.unrecognized": "No conversations were recognized in that file.",
++  "import.error.gemini_html": "HTML Takeout is not supported. Export Gemini Apps activity as JSON.",
++  "import.error.empty": "No conversations were found in that export."
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index 0e4930e..c377410 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -3,6 +3,7 @@
+   "nav.home": "In├¡cio",
+   "nav.settings": "Configura├º├Áes",
+   "nav.debug": "Debug",
++  "nav.import": "Importar",
+   "status.ready": "Pronto",
+   "status.theme": "Tema: {{theme}}",
+   "status.health.empty": "Ainda sem pulso de provedor",
+@@ -30,6 +31,11 @@
+   "workspace.projects": "Projetos",
+   "workspace.inbox": "Avulsas",
+   "workspace.inboxHint": "Chats sem projeto",
++  "workspace.importedInbox": "Importadas",
++  "workspace.importedInboxHint": "Chats trazidos do ChatGPT, Claude ou Gemini",
++  "workspace.noConversationsImported": "Nenhum chat importado aqui. Abra o Import Hub para trazer um export.",
++  "workspace.moveTo": "Mover para projeto",
++  "workspace.moveInbox": "Manter em Importadas",
+   "workspace.projectPlaceholder": "Nome do projeto",
+   "workspace.newProject": "Novo projeto",
+   "workspace.projectColor": "Cor",
+@@ -112,6 +118,9 @@
+   "workspace.receipt.created": "Registado {{at}}",
+   "workspace.receipt.tokens": "entrada / sa├¡da",
+   "workspace.receipt.latency": "Lat├¬ncia",
++  "workspace.receipt.source": "Origem",
++  "workspace.receipt.source.import": "Importado",
++  "workspace.receipt.source.chat": "Chat",
+   "workspace.cost.conversation": "Fio ${{usd}}",
+   "workspace.cost.project": "Projeto ${{usd}}",
+   "workspace.estimate": "Est. ${{usd}} neste envio",
+@@ -146,6 +155,7 @@
+   "fallback.dismiss": "Manter este provedor",
+   "fallback.estimate": "Estimado ${{usd}} em {{suggested}}",
+   "command.debug": "Abrir debug",
++  "command.import": "Abrir Import Hub",
+   "workspace.sibling.prev": "Alternativa anterior",
+   "workspace.sibling.next": "Pr├│xima alternativa",
+   "workspace.sibling.count": "{{current}} / {{total}}",
+@@ -202,5 +212,31 @@
+   "updates.status.skipped": "Ignorado (build de desenvolvimento)",
+   "updates.status.uptodate": "J├í est├í atualizado",
+   "updates.status.available": "Atualiza├º├úo dispon├¡vel ({{version}})",
+-  "updates.status.unavailable": "Feed de update indispon├¡vel ÔÇö o app continua"
++  "updates.status.unavailable": "Feed de update indispon├¡vel ÔÇö o app continua",
++  "import.title": "Import Hub",
++  "import.hint": "Traga exports oficiais do ChatGPT, Claude ou Gemini. Reimportar o mesmo chat ├® ignorado. Ficheiros bin├írios ficam de fora.",
++  "import.source": "Origem do export",
++  "import.source.chatgpt": "ChatGPT (ZIP ou conversations.json)",
++  "import.source.claude": "Claude (conversations.json)",
++  "import.source.gemini": "Gemini (MyActivity.json, melhor esfor├ºo)",
++  "import.geminiLimits": "O Takeout do Gemini ├® um log de atividade, n├úo um arquivo completo. Use JSON (n├úo HTML). Conversas agrupam-se pelo URL; imagens s├úo ignoradas. Alguns turnos podem faltar.",
++  "import.destination": "Destino",
++  "import.destination.inbox": "Inbox Importadas",
++  "import.pickFile": "Escolher ficheiro",
++  "import.start": "Iniciar importa├º├úo",
++  "import.cancel": "Cancelar",
++  "import.fileName": "Selecionado: {{name}}",
++  "import.empty": "Ainda sem ficheiro.",
++  "import.progress": "A importar {{current}} / {{total}}",
++  "import.report.title": "Relat├│rio de importa├º├úo",
++  "import.report.ok": "{{count}} conversas importadas",
++  "import.report.skipped": "{{count}} ignoradas (j├í importadas)",
++  "import.report.errors": "{{count}} erros",
++  "import.report.attachments": "{{count}} placeholders de ficheiro (bin├írios n├úo importados)",
++  "import.openDestination": "Abrir chats importados",
++  "import.error.generic": "A importa├º├úo n├úo p├┤de ser conclu├¡da.",
++  "import.error.invalid_json": "Esse ficheiro n├úo ├® JSON v├ílido.",
++  "import.error.unrecognized": "Nenhuma conversa foi reconhecida nesse ficheiro.",
++  "import.error.gemini_html": "Takeout em HTML n├úo ├® suportado. Exporte a atividade do Gemini Apps em JSON.",
++  "import.error.empty": "Nenhuma conversa foi encontrada nesse export."
+ }
+diff --git a/apps/desktop/tsconfig.node.json b/apps/desktop/tsconfig.node.json
+index 281c901..ba03c9d 100644
+--- a/apps/desktop/tsconfig.node.json
++++ b/apps/desktop/tsconfig.node.json
+@@ -6,6 +6,7 @@
+     "types": ["electron-vite/node", "node"],
+     "baseUrl": ".",
+     "paths": {
++      "@ai-hub/shared/import": ["../../packages/shared/src/import/index.ts"],
+       "@ai-hub/shared": ["../../packages/shared/src/index.ts"],
+       "@ai-hub/db": ["../../packages/db/src/index.ts"],
+       "@ai-hub/ai-gateway": ["../../packages/ai-gateway/src/index.ts"],
+diff --git a/apps/desktop/tsconfig.web.json b/apps/desktop/tsconfig.web.json
+index 44849c0..f7654a3 100644
+--- a/apps/desktop/tsconfig.web.json
++++ b/apps/desktop/tsconfig.web.json
+@@ -19,5 +19,6 @@
+     "src/preload/index.d.ts",
+     "../../packages/shared/src/**/*.ts",
+     "../../packages/shared/src/**/*.json"
+-  ]
++  ],
++  "exclude": ["../../packages/shared/src/import/**"]
+ }
+diff --git a/docs/ADR/ADR-W09-002-import-identity-and-receipt-source.md b/docs/ADR/ADR-W09-002-import-identity-and-receipt-source.md
+new file mode 100644
+index 0000000..466d4a8
+--- /dev/null
++++ b/docs/ADR/ADR-W09-002-import-identity-and-receipt-source.md
+@@ -0,0 +1,35 @@
++# ADR-W09-002-import-identity-and-receipt-source
++
++- **Status:** accepted
++- **Onda:** W09
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++D2 exige idempot├¬ncia no reimport (`provider + external_id`) e receipts das importadas com `source=import` e custo nulo. O schema W1 tem `import_jobs` vazio e conversas sem identidade de origem.
++
++## Decis├úo
++
++- Colunas em `conversations`: `import_source` (`chatgpt` | `claude` | `gemini`) e `external_id` (id do vendor). ├ìndice ├║nico parcial `(import_source, external_id)` onde ambos NOT NULL.
++- Coluna `message_receipts.source` com default `chat`. Import grava `import`, `cost_usd` NULL, `provider` = fonte do export, `model` NULL.
++- Identidade **n├úo** vai no renderer al├®m de `importSource` no DTO (sem path de ficheiro, sem JSON cru).
++
++## Alternativas consideradas
++
++- **Hash do conte├║do como chave:** muda se o vendor reexportar com whitespace diferente; o id est├ível do vendor ├® o contrato do plano.
++- **Tabela auxiliar de mapeamento:** extra join sem ganho; a conversa *├®* o mapeamento.
++
++## Consequ├¬ncias
++
++- Positivas: reimport ├® no-op; receipts de chat e import distingu├¡veis; caps n├úo somam custo fantasma.
++- Negativas: Gemini sem `titleUrl` cai num id derivado (best-effort).
++- Riscos aceitos: formatos oficiais mudam; parsers s├úo best-effort versionados nesta onda.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 9 / D2
++- ADR-W06-002 (inbox null)
++- ADR-W09-003 (inbox Importadas)
+diff --git a/docs/ADR/ADR-W09-003-imported-inbox-not-sentinel-project.md b/docs/ADR/ADR-W09-003-imported-inbox-not-sentinel-project.md
+new file mode 100644
+index 0000000..50f5739
+--- /dev/null
++++ b/docs/ADR/ADR-W09-003-imported-inbox-not-sentinel-project.md
+@@ -0,0 +1,37 @@
++# ADR-W09-003-imported-inbox-not-sentinel-project
++
++- **Status:** accepted
++- **Onda:** W09
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++D2 pede inbox ÔÇ£ImportadasÔÇØ + mover para projeto. ADR-W06-002 j├í definiu Avulsas como `projectId === null`, sem linha sentinela em `projects`.
++
++## Decis├úo
++
++- **Avulsas:** `project_id IS NULL AND import_source IS NULL`.
++- **Importadas:** `project_id IS NULL AND import_source IS NOT NULL`.
++- Destino do job: `projectId` UUID escolhido **ou** `null` (cai em Importadas).
++- Mover: `conversations:update` s├│ altera `project_id`. `import_source` permanece (idempot├¬ncia sobrevive ├á mudan├ºa de projeto).
++- Apagar projeto continua a p├┤r `project_id = NULL` (voltam a Importadas se tiverem `import_source`).
++
++## Alternativas consideradas
++
++- **Projeto sentinela ÔÇ£ImportadasÔÇØ:** contradiz ADR-W06-002 e aparece na lista de projetos como dado do utilizador.
++- **Tudo em Avulsas:** mistura chats novos com dumps de 500 conversas do ChatGPT.
++
++## Consequ├¬ncias
++
++- Positivas: duas inboxes virtuais; sem FK fantasma.
++- Negativas: `listConversations(null)` deixa de devolver importadas ÔÇö callers passam `inbox`.
++- Riscos aceitos: sess├úo persiste `importedInbox` boolean.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 9 / D2
++- ADR-W06-002-inbox-null-project
++- ADR-W09-002
+diff --git a/docs/ADR/ADR-W09-004-vendor-parsers-and-opaque-ticket.md b/docs/ADR/ADR-W09-004-vendor-parsers-and-opaque-ticket.md
+new file mode 100644
+index 0000000..fb0ff52
+--- /dev/null
++++ b/docs/ADR/ADR-W09-004-vendor-parsers-and-opaque-ticket.md
+@@ -0,0 +1,41 @@
++# ADR-W09-004-vendor-parsers-and-opaque-ticket
++
++- **Status:** accepted
++- **Onda:** W09
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++O renderer n├úo pode ler o filesystem. Export W4 j├í usa di├ílogo nativo no main. Import precisa de ZIP/JSON de ChatGPT, Claude e Gemini (best-effort) sem mandar o ficheiro inteiro ao React.
++
++## Decis├úo
++
++- Parsers puros em `packages/shared` (Vitest, sem Electron). ZIP no main via inflate de headers locais (m├®todo 0/8).
++- ChatGPT: array/`conversations` + `mapping` + walk `current_node` ÔåÆ parent; ramos inativos ficam de fora nesta onda (path ativo, como o utilizador viu).
++- Claude: `chat_messages` + `sender` human/assistant; thinking/tool_use n├úo viram mensagens.
++- Gemini: Takeout `MyActivity.json` agrupado por id em `titleUrl`; HTML Takeout **rejeitado** com erro i18n; limita├º├Áes vis├¡veis na UI.
++- Anexos bin├írios: placeholder `[file not imported]` + contagem no relat├│rio. Sem blobs na DB.
++- IPC: `import:pickFile` devolve ticket opaco + `fileName` (n├úo o path). `import:start` s├│ aceita ticket. Conte├║do nunca atravessa o preload.
++- Progresso: eventos `import:event` (contagens, sem texto de conversa). Cancel via AbortController no job.
++- e2e: `AI_HUB_E2E_IMPORT_FIXTURE` substitui o di├ílogo.
++
++## Alternativas consideradas
++
++- **Path absoluto no renderer:** o preload poderia pedir ao main para ler qualquer ficheiro local.
++- **Importar ├írvore ChatGPT completa:** W4 j├í tem ramos; nesta onda o DoD ├® ÔÇ£naveg├íveis, sem duplicarÔÇØ. Path ativo ├® o m├¡nimo honesto.
++- **jszip como depend├¬ncia:** evit├ível para ZIP store/deflate t├¡pico dos takeouts.
++
++## Consequ├¬ncias
++
++- Positivas: trust boundary; parsers test├íveis com fixtures anonimizadas.
++- Negativas: ZIP com data descriptor (bit 3) ou Zip64 pode falhar ÔÇö o utilizador extrai o JSON.
++- Riscos aceitos: Gemini ├® activity log, n├úo arquivo de conversa; threads incompletos s├úo esperados.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 9 / D2
++- ADR-W04-004-export-json-main-process
++- ADR-W01-003-keytar-and-ipc-secrets
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index 8a4be30..e1325cc 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -74,3 +74,6 @@ N├úo escrever ADR de detalhe cosm├®tica. Se mexe em seguran├ºa, custo, provider
+ | [ADR-W08-004](./ADR-W08-004-crash-reporter-opt-in-local.md) | W08 | Crash reporter opt-in, dumps locais | accepted |
+ | [ADR-W08-005](./ADR-W08-005-composer-secret-hint.md) | W08 | Aviso de secret no composer via shared | accepted |
+ | [ADR-W09-001](./ADR-W09-001-run-modes-and-agent-orchestration-waves.md) | W09 | Mapa W21 run modes + W24 orquestra├º├úo (plano) | accepted |
++| [ADR-W09-002](./ADR-W09-002-import-identity-and-receipt-source.md) | W09 | Identidade de import + receipt `source` | accepted |
++| [ADR-W09-003](./ADR-W09-003-imported-inbox-not-sentinel-project.md) | W09 | Inbox Importadas virtual, sem projeto sentinela | accepted |
++| [ADR-W09-004](./ADR-W09-004-vendor-parsers-and-opaque-ticket.md) | W09 | Parsers no shared; ticket opaco; Gemini best-effort | accepted |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 9415d5a..b206da4 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave
+ |---|---|
+ | Wave | **W09** |
+ | Marco | B ÔÇö MVP+ |
+-| State | `pending` |
++| State | `review` |
+ | Last completed | **W08** |
+-| Next action | Wave 9 ÔÇö Import Hub |
++| Next action | Wave-close W09: independent review + persist `docs/reviews/W09/` |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -36,8 +36,9 @@ None.
+ ## Notes for the next session
+ 
+ - W08 fechada: wizard <90s, aviso de secret no composer, NSIS, electron-updater, crash opt-in local.
+-- Plano atualizado (ADR-W09-001): duas ondas novas ÔÇö **W21** run modes + HUD de tokens (D13); **W24** orquestra├º├úo (D14). MCP deslocou para W22; agente ├║nico W23; marcos D/E at├® W31. **N├úo implementar isso agora.**
+-- N├úo popular FTS plaintext. N├úo come├ºar W09 sem o utilizador pedir. N├úo pular para agentes.
++- W09 em curso: Import Hub (D2). N├úo implementar packet W10, RAG, MCP, agentes, run modes.
++- Plano W21/W24 (ADR-W09-001) continua lock de mapa, n├úo c├│digo.
++- N├úo popular FTS plaintext.
+ 
+ ## Last review / ADR
+ 
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index c197a92..7a6a918 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -1,5 +1,5 @@
+ export { applyMigrations } from "./migrate";
+-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL } from "./migrations";
++export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL } from "./migrations";
+ export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
+ export {
+   HubRepos,
+diff --git a/packages/db/src/migrations.ts b/packages/db/src/migrations.ts
+index 26b4a0c..9a7248c 100644
+--- a/packages/db/src/migrations.ts
++++ b/packages/db/src/migrations.ts
+@@ -144,10 +144,20 @@ export const MIGRATION_0005_SQL = `
+ CREATE UNIQUE INDEX IF NOT EXISTS spend_caps_scope_idx ON spend_caps(scope);
+ `;
+ 
++export const MIGRATION_0006_SQL = `
++ALTER TABLE conversations ADD COLUMN import_source TEXT;
++ALTER TABLE conversations ADD COLUMN external_id TEXT;
++CREATE UNIQUE INDEX IF NOT EXISTS conversations_import_identity_idx
++  ON conversations(import_source, external_id)
++  WHERE import_source IS NOT NULL AND external_id IS NOT NULL;
++ALTER TABLE message_receipts ADD COLUMN source TEXT NOT NULL DEFAULT 'chat';
++`;
++
+ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 1, sql: MIGRATION_0001_SQL },
+   { version: 2, sql: MIGRATION_0002_SQL },
+   { version: 3, sql: MIGRATION_0003_SQL },
+   { version: 4, sql: MIGRATION_0004_SQL },
+   { version: 5, sql: MIGRATION_0005_SQL },
++  { version: 6, sql: MIGRATION_0006_SQL },
+ ];
+diff --git a/packages/db/src/open.ts b/packages/db/src/open.ts
+index d973bba..bcd885a 100644
+--- a/packages/db/src/open.ts
++++ b/packages/db/src/open.ts
+@@ -21,7 +21,7 @@ export function openHubDatabase(options: OpenHubDatabaseOptions): HubDatabase {
+   const sqlite = new Database(options.path);
+   applyMigrations(sqlite);
+   const db = drizzle(sqlite, { schema });
+-  const repos = new HubRepos(db, options.masterKey, options.secretStore);
++  const repos = new HubRepos(db, sqlite, options.masterKey, options.secretStore);
+   return {
+     sqlite,
+     repos,
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index dc875bc..f4d165a 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -125,7 +125,7 @@ describe("hub database", () => {
+       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
+       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
+       applyMigrations(second.sqlite);
+-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(5);
++      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(6);
+       second.close();
+     } finally {
+       rmSync(dir, { recursive: true, force: true });
+@@ -286,6 +286,7 @@ describe("hub database", () => {
+       temperature: 0.4,
+       maxTokens: 256,
+       extraSystem: "Be terse.",
++      importedInbox: false,
+     });
+     expect(hub.repos.getWorkspaceSession()).toEqual({
+       projectId: project.id,
+@@ -294,6 +295,7 @@ describe("hub database", () => {
+       temperature: 0.4,
+       maxTokens: 256,
+       extraSystem: "Be terse.",
++      importedInbox: false,
+     });
+     hub.close();
+   });
+@@ -552,4 +554,48 @@ describe("hub database", () => {
+     expect(hub.repos.listSpendCapOverrides()).toHaveLength(1);
+     hub.close();
+   });
++
++  it("imports conversations idempotently into the Importadas inbox", () => {
++    const { hub } = openTestDb();
++    const first = hub.repos.importConversation({
++      projectId: null,
++      source: "chatgpt",
++      externalId: "conv-1",
++      title: "Imported alpha",
++      createdAtMs: 1_700_000_000_000,
++      updatedAtMs: 1_700_000_100_000,
++      messages: [
++        { role: "user", content: "hello import", createdAtMs: 1_700_000_000_000 },
++        { role: "assistant", content: "hi import", createdAtMs: 1_700_000_010_000 },
++      ],
++    });
++    expect(first.outcome).toBe("created");
++    const avulsas = hub.repos.createConversation(null, "Loose note");
++    expect(hub.repos.listConversations(null, "avulsas").map((item) => item.title)).toEqual(["Loose note"]);
++    expect(hub.repos.listConversations(null, "imported").map((item) => item.title)).toEqual(["Imported alpha"]);
++    const again = hub.repos.importConversation({
++      projectId: null,
++      source: "chatgpt",
++      externalId: "conv-1",
++      title: "Imported alpha again",
++      createdAtMs: 1_700_000_000_000,
++      updatedAtMs: 1_700_000_100_000,
++      messages: [{ role: "user", content: "hello import", createdAtMs: 1_700_000_000_000 }],
++    });
++    expect(again.outcome).toBe("skipped");
++    expect(again.conversationId).toBe(first.conversationId);
++    const messages = hub.repos.listMessages(first.conversationId ?? "");
++    expect(messages).toHaveLength(2);
++    expect(messages[0]?.receipt).toBeNull();
++    expect(messages[1]?.receipt?.source).toBe("import");
++    expect(messages[1]?.receipt?.costUsd).toBeNull();
++    expect(messages[1]?.receipt?.provider).toBe("chatgpt");
++    const project = hub.repos.createProject("Dest");
++    const moved = hub.repos.moveConversation(first.conversationId ?? "", project.id);
++    expect(moved.projectId).toBe(project.id);
++    expect(hub.repos.listConversations(null, "imported")).toHaveLength(0);
++    expect(hub.repos.listConversations(project.id)[0]?.importSource).toBe("chatgpt");
++    expect(hub.repos.listConversations(null, "avulsas").map((item) => item.id)).toEqual([avulsas.id]);
++    hub.close();
++  });
+ });
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 041ad68..12ff734 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -1,6 +1,7 @@
+ import { randomUUID } from "node:crypto";
+-import { and, desc, eq, gte, isNull, ne } from "drizzle-orm";
++import { and, desc, eq, gte, isNotNull, isNull, ne } from "drizzle-orm";
+ import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
++import type Database from "better-sqlite3";
+ import {
+   decryptUtf8,
+   encryptUtf8,
+@@ -14,6 +15,7 @@ import {
+   conversations,
+   conversationTags,
+   healthSamples,
++  importJobs,
+   messageReceipts,
+   messages,
+   projects,
+@@ -52,6 +54,7 @@ export interface ConversationRecord {
+   tags: string[];
+   createdAt: string;
+   updatedAt: string;
++  importSource: "chatgpt" | "claude" | "gemini" | null;
+ }
+ 
+ export interface SearchHitRecord {
+@@ -75,6 +78,7 @@ export interface ReceiptRecord {
+   latencyMs: number | null;
+   costUsd: string | null;
+   errorCode: string | null;
++  source: "chat" | "import";
+   createdAt: string;
+ }
+ 
+@@ -151,6 +155,7 @@ export interface WorkspaceSessionRecord {
+   temperature: number;
+   maxTokens: number | null;
+   extraSystem: string;
++  importedInbox: boolean;
+ }
+ 
+ export interface AppPrefsRecord {
+@@ -190,6 +195,7 @@ const DEFAULT_SESSION: WorkspaceSessionRecord = {
+   temperature: 1,
+   maxTokens: null,
+   extraSystem: "",
++  importedInbox: false,
+ };
+ 
+ function maskListedKey(last4: string, slug: string): string {
+@@ -333,6 +339,7 @@ function asStatus(value: string): MessageStatus {
+ export class HubRepos {
+   constructor(
+     private readonly db: HubDrizzle,
++    private readonly sqlite: Database.Database,
+     private readonly masterKey: Buffer,
+     private readonly secrets: SecretStore,
+   ) {}
+@@ -348,6 +355,7 @@ export class HubRepos {
+       latencyMs: row.latencyMs,
+       costUsd: row.costUsd,
+       errorCode: row.errorCode,
++      source: row.source === "import" ? "import" : "chat",
+       createdAt: iso(row.createdAt),
+     };
+   }
+@@ -375,6 +383,10 @@ export class HubRepos {
+       tags: this.listConversationTagNames(row.id),
+       createdAt: iso(row.createdAt),
+       updatedAt: iso(row.updatedAt),
++      importSource:
++        row.importSource === "chatgpt" || row.importSource === "claude" || row.importSource === "gemini"
++          ? row.importSource
++          : null,
+     };
+   }
+ 
+@@ -495,10 +507,20 @@ export class HubRepos {
+     this.db.delete(projects).where(eq(projects.id, id)).run();
+   }
+ 
+-  listConversations(projectId: string | null): ConversationRecord[] {
++  listConversations(projectId: string | null, inbox: "avulsas" | "imported" = "avulsas"): ConversationRecord[] {
+     const rows =
+       projectId === null
+-        ? this.db.select().from(conversations).where(isNull(conversations.projectId)).all()
++        ? inbox === "imported"
++          ? this.db
++              .select()
++              .from(conversations)
++              .where(and(isNull(conversations.projectId), isNotNull(conversations.importSource)))
++              .all()
++          : this.db
++              .select()
++              .from(conversations)
++              .where(and(isNull(conversations.projectId), isNull(conversations.importSource)))
++              .all()
+         : this.db.select().from(conversations).where(eq(conversations.projectId, projectId)).all();
+     return rows
+       .map((row) => this.toConversation(row))
+@@ -521,9 +543,11 @@ export class HubRepos {
+         titleCipher: encryptUtf8(title, this.masterKey),
+         createdAt: now,
+         updatedAt: now,
++        importSource: null,
++        externalId: null,
+       })
+       .run();
+-    return { id, projectId, title, tags: [], createdAt: iso(now), updatedAt: iso(now) };
++    return { id, projectId, title, tags: [], createdAt: iso(now), updatedAt: iso(now), importSource: null };
+   }
+ 
+   removeConversation(id: string): void {
+@@ -531,6 +555,129 @@ export class HubRepos {
+     this.db.delete(conversations).where(eq(conversations.id, id)).run();
+   }
+ 
++  moveConversation(id: string, projectId: string | null): ConversationRecord {
++    const existing = this.getConversation(id);
++    if (!existing) {
++      throw new Error("Conversation not found");
++    }
++    if (projectId) {
++      const project = this.getProject(projectId);
++      if (!project) {
++        throw new Error("Project not found");
++      }
++    }
++    const now = Date.now();
++    this.db.update(conversations).set({ projectId, updatedAt: now }).where(eq(conversations.id, id)).run();
++    const moved = this.getConversation(id);
++    if (!moved) {
++      throw new Error("Conversation not found");
++    }
++    return moved;
++  }
++
++  findConversationByImportIdentity(
++    source: "chatgpt" | "claude" | "gemini",
++    externalId: string,
++  ): ConversationRecord | null {
++    const row = this.db
++      .select()
++      .from(conversations)
++      .where(and(eq(conversations.importSource, source), eq(conversations.externalId, externalId)))
++      .get();
++    return row ? this.toConversation(row) : null;
++  }
++
++  importConversation(input: {
++    projectId: string | null;
++    source: "chatgpt" | "claude" | "gemini";
++    externalId: string;
++    title: string;
++    createdAtMs: number;
++    updatedAtMs: number;
++    messages: Array<{ role: MessageRole; content: string; createdAtMs: number }>;
++  }): { outcome: "created" | "skipped" | "empty"; conversationId: string | null } {
++    if (input.messages.length === 0) {
++      return { outcome: "empty", conversationId: null };
++    }
++    const existing = this.findConversationByImportIdentity(input.source, input.externalId);
++    if (existing) {
++      return { outcome: "skipped", conversationId: existing.id };
++    }
++    const title = redactSecrets(input.title).slice(0, 200) || "Imported chat";
++    const id = randomUUID();
++    const createdAt = input.createdAtMs;
++    const updatedAt = input.updatedAtMs;
++    this.sqlite.transaction(() => {
++      this.db
++        .insert(conversations)
++        .values({
++          id,
++          projectId: input.projectId,
++          titleCipher: encryptUtf8(title, this.masterKey),
++          createdAt,
++          updatedAt,
++          importSource: input.source,
++          externalId: input.externalId,
++        })
++        .run();
++      let parentId: string | null = null;
++      let branchId: string | null = null;
++      for (const message of input.messages) {
++        const stored = this.createMessage({
++          conversationId: id,
++          role: message.role,
++          content: redactSecrets(message.content),
++          parentId,
++          branchId,
++          status: "complete",
++          createdAtMs: message.createdAtMs,
++        });
++        parentId = stored.id;
++        branchId = stored.branchId;
++        if (message.role !== "assistant") {
++          continue;
++        }
++        this.createReceipt({
++          messageId: stored.id,
++          provider: input.source,
++          model: null,
++          tokensIn: null,
++          tokensOut: null,
++          latencyMs: null,
++          costUsd: null,
++          errorCode: null,
++          source: "import",
++        });
++      }
++      this.db.update(conversations).set({ updatedAt }).where(eq(conversations.id, id)).run();
++    })();
++    return { outcome: "created", conversationId: id };
++  }
++
++  createImportJob(source: "chatgpt" | "claude" | "gemini"): { id: string; createdAt: string } {
++    const id = randomUUID();
++    const now = Date.now();
++    this.db
++      .insert(importJobs)
++      .values({
++        id,
++        source,
++        status: "queued",
++        reportJson: null,
++        createdAt: now,
++      })
++      .run();
++    return { id, createdAt: iso(now) };
++  }
++
++  updateImportJob(
++    id: string,
++    status: "queued" | "running" | "complete" | "cancelled" | "failed",
++    reportJson: string | null,
++  ): void {
++    this.db.update(importJobs).set({ status, reportJson }).where(eq(importJobs.id, id)).run();
++  }
++
+   listConversationTagNames(conversationId: string): string[] {
+     const links = this.db
+       .select()
+@@ -659,6 +806,7 @@ export class HubRepos {
+     parentId: string | null;
+     branchId: string | null;
+     status?: MessageStatus;
++    createdAtMs?: number;
+   }): MessageRecord {
+     const conversation = this.db
+       .select()
+@@ -679,7 +827,7 @@ export class HubRepos {
+     }
+     branchId = branchId ?? randomUUID();
+ 
+-    const now = Date.now();
++    const now = input.createdAtMs ?? Date.now();
+     const id = randomUUID();
+     const status = input.status ?? "complete";
+     this.db
+@@ -888,12 +1036,14 @@ export class HubRepos {
+     latencyMs: number | null;
+     costUsd: string | null;
+     errorCode: string | null;
++    source?: "chat" | "import";
+   }): ReceiptRecord {
+     const message = this.db.select().from(messages).where(eq(messages.id, input.messageId)).get();
+     if (!message) {
+       throw new Error("Message not found");
+     }
+     const existing = this.getReceipt(input.messageId);
++    const source = input.source ?? "chat";
+     if (existing) {
+       this.db
+         .update(messageReceipts)
+@@ -905,6 +1055,7 @@ export class HubRepos {
+           latencyMs: input.latencyMs,
+           costUsd: input.costUsd,
+           errorCode: input.errorCode,
++          source,
+         })
+         .where(eq(messageReceipts.id, existing.id))
+         .run();
+@@ -917,6 +1068,7 @@ export class HubRepos {
+         latencyMs: input.latencyMs,
+         costUsd: input.costUsd,
+         errorCode: input.errorCode,
++        source,
+       };
+     }
+     const now = Date.now();
+@@ -933,6 +1085,7 @@ export class HubRepos {
+         latencyMs: input.latencyMs,
+         costUsd: input.costUsd,
+         errorCode: input.errorCode,
++        source,
+         createdAt: now,
+       })
+       .run();
+@@ -946,6 +1099,7 @@ export class HubRepos {
+       latencyMs: input.latencyMs,
+       costUsd: input.costUsd,
+       errorCode: input.errorCode,
++      source,
+       createdAt: iso(now),
+     };
+   }
+@@ -1123,6 +1277,7 @@ export class HubRepos {
+           temperature,
+           maxTokens,
+           extraSystem,
++          importedInbox: "importedInbox" in parsed && parsed.importedInbox === true,
+         };
+       }
+     }
+diff --git a/packages/db/src/schema.ts b/packages/db/src/schema.ts
+index 89e87b5..ba3d801 100644
+--- a/packages/db/src/schema.ts
++++ b/packages/db/src/schema.ts
+@@ -17,6 +17,8 @@ export const conversations = sqliteTable("conversations", {
+   titleCipher: text("title_cipher").notNull(),
+   createdAt: integer("created_at", { mode: "number" }).notNull(),
+   updatedAt: integer("updated_at", { mode: "number" }).notNull(),
++  importSource: text("import_source"),
++  externalId: text("external_id"),
+ });
+ 
+ export const messages = sqliteTable("messages", {
+@@ -41,6 +43,7 @@ export const messageReceipts = sqliteTable("message_receipts", {
+   latencyMs: integer("latency_ms", { mode: "number" }),
+   costUsd: text("cost_usd"),
+   errorCode: text("error_code"),
++  source: text("source").notNull().default("chat"),
+   createdAt: integer("created_at", { mode: "number" }).notNull(),
+ });
+ 
+diff --git a/packages/shared/package.json b/packages/shared/package.json
+index cc7ace9..936070b 100644
+--- a/packages/shared/package.json
++++ b/packages/shared/package.json
+@@ -7,6 +7,10 @@
+     ".": {
+       "types": "./src/index.ts",
+       "default": "./src/index.ts"
++    },
++    "./import": {
++      "types": "./src/import/index.ts",
++      "default": "./src/import/index.ts"
+     }
+   },
+   "scripts": {
+@@ -18,6 +22,7 @@
+     "zod": "^3.25.76"
+   },
+   "devDependencies": {
++    "@types/node": "^22.18.1",
+     "vitest": "^3.2.4"
+   }
+ }
+diff --git a/packages/shared/src/gateway.test.ts b/packages/shared/src/gateway.test.ts
+index 7ffcb1c..790d054 100644
+--- a/packages/shared/src/gateway.test.ts
++++ b/packages/shared/src/gateway.test.ts
+@@ -176,8 +176,10 @@ describe("chat contracts", () => {
+       costUsd: "0.000001",
+       errorCode: null,
+       createdAt: "2026-09-16T00:00:00.000Z",
++      source: "chat",
+     });
+     expect(receipt.provider).toBe("openai");
++    expect(receipt.source).toBe("chat");
+     expect("secret" in receipt).toBe(false);
+   });
+ });
+diff --git a/packages/shared/src/gateway.ts b/packages/shared/src/gateway.ts
+index e1d3140..76aadd1 100644
+--- a/packages/shared/src/gateway.ts
++++ b/packages/shared/src/gateway.ts
+@@ -53,6 +53,7 @@ export const receiptDtoSchema = z.object({
+   costUsd: z.string().nullable(),
+   errorCode: gatewayErrorCodeSchema.nullable(),
+   createdAt: z.string().min(1),
++  source: z.enum(["chat", "import"]),
+ });
+ 
+ export type ReceiptDto = z.infer<typeof receiptDtoSchema>;
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index 024ff16..366b05b 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -13,6 +13,7 @@ import type {
+   ConversationTagsSetInput,
+   ConversationExportResult,
+   ConversationListInput,
++  ConversationMoveInput,
+   IdInput,
+   MessageCreateInput,
+   MessageDto,
+@@ -35,6 +36,11 @@ import type {
+   AppPrefs,
+   AppPrefsPatch,
+   UpdateCheckResult,
++  ImportCancelInput,
++  ImportEvent,
++  ImportPickResult,
++  ImportStartInput,
++  ImportStartResult,
+   ProviderKeyDto,
+   SecretsSaveInput,
+   SecretsTestInput,
+@@ -64,6 +70,7 @@ export interface HubConversationsApi {
+   getBranchLabels: (input: BranchLabelsGetInput) => Promise<BranchLabels>;
+   setBranchLabel: (input: BranchLabelSetInput) => Promise<void>;
+   setTags: (input: ConversationTagsSetInput) => Promise<ConversationDto>;
++  move: (input: ConversationMoveInput) => Promise<ConversationDto>;
+ }
+ 
+ export interface HubMessagesApi {
+@@ -121,6 +128,13 @@ export interface HubDebugApi {
+   getLatest: () => Promise<DebugSnapshot | null>;
+ }
+ 
++export interface HubImportApi {
++  pickFile: () => Promise<ImportPickResult>;
++  start: (input: ImportStartInput) => Promise<ImportStartResult>;
++  cancel: (input: ImportCancelInput) => Promise<void>;
++  onEvent: (listener: (event: ImportEvent) => void) => () => void;
++}
++
+ export interface HubChatApi {
+   send: (input: ChatSendInput) => Promise<ChatSendResult>;
+   abort: (input: ChatAbortInput) => Promise<void>;
+@@ -145,6 +159,7 @@ export interface HubApi {
+   costs: HubCostsApi;
+   debug: HubDebugApi;
+   chat: HubChatApi;
++  import: HubImportApi;
+ }
+ 
+ export type { AppLocale, ThemeMode };
+diff --git a/packages/shared/src/import/chatgpt.ts b/packages/shared/src/import/chatgpt.ts
+new file mode 100644
+index 0000000..79b2a40
+--- /dev/null
++++ b/packages/shared/src/import/chatgpt.ts
+@@ -0,0 +1,162 @@
++import { IMPORT_ATTACHMENT_PLACEHOLDER, asRecord, asString, unixToMs, type NormalizedImportConversation } from "./types";
++
++function extractPartText(part: unknown): { text: string; skippedAttachment: boolean } {
++  if (typeof part === "string") {
++    return { text: part, skippedAttachment: false };
++  }
++  const record = asRecord(part);
++  if (!record) {
++    return { text: "", skippedAttachment: true };
++  }
++  if (typeof record === "object" && "asset_pointer" in record) {
++    return { text: "", skippedAttachment: true };
++  }
++  const contentType = asString(record.content_type);
++  if (contentType && contentType !== "text") {
++    return { text: "", skippedAttachment: true };
++  }
++  if (typeof record.text === "string") {
++    return { text: record.text, skippedAttachment: false };
++  }
++  return { text: "", skippedAttachment: Boolean(contentType) };
++}
++
++function pickCurrentNode(mapping: Record<string, unknown>, declared: string | null): string | null {
++  if (declared && mapping[declared]) {
++    return declared;
++  }
++  const parentIds = new Set<string>();
++  for (const value of Object.values(mapping)) {
++    const record = asRecord(value);
++    const parent = record ? asString(record.parent) : null;
++    if (parent) {
++      parentIds.add(parent);
++    }
++  }
++  let best: string | null = null;
++  let bestTime = Number.NEGATIVE_INFINITY;
++  for (const [id, value] of Object.entries(mapping)) {
++    if (parentIds.has(id)) {
++      continue;
++    }
++    const record = asRecord(value);
++    const message = record ? asRecord(record.message) : null;
++    const time = message ? unixToMs(message.create_time, 0) : 0;
++    if (time >= bestTime) {
++      bestTime = time;
++      best = id;
++    }
++  }
++  return best;
++}
++
++function walkActivePath(
++  mapping: Record<string, unknown>,
++  currentNode: string | null,
++): unknown[] {
++  const ordered: unknown[] = [];
++  const seen = new Set<string>();
++  let cursor = currentNode;
++  while (cursor && !seen.has(cursor)) {
++    seen.add(cursor);
++    const node = mapping[cursor];
++    ordered.push(node);
++    const record = asRecord(node);
++    const parent = record ? asString(record.parent) : null;
++    cursor = parent;
++  }
++  return ordered.reverse();
++}
++
++export function parseChatGptConversations(payload: unknown): NormalizedImportConversation[] {
++  const list = Array.isArray(payload)
++    ? payload
++    : asRecord(payload) && Array.isArray(asRecord(payload)?.conversations)
++      ? (asRecord(payload)?.conversations as unknown[])
++      : null;
++  if (!list) {
++    return [];
++  }
++  const now = Date.now();
++  const result: NormalizedImportConversation[] = [];
++  for (const item of list) {
++    const conversation = asRecord(item);
++    if (!conversation) {
++      continue;
++    }
++    const mappingRaw = asRecord(conversation.mapping);
++    if (!mappingRaw) {
++      continue;
++    }
++    const externalId =
++      asString(conversation.conversation_id) ?? asString(conversation.id) ?? asString(conversation.conversationId);
++    if (!externalId) {
++      continue;
++    }
++    const createdAtMs = unixToMs(conversation.create_time, now);
++    const updatedAtMs = unixToMs(conversation.update_time, createdAtMs);
++    const title = asString(conversation.title)?.slice(0, 200) ?? "Imported chat";
++    const currentNode = pickCurrentNode(mappingRaw, asString(conversation.current_node));
++    const nodes = walkActivePath(mappingRaw, currentNode);
++    const messages: NormalizedImportConversation["messages"] = [];
++    for (const node of nodes) {
++      const record = asRecord(node);
++      const message = record ? asRecord(record.message) : null;
++      if (!message) {
++        continue;
++      }
++      const author = asRecord(message.author);
++      const roleRaw = author ? asString(author.role) : null;
++      if (roleRaw === "tool" || roleRaw === "system") {
++        const metadata = asRecord(message.metadata);
++        if (roleRaw === "system" && metadata?.is_user_system_message !== true) {
++          continue;
++        }
++        if (roleRaw === "tool") {
++          continue;
++        }
++      }
++      const role = roleRaw === "assistant" || roleRaw === "system" ? roleRaw : "user";
++      const content = asRecord(message.content);
++      const parts = content && Array.isArray(content.parts) ? content.parts : [];
++      let text = "";
++      let skippedAttachment = false;
++      if (parts.length === 0 && typeof content?.text === "string") {
++        text = content.text;
++      }
++      for (const part of parts) {
++        const extracted = extractPartText(part);
++        if (extracted.skippedAttachment) {
++          skippedAttachment = true;
++        }
++        if (extracted.text.length > 0) {
++          text = text.length > 0 ? `${text}\n${extracted.text}` : extracted.text;
++        }
++      }
++      if (skippedAttachment) {
++        text = text.length > 0 ? `${text}\n\n${IMPORT_ATTACHMENT_PLACEHOLDER}` : IMPORT_ATTACHMENT_PLACEHOLDER;
++      }
++      if (text.trim().length === 0) {
++        continue;
++      }
++      messages.push({
++        role,
++        content: text,
++        createdAtMs: unixToMs(message.create_time, createdAtMs),
++        skippedAttachment,
++      });
++    }
++    if (messages.length === 0) {
++      continue;
++    }
++    result.push({
++      source: "chatgpt",
++      externalId,
++      title,
++      createdAtMs,
++      updatedAtMs,
++      messages,
++    });
++  }
++  return result;
++}
+diff --git a/packages/shared/src/import/claude.ts b/packages/shared/src/import/claude.ts
+new file mode 100644
+index 0000000..1358f07
+--- /dev/null
++++ b/packages/shared/src/import/claude.ts
+@@ -0,0 +1,101 @@
++import { IMPORT_ATTACHMENT_PLACEHOLDER, asRecord, asString, unixToMs, type NormalizedImportConversation } from "./types";
++
++function textFromBlocks(value: unknown): { text: string; skippedAttachment: boolean } {
++  if (typeof value === "string") {
++    return { text: value, skippedAttachment: false };
++  }
++  if (!Array.isArray(value)) {
++    return { text: "", skippedAttachment: false };
++  }
++  const chunks: string[] = [];
++  let skippedAttachment = false;
++  for (const block of value) {
++    const record = asRecord(block);
++    if (!record) {
++      continue;
++    }
++    const type = asString(record.type);
++    if (type === "text" && typeof record.text === "string") {
++      chunks.push(record.text);
++      continue;
++    }
++    if (type === "thinking" || type === "tool_use" || type === "tool_result") {
++      continue;
++    }
++    if (type && type !== "text") {
++      skippedAttachment = true;
++    }
++  }
++  return { text: chunks.join("\n"), skippedAttachment };
++}
++
++export function parseClaudeConversations(payload: unknown): NormalizedImportConversation[] {
++  const list = Array.isArray(payload)
++    ? payload
++    : asRecord(payload) && Array.isArray(asRecord(payload)?.conversations)
++      ? (asRecord(payload)?.conversations as unknown[])
++      : null;
++  if (!list) {
++    return [];
++  }
++  const now = Date.now();
++  const result: NormalizedImportConversation[] = [];
++  for (const item of list) {
++    const conversation = asRecord(item);
++    if (!conversation) {
++      continue;
++    }
++    const externalId = asString(conversation.uuid) ?? asString(conversation.id);
++    if (!externalId) {
++      continue;
++    }
++    const createdAtMs = unixToMs(conversation.created_at, now);
++    const updatedAtMs = unixToMs(conversation.updated_at, createdAtMs);
++    const title = asString(conversation.name)?.slice(0, 200) ?? asString(conversation.title)?.slice(0, 200) ?? "Imported chat";
++    const rawMessages = Array.isArray(conversation.chat_messages) ? conversation.chat_messages : [];
++    const messages: NormalizedImportConversation["messages"] = [];
++    for (const raw of rawMessages) {
++      const message = asRecord(raw);
++      if (!message) {
++        continue;
++      }
++      const sender = asString(message.sender);
++      const role = sender === "assistant" ? "assistant" : sender === "human" || sender === "user" ? "user" : null;
++      if (!role) {
++        continue;
++      }
++      const fromText = typeof message.text === "string" ? message.text : "";
++      const fromBlocks = textFromBlocks(message.content);
++      let text = fromText.trim().length > 0 ? fromText : fromBlocks.text;
++      const hasFiles =
++        (Array.isArray(message.attachments) && message.attachments.length > 0) ||
++        (Array.isArray(message.files) && message.files.length > 0) ||
++        (Array.isArray(message.files_v2) && message.files_v2.length > 0);
++      const skippedAttachment = fromBlocks.skippedAttachment || hasFiles;
++      if (skippedAttachment) {
++        text = text.length > 0 ? `${text}\n\n${IMPORT_ATTACHMENT_PLACEHOLDER}` : IMPORT_ATTACHMENT_PLACEHOLDER;
++      }
++      if (text.trim().length === 0) {
++        continue;
++      }
++      messages.push({
++        role,
++        content: text,
++        createdAtMs: unixToMs(message.created_at, createdAtMs),
++        skippedAttachment,
++      });
++    }
++    if (messages.length === 0) {
++      continue;
++    }
++    result.push({
++      source: "claude",
++      externalId,
++      title,
++      createdAtMs,
++      updatedAtMs,
++      messages,
++    });
++  }
++  return result;
++}
+diff --git a/packages/shared/src/import/gemini.ts b/packages/shared/src/import/gemini.ts
+new file mode 100644
+index 0000000..d1f3ac0
+--- /dev/null
++++ b/packages/shared/src/import/gemini.ts
+@@ -0,0 +1,162 @@
++import {
++  IMPORT_ATTACHMENT_PLACEHOLDER,
++  asRecord,
++  asString,
++  fnv1aHex,
++  unixToMs,
++  type NormalizedImportConversation,
++} from "./types";
++
++function conversationIdFromUrl(url: string | null): string | null {
++  if (!url) {
++    return null;
++  }
++  try {
++    const parsed = new URL(url);
++    const parts = parsed.pathname.split("/").filter((part) => part.length > 0);
++    const appIndex = parts.lastIndexOf("app");
++    const appId = parts[appIndex + 1];
++    if (appIndex >= 0 && appId) {
++      return appId;
++    }
++    const gemIndex = parts.lastIndexOf("gem");
++    const gemId = parts[gemIndex + 1];
++    if (gemIndex >= 0 && gemId) {
++      return gemId;
++    }
++    return parts.at(-1) ?? null;
++  } catch {
++    const match = /\/(?:app|gem)\/([^/?#]+)/.exec(url);
++    return match?.[1] ?? null;
++  }
++}
++
++function stripHtml(value: string): string {
++  return value.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
++}
++
++function parseInteractionPayload(raw: unknown): { request: string; response: string; skippedAttachment: boolean } {
++  if (typeof raw !== "string" || raw.trim().length === 0) {
++    return { request: "", response: "", skippedAttachment: false };
++  }
++  try {
++    const parsed: unknown = JSON.parse(raw);
++    const record = asRecord(parsed);
++    if (!record) {
++      return { request: stripHtml(raw), response: "", skippedAttachment: false };
++    }
++    const request = asString(record.text) ?? asString(record.prompt) ?? asString(record.request) ?? "";
++    const response = asString(record.response) ?? asString(record.answer) ?? "";
++    return { request, response, skippedAttachment: false };
++  } catch {
++    return { request: stripHtml(raw), response: "", skippedAttachment: false };
++  }
++}
++
++export function parseGeminiActivities(payload: unknown): NormalizedImportConversation[] {
++  const list = Array.isArray(payload)
++    ? payload
++    : asRecord(payload) && Array.isArray(asRecord(payload)?.["My Activity"])
++      ? (asRecord(payload)?.["My Activity"] as unknown[])
++      : null;
++  if (!list) {
++    return [];
++  }
++  const groups = new Map<string, NormalizedImportConversation>();
++  const now = Date.now();
++  for (const item of list) {
++    const record = asRecord(item);
++    if (!record) {
++      continue;
++    }
++    const header = asString(record.header)?.toLowerCase() ?? "";
++    const products = Array.isArray(record.products) ? record.products.map((value) => String(value).toLowerCase()) : [];
++    const looksGemini =
++      header.includes("gemini") ||
++      products.some((product) => product.includes("gemini")) ||
++      (asString(record.titleUrl) ?? "").includes("gemini.google.com");
++    if (!looksGemini && header.length > 0 && !header.includes("bard")) {
++      continue;
++    }
++    const titleUrl = asString(record.titleUrl);
++    const timeMs = unixToMs(record.time, now);
++    const titleText = stripHtml(asString(record.title) ?? "Imported chat").slice(0, 200);
++    const externalId = conversationIdFromUrl(titleUrl) ?? `derived:${fnv1aHex(`${titleText}|${timeMs}`)}`;
++    let userText = titleText.replace(/^prompt:\s*/i, "");
++    let assistantText = "";
++    let skippedAttachment = false;
++    const subtitles = Array.isArray(record.subtitles) ? record.subtitles : [];
++    for (const subtitle of subtitles) {
++      const sub = asRecord(subtitle);
++      if (!sub) {
++        continue;
++      }
++      const name = asString(sub.name);
++      if (name) {
++        assistantText = assistantText.length > 0 ? `${assistantText}\n${stripHtml(name)}` : stripHtml(name);
++      }
++    }
++    const interactions = Array.isArray(record.userInteractions) ? record.userInteractions : [];
++    for (const interaction of interactions) {
++      const wrapped = asRecord(interaction);
++      const payloadRaw = wrapped?.userInteraction ?? wrapped?.request ?? interaction;
++      if (typeof payloadRaw === "string") {
++        const parsed = parseInteractionPayload(payloadRaw);
++        if (parsed.request.length > 0) {
++          userText = parsed.request;
++        }
++        if (parsed.response.length > 0) {
++          assistantText = parsed.response;
++        }
++      } else {
++        const inner = asRecord(payloadRaw);
++        if (inner) {
++          const request = asString(inner.request) ?? asString(inner.text);
++          const response = asString(inner.response);
++          if (request) {
++            userText = request;
++          }
++          if (response) {
++            assistantText = response;
++          }
++        }
++      }
++    }
++    if (Array.isArray(record.imageViews) && record.imageViews.length > 0) {
++      skippedAttachment = true;
++      assistantText =
++        assistantText.length > 0 ? `${assistantText}\n\n${IMPORT_ATTACHMENT_PLACEHOLDER}` : IMPORT_ATTACHMENT_PLACEHOLDER;
++    }
++    const existing = groups.get(externalId);
++    const conversation =
++      existing ??
++      ({
++        source: "gemini",
++        externalId,
++        title: userText.slice(0, 200) || "Imported chat",
++        createdAtMs: timeMs,
++        updatedAtMs: timeMs,
++        messages: [],
++      } satisfies NormalizedImportConversation);
++    if (userText.trim().length > 0) {
++      conversation.messages.push({
++        role: "user",
++        content: userText,
++        createdAtMs: timeMs,
++        skippedAttachment: false,
++      });
++    }
++    if (assistantText.trim().length > 0) {
++      conversation.messages.push({
++        role: "assistant",
++        content: assistantText,
++        createdAtMs: timeMs + 1,
++        skippedAttachment,
++      });
++    }
++    conversation.updatedAtMs = Math.max(conversation.updatedAtMs, timeMs);
++    conversation.createdAtMs = Math.min(conversation.createdAtMs, timeMs);
++    groups.set(externalId, conversation);
++  }
++  return [...groups.values()].filter((conversation) => conversation.messages.length > 0);
++}
+diff --git a/packages/shared/src/import/index.ts b/packages/shared/src/import/index.ts
+new file mode 100644
+index 0000000..bd14817
+--- /dev/null
++++ b/packages/shared/src/import/index.ts
+@@ -0,0 +1,17 @@
++export {
++  IMPORT_ATTACHMENT_PLACEHOLDER,
++  IMPORT_SOURCES,
++  ImportParseError,
++  fnv1aHex,
++  isImportSource,
++  unixToMs,
++  type ImportParseErrorCode,
++  type ImportSource,
++  type NormalizedImportConversation,
++  type NormalizedImportMessage,
++} from "./types";
++export { parseImportBytes } from "./parse";
++export { isZipBuffer, unzipUtf8Files } from "./zip";
++export { parseChatGptConversations } from "./chatgpt";
++export { parseClaudeConversations } from "./claude";
++export { parseGeminiActivities } from "./gemini";
+diff --git a/packages/shared/src/import/parse.test.ts b/packages/shared/src/import/parse.test.ts
+new file mode 100644
+index 0000000..1632db7
+--- /dev/null
++++ b/packages/shared/src/import/parse.test.ts
+@@ -0,0 +1,183 @@
++import { deflateRawSync } from "node:zlib";
++import { describe, expect, it } from "vitest";
++import { parseImportBytes } from "./parse";
++import { IMPORT_ATTACHMENT_PLACEHOLDER } from "./types";
++import { unzipUtf8Files } from "./zip";
++
++function zipStore(name: string, text: string): Uint8Array {
++  const payload = Buffer.from(text, "utf8");
++  const compressed = deflateRawSync(payload);
++  const nameBytes = Buffer.from(name, "utf8");
++  const header = Buffer.alloc(30);
++  header.writeUInt32LE(0x04034b50, 0);
++  header.writeUInt16LE(20, 4);
++  header.writeUInt16LE(0, 6);
++  header.writeUInt16LE(8, 8);
++  header.writeUInt32LE(0, 14);
++  header.writeUInt32LE(compressed.length, 18);
++  header.writeUInt32LE(payload.length, 22);
++  header.writeUInt16LE(nameBytes.length, 26);
++  header.writeUInt16LE(0, 28);
++  return Buffer.concat([header, nameBytes, compressed]);
++}
++
++const chatgptFixture = [
++  {
++    id: "conv-1",
++    title: "Alpha thread",
++    create_time: 1_700_000_000,
++    update_time: 1_700_000_100,
++    current_node: "n3",
++    mapping: {
++      n0: { id: "n0", parent: null, message: null },
++      n1: {
++        id: "n1",
++        parent: "n0",
++        message: {
++          author: { role: "user" },
++          create_time: 1_700_000_000,
++          content: { content_type: "text", parts: ["Hello from ChatGPT"] },
++        },
++      },
++      n2: {
++        id: "n2",
++        parent: "n1",
++        message: {
++          author: { role: "assistant" },
++          create_time: 1_700_000_010,
++          content: { content_type: "text", parts: ["Hi there"] },
++        },
++      },
++      n3: {
++        id: "n3",
++        parent: "n2",
++        message: {
++          author: { role: "user" },
++          create_time: 1_700_000_020,
++          content: {
++            content_type: "text",
++            parts: ["See this", { content_type: "image_asset_pointer", asset_pointer: "file-1" }],
++          },
++        },
++      },
++    },
++  },
++];
++
++const claudeFixture = [
++  {
++    uuid: "claude-1",
++    name: "Claude thread",
++    created_at: "2024-01-01T00:00:00.000Z",
++    updated_at: "2024-01-01T00:01:00.000Z",
++    chat_messages: [
++      {
++        uuid: "m1",
++        sender: "human",
++        text: "Review this",
++        created_at: "2024-01-01T00:00:00.000Z",
++        attachments: [{ name: "spec.pdf" }],
++      },
++      {
++        uuid: "m2",
++        sender: "assistant",
++        content: [
++          { type: "thinking", thinking: "secret chain" },
++          { type: "text", text: "Looks good" },
++        ],
++        created_at: "2024-01-01T00:00:30.000Z",
++      },
++    ],
++  },
++];
++
++const geminiFixture = [
++  {
++    header: "Gemini",
++    title: "What is TypeScript?",
++    titleUrl: "https://gemini.google.com/app/abc123",
++    time: "2024-06-01T12:00:00.000Z",
++    products: ["Gemini Apps"],
++    subtitles: [{ name: "A typed superset of JavaScript." }],
++  },
++  {
++    header: "Gemini",
++    title: "And Java?",
++    titleUrl: "https://gemini.google.com/app/abc123",
++    time: "2024-06-01T12:01:00.000Z",
++    products: ["Gemini Apps"],
++    subtitles: [{ name: "A different language." }],
++  },
++];
++
++describe("vendor import parsers", () => {
++  it("walks the ChatGPT active path and placeholders attachments", () => {
++    const parsed = parseImportBytes("chatgpt", Buffer.from(JSON.stringify(chatgptFixture), "utf8"));
++    expect(parsed).toHaveLength(1);
++    expect(parsed[0]?.externalId).toBe("conv-1");
++    expect(parsed[0]?.messages.map((item) => item.role)).toEqual(["user", "assistant", "user"]);
++    expect(parsed[0]?.messages[2]?.content).toContain(IMPORT_ATTACHMENT_PLACEHOLDER);
++    expect(parsed[0]?.messages[2]?.skippedAttachment).toBe(true);
++  });
++
++  it("parses Claude chat_messages and skips thinking blocks", () => {
++    const parsed = parseImportBytes("claude", Buffer.from(JSON.stringify(claudeFixture), "utf8"));
++    expect(parsed[0]?.messages).toHaveLength(2);
++    expect(parsed[0]?.messages[1]?.content).toBe("Looks good");
++    expect(parsed[0]?.messages[0]?.content).toContain(IMPORT_ATTACHMENT_PLACEHOLDER);
++  });
++
++  it("groups Gemini activity rows by titleUrl", () => {
++    const parsed = parseImportBytes("gemini", Buffer.from(JSON.stringify(geminiFixture), "utf8"));
++    expect(parsed).toHaveLength(1);
++    expect(parsed[0]?.externalId).toBe("abc123");
++    expect(parsed[0]?.messages).toHaveLength(4);
++  });
++
++  it("reads conversations.json from a deflated zip", () => {
++    const archive = zipStore("conversations.json", JSON.stringify(chatgptFixture));
++    expect(unzipUtf8Files(archive)[0]?.name).toBe("conversations.json");
++    const parsed = parseImportBytes("chatgpt", archive);
++    expect(parsed[0]?.title).toBe("Alpha thread");
++  });
++
++  it("rejects HTML takeout", () => {
++    expect(() => parseImportBytes("gemini", Buffer.from("<!DOCTYPE html><html></html>", "utf8"))).toThrow(
++      /HTML Takeout/,
++    );
++  });
++
++  it("walks ChatGPT mapping without current_node by picking a leaf", () => {
++    const parsed = parseImportBytes(
++      "chatgpt",
++      Buffer.from(
++        JSON.stringify([
++          {
++            id: "conv-leaf",
++            title: "No current node",
++            mapping: {
++              root: { id: "root", parent: null, message: null },
++              leaf: {
++                id: "leaf",
++                parent: "root",
++                message: {
++                  author: { role: "user" },
++                  create_time: 1_700_000_000,
++                  content: { content_type: "text", parts: ["Fallback path"] },
++                },
++              },
++            },
++          },
++        ]),
++        "utf8",
++      ),
++    );
++    expect(parsed[0]?.messages[0]?.content).toBe("Fallback path");
++  });
++
++  it("parses JSON with a UTF-8 BOM", () => {
++    const json = JSON.stringify(chatgptFixture);
++    const parsed = parseImportBytes("chatgpt", Buffer.from(`\uFEFF${json}`, "utf8"));
++    expect(parsed[0]?.externalId).toBe("conv-1");
++  });
++});
+diff --git a/packages/shared/src/import/parse.ts b/packages/shared/src/import/parse.ts
+new file mode 100644
+index 0000000..c0b09c6
+--- /dev/null
++++ b/packages/shared/src/import/parse.ts
+@@ -0,0 +1,67 @@
++import { parseChatGptConversations } from "./chatgpt";
++import { parseClaudeConversations } from "./claude";
++import { parseGeminiActivities } from "./gemini";
++import { ImportParseError, type ImportSource, type NormalizedImportConversation } from "./types";
++import { isZipBuffer, unzipUtf8Files } from "./zip";
++
++function looksLikeHtml(text: string): boolean {
++  const head = text.slice(0, 200).trim().toLowerCase();
++  return head.startsWith("<!doctype html") || head.startsWith("<html") || head.includes("<body");
++}
++
++function parseJsonDocument(text: string): unknown {
++  const trimmed = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
++  try {
++    return JSON.parse(trimmed) as unknown;
++  } catch {
++    throw new ImportParseError("invalid_json", "Invalid JSON");
++  }
++}
++
++function jsonFilesFromArchive(bytes: Uint8Array): string[] {
++  if (!isZipBuffer(bytes)) {
++    return [new TextDecoder("utf8").decode(bytes)];
++  }
++  const files = unzipUtf8Files(bytes);
++  const jsonFiles = files
++    .filter((file) => file.name.toLowerCase().endsWith(".json"))
++    .sort((left, right) => left.name.localeCompare(right.name));
++  if (jsonFiles.length === 0) {
++    throw new ImportParseError("unrecognized", "ZIP has no JSON files");
++  }
++  return jsonFiles.map((file) => file.text);
++}
++
++function parseOne(source: ImportSource, payload: unknown): NormalizedImportConversation[] {
++  if (source === "chatgpt") {
++    return parseChatGptConversations(payload);
++  }
++  if (source === "claude") {
++    return parseClaudeConversations(payload);
++  }
++  return parseGeminiActivities(payload);
++}
++
++export function parseImportBytes(source: ImportSource, bytes: Uint8Array): NormalizedImportConversation[] {
++  const texts = jsonFilesFromArchive(bytes);
++  if (texts.some((text) => looksLikeHtml(text))) {
++    throw new ImportParseError("gemini_html", "HTML Takeout is not supported");
++  }
++  const conversations: NormalizedImportConversation[] = [];
++  const seen = new Set<string>();
++  for (const text of texts) {
++    const payload = parseJsonDocument(text);
++    for (const conversation of parseOne(source, payload)) {
++      const key = `${conversation.source}:${conversation.externalId}`;
++      if (seen.has(key)) {
++        continue;
++      }
++      seen.add(key);
++      conversations.push(conversation);
++    }
++  }
++  if (conversations.length === 0) {
++    throw new ImportParseError("empty", "No conversations found");
++  }
++  return conversations;
++}
+diff --git a/packages/shared/src/import/types.ts b/packages/shared/src/import/types.ts
+new file mode 100644
+index 0000000..144ea10
+--- /dev/null
++++ b/packages/shared/src/import/types.ts
+@@ -0,0 +1,74 @@
++export const IMPORT_SOURCES = ["chatgpt", "claude", "gemini"] as const;
++
++export type ImportSource = (typeof IMPORT_SOURCES)[number];
++
++export const IMPORT_ATTACHMENT_PLACEHOLDER = "[file not imported]";
++
++export interface NormalizedImportMessage {
++  role: "user" | "assistant" | "system";
++  content: string;
++  createdAtMs: number;
++  skippedAttachment: boolean;
++}
++
++export interface NormalizedImportConversation {
++  source: ImportSource;
++  externalId: string;
++  title: string;
++  createdAtMs: number;
++  updatedAtMs: number;
++  messages: NormalizedImportMessage[];
++}
++
++export type ImportParseErrorCode = "invalid_json" | "unrecognized" | "gemini_html" | "empty";
++
++export class ImportParseError extends Error {
++  readonly code: ImportParseErrorCode;
++
++  constructor(code: ImportParseErrorCode, message: string) {
++    super(message);
++    this.name = "ImportParseError";
++    this.code = code;
++  }
++}
++
++export function isImportSource(value: string): value is ImportSource {
++  return (IMPORT_SOURCES as readonly string[]).includes(value);
++}
++
++export function unixToMs(value: unknown, fallback: number): number {
++  if (typeof value === "number" && Number.isFinite(value)) {
++    return value > 1_000_000_000_000 ? Math.trunc(value) : Math.trunc(value * 1000);
++  }
++  if (typeof value === "string" && value.trim().length > 0) {
++    const asNumber = Number(value);
++    if (Number.isFinite(asNumber) && asNumber > 0) {
++      return unixToMs(asNumber, fallback);
++    }
++    const parsed = Date.parse(value);
++    if (Number.isFinite(parsed)) {
++      return parsed;
++    }
++  }
++  return fallback;
++}
++
++export function asRecord(value: unknown): Record<string, unknown> | null {
++  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
++    return value as Record<string, unknown>;
++  }
++  return null;
++}
++
++export function asString(value: unknown): string | null {
++  return typeof value === "string" && value.trim().length > 0 ? value : null;
++}
++
++export function fnv1aHex(input: string): string {
++  let hash = 2166136261;
++  for (let index = 0; index < input.length; index += 1) {
++    hash ^= input.charCodeAt(index);
++    hash = Math.imul(hash, 16777619);
++  }
++  return (hash >>> 0).toString(16).padStart(8, "0");
++}
+diff --git a/packages/shared/src/import/zip.ts b/packages/shared/src/import/zip.ts
+new file mode 100644
+index 0000000..d2eefc9
+--- /dev/null
++++ b/packages/shared/src/import/zip.ts
+@@ -0,0 +1,54 @@
++import { inflateRawSync } from "node:zlib";
++
++function readU16(buffer: Buffer, offset: number): number {
++  return buffer.readUInt16LE(offset);
++}
++
++function readU32(buffer: Buffer, offset: number): number {
++  return buffer.readUInt32LE(offset);
++}
++
++export function isZipBuffer(bytes: Uint8Array): boolean {
++  return bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04;
++}
++
++export function unzipUtf8Files(bytes: Uint8Array): Array<{ name: string; text: string }> {
++  const buffer = Buffer.from(bytes);
++  const files: Array<{ name: string; text: string }> = [];
++  let offset = 0;
++  while (offset + 30 <= buffer.length) {
++    const signature = readU32(buffer, offset);
++    if (signature === 0x02014b50 || signature === 0x06054b50) {
++      break;
++    }
++    if (signature !== 0x04034b50) {
++      break;
++    }
++    const flags = readU16(buffer, offset + 6);
++    const method = readU16(buffer, offset + 8);
++    const compressedSize = readU32(buffer, offset + 18);
++    const nameLength = readU16(buffer, offset + 26);
++    const extraLength = readU16(buffer, offset + 28);
++    if (flags & 0x8) {
++      throw new Error("Unsupported ZIP (streaming data descriptor)");
++    }
++    const nameStart = offset + 30;
++    const name = buffer.subarray(nameStart, nameStart + nameLength).toString("utf8").replaceAll("\\", "/");
++    const dataStart = nameStart + nameLength + extraLength;
++    const compressed = buffer.subarray(dataStart, dataStart + compressedSize);
++    offset = dataStart + compressedSize;
++    if (name.endsWith("/")) {
++      continue;
++    }
++    let raw: Buffer;
++    if (method === 0) {
++      raw = Buffer.from(compressed);
++    } else if (method === 8) {
++      raw = inflateRawSync(compressed);
++    } else {
++      continue;
++    }
++    files.push({ name, text: raw.toString("utf8") });
++  }
++  return files;
++}
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 12f6fa2..20888b5 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -15,6 +15,7 @@ export {
+   type HubHealthApi,
+   type HubCostsApi,
+   type HubDebugApi,
++  type HubImportApi,
+   type HubWindowApi,
+ } from "./hub-api";
+ export {
+@@ -70,6 +71,7 @@ export {
+   conversationExportResultSchema,
+   conversationListInputSchema,
+   conversationListResultSchema,
++  conversationMoveInputSchema,
+   emptyIpcPayloadSchema,
+   idInputSchema,
+   ipcAckResultSchema,
+@@ -103,6 +105,15 @@ export {
+   appPrefsPatchSchema,
+   updateCheckResultSchema,
+   updateCheckStatusSchema,
++  importSourceSchema,
++  importPickResultSchema,
++  importStartInputSchema,
++  importStartResultSchema,
++  importCancelInputSchema,
++  importEventSchema,
++  importReportSchema,
++  importJobDtoSchema,
++  importJobStatusSchema,
+   providerDtoSchema,
+   providerKeyDtoSchema,
+   providerKeyListResultSchema,
+@@ -126,6 +137,7 @@ export {
+   type ConversationExportMode,
+   type ConversationExportResult,
+   type ConversationListInput,
++  type ConversationMoveInput,
+   type EmptyIpcPayload,
+   type IdInput,
+   type MessageCreateInput,
+@@ -152,6 +164,15 @@ export {
+   type AppPrefsPatch,
+   type UpdateCheckResult,
+   type UpdateCheckStatus,
++  type ImportSourceDto,
++  type ImportPickResult,
++  type ImportStartInput,
++  type ImportStartResult,
++  type ImportCancelInput,
++  type ImportEvent,
++  type ImportReport,
++  type ImportJobDto,
++  type ImportJobStatus,
+   type ProviderKeyDto,
+   type SecretsSaveInput,
+   type SecretsTestInput,
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index 24bd6dd..6a40e7f 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -14,6 +14,11 @@ export const IpcChannel = {
+   conversationsGetBranchLabels: "conversations:getBranchLabels",
+   conversationsSetBranchLabel: "conversations:setBranchLabel",
+   conversationsSetTags: "conversations:setTags",
++  conversationsMove: "conversations:move",
++  importPickFile: "import:pickFile",
++  importStart: "import:start",
++  importCancel: "import:cancel",
++  importEvent: "import:event",
+   searchQuery: "search:query",
+   spendCapsGet: "spendCaps:get",
+   spendCapsSet: "spendCaps:set",
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index 0acfec4..1d0fca6 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -4,6 +4,7 @@ import {
+   conversationExportDocumentSchema,
+   debugSnapshotSchema,
+   emptyIpcPayloadSchema,
++  importStartInputSchema,
+   ipcAckResultSchema,
+   messageCreateInputSchema,
+   messageDtoSchema,
+@@ -264,6 +265,19 @@ describe("project and search contracts", () => {
+   });
+ });
+ 
++describe("import start payload", () => {
++  it("rejects a filesystem path piggybacked on start", () => {
++    expect(() =>
++      importStartInputSchema.parse({
++        ticket: "11111111-1111-4111-8111-111111111111",
++        source: "chatgpt",
++        projectId: null,
++        path: "C:\\\\secrets\\\\export.json",
++      }),
++    ).toThrow();
++  });
++});
++
+ describe("wave 7 contracts", () => {
+   it("rejects secrets on a debug snapshot", () => {
+     const snapshot = {
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index c6f2a8f..272c8ec 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -88,6 +88,10 @@ export type IdInput = z.infer<typeof idInputSchema>;
+ 
+ export const tagNameSchema = z.string().trim().min(1).max(40);
+ 
++export const importSourceSchema = z.enum(["chatgpt", "claude", "gemini"]);
++
++export type ImportSourceDto = z.infer<typeof importSourceSchema>;
++
+ export const conversationDtoSchema = z.object({
+   id: z.string().uuid(),
+   projectId: z.string().uuid().nullable(),
+@@ -95,6 +99,7 @@ export const conversationDtoSchema = z.object({
+   tags: z.array(tagNameSchema),
+   createdAt: isoTimestampSchema,
+   updatedAt: isoTimestampSchema,
++  importSource: importSourceSchema.nullable(),
+ });
+ 
+ export type ConversationDto = z.infer<typeof conversationDtoSchema>;
+@@ -104,6 +109,7 @@ export const conversationListResultSchema = z.array(conversationDtoSchema);
+ export const conversationListInputSchema = z
+   .object({
+     projectId: z.string().uuid().nullable(),
++    inbox: z.enum(["avulsas", "imported"]).optional(),
+   })
+   .strict();
+ 
+@@ -127,6 +133,15 @@ export const conversationTagsSetInputSchema = z
+ 
+ export type ConversationTagsSetInput = z.infer<typeof conversationTagsSetInputSchema>;
+ 
++export const conversationMoveInputSchema = z
++  .object({
++    conversationId: z.string().uuid(),
++    projectId: z.string().uuid().nullable(),
++  })
++  .strict();
++
++export type ConversationMoveInput = z.infer<typeof conversationMoveInputSchema>;
++
+ export const searchInputSchema = z
+   .object({
+     query: z.string().trim().min(1).max(200),
+@@ -240,6 +255,7 @@ export const workspaceSessionSchema = z
+     temperature: z.number().min(0).max(2).optional(),
+     maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
+     extraSystem: z.string().max(20_000).optional(),
++    importedInbox: z.boolean().optional(),
+   })
+   .strict();
+ 
+@@ -527,3 +543,107 @@ export const updateCheckResultSchema = z
+   .strict();
+ 
+ export type UpdateCheckResult = z.infer<typeof updateCheckResultSchema>;
++
++export const importJobStatusSchema = z.enum(["queued", "running", "complete", "cancelled", "failed"]);
++
++export type ImportJobStatus = z.infer<typeof importJobStatusSchema>;
++
++export const importPickResultSchema = z.discriminatedUnion("status", [
++  z
++    .object({
++      status: z.literal("picked"),
++      ticket: z.string().uuid(),
++      fileName: z.string().min(1).max(260),
++    })
++    .strict(),
++  z.object({ status: z.literal("cancelled") }).strict(),
++]);
++
++export type ImportPickResult = z.infer<typeof importPickResultSchema>;
++
++export const importStartInputSchema = z
++  .object({
++    ticket: z.string().uuid(),
++    source: importSourceSchema,
++    projectId: z.string().uuid().nullable(),
++  })
++  .strict();
++
++export type ImportStartInput = z.infer<typeof importStartInputSchema>;
++
++export const importStartResultSchema = z
++  .object({
++    jobId: z.string().uuid(),
++  })
++  .strict();
++
++export type ImportStartResult = z.infer<typeof importStartResultSchema>;
++
++export const importCancelInputSchema = z.object({ jobId: z.string().uuid() }).strict();
++
++export type ImportCancelInput = z.infer<typeof importCancelInputSchema>;
++
++export const importItemErrorSchema = z
++  .object({
++    externalId: z.string().max(200).nullable(),
++    title: z.string().max(200).nullable(),
++    reason: z.string().max(200),
++  })
++  .strict();
++
++export type ImportItemError = z.infer<typeof importItemErrorSchema>;
++
++export const importReportSchema = z
++  .object({
++    ok: z.number().int().nonnegative(),
++    skipped: z.number().int().nonnegative(),
++    errors: z.array(importItemErrorSchema).max(200),
++    attachmentsSkipped: z.number().int().nonnegative(),
++    total: z.number().int().nonnegative(),
++  })
++  .strict();
++
++export type ImportReport = z.infer<typeof importReportSchema>;
++
++export const importEventSchema = z.discriminatedUnion("type", [
++  z
++    .object({
++      type: z.literal("progress"),
++      jobId: z.string().uuid(),
++      processed: z.number().int().nonnegative(),
++      total: z.number().int().nonnegative(),
++      ok: z.number().int().nonnegative(),
++      skipped: z.number().int().nonnegative(),
++    })
++    .strict(),
++  z
++    .object({
++      type: z.literal("done"),
++      jobId: z.string().uuid(),
++      status: z.enum(["complete", "cancelled", "failed"]),
++      report: importReportSchema,
++    })
++    .strict(),
++  z
++    .object({
++      type: z.literal("error"),
++      jobId: z.string().uuid().nullable(),
++      code: z.enum(["invalid_json", "unrecognized", "gemini_html", "empty", "generic"]),
++    })
++    .strict(),
++]);
++
++export type ImportEvent = z.infer<typeof importEventSchema>;
++
++export const importJobDtoSchema = z
++  .object({
++    id: z.string().uuid(),
++    source: importSourceSchema,
++    status: importJobStatusSchema,
++    report: importReportSchema.nullable(),
++    createdAt: isoTimestampSchema,
++  })
++  .strict();
++
++export type ImportJobDto = z.infer<typeof importJobDtoSchema>;
++
+diff --git a/packages/shared/tsconfig.json b/packages/shared/tsconfig.json
+index 8a5cc63..db2d521 100644
+--- a/packages/shared/tsconfig.json
++++ b/packages/shared/tsconfig.json
+@@ -1,7 +1,8 @@
+ {
+   "extends": "../../tsconfig.base.json",
+   "compilerOptions": {
+-    "noEmit": true
++    "noEmit": true,
++    "types": ["node"]
+   },
+   "include": ["src", "src/**/*.json"],
+   "exclude": ["src/**/*.test.ts"]
