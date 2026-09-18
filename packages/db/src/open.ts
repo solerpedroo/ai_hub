@@ -21,7 +21,7 @@ export function openHubDatabase(options: OpenHubDatabaseOptions): HubDatabase {
   const sqlite = new Database(options.path);
   applyMigrations(sqlite);
   const db = drizzle(sqlite, { schema });
-  const repos = new HubRepos(db, options.masterKey, options.secretStore);
+  const repos = new HubRepos(db, sqlite, options.masterKey, options.secretStore);
   return {
     sqlite,
     repos,
