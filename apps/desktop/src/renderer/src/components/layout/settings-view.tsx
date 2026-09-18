@@ -1,6 +1,15 @@
 import { type FormEvent, type JSX, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { AppLocale, ProviderDto, ProviderKeyDto, SecretsTestResult, SpendCapDto, ThemeMode } from "@ai-hub/shared";
+import type {
+  AppLocale,
+  AppPrefs,
+  ProviderDto,
+  ProviderKeyDto,
+  SecretsTestResult,
+  SpendCapDto,
+  ThemeMode,
+  UpdateCheckResult,
+} from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { persistLocale } from "@/lib/i18n";
@@ -24,6 +33,9 @@ export function SettingsView(): JSX.Element {
     global: "",
   });
   const [capsNotice, setCapsNotice] = useState<string | null>(null);
+  const [prefs, setPrefs] = useState<AppPrefs | null>(null);
+  const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
 
   const reloadKeys = (): void => {
     void window.hub.secrets
@@ -76,6 +88,18 @@ export function SettingsView(): JSX.Element {
           day: list.find((item) => item.scope === "day")?.limitUsd ?? "",
           global: list.find((item) => item.scope === "global")?.limitUsd ?? "",
         });
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setError(t("workspace.error.generic"));
+        }
+      });
+    void window.hub.prefs
+      .get()
+      .then((next) => {
+        if (!cancelled) {
+          setPrefs(next);
+        }
       })
       .catch(() => {
         if (!cancelled) {
@@ -311,6 +335,69 @@ export function SettingsView(): JSX.Element {
         {capsNotice ? (
           <p className="text-[11px] text-muted-foreground" role="status">
             {capsNotice}
+          </p>
+        ) : null}
+      </section>
+      <section className="flex flex-col gap-2">
+        <h2 className="text-[12px] font-medium">{t("privacy.title")}</h2>
+        <p className="text-muted-foreground">{t("privacy.hint")}</p>
+        <label className="flex items-center gap-2 text-[13px]">
+          <input
+            type="checkbox"
+            data-testid="crash-reporter-opt-in"
+            checked={prefs?.crashReporterOptIn === true}
+            onChange={(event) => {
+              const optIn = event.target.checked;
+              void window.hub.prefs
+                .set({ crashReporterOptIn: optIn })
+                .then(setPrefs)
+                .catch(() => setError(t("workspace.error.generic")));
+            }}
+          />
+          {t("privacy.crashOptIn")}
+        </label>
+        <p className="text-[11px] text-muted-foreground">{t("privacy.crashDetail")}</p>
+      </section>
+      <section className="flex flex-col gap-2">
+        <h2 className="text-[12px] font-medium">{t("updates.title")}</h2>
+        <p className="text-muted-foreground">{t("updates.hint")}</p>
+        <Button
+          type="button"
+          variant="outline"
+          data-testid="updates-check"
+          disabled={checkingUpdate}
+          onClick={() => {
+            setCheckingUpdate(true);
+            void window.hub.updates
+              .check()
+              .then((result) => {
+                setUpdateResult(result);
+                return window.hub.prefs.get();
+              })
+              .then(setPrefs)
+              .catch(() => setError(t("workspace.error.generic")))
+              .finally(() => setCheckingUpdate(false));
+          }}
+        >
+          {checkingUpdate ? t("updates.checking") : t("updates.check")}
+        </Button>
+        {updateResult ? (
+          <p
+            className="text-[11px] text-muted-foreground"
+            role="status"
+            data-testid="updates-status"
+            data-status={updateResult.status}
+          >
+            {t(`updates.status.${updateResult.status}`, { version: updateResult.version ?? "—" })}
+          </p>
+        ) : prefs?.lastUpdateStatus && prefs.lastUpdateStatus !== "idle" ? (
+          <p
+            className="text-[11px] text-muted-foreground"
+            role="status"
+            data-testid="updates-status"
+            data-status={prefs.lastUpdateStatus}
+          >
+            {t(`updates.status.${prefs.lastUpdateStatus}`, { version: "—" })}
           </p>
         ) : null}
       </section>
