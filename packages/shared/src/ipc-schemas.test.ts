@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  appPrefsSchema,
   conversationExportDocumentSchema,
   debugSnapshotSchema,
   emptyIpcPayloadSchema,
@@ -312,5 +313,19 @@ describe("wave 7 contracts", () => {
         secret: "sk-testfixtureABCDEFGH",
       }),
     ).toThrow();
+  });
+});
+
+describe("wave 8 contracts", () => {
+  it("rejects extra keys on app prefs", () => {
+    const prefs = {
+      onboardingComplete: false,
+      crashReporterOptIn: false,
+      lastUpdateCheckAt: null,
+      lastUpdateStatus: "idle" as const,
+      lastWizardTtftMs: null,
+    };
+    expect(appPrefsSchema.parse(prefs).crashReporterOptIn).toBe(false);
+    expect(() => appPrefsSchema.parse({ ...prefs, apiKey: "sk-test" })).toThrow();
   });
 });
