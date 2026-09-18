@@ -28,7 +28,8 @@ A janela é frameless. Projetos e conversas ficam no SQLite local (campos sensí
 ## Limitações do MVP
 
 - Windows first. **Sem build macOS assinado.**
-- Sem RAG, MCP, agentes, import Hub, packet portátil completo, artifacts, skills, @-mentions, sync ou team.
+- Sem RAG, MCP, agentes, packet portátil completo, artifacts, skills, @-mentions, sync ou team.
+- Import Hub: ChatGPT (ZIP/JSON), Claude JSON e Gemini `MyActivity.json` (best-effort). Takeout HTML do Gemini não é suportado. Anexos binários viram placeholder. Reimport do mesmo `external_id` não duplica.
 - Auto-update consulta GitHub Releases; feed vazio/fora **não** fecha o app.
 - Crash dumps são **opt-in** e só locais (sem upload, sem conversa).
 - e2e de CI usa adapter mock (`AI_HUB_E2E=1`), não chaves reais.
