@@ -77,3 +77,6 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W09-002](./ADR-W09-002-import-identity-and-receipt-source.md) | W09 | Identidade de import + receipt `source` | accepted |
 | [ADR-W09-003](./ADR-W09-003-imported-inbox-not-sentinel-project.md) | W09 | Inbox Importadas virtual, sem projeto sentinela | accepted |
 | [ADR-W09-004](./ADR-W09-004-vendor-parsers-and-opaque-ticket.md) | W09 | Parsers no shared; ticket opaco; Gemini best-effort | accepted |
+| [ADR-W10-001](./ADR-W10-001-portable-packet-json-v1.md) | W10 | Envelope `.aihub-packet.json` v1 | accepted |
+| [ADR-W10-002](./ADR-W10-002-context-packets-apply.md) | W10 | Persistência, apply no chat, ticket de ficheiro | accepted |
+| [ADR-W10-003](./ADR-W10-003-deterministic-inactive-summary-and-pins.md) | W10 | Resumo de ramos inativos sem LLM; pins no compact | accepted |
