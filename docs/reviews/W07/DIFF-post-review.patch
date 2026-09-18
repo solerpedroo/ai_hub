@@ -1,0 +1,3452 @@
+diff --git a/apps/desktop/e2e/send.spec.ts b/apps/desktop/e2e/send.spec.ts
+index 11ef175..c929172 100644
+--- a/apps/desktop/e2e/send.spec.ts
++++ b/apps/desktop/e2e/send.spec.ts
+@@ -158,3 +158,47 @@ test("switches from GPT to Claude on the same thread", async () => {
+     await app.close();
+   }
+ });
++
++test("a zero request cap blocks send before an assistant bubble appears", async () => {
++  const app = await launchHub();
++  try {
++    const window = await app.firstWindow();
++    await window.getByTestId("nav-settings").click();
++    await window.getByTestId("spend-cap-request").fill("0");
++    await window.getByTestId("spend-cap-save").click();
++    await window.getByTestId("nav-home").click();
++    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
++    await window.getByTestId("chat-composer").fill("Hello");
++    await window.getByTestId("chat-send").click();
++    await expect(window.getByTestId("workspace-error")).toBeVisible({ timeout: 15_000 });
++    await expect(window.getByTestId("message-assistant")).toHaveCount(0);
++    await expect(window.getByTestId("chat-composer")).toHaveValue("Hello");
++    await window.getByTestId("cap-allow-once").click();
++    await expect(window.getByTestId("message-assistant")).toContainText("Hello from mock", {
++      timeout: 30_000,
++    });
++  } finally {
++    await app.close();
++  }
++});
++
++test("assistant receipt opens a detail dialog without treating abort as failure", async () => {
++  const app = await launchHub();
++  try {
++    const window = await app.firstWindow();
++    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
++    await window.getByTestId("chat-composer").fill("Hello");
++    await window.getByTestId("chat-send").click();
++    await expect(window.getByTestId("message-assistant")).toHaveAttribute("data-status", "complete", {
++      timeout: 30_000,
++    });
++    await window.getByTestId("receipt-open").click();
++    await expect(window.getByTestId("receipt-dialog")).toBeVisible();
++    await window.keyboard.press("Escape");
++    await expect(window.getByTestId("receipt-dialog")).toHaveCount(0);
++    await window.getByTestId("nav-debug").click();
++    await expect(window.getByTestId("debug-snapshot")).toBeVisible();
++  } finally {
++    await app.close();
++  }
++});
+diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts
+index b793835..b26de85 100644
+--- a/apps/desktop/src/main/chat-session.ts
++++ b/apps/desktop/src/main/chat-session.ts
+@@ -11,6 +11,7 @@ import {
+   GatewayStreamError,
+   gatewayErrorCode,
+   resolveAdapter,
++  withTransientRetry,
+   type CompilerGraphMessage,
+   type CompilerMessage,
+   type ProviderAdapter,
+@@ -24,15 +25,21 @@ import {
+   findCatalogModel,
+   IpcChannel,
+   packetV0Schema,
++  SpendCapError,
++  suggestFallbackProvider,
++  summarizeProviderHealth,
+   type ChatEvent,
+   type ChatSendInput,
+   type ChatSendResult,
++  type DebugSnapshot,
+   type GatewayErrorCode,
+   type ProviderAgnosticPacket,
+ } from "@ai-hub/shared";
+-import { getHubDatabase } from "./persistence";
++import { recordDebugSnapshot } from "./debug-snapshot";
+ import { isE2eMode } from "./e2e-mode";
+ import { toMessageDto } from "./message-dto";
++import { getHubDatabase } from "./persistence";
++import { estimateOutgoingCostUsd, evaluateOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
+ 
+ interface ActiveRun {
+   runId: string;
+@@ -55,7 +62,7 @@ function adapterFor(slug: string, baseUrl: string | null): ProviderAdapter {
+   }
+   if (slug === "custom") {
+     if (baseUrl === null || baseUrl.length === 0) {
+-      throw new GatewayError("unknown", "Custom provider requires a base URL");
++      throw new GatewayError("unknown", "gateway:unknown");
+     }
+     return resolveAdapter("custom", { baseUrl });
+   }
+@@ -161,6 +168,39 @@ function compileOutgoing(
+   );
+ }
+ 
++function pendingUser(
++  conversationId: string,
++  content: string,
++  parentId: string | null,
++  branchId: string,
++): MessageRecord {
++  return {
++    id: randomUUID(),
++    conversationId,
++    parentId,
++    branchId,
++    isActiveBranch: true,
++    role: "user",
++    content,
++    status: "complete",
++    createdAt: new Date().toISOString(),
++    receipt: null,
++  };
++}
++
++function snapshotDecision(blocked: string | null, warnings: string[], allowOnce: boolean): DebugSnapshot["capDecision"] {
++  if (allowOnce && blocked) {
++    return "override";
++  }
++  if (blocked) {
++    return "block";
++  }
++  if (warnings.length > 0) {
++    return "warn";
++  }
++  return "ok";
++}
++
+ export async function sendChat(input: ChatSendInput, sender: WebContents): Promise<ChatSendResult> {
+   const repos = getHubDatabase().repos;
+   if (runByConversation.has(input.conversationId)) {
+@@ -174,14 +214,14 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+ 
+   const key = await repos.getProviderSecret(input.providerKeyId);
+   if (!key) {
+-    throw new GatewayError("auth", "Provider key is missing");
++    throw new GatewayError("auth", "gateway:auth");
+   }
+   if (key.providerSlug === "custom") {
+     if (input.model.trim().length === 0) {
+-      throw new Error("Unknown model");
++      throw new Error("unknown_model");
+     }
+   } else if (!findCatalogModel(input.model, key.providerSlug)) {
+-    throw new Error("Unknown model");
++    throw new Error("unknown_model");
+   }
+ 
+   const adapter = adapterFor(key.providerSlug, repos.getCustomBaseUrl(key.id));
+@@ -191,24 +231,27 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+     throw new Error("A stream is already running in this conversation");
+   }
+ 
+-  let userMessage: MessageRecord | null = null;
+   let compileRows: MessageRecord[] = [];
++  let persistUser: (() => MessageRecord | null) | null = null;
+   let assistantParentId: string | null = null;
+   let assistantBranchId: string | null = null;
+ 
+   switch (input.mode) {
+     case "send": {
+       const leaf = activePath(existing).at(-1);
+-      userMessage = repos.createMessage({
+-        conversationId: input.conversationId,
+-        role: "user",
+-        content: input.content,
+-        parentId: leaf?.id ?? null,
+-        branchId: leaf?.branchId ?? null,
+-      });
+-      compileRows = repos.listActivePath(input.conversationId);
+-      assistantParentId = userMessage.id;
+-      assistantBranchId = userMessage.branchId;
++      const branchId = leaf?.branchId ?? randomUUID();
++      const draft = pendingUser(input.conversationId, input.content, leaf?.id ?? null, branchId);
++      compileRows = [...existing, draft];
++      persistUser = () =>
++        repos.createMessage({
++          conversationId: input.conversationId,
++          role: "user",
++          content: input.content,
++          parentId: leaf?.id ?? null,
++          branchId: leaf?.branchId ?? null,
++        });
++      assistantParentId = "pending";
++      assistantBranchId = branchId;
+       break;
+     }
+     case "continue": {
+@@ -217,6 +260,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+       if (!leaf) {
+         throw new Error("Add a user message before sending");
+       }
++      persistUser = () => null;
+       assistantParentId = leaf.id;
+       assistantBranchId = leaf.branchId;
+       break;
+@@ -233,6 +277,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+       const index = path.findIndex((item) => item.id === target.id);
+       compileRows =
+         index >= 0 ? path.slice(0, index) : ancestorsOf(existing, target.id).slice(1).reverse();
++      persistUser = () => null;
+       assistantParentId = target.parentId;
+       assistantBranchId = randomUUID();
+       break;
+@@ -242,16 +287,21 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+       if (!target || target.conversationId !== input.conversationId || target.role !== "user") {
+         throw new Error("User message not found");
+       }
+-      userMessage = repos.createMessage({
+-        conversationId: input.conversationId,
+-        role: "user",
+-        content: input.content,
+-        parentId: target.parentId,
+-        branchId: randomUUID(),
+-      });
+-      compileRows = repos.listActivePath(input.conversationId);
+-      assistantParentId = userMessage.id;
+-      assistantBranchId = userMessage.branchId;
++      const branchId = randomUUID();
++      const draft = pendingUser(input.conversationId, input.content, target.parentId, branchId);
++      compileRows = existing
++        .map((item) => (item.id === target.id ? { ...item, isActiveBranch: false } : item))
++        .concat(draft);
++      persistUser = () =>
++        repos.createMessage({
++          conversationId: input.conversationId,
++          role: "user",
++          content: input.content,
++          parentId: target.parentId,
++          branchId,
++        });
++      assistantParentId = "pending";
++      assistantBranchId = branchId;
+       break;
+     }
+     default: {
+@@ -266,9 +316,68 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+     throw new Error("Add a user message before sending");
+   }
+ 
++  const catalog = findCatalogModel(input.model, key.providerSlug);
++  const contextWindow = catalog?.contextWindow ?? 128_000;
++  const overflow = packet.tokenEstimate > contextWindow;
++  if (overflow) {
++    throw new GatewayError("context_overflow", "gateway:context_overflow");
++  }
++
++  const estimatedCostUsd = estimateOutgoingCostUsd(
++    input.model,
++    key.providerSlug,
++    packet.tokenEstimate,
++    input.maxTokens ?? null,
++  );
++  const limits = spendCapLimitsFromRows(repos.listSpendCaps());
++  const daySpentUsd = repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() });
++  const globalSpentUsd = repos.sumReceiptCostUsd({});
++  const cap = evaluateOutgoingCaps({
++    estimatedRequestUsd: estimatedCostUsd,
++    daySpentUsd,
++    globalSpentUsd,
++    limits,
++  });
++  const allowOnce = input.allowOnce === true;
++  recordDebugSnapshot({
++    at: new Date().toISOString(),
++    provider: key.providerSlug,
++    model: input.model,
++    retries: 0,
++    lastErrorCode: null,
++    tokenEstimate: packet.tokenEstimate,
++    estimatedCostUsd,
++    capDecision: snapshotDecision(cap.blocked, cap.warnings, allowOnce),
++    capScope: cap.blocked,
++    overflow,
++  });
++  if (cap.blocked && !allowOnce) {
++    throw new SpendCapError(cap.blocked);
++  }
++  if (cap.blocked && allowOnce) {
++    repos.appendSpendCapOverride({
++      at: new Date().toISOString(),
++      scope: cap.blocked,
++      limitUsd: limits[cap.blocked] ?? "0",
++      estimatedUsd: estimatedCostUsd,
++      conversationId: input.conversationId,
++      model: input.model,
++      provider: key.providerSlug,
++    });
++  }
++
+   console.info("[hub:packet]", redactSecrets(JSON.stringify(packet)));
+   const publicPacket = inspectablePacket(packet);
+ 
++  const userMessage = persistUser ? persistUser() : null;
++  if (assistantParentId === "pending") {
++    if (!userMessage) {
++      throw new Error("Add a user message before sending");
++    }
++    assistantParentId = userMessage.id;
++    assistantBranchId = userMessage.branchId;
++  }
++
+   const assistant = repos.createMessage({
+     conversationId: input.conversationId,
+     role: "assistant",
+@@ -306,34 +415,77 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+ 
+   const secret = key.secret;
+   void (async () => {
++    let retries = 0;
+     try {
+-      const result = await consumeCrashSafeStream({
+-        stream: adapter.chatStream({
+-          secret,
+-          model: input.model,
+-          packet,
+-          signal: run.abort.signal,
+-          temperature: input.temperature ?? 1,
+-          maxTokens: input.maxTokens ?? null,
+-        }),
+-        onDelta: (text) => {
+-          emit(run.sender, {
+-            type: "chunk",
+-            runId,
+-            messageId: assistant.id,
+-            text,
++      let streamed = false;
++      const result = await withTransientRetry({
++        maxAttempts: 3,
++        signal: run.abort.signal,
++        didStream: () => streamed,
++        onRetry: (nextRetries, code) => {
++          retries = nextRetries;
++          recordDebugSnapshot({
++            at: new Date().toISOString(),
++            provider: run.provider,
++            model: run.model,
++            retries,
++            lastErrorCode: code,
++            tokenEstimate: packet.tokenEstimate,
++            estimatedCostUsd,
++            capDecision: snapshotDecision(cap.blocked, cap.warnings, allowOnce),
++            capScope: cap.blocked,
++            overflow,
+           });
+         },
+-        onFlush: (content) => {
+-          repos.updateMessage(assistant.id, content, "streaming");
++        run: async () => {
++          streamed = false;
++          return consumeCrashSafeStream({
++            stream: adapter.chatStream({
++              secret,
++              model: input.model,
++              packet,
++              signal: run.abort.signal,
++              temperature: input.temperature ?? 1,
++              maxTokens: input.maxTokens ?? null,
++            }),
++            onDelta: (text) => {
++              streamed = true;
++              emit(run.sender, {
++                type: "chunk",
++                runId,
++                messageId: assistant.id,
++                text,
++              });
++            },
++            onFlush: (content) => {
++              repos.updateMessage(assistant.id, content, "streaming");
++            },
++          });
+         },
+       });
+       repos.updateMessage(assistant.id, result.content, "complete");
+       writeReceipt(assistant.id, run, result.tokensIn, result.tokensOut, result.content.length, null, result.costUsd);
++      repos.recordHealthSample({
++        providerSlug: run.provider,
++        ok: true,
++        latencyMs: Math.max(0, Date.now() - run.startedAt),
++      });
+       const stored = repos.getMessage(assistant.id);
+       if (!stored) {
+         throw new Error("Message not found");
+       }
++      recordDebugSnapshot({
++        at: new Date().toISOString(),
++        provider: run.provider,
++        model: run.model,
++        retries,
++        lastErrorCode: null,
++        tokenEstimate: packet.tokenEstimate,
++        estimatedCostUsd,
++        capDecision: snapshotDecision(cap.blocked, cap.warnings, allowOnce),
++        capScope: cap.blocked,
++        overflow,
++      });
+       emit(run.sender, {
+         type: "done",
+         runId,
+@@ -358,11 +510,42 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+         code,
+         streamed?.costUsd ?? null,
+       );
++      if (code !== "aborted") {
++        repos.recordHealthSample({
++          providerSlug: run.provider,
++          ok: false,
++          latencyMs: Math.max(0, Date.now() - run.startedAt),
++        });
++      }
++      const keys = await repos.listProviderKeys();
++      const suggestion =
++        code === "aborted"
++          ? null
++          : suggestFallbackProvider({
++              failedProvider: run.provider,
++              keys,
++              summaries: summarizeProviderHealth(repos.listRecentHealthSamples()),
++            });
++      recordDebugSnapshot({
++        at: new Date().toISOString(),
++        provider: run.provider,
++        model: run.model,
++        retries,
++        lastErrorCode: code,
++        tokenEstimate: packet.tokenEstimate,
++        estimatedCostUsd,
++        capDecision: snapshotDecision(cap.blocked, cap.warnings, allowOnce),
++        capScope: cap.blocked,
++        overflow,
++      });
+       emit(run.sender, {
+         type: "error",
+         runId,
+         messageId: assistant.id,
+         code,
++        suggestProviderSlug: suggestion?.providerSlug ?? null,
++        suggestKeyId: suggestion?.keyId ?? null,
++        suggestModel: suggestion?.model ?? null,
+       });
+     } finally {
+       runs.delete(runId);
+diff --git a/apps/desktop/src/main/debug-snapshot.ts b/apps/desktop/src/main/debug-snapshot.ts
+new file mode 100644
+index 0000000..482303b
+--- /dev/null
++++ b/apps/desktop/src/main/debug-snapshot.ts
+@@ -0,0 +1,11 @@
++import type { DebugSnapshot } from "@ai-hub/shared";
++
++let latest: DebugSnapshot | null = null;
++
++export function recordDebugSnapshot(snapshot: DebugSnapshot): void {
++  latest = snapshot;
++}
++
++export function getLatestDebugSnapshot(): DebugSnapshot | null {
++  return latest;
++}
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index db2cca6..64f0ed5 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -16,7 +16,11 @@ import {
+   conversationListInputSchema,
+   conversationListResultSchema,
+   conversationTagsSetInputSchema,
++  costsAggregateInputSchema,
++  costsAggregateResultSchema,
++  debugSnapshotResultSchema,
+   emptyIpcPayloadSchema,
++  healthSummaryListSchema,
+   idInputSchema,
+   ipcAckResultSchema,
+   messageCreateInputSchema,
+@@ -38,16 +42,22 @@ import {
+   secretsSaveInputSchema,
+   secretsTestInputSchema,
+   secretsTestResultSchema,
++  spendCapListResultSchema,
++  spendCapSetInputSchema,
++  SPEND_CAP_SCOPES,
++  summarizeProviderHealth,
+   windowIsMaximizedResultSchema,
+   workspaceSessionSchema,
+ } from "@ai-hub/shared";
+ import { safeErrorMessage } from "@ai-hub/security";
+ import { abortChat, sendChat } from "./chat-session";
+ import { exportConversation } from "./conversation-export";
++import { getLatestDebugSnapshot } from "./debug-snapshot";
+ import { toMessageDto } from "./message-dto";
+ import { previewPacket } from "./packet-preview";
+ import { getHubDatabase } from "./persistence";
+ import { testProviderKey } from "./provider-health";
++import { localDayStartMs } from "./spend-guard";
+ 
+ function registerHandler<TIn, TOut>(
+   channel: string,
+@@ -272,6 +282,73 @@ export function registerWorkspaceIpc(): void {
+     packetPreviewResultSchema,
+     (input) => previewPacket(input),
+   );
++
++  registerHandler(IpcChannel.spendCapsGet, emptyIpcPayloadSchema, spendCapListResultSchema, () => {
++    const rows = getHubDatabase().repos.listSpendCaps();
++    return SPEND_CAP_SCOPES.map((scope) => ({
++      scope,
++      limitUsd: rows.find((row) => row.scope === scope)?.limitUsd ?? null,
++    }));
++  });
++
++  registerHandler(
++    IpcChannel.spendCapsSet,
++    spendCapSetInputSchema,
++    spendCapListResultSchema,
++    (input) => {
++      const repos = getHubDatabase().repos;
++      for (const cap of input.caps) {
++        repos.upsertSpendCap(cap.scope, cap.limitUsd);
++      }
++      const rows = repos.listSpendCaps();
++      return SPEND_CAP_SCOPES.map((scope) => ({
++        scope,
++        limitUsd: rows.find((row) => row.scope === scope)?.limitUsd ?? null,
++      }));
++    },
++  );
++
++  registerHandler(IpcChannel.healthSummary, emptyIpcPayloadSchema, healthSummaryListSchema, async () => {
++    const repos = getHubDatabase().repos;
++    const samples = summarizeProviderHealth(repos.listRecentHealthSamples());
++    const bySlug = new Map(samples.map((item) => [item.providerSlug, item]));
++    const keys = await repos.listProviderKeys();
++    const slugs = [...new Set([...keys.map((key) => key.providerSlug), ...bySlug.keys()])].sort();
++    return slugs.map((providerSlug) => {
++      const existing = bySlug.get(providerSlug);
++      if (existing) {
++        return existing;
++      }
++      return {
++        providerSlug,
++        lastOk: null,
++        lastLatencyMs: null,
++        errorRate: 0,
++        sampleCount: 0,
++      };
++    });
++  });
++
++  registerHandler(
++    IpcChannel.costsAggregate,
++    costsAggregateInputSchema,
++    costsAggregateResultSchema,
++    (input) => {
++      const repos = getHubDatabase().repos;
++      return {
++        conversationUsd: input.conversationId
++          ? repos.sumReceiptCostUsd({ conversationId: input.conversationId })
++          : null,
++        projectUsd: input.projectId ? repos.sumReceiptCostUsd({ projectId: input.projectId }) : null,
++        dayUsd: repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() }),
++        globalUsd: repos.sumReceiptCostUsd({}),
++      };
++    },
++  );
++
++  registerHandler(IpcChannel.debugGetLatest, emptyIpcPayloadSchema, debugSnapshotResultSchema, () =>
++    getLatestDebugSnapshot(),
++  );
+ }
+ 
+ export function registerWindowIpc(
+diff --git a/apps/desktop/src/main/packet-preview.ts b/apps/desktop/src/main/packet-preview.ts
+index 1e559df..59ee075 100644
+--- a/apps/desktop/src/main/packet-preview.ts
++++ b/apps/desktop/src/main/packet-preview.ts
+@@ -1,4 +1,5 @@
+ import { compileActivePath } from "@ai-hub/ai-gateway";
++import { randomUUID } from "node:crypto";
+ import {
+   findCatalogModel,
+   packetPreviewResultSchema,
+@@ -6,6 +7,7 @@ import {
+   type PacketPreviewResult,
+ } from "@ai-hub/shared";
+ import { getHubDatabase } from "./persistence";
++import { estimateOutgoingCostUsd, evaluateOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
+ 
+ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
+   const repos = getHubDatabase().repos;
+@@ -18,10 +20,14 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
+     input.extraSystem !== undefined && input.extraSystem.trim().length > 0 ? input.extraSystem.trim() : null;
+   const catalog = findCatalogModel(input.model, input.providerSlug);
+   const contextWindow = catalog?.contextWindow ?? 128_000;
+-  const compiled = {
+-    projectInstructions: project?.instructions ?? null,
+-    extraSystem,
+-    messages: repos.listActivePath(input.conversationId).map((item) => ({
++  const path = repos.listActivePath(input.conversationId);
++  const pending =
++    input.pendingContent !== undefined && input.pendingContent.trim().length > 0
++      ? input.pendingContent.trim()
++      : null;
++  const leaf = path.at(-1);
++  const messages = [
++    ...path.map((item) => ({
+       id: item.id,
+       parentId: item.parentId,
+       isActiveBranch: item.isActiveBranch,
+@@ -30,15 +36,48 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
+       content: item.content,
+       status: item.status,
+     })),
++    ...(pending
++      ? [
++          {
++            id: randomUUID(),
++            parentId: leaf?.id ?? null,
++            isActiveBranch: true,
++            createdAt: new Date().toISOString(),
++            role: "user" as const,
++            content: pending,
++            status: "complete" as const,
++          },
++        ]
++      : []),
++  ];
++  const compiled = {
++    projectInstructions: project?.instructions ?? null,
++    extraSystem,
++    messages,
+   };
+   const packet = compileActivePath(
+     input.compact === true ? { ...compiled, maxTokenBudget: contextWindow } : compiled,
+   );
++  const estimatedCostUsd = estimateOutgoingCostUsd(
++    input.model,
++    input.providerSlug,
++    packet.tokenEstimate,
++    input.maxTokens ?? null,
++  );
++  const cap = evaluateOutgoingCaps({
++    estimatedRequestUsd: estimatedCostUsd,
++    daySpentUsd: repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() }),
++    globalSpentUsd: repos.sumReceiptCostUsd({}),
++    limits: spendCapLimitsFromRows(repos.listSpendCaps()),
++  });
+   return packetPreviewResultSchema.parse({
+     tokenEstimate: packet.tokenEstimate,
+     contextWindow,
+     overflow: packet.tokenEstimate > contextWindow,
+     compacted: input.compact === true && packet.excluded.length > 0,
+     excludedCount: packet.excluded.length,
++    estimatedCostUsd,
++    capWarnings: cap.warnings,
++    capBlocked: cap.blocked,
+   });
+ }
+diff --git a/apps/desktop/src/main/spend-guard.ts b/apps/desktop/src/main/spend-guard.ts
+new file mode 100644
+index 0000000..494d0dd
+--- /dev/null
++++ b/apps/desktop/src/main/spend-guard.ts
+@@ -0,0 +1,50 @@
++import {
++  DEFAULT_ESTIMATED_OUTPUT_TOKENS,
++  evaluateSpendCaps,
++  estimateCostUsd,
++  findCatalogModel,
++  isSpendCapScope,
++  type SpendCapLimits,
++  type SpendCapScope,
++} from "@ai-hub/shared";
++import type { SpendCapRecord } from "@ai-hub/db";
++
++export function localDayStartMs(now = Date.now()): number {
++  const date = new Date(now);
++  date.setHours(0, 0, 0, 0);
++  return date.getTime();
++}
++
++export function spendCapLimitsFromRows(rows: readonly SpendCapRecord[]): SpendCapLimits {
++  const limits: SpendCapLimits = {};
++  for (const row of rows) {
++    if (isSpendCapScope(row.scope)) {
++      limits[row.scope] = row.limitUsd;
++    }
++  }
++  return limits;
++}
++
++export function estimateOutgoingCostUsd(
++  model: string,
++  providerSlug: string,
++  tokensIn: number,
++  maxTokens: number | null | undefined,
++): string | null {
++  const catalog = findCatalogModel(model, providerSlug);
++  if (!catalog) {
++    return null;
++  }
++  const tokensOut = maxTokens ?? DEFAULT_ESTIMATED_OUTPUT_TOKENS;
++  return estimateCostUsd(catalog, tokensIn, tokensOut);
++}
++
++export function evaluateOutgoingCaps(input: {
++  estimatedRequestUsd: string | null;
++  daySpentUsd: string;
++  globalSpentUsd: string;
++  limits: SpendCapLimits;
++}): { blocked: SpendCapScope | null; warnings: SpendCapScope[] } {
++  const result = evaluateSpendCaps(input);
++  return { blocked: result.blocked, warnings: result.warnings };
++}
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index 494e44b..41bcb33 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -18,7 +18,11 @@ import {
+   conversationExportInputSchema,
+   conversationExportResultSchema,
+   conversationTagsSetInputSchema,
++  costsAggregateInputSchema,
++  costsAggregateResultSchema,
++  debugSnapshotResultSchema,
+   emptyIpcPayloadSchema,
++  healthSummaryListSchema,
+   idInputSchema,
+   ipcAckResultSchema,
+   messageCreateInputSchema,
+@@ -40,6 +44,8 @@ import {
+   secretsSaveInputSchema,
+   secretsTestInputSchema,
+   secretsTestResultSchema,
++  spendCapListResultSchema,
++  spendCapSetInputSchema,
+   windowIsMaximizedResultSchema,
+   workspaceSessionSchema,
+ } from "@ai-hub/shared";
+@@ -191,6 +197,24 @@ const hub: HubApi = {
+   search: {
+     query: (input) => invokeParsed(IpcChannel.searchQuery, input, searchInputSchema, searchResultSchema),
+   },
++  spendCaps: {
++    get: () =>
++      invokeParsed(IpcChannel.spendCapsGet, empty, emptyIpcPayloadSchema, spendCapListResultSchema),
++    set: (input) =>
++      invokeParsed(IpcChannel.spendCapsSet, input, spendCapSetInputSchema, spendCapListResultSchema),
++  },
++  health: {
++    summary: () =>
++      invokeParsed(IpcChannel.healthSummary, empty, emptyIpcPayloadSchema, healthSummaryListSchema),
++  },
++  costs: {
++    aggregate: (input) =>
++      invokeParsed(IpcChannel.costsAggregate, input, costsAggregateInputSchema, costsAggregateResultSchema),
++  },
++  debug: {
++    getLatest: () =>
++      invokeParsed(IpcChannel.debugGetLatest, empty, emptyIpcPayloadSchema, debugSnapshotResultSchema),
++  },
+   chat: {
+     send: (input) => invokeParsed(IpcChannel.chatSend, input, chatSendInputSchema, chatSendResultSchema),
+     abort: (input) => invokeAckWith(IpcChannel.chatAbort, input, chatAbortInputSchema),
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index f48ef22..7bcc83f 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -1,10 +1,14 @@
+ import { useCallback, useEffect, useRef, useState, type JSX } from "react";
+ import { useTranslation } from "react-i18next";
++import type { TFunction } from "i18next";
+ import type {
+   BranchLabels,
+   ChatSendInput,
+   ChatSendResult,
+   ConversationDto,
++  CostsAggregateResult,
++  GatewayErrorCode,
++  HealthSummaryDto,
+   MessageDto,
+   PacketPreviewResult,
+   ProjectDto,
+@@ -14,6 +18,7 @@ import type {
+ } from "@ai-hub/shared";
+ import {
+   catalogModelsForProvider,
++  classifyHubIpcError,
+   findCatalogModel,
+   upsertActivated,
+ } from "@ai-hub/shared";
+@@ -22,8 +27,11 @@ import { Sidebar } from "@/components/layout/sidebar";
+ import { StatusBar } from "@/components/layout/status-bar";
+ import { HomeView } from "@/components/layout/home-view";
+ import { SettingsView } from "@/components/layout/settings-view";
++import { DebugView } from "@/components/layout/debug-view";
+ import { ChromeCommandPalette } from "@/components/layout/command-palette";
+ import type { AppView } from "@/components/layout/types";
++import { Button } from "@/components/ui/button";
++import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+ 
+ function applySendResult(current: MessageDto[], result: ChatSendResult): MessageDto[] {
+   let next = current;
+@@ -33,6 +41,38 @@ function applySendResult(current: MessageDto[], result: ChatSendResult): Message
+   return upsertActivated(next, result.assistant);
+ }
+ 
++const GATEWAY_ERROR_KEYS = new Set<GatewayErrorCode>([
++  "timeout",
++  "rate_limit",
++  "auth",
++  "context_overflow",
++  "quota",
++  "network",
++  "unknown",
++]);
++
++function workspaceErrorText(t: TFunction, error: unknown): { text: string; cap: boolean } {
++  const message = error instanceof Error ? error.message : String(error);
++  const classified = classifyHubIpcError(message);
++  if (classified.kind === "cap" && classified.scope) {
++    return { text: t("workspace.error.cap", { scope: t(`caps.scope.${classified.scope}`) }), cap: true };
++  }
++  if (classified.kind === "unknown_model") {
++    return { text: t("workspace.error.unknownModel"), cap: false };
++  }
++  if (classified.kind === "gateway" && classified.code && GATEWAY_ERROR_KEYS.has(classified.code)) {
++    return { text: t(`workspace.error.${classified.code}`), cap: false };
++  }
++  return { text: t("workspace.error.generic"), cap: false };
++}
++
++function chatEventErrorText(t: TFunction, code: GatewayErrorCode): string {
++  if (GATEWAY_ERROR_KEYS.has(code)) {
++    return t(`workspace.error.${code}`);
++  }
++  return t("workspace.error.chat", { code });
++}
++
+ export function App(): JSX.Element {
+   const { t } = useTranslation();
+   const [view, setView] = useState<AppView>("home");
+@@ -59,10 +99,28 @@ export function App(): JSX.Element {
+   const [searchQuery, setSearchQuery] = useState("");
+   const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
+   const [threadStartModel, setThreadStartModel] = useState<string | null>(null);
++  const [health, setHealth] = useState<HealthSummaryDto[]>([]);
++  const [costs, setCosts] = useState<CostsAggregateResult | null>(null);
++  const [showAllowOnce, setShowAllowOnce] = useState(false);
++  const [composerDraft, setComposerDraft] = useState("");
++  const [fallback, setFallback] = useState<{
++    messageId: string;
++    code: GatewayErrorCode;
++    failedProvider: string;
++    suggestProviderSlug: string;
++    suggestKeyId: string;
++    suggestModel: string;
++  } | null>(null);
++  const [fallbackPreview, setFallbackPreview] = useState<PacketPreviewResult | null>(null);
+   const projectInputRef = useRef<HTMLInputElement | null>(null);
+   const searchInputRef = useRef<HTMLInputElement | null>(null);
+   const selectedModelRef = useRef(selectedModel);
+   const searchGeneration = useRef(0);
++  const lastSendRef = useRef<ChatSendInput | null>(null);
++
++  const reportComposerDraft = useCallback((value: string): void => {
++    setComposerDraft(value);
++  }, []);
+ 
+   const fail = useCallback((): void => {
+     setError(t("workspace.error.generic"));
+@@ -94,6 +152,14 @@ export function App(): JSX.Element {
+     return list;
+   }, []);
+ 
++  const loadHealth = useCallback(async (): Promise<void> => {
++    try {
++      setHealth(await window.hub.health.summary());
++    } catch {
++      // Status bar stays on the last successful sample set.
++    }
++  }, []);
++
+   useEffect(() => {
+     void (async () => {
+       try {
+@@ -165,6 +231,24 @@ export function App(): JSX.Element {
+     })();
+   }, [fail, loadConversations, loadKeys, loadMessages, loadProjects]);
+ 
++  useEffect(() => {
++    void loadHealth();
++    const handle = window.setInterval(() => {
++      void loadHealth();
++    }, 8_000);
++    return () => window.clearInterval(handle);
++  }, [loadHealth]);
++
++  useEffect(() => {
++    void window.hub.costs
++      .aggregate({
++        conversationId: selectedConversationId,
++        projectId: selectedProjectId,
++      })
++      .then(setCosts)
++      .catch(() => setCosts(null));
++  }, [messages, selectedConversationId, selectedProjectId]);
++
+   useEffect(() => {
+     if (!sessionReady) {
+       return;
+@@ -251,20 +335,28 @@ export function App(): JSX.Element {
+       return;
+     }
+     const extra = extraSystem.trim().length > 0 ? extraSystem : undefined;
+-    void window.hub.chat
+-      .previewPacket({
+-        conversationId: selectedConversationId,
+-        model: selectedModel,
+-        providerSlug: key.providerSlug,
+-        compact: compactHistory,
+-        ...(extra !== undefined ? { extraSystem: extra } : {}),
+-      })
+-      .then(setPacketPreview)
+-      .catch(fail);
++    const pending = composerDraft.trim().length > 0 ? composerDraft.trim() : undefined;
++    const handle = window.setTimeout(() => {
++      void window.hub.chat
++        .previewPacket({
++          conversationId: selectedConversationId,
++          model: selectedModel,
++          providerSlug: key.providerSlug,
++          compact: compactHistory,
++          ...(extra !== undefined ? { extraSystem: extra } : {}),
++          ...(pending !== undefined ? { pendingContent: pending } : {}),
++          ...(maxTokens !== null ? { maxTokens } : {}),
++        })
++        .then(setPacketPreview)
++        .catch(fail);
++    }, 200);
++    return () => window.clearTimeout(handle);
+   }, [
+     compactHistory,
++    composerDraft,
+     extraSystem,
+     fail,
++    maxTokens,
+     messages,
+     providerKeys,
+     selectedConversationId,
+@@ -289,12 +381,27 @@ export function App(): JSX.Element {
+           current.map((message) => (message.id === event.message.id ? event.message : message)),
+         );
+         setRun((current) => (current?.runId === event.runId ? null : current));
++        void loadHealth();
+         return;
+       }
+       setRun((current) => (current?.runId === event.runId ? null : current));
+       if (event.code !== "aborted") {
+-        setError(t("workspace.error.chat", { code: event.code }));
++        setError(chatEventErrorText(t, event.code));
++        setShowAllowOnce(false);
++        if (event.suggestKeyId && event.suggestProviderSlug && event.suggestModel) {
++          const failed =
++            providerKeys.find((item) => item.id === selectedKeyId)?.providerSlug ?? event.suggestProviderSlug;
++          setFallback({
++            messageId: event.messageId,
++            code: event.code,
++            failedProvider: failed,
++            suggestProviderSlug: event.suggestProviderSlug,
++            suggestKeyId: event.suggestKeyId,
++            suggestModel: event.suggestModel,
++          });
++        }
+       }
++      void loadHealth();
+       setSelectedConversationId((conversationId) => {
+         if (conversationId) {
+           void loadMessages(conversationId).catch(fail);
+@@ -303,7 +410,26 @@ export function App(): JSX.Element {
+       });
+     });
+     return off;
+-  }, [fail, loadMessages, t]);
++  }, [fail, loadHealth, loadMessages, providerKeys, selectedKeyId, t]);
++
++  useEffect(() => {
++    if (!fallback || !selectedConversationId) {
++      setFallbackPreview(null);
++      return;
++    }
++    const extra = extraSystem.trim().length > 0 ? extraSystem : undefined;
++    void window.hub.chat
++      .previewPacket({
++        conversationId: selectedConversationId,
++        model: fallback.suggestModel,
++        providerSlug: fallback.suggestProviderSlug,
++        compact: compactHistory,
++        ...(extra !== undefined ? { extraSystem: extra } : {}),
++        ...(maxTokens !== null ? { maxTokens } : {}),
++      })
++      .then(setFallbackPreview)
++      .catch(() => setFallbackPreview(null));
++  }, [compactHistory, extraSystem, fallback, maxTokens, selectedConversationId]);
+ 
+   const applyProjectPreferences = useCallback(
+     (project: ProjectDto, keys: ProviderKeyDto[]): void => {
+@@ -347,18 +473,25 @@ export function App(): JSX.Element {
+     }
+   }, [fail, loadConversations, run, selectedProjectId, t]);
+ 
+-  const sendToModel = async (input: ChatSendInput): Promise<void> => {
++  const sendToModel = async (input: ChatSendInput): Promise<boolean> => {
+     if (!selectedConversationId || !selectedKeyId) {
+-      return;
++      return false;
+     }
++    lastSendRef.current = input;
+     setSending(true);
+     try {
+       const result = await window.hub.chat.send({ ...input, compactHistory });
+       setError(null);
++      setShowAllowOnce(false);
++      setFallback(null);
+       setRun({ runId: result.runId, conversationId: selectedConversationId });
+       setMessages((current) => applySendResult(current, result));
+-    } catch {
+-      fail();
++      return true;
++    } catch (error) {
++      const mapped = workspaceErrorText(t, error);
++      setError(mapped.text);
++      setShowAllowOnce(mapped.cap);
++      return false;
+     } finally {
+       setSending(false);
+     }
+@@ -510,7 +643,7 @@ export function App(): JSX.Element {
+               onSelectExtraSystem={setExtraSystem}
+               onSend={(content) => {
+                 if (!selectedConversationId || !selectedKeyId) {
+-                  return Promise.resolve();
++                  return Promise.resolve(false);
+                 }
+                 return sendToModel({
+                   mode: "send",
+@@ -549,11 +682,11 @@ export function App(): JSX.Element {
+                   extraSystem,
+                 });
+               }}
+-              onContinue={() => {
++              onContinue={async () => {
+                 if (!selectedConversationId || !selectedKeyId) {
+-                  return Promise.resolve();
++                  return;
+                 }
+-                return sendToModel({
++                await sendToModel({
+                   mode: "continue",
+                   conversationId: selectedConversationId,
+                   providerKeyId: selectedKeyId,
+@@ -686,13 +819,87 @@ export function App(): JSX.Element {
+                 threadStartModel !== selectedModel &&
+                 messages.length > 0
+               }
++              conversationCost={costs?.conversationUsd ?? null}
++              projectCost={costs?.projectUsd ?? null}
++              showAllowOnce={showAllowOnce}
++              onAllowOnce={() => {
++                const pending = lastSendRef.current;
++                if (!pending) {
++                  return;
++                }
++                void sendToModel({ ...pending, allowOnce: true });
++              }}
++              onComposerDraft={reportComposerDraft}
+             />
++          ) : view === "debug" ? (
++            <DebugView />
+           ) : (
+             <SettingsView />
+           )}
+         </main>
+       </div>
+-      <StatusBar />
++      <StatusBar health={health} />
++      <Dialog open={fallback !== null} onOpenChange={(open) => {
++        if (!open) {
++          setFallback(null);
++          setFallbackPreview(null);
++        }
++      }}>
++        <DialogContent data-testid="fallback-dialog">
++          <DialogHeader>
++            <DialogTitle>{t("fallback.title")}</DialogTitle>
++          </DialogHeader>
++          {fallback ? (
++            <>
++              <p className="text-[13px]">
++                {t("fallback.body", {
++                  failed: fallback.failedProvider,
++                  code: fallback.code,
++                  suggested: fallback.suggestProviderSlug,
++                })}
++              </p>
++              {fallbackPreview?.estimatedCostUsd ? (
++                <p className="text-[12px] text-muted-foreground" data-testid="fallback-estimate">
++                  {t("fallback.estimate", {
++                    usd: fallbackPreview.estimatedCostUsd,
++                    suggested: fallback.suggestProviderSlug,
++                  })}
++                </p>
++              ) : null}
++              <div className="flex gap-2">
++                <Button
++                  type="button"
++                  data-testid="fallback-confirm"
++                  onClick={() => {
++                    const pending = fallback;
++                    if (!selectedConversationId) {
++                      return;
++                    }
++                    setFallback(null);
++                    setSelectedKeyId(pending.suggestKeyId);
++                    setSelectedModel(pending.suggestModel);
++                    void sendToModel({
++                      mode: "regenerate",
++                      conversationId: selectedConversationId,
++                      providerKeyId: pending.suggestKeyId,
++                      model: pending.suggestModel,
++                      messageId: pending.messageId,
++                      temperature,
++                      maxTokens,
++                      extraSystem,
++                    });
++                  }}
++                >
++                  {t("fallback.confirm", { suggested: fallback.suggestProviderSlug })}
++                </Button>
++                <Button type="button" variant="outline" onClick={() => setFallback(null)}>
++                  {t("fallback.dismiss")}
++                </Button>
++              </div>
++            </>
++          ) : null}
++        </DialogContent>
++      </Dialog>
+       <ChromeCommandPalette
+         onNewProject={() => {
+           setView("home");
+@@ -705,6 +912,7 @@ export function App(): JSX.Element {
+           setView("home");
+           window.setTimeout(() => searchInputRef.current?.focus(), 0);
+         }}
++        onDebug={() => setView("debug")}
+       />
+     </div>
+   );
+diff --git a/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx b/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx
+index ac55c7f..3c9c984 100644
+--- a/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx
++++ b/apps/desktop/src/renderer/src/components/chat/message-bubble.tsx
+@@ -2,6 +2,7 @@ import { type JSX, useState } from "react";
+ import { useTranslation } from "react-i18next";
+ import { siblingsOf, type MessageDto } from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
++import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+ import { CopyResponseButton, MessageMarkdown } from "@/components/chat/message-markdown";
+ 
+ export function MessageBubble({
+@@ -30,6 +31,7 @@ export function MessageBubble({
+   const { t } = useTranslation();
+   const [editing, setEditing] = useState(false);
+   const [draft, setDraft] = useState(message.content);
++  const [receiptOpen, setReceiptOpen] = useState(false);
+   const statusLabel =
+     message.status === "complete" ? null : t(`workspace.status.${message.status}`);
+   const canContinue =
+@@ -147,18 +149,54 @@ export function MessageBubble({
+         <p className="whitespace-pre-wrap">{message.content}</p>
+       )}
+       {message.receipt ? (
+-        <p className="mt-1 text-[11px] text-muted-foreground">
+-          {t("workspace.receipt", {
+-            model: message.receipt.model ?? "—",
+-            tokensIn: message.receipt.tokensIn ?? "—",
+-            tokensOut: message.receipt.tokensOut ?? "—",
+-            cost: message.receipt.costUsd ?? "—",
+-            latency: message.receipt.latencyMs ?? "—",
+-          })}
+-          {message.receipt.errorCode
+-            ? ` · ${t("workspace.receipt.error", { code: message.receipt.errorCode })}`
+-            : ""}
+-        </p>
++        <div className="mt-1">
++          <button
++            type="button"
++            className="text-left text-[11px] text-muted-foreground underline-offset-2 hover:underline"
++            data-testid="receipt-open"
++            aria-label={t("workspace.receipt.open")}
++            onClick={() => setReceiptOpen(true)}
++          >
++            {t("workspace.receipt", {
++              provider: message.receipt.provider ?? "—",
++              model: message.receipt.model ?? "—",
++              tokensIn: message.receipt.tokensIn ?? "—",
++              tokensOut: message.receipt.tokensOut ?? "—",
++              cost: message.receipt.costUsd ?? "—",
++              latency: message.receipt.latencyMs ?? "—",
++              at: message.receipt.createdAt,
++            })}
++            {message.receipt.errorCode
++              ? ` · ${t("workspace.receipt.error", { code: message.receipt.errorCode })}`
++              : ""}
++          </button>
++          <Dialog open={receiptOpen} onOpenChange={setReceiptOpen}>
++            <DialogContent data-testid="receipt-dialog">
++              <DialogHeader>
++                <DialogTitle>{t("workspace.receipt.title")}</DialogTitle>
++              </DialogHeader>
++              <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[12px]">
++                <dt className="text-muted-foreground">{t("debug.provider")}</dt>
++                <dd>{message.receipt.provider ?? "—"}</dd>
++                <dt className="text-muted-foreground">{t("debug.model")}</dt>
++                <dd>{message.receipt.model ?? "—"}</dd>
++                <dt className="text-muted-foreground">{t("workspace.receipt.tokens")}</dt>
++                <dd>
++                  {message.receipt.tokensIn ?? "—"} / {message.receipt.tokensOut ?? "—"}
++                </dd>
++                <dt className="text-muted-foreground">{t("debug.cost")}</dt>
++                <dd>{message.receipt.costUsd ?? "—"}</dd>
++                <dt className="text-muted-foreground">{t("workspace.receipt.latency")}</dt>
++                <dd>{message.receipt.latencyMs ?? "—"}</dd>
++                <dt className="text-muted-foreground">{t("debug.error")}</dt>
++                <dd>{message.receipt.errorCode ?? "—"}</dd>
++              </dl>
++              <p className="text-[11px] text-muted-foreground">
++                {t("workspace.receipt.created", { at: message.receipt.createdAt })}
++              </p>
++            </DialogContent>
++          </Dialog>
++        </div>
+       ) : null}
+       {canEdit || canRegenerate || canContinue ? (
+         <div className="mt-1.5 flex flex-wrap gap-1">
+diff --git a/apps/desktop/src/renderer/src/components/layout/command-palette.tsx b/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
+index 07e2d77..f01a96d 100644
+--- a/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
+@@ -15,10 +15,12 @@ export function ChromeCommandPalette({
+   onNewProject,
+   onNewChat,
+   onSearch,
++  onDebug,
+ }: {
+   onNewProject: () => void;
+   onNewChat: () => void;
+   onSearch: () => void;
++  onDebug: () => void;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const { setTheme } = useTheme();
+@@ -75,6 +77,14 @@ export function ChromeCommandPalette({
+             >
+               {t("command.search")}
+             </CommandItem>
++            <CommandItem
++              onSelect={() => {
++                onDebug();
++                setOpen(false);
++              }}
++            >
++              {t("command.debug")}
++            </CommandItem>
+             <CommandItem onSelect={() => applyTheme("light")}>
+               {t("command.theme")}: {t("theme.light")}
+             </CommandItem>
+diff --git a/apps/desktop/src/renderer/src/components/layout/debug-view.tsx b/apps/desktop/src/renderer/src/components/layout/debug-view.tsx
+new file mode 100644
+index 0000000..0ee01fa
+--- /dev/null
++++ b/apps/desktop/src/renderer/src/components/layout/debug-view.tsx
+@@ -0,0 +1,74 @@
++import { type JSX, useEffect, useState } from "react";
++import { useTranslation } from "react-i18next";
++import type { DebugSnapshot } from "@ai-hub/shared";
++import { Button } from "@/components/ui/button";
++
++export function DebugView(): JSX.Element {
++  const { t } = useTranslation();
++  const [snapshot, setSnapshot] = useState<DebugSnapshot | null>(null);
++  const [error, setError] = useState<string | null>(null);
++
++  const reload = (): void => {
++    void window.hub.debug
++      .getLatest()
++      .then((next) => {
++        setSnapshot(next);
++        setError(null);
++      })
++      .catch(() => setError(t("workspace.error.generic")));
++  };
++
++  useEffect(() => {
++    void window.hub.debug
++      .getLatest()
++      .then((next) => {
++        setSnapshot(next);
++        setError(null);
++      })
++      .catch(() => setError(t("workspace.error.generic")));
++  }, [t]);
++
++  return (
++    <div className="mx-auto flex w-full max-w-lg flex-col gap-4 p-6">
++      <div>
++        <h1 className="text-base font-semibold">{t("debug.title")}</h1>
++        <p className="mt-1 text-muted-foreground">{t("debug.hint")}</p>
++      </div>
++      <Button type="button" variant="outline" onClick={reload} data-testid="debug-refresh">
++        {t("debug.refresh")}
++      </Button>
++      {snapshot ? (
++        <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[13px]" data-testid="debug-snapshot">
++          <dt className="text-muted-foreground">{t("debug.at")}</dt>
++          <dd>{snapshot.at}</dd>
++          <dt className="text-muted-foreground">{t("debug.provider")}</dt>
++          <dd>{snapshot.provider}</dd>
++          <dt className="text-muted-foreground">{t("debug.model")}</dt>
++          <dd>{snapshot.model}</dd>
++          <dt className="text-muted-foreground">{t("debug.retries")}</dt>
++          <dd>{snapshot.retries}</dd>
++          <dt className="text-muted-foreground">{t("debug.error")}</dt>
++          <dd>{snapshot.lastErrorCode ?? "—"}</dd>
++          <dt className="text-muted-foreground">{t("debug.tokens")}</dt>
++          <dd>{snapshot.tokenEstimate}</dd>
++          <dt className="text-muted-foreground">{t("debug.cost")}</dt>
++          <dd>{snapshot.estimatedCostUsd ?? "—"}</dd>
++          <dt className="text-muted-foreground">{t("debug.cap")}</dt>
++          <dd>
++            {snapshot.capDecision}
++            {snapshot.capScope ? ` · ${snapshot.capScope}` : ""}
++          </dd>
++          <dt className="text-muted-foreground">{t("debug.overflow")}</dt>
++          <dd>{String(snapshot.overflow)}</dd>
++        </dl>
++      ) : (
++        <p className="text-muted-foreground">{t("debug.empty")}</p>
++      )}
++      {error ? (
++        <p className="text-destructive" role="alert">
++          {error}
++        </p>
++      ) : null}
++    </div>
++  );
++}
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index b837eb5..a3f45f6 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -60,6 +60,11 @@ export function HomeView({
+   onToggleCompact,
+   packetPreview,
+   modelSwitchNotice,
++  conversationCost,
++  projectCost,
++  showAllowOnce,
++  onAllowOnce,
++  onComposerDraft,
+ }: {
+   project: ProjectDto | null;
+   conversations: ConversationDto[];
+@@ -83,7 +88,7 @@ export function HomeView({
+   onSelectTemperature: (value: number) => void;
+   onSelectMaxTokens: (value: number | null) => void;
+   onSelectExtraSystem: (value: string) => void;
+-  onSend: (content: string) => Promise<void>;
++  onSend: (content: string) => Promise<boolean>;
+   onAbort: () => Promise<void>;
+   onRegenerate: (messageId: string) => Promise<void>;
+   onContinue: () => Promise<void>;
+@@ -98,6 +103,11 @@ export function HomeView({
+   onToggleCompact: (value: boolean) => void;
+   packetPreview: PacketPreviewResult | null;
+   modelSwitchNotice: boolean;
++  conversationCost: string | null;
++  projectCost: string | null;
++  showAllowOnce: boolean;
++  onAllowOnce: () => void;
++  onComposerDraft: (value: string) => void;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const [title, setTitle] = useState("");
+@@ -128,7 +138,9 @@ export function HomeView({
+     setEditing(false);
+     setTreeOpen(false);
+     setTagDraft("");
+-  }, [selectedConversationId]);
++    setDraft("");
++    onComposerDraft("");
++  }, [onComposerDraft, selectedConversationId]);
+ 
+   useEffect(() => {
+     setProjectName(project?.name ?? "");
+@@ -452,6 +464,16 @@ export function HomeView({
+                 </>
+               )}
+               <div className="ml-auto flex flex-wrap items-center gap-1">
++                {conversationCost ? (
++                  <span className="text-[11px] text-muted-foreground" data-testid="cost-conversation">
++                    {t("workspace.cost.conversation", { usd: conversationCost })}
++                  </span>
++                ) : null}
++                {projectCost ? (
++                  <span className="text-[11px] text-muted-foreground" data-testid="cost-project">
++                    {t("workspace.cost.project", { usd: projectCost })}
++                  </span>
++                ) : null}
+                 {packetPreview ? (
+                   <span
+                     className="rounded-md border px-2 py-1 text-[11px] text-muted-foreground"
+@@ -460,6 +482,13 @@ export function HomeView({
+                     {t("workspace.packet.badge", { n: packetPreview.tokenEstimate })}
+                   </span>
+                 ) : null}
++                {packetPreview?.estimatedCostUsd ? (
++                  <span className="text-[11px] text-muted-foreground" data-testid="send-estimate">
++                    {t("workspace.estimate", { usd: packetPreview.estimatedCostUsd })}
++                  </span>
++                ) : packetPreview && selectedCatalog === null ? (
++                  <span className="text-[11px] text-muted-foreground">{t("workspace.estimate.none")}</span>
++                ) : null}
+                 <Button
+                   type="button"
+                   size="sm"
+@@ -520,6 +549,15 @@ export function HomeView({
+             ) : compactHistory ? (
+               <p className="border-b px-3 py-1 text-[11px] text-muted-foreground">{t("workspace.compact.on")}</p>
+             ) : null}
++            {packetPreview?.capBlocked ? (
++              <p className="border-b px-3 py-1 text-[12px] text-destructive" role="status" data-testid="cap-block">
++                {t("workspace.cap.block", { scope: t(`caps.scope.${packetPreview.capBlocked}`) })}
++              </p>
++            ) : packetPreview && packetPreview.capWarnings.length > 0 ? (
++              <p className="border-b px-3 py-1 text-[12px]" role="status" data-testid="cap-warn">
++                {t("workspace.cap.warn", { scope: t(`caps.scope.${packetPreview.capWarnings[0]}`) })}
++              </p>
++            ) : null}
+             {exportNotice ? (
+               <p className="border-b px-3 py-1 text-[11px] text-muted-foreground" role="status">
+                 {exportNotice}
+@@ -570,7 +608,10 @@ export function HomeView({
+             <ChatComposer
+               key={selectedConversationId}
+               value={draft}
+-              onChange={setDraft}
++              onChange={(value) => {
++                setDraft(value);
++                onComposerDraft(value);
++              }}
+               streaming={streaming}
+               sending={sending}
+               disabled={!hasKey || editing}
+@@ -579,7 +620,12 @@ export function HomeView({
+                 if (!next) {
+                   return;
+                 }
+-                void onSend(next).then(() => setDraft(""));
++                void onSend(next).then((ok) => {
++                  if (ok) {
++                    setDraft("");
++                    onComposerDraft("");
++                  }
++                });
+               }}
+               onAbort={() => {
+                 void onAbort();
+@@ -607,9 +653,16 @@ export function HomeView({
+           </div>
+         )}
+         {error ? (
+-          <p className="border-t px-3 py-2 text-destructive" role="alert" data-testid="workspace-error">
+-            {error}
+-          </p>
++          <div className="flex flex-wrap items-center gap-2 border-t px-3 py-2">
++            <p className="text-destructive" role="alert" data-testid="workspace-error">
++              {error}
++            </p>
++            {showAllowOnce ? (
++              <Button type="button" size="sm" data-testid="cap-allow-once" onClick={onAllowOnce} disabled={busy}>
++                {t("workspace.cap.allowOnce")}
++              </Button>
++            ) : null}
++          </div>
+         ) : null}
+       </section>
+     </div>
+diff --git a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+index e02e5bf..8389f16 100644
+--- a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+@@ -1,6 +1,6 @@
+ import { type FormEvent, type JSX, useEffect, useState } from "react";
+ import { useTranslation } from "react-i18next";
+-import type { AppLocale, ProviderDto, ProviderKeyDto, SecretsTestResult, ThemeMode } from "@ai-hub/shared";
++import type { AppLocale, ProviderDto, ProviderKeyDto, SecretsTestResult, SpendCapDto, ThemeMode } from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import { persistLocale } from "@/lib/i18n";
+@@ -18,6 +18,12 @@ export function SettingsView(): JSX.Element {
+   const [error, setError] = useState<string | null>(null);
+   const [testingId, setTestingId] = useState<string | null>(null);
+   const [testResults, setTestResults] = useState<Record<string, SecretsTestResult>>({});
++  const [caps, setCaps] = useState<Record<SpendCapDto["scope"], string>>({
++    request: "",
++    day: "",
++    global: "",
++  });
++  const [capsNotice, setCapsNotice] = useState<string | null>(null);
+ 
+   const reloadKeys = (): void => {
+     void window.hub.secrets
+@@ -59,6 +65,23 @@ export function SettingsView(): JSX.Element {
+           setError(t("workspace.error.generic"));
+         }
+       });
++    void window.hub.spendCaps
++      .get()
++      .then((list) => {
++        if (cancelled) {
++          return;
++        }
++        setCaps({
++          request: list.find((item) => item.scope === "request")?.limitUsd ?? "",
++          day: list.find((item) => item.scope === "day")?.limitUsd ?? "",
++          global: list.find((item) => item.scope === "global")?.limitUsd ?? "",
++        });
++      })
++      .catch(() => {
++        if (!cancelled) {
++          setError(t("workspace.error.generic"));
++        }
++      });
+     return () => {
+       cancelled = true;
+     };
+@@ -234,6 +257,63 @@ export function SettingsView(): JSX.Element {
+           </p>
+         ) : null}
+       </section>
++      <section className="flex flex-col gap-2">
++        <h2 className="text-[12px] font-medium">{t("caps.title")}</h2>
++        <p className="text-muted-foreground">{t("caps.hint")}</p>
++        <form
++          className="flex flex-col gap-2"
++          onSubmit={(event) => {
++            event.preventDefault();
++            const nextCaps = (["request", "day", "global"] as const).map((scope) => {
++              const raw = caps[scope].trim();
++              return { scope, limitUsd: raw.length === 0 ? null : raw };
++            });
++            if (
++              nextCaps.some(
++                (item) => item.limitUsd !== null && !/^\d+(\.\d{1,6})?$/.test(item.limitUsd),
++              )
++            ) {
++              setError(t("workspace.error.generic"));
++              return;
++            }
++            void window.hub.spendCaps
++              .set({
++                caps: nextCaps,
++              })
++              .then((list) => {
++                setCaps({
++                  request: list.find((item) => item.scope === "request")?.limitUsd ?? "",
++                  day: list.find((item) => item.scope === "day")?.limitUsd ?? "",
++                  global: list.find((item) => item.scope === "global")?.limitUsd ?? "",
++                });
++                setCapsNotice(t("caps.saved"));
++                setError(null);
++              })
++              .catch(() => setError(t("workspace.error.generic")));
++          }}
++        >
++          {(["request", "day", "global"] as const).map((scope) => (
++            <label key={scope} className="flex flex-col gap-1 text-[12px]">
++              {t(`caps.scope.${scope}`)}
++              <Input
++                value={caps[scope]}
++                placeholder={t("caps.unlimited")}
++                onChange={(event) => setCaps((current) => ({ ...current, [scope]: event.target.value }))}
++                data-testid={`spend-cap-${scope}`}
++                inputMode="decimal"
++              />
++            </label>
++          ))}
++          <Button type="submit" data-testid="spend-cap-save">
++            {t("caps.save")}
++          </Button>
++        </form>
++        {capsNotice ? (
++          <p className="text-[11px] text-muted-foreground" role="status">
++            {capsNotice}
++          </p>
++        ) : null}
++      </section>
+     </div>
+   );
+ }
+diff --git a/apps/desktop/src/renderer/src/components/layout/sidebar.tsx b/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
+index 9c5162f..ea33135 100644
+--- a/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
+@@ -1,5 +1,5 @@
+ import { type JSX, type ReactNode, useState, type RefObject } from "react";
+-import { Home, Inbox, Plus, Settings } from "lucide-react";
++import { Activity, Home, Inbox, Plus, Settings } from "lucide-react";
+ import { useTranslation } from "react-i18next";
+ import type { ProjectDto, SearchHit } from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
+@@ -63,6 +63,13 @@ export function Sidebar({
+             onClick={() => onChange("settings")}
+             testId="nav-settings"
+           />
++          <NavButton
++            active={view === "debug"}
++            icon={<Activity className="h-3.5 w-3.5" />}
++            label={t("nav.debug")}
++            onClick={() => onChange("debug")}
++            testId="nav-debug"
++          />
+         </nav>
+         <div className="mt-3 px-1">
+           <Input
+diff --git a/apps/desktop/src/renderer/src/components/layout/status-bar.tsx b/apps/desktop/src/renderer/src/components/layout/status-bar.tsx
+index 128eda1..80de5b9 100644
+--- a/apps/desktop/src/renderer/src/components/layout/status-bar.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/status-bar.tsx
+@@ -1,14 +1,43 @@
+ import { type JSX } from "react";
+ import { useTranslation } from "react-i18next";
++import type { HealthSummaryDto } from "@ai-hub/shared";
+ import { useTheme } from "@/lib/theme";
+ 
+-export function StatusBar(): JSX.Element {
++function healthState(summary: HealthSummaryDto): "ok" | "down" | "unknown" {
++  if (summary.lastOk === true) {
++    return "ok";
++  }
++  if (summary.lastOk === false) {
++    return "down";
++  }
++  return "unknown";
++}
++
++export function StatusBar({ health }: { health: HealthSummaryDto[] }): JSX.Element {
+   const { t } = useTranslation();
+   const { theme } = useTheme();
+ 
+   return (
+-    <footer className="flex h-6 shrink-0 items-center justify-between border-t bg-background px-3 text-[11px] text-muted-foreground">
+-      <span>{t("status.ready")}</span>
++    <footer className="flex h-6 shrink-0 items-center justify-between gap-3 border-t bg-background px-3 text-[11px] text-muted-foreground">
++      <span className="truncate" data-testid="status-health">
++        {health.length === 0
++          ? t("status.health.empty")
++          : health
++              .map((item) => {
++                const state = healthState(item);
++                return t("status.health.item", {
++                  provider: item.providerSlug,
++                  state: t(`status.health.${state}`),
++                  latency:
++                    item.lastLatencyMs === null ? "" : t("status.health.latency", { ms: item.lastLatencyMs }),
++                  errors:
++                    item.sampleCount === 0
++                      ? ""
++                      : t("status.health.errors", { pct: Math.round(item.errorRate * 100) }),
++                });
++              })
++              .join(" · ")}
++      </span>
+       <span>{t("status.theme", { theme: t(`theme.${theme}`) })}</span>
+     </footer>
+   );
+diff --git a/apps/desktop/src/renderer/src/components/layout/types.ts b/apps/desktop/src/renderer/src/components/layout/types.ts
+index 416d150..2aa2766 100644
+--- a/apps/desktop/src/renderer/src/components/layout/types.ts
++++ b/apps/desktop/src/renderer/src/components/layout/types.ts
+@@ -1 +1 @@
+-export type AppView = "home" | "settings";
++export type AppView = "home" | "settings" | "debug";
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 2391753..ce2c2e8 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -2,8 +2,16 @@
+   "app.name": "AI Hub",
+   "nav.home": "Home",
+   "nav.settings": "Settings",
++  "nav.debug": "Debug",
+   "status.ready": "Ready",
+   "status.theme": "Theme: {{theme}}",
++  "status.health.empty": "No provider health yet",
++  "status.health.ok": "ok",
++  "status.health.down": "down",
++  "status.health.unknown": "idle",
++  "status.health.item": "{{provider}} {{state}}{{latency}}{{errors}}",
++  "status.health.latency": " · {{ms}}ms",
++  "status.health.errors": " · {{pct}}% err",
+   "theme.light": "Light",
+   "theme.dark": "Dark",
+   "theme.system": "System",
+@@ -55,6 +63,15 @@
+   "workspace.modelSwitch": "Next reply uses {{model}}. History is compiled — you do not need to paste a summary.",
+   "workspace.error.generic": "That action could not be completed. Try again.",
+   "workspace.error.chat": "The model request failed ({{code}}).",
++  "workspace.error.cap": "Spend cap reached ({{scope}}). This send was not started.",
++  "workspace.error.unknownModel": "That model is not in the local catalog for this provider.",
++  "workspace.error.timeout": "The provider timed out. Retry or try another model.",
++  "workspace.error.rate_limit": "The provider is rate-limiting this key. Wait and retry.",
++  "workspace.error.auth": "The provider rejected this key. Check it in Settings.",
++  "workspace.error.context_overflow": "This thread exceeds the model window. Turn on Compact history and send again.",
++  "workspace.error.quota": "The provider reports no remaining credit on this key.",
++  "workspace.error.network": "The network is unreachable. Check the connection and retry.",
++  "workspace.error.unknown": "The provider returned an unexpected error.",
+   "workspace.model": "Model",
+   "workspace.customModel": "Custom model id",
+   "workspace.model.vision": "Vision",
+@@ -86,8 +103,47 @@
+   "workspace.status.interrupted": "interrupted",
+   "workspace.status.aborted": "aborted",
+   "workspace.status.complete": "complete",
+-  "workspace.receipt": "Receipt: {{model}} · in {{tokensIn}} / out {{tokensOut}} · {{cost}} · {{latency}}ms",
++  "workspace.receipt": "{{provider}} · {{model}} · in {{tokensIn}} / out {{tokensOut}} · {{cost}} · {{latency}}ms · {{at}}",
+   "workspace.receipt.error": "error {{code}}",
++  "workspace.receipt.open": "Receipt details",
++  "workspace.receipt.title": "Receipt",
++  "workspace.receipt.created": "Recorded {{at}}",
++  "workspace.receipt.tokens": "in / out",
++  "workspace.receipt.latency": "Latency",
++  "workspace.cost.conversation": "Thread ${{usd}}",
++  "workspace.cost.project": "Project ${{usd}}",
++  "workspace.estimate": "Est. ${{usd}} this send",
++  "workspace.estimate.none": "No catalog price for a pre-send estimate",
++  "workspace.cap.warn": "Spend is at 80% of the {{scope}} cap.",
++  "workspace.cap.block": "Spend cap would block this send ({{scope}}).",
++  "workspace.cap.allowOnce": "Allow this once",
++  "caps.title": "Spend caps",
++  "caps.hint": "Hard-stops in USD. Empty means unlimited. 80% warns; 100% blocks until you allow once.",
++  "caps.scope.request": "per request",
++  "caps.scope.day": "per day",
++  "caps.scope.global": "global",
++  "caps.unlimited": "Unlimited",
++  "caps.save": "Save caps",
++  "caps.saved": "Caps saved",
++  "debug.title": "Debug / observability",
++  "debug.hint": "Last request metadata only. No Authorization headers, keys, or conversation body.",
++  "debug.empty": "No request has been compiled yet this session.",
++  "debug.refresh": "Refresh",
++  "debug.provider": "Provider",
++  "debug.model": "Model",
++  "debug.retries": "Retries",
++  "debug.error": "Last error",
++  "debug.tokens": "Token estimate",
++  "debug.cost": "Estimated USD",
++  "debug.cap": "Cap decision",
++  "debug.overflow": "Window overflow",
++  "debug.at": "Captured",
++  "fallback.title": "Try another provider?",
++  "fallback.body": "{{failed}} failed ({{code}}). {{suggested}} looks healthier. Confirm to regenerate on that key — this is not automatic.",
++  "fallback.confirm": "Try {{suggested}}",
++  "fallback.dismiss": "Keep this provider",
++  "fallback.estimate": "Estimated ${{usd}} on {{suggested}}",
++  "command.debug": "Open debug",
+   "workspace.sibling.prev": "Previous alternative",
+   "workspace.sibling.next": "Next alternative",
+   "workspace.sibling.count": "{{current}} / {{total}}",
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index beae4a8..cfa15a9 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -2,8 +2,16 @@
+   "app.name": "AI Hub",
+   "nav.home": "Início",
+   "nav.settings": "Configurações",
++  "nav.debug": "Debug",
+   "status.ready": "Pronto",
+   "status.theme": "Tema: {{theme}}",
++  "status.health.empty": "Ainda sem pulso de provedor",
++  "status.health.ok": "ok",
++  "status.health.down": "fora",
++  "status.health.unknown": "idle",
++  "status.health.item": "{{provider}} {{state}}{{latency}}{{errors}}",
++  "status.health.latency": " · {{ms}}ms",
++  "status.health.errors": " · {{pct}}% err",
+   "theme.light": "Claro",
+   "theme.dark": "Escuro",
+   "theme.system": "Sistema",
+@@ -55,6 +63,15 @@
+   "workspace.modelSwitch": "A próxima resposta usa {{model}}. O histórico é compilado — você não precisa colar um resumo.",
+   "workspace.error.generic": "Não foi possível concluir a ação. Tente de novo.",
+   "workspace.error.chat": "A chamada ao modelo falhou ({{code}}).",
++  "workspace.error.cap": "Teto de gasto atingido ({{scope}}). Este envio não começou.",
++  "workspace.error.unknownModel": "Este modelo não está no catálogo local deste provedor.",
++  "workspace.error.timeout": "O provedor estourou o tempo. Tente de novo ou troque o modelo.",
++  "workspace.error.rate_limit": "O provedor está limitando esta chave. Espere e tente de novo.",
++  "workspace.error.auth": "O provedor recusou esta chave. Verifique em Configurações.",
++  "workspace.error.context_overflow": "Este fio passa da janela do modelo. Ligue Compactar histórico e envie de novo.",
++  "workspace.error.quota": "O provedor informa que não há crédito nesta chave.",
++  "workspace.error.network": "A rede está inacessível. Verifique a conexão e tente de novo.",
++  "workspace.error.unknown": "O provedor devolveu um erro inesperado.",
+   "workspace.model": "Modelo",
+   "workspace.customModel": "Id do modelo custom",
+   "workspace.model.vision": "Visão",
+@@ -86,8 +103,47 @@
+   "workspace.status.interrupted": "interrompida",
+   "workspace.status.aborted": "abortada",
+   "workspace.status.complete": "completa",
+-  "workspace.receipt": "Recibo: {{model}} · entrada {{tokensIn}} / saída {{tokensOut}} · {{cost}} · {{latency}}ms",
++  "workspace.receipt": "{{provider}} · {{model}} · entrada {{tokensIn}} / saída {{tokensOut}} · {{cost}} · {{latency}}ms · {{at}}",
+   "workspace.receipt.error": "erro {{code}}",
++  "workspace.receipt.open": "Detalhe do recibo",
++  "workspace.receipt.title": "Recibo",
++  "workspace.receipt.created": "Registado {{at}}",
++  "workspace.receipt.tokens": "entrada / saída",
++  "workspace.receipt.latency": "Latência",
++  "workspace.cost.conversation": "Fio ${{usd}}",
++  "workspace.cost.project": "Projeto ${{usd}}",
++  "workspace.estimate": "Est. ${{usd}} neste envio",
++  "workspace.estimate.none": "Sem preço no catálogo para estimar antes do envio",
++  "workspace.cap.warn": "O gasto está em 80% do teto {{scope}}.",
++  "workspace.cap.block": "O teto de gasto bloquearia este envio ({{scope}}).",
++  "workspace.cap.allowOnce": "Permitir esta vez",
++  "caps.title": "Tetos de gasto",
++  "caps.hint": "Hard-stop em USD. Vazio = ilimitado. 80% avisa; 100% bloqueia até você permitir uma vez.",
++  "caps.scope.request": "por request",
++  "caps.scope.day": "por dia",
++  "caps.scope.global": "global",
++  "caps.unlimited": "Ilimitado",
++  "caps.save": "Guardar tetos",
++  "caps.saved": "Tetos guardados",
++  "debug.title": "Debug / observabilidade",
++  "debug.hint": "Só meta do último request. Sem headers de Authorization, chaves ou corpo da conversa.",
++  "debug.empty": "Nenhum request compilado nesta sessão ainda.",
++  "debug.refresh": "Atualizar",
++  "debug.provider": "Provedor",
++  "debug.model": "Modelo",
++  "debug.retries": "Retries",
++  "debug.error": "Último erro",
++  "debug.tokens": "Estimativa de tokens",
++  "debug.cost": "USD estimado",
++  "debug.cap": "Decisão de cap",
++  "debug.overflow": "Estouro de janela",
++  "debug.at": "Capturado",
++  "fallback.title": "Tentar outro provedor?",
++  "fallback.body": "{{failed}} falhou ({{code}}). {{suggested}} parece mais saudável. Confirme para regenerar nessa chave — isso não é automático.",
++  "fallback.confirm": "Tentar {{suggested}}",
++  "fallback.dismiss": "Manter este provedor",
++  "fallback.estimate": "Estimado ${{usd}} em {{suggested}}",
++  "command.debug": "Abrir debug",
+   "workspace.sibling.prev": "Alternativa anterior",
+   "workspace.sibling.next": "Próxima alternativa",
+   "workspace.sibling.count": "{{current}} / {{total}}",
+diff --git a/docs/ADR/ADR-W07-001-spend-caps-hard-stop.md b/docs/ADR/ADR-W07-001-spend-caps-hard-stop.md
+new file mode 100644
+index 0000000..4d4d0b2
+--- /dev/null
++++ b/docs/ADR/ADR-W07-001-spend-caps-hard-stop.md
+@@ -0,0 +1,40 @@
++# ADR-W07-001-spend-caps-hard-stop
++
++- **Status:** accepted
++- **Onda:** W07
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++D7 exige freio de custo, não só dashboard. A tabela `spend_caps` existia desde W1 sem consumidores. Sem hard-stop no caminho de envio, regenerate/edit/continue/compact poderiam ignorar o limite.
++
++## Decisão
++
++Caps desta onda: `request`, `day` (meia-noite local do processo main), `global`. Linha ausente = ilimitado. `limit_usd` `"0"` bloqueia qualquer estimativa positiva.
++
++A checagem corre **depois** de compilar o packet e **antes** de persistir user/assistant. Todo modo de `chat:send` passa pelo mesmo guard. Aviso em ≥80% do limite; bloqueio em ≥100%. Override `allowOnce` grava audit local em `settings` (JSON, sem secrets). Sem preço no catálogo, o cap de request é ignorado; day/global usam só receipts já gravados.
++
++Estimativa pré-envio: tokens de input do packet × preço de input + `maxTokens` ou **1024** tokens de saída quando o catálogo tem preço.
++
++Caps por projeto/provider ficam para W18.
++
++## Alternativas consideradas
++
++- **Só UI / dashboard:** não atende D7 (hard-stop).
++- **Checar depois de criar a user message:** o draft ficaria no grafo mesmo bloqueado.
++- **Cap em micros inteiros no SQLite:** possível; W7 soma `cost_usd` TEXT com aritmética em micros no shared.
++
++## Consequências
++
++- Positivas: um único choke-point; override auditável; sem persistência órfã no block.
++- Negativas: estimativa de saída 1024 pode superestimar; modelos fora do catálogo não travam o cap de request.
++- Riscos aceitos: timezone do OS para o cap diário; W18 ainda precisa de escopos projeto/provider.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 7, D7)
++- `docs/reviews/W07/REVIEW.md`
++- ADR-W02-004 (receipts / catálogo)
+diff --git a/docs/ADR/ADR-W07-002-health-from-chat.md b/docs/ADR/ADR-W07-002-health-from-chat.md
+new file mode 100644
+index 0000000..bd01ccd
+--- /dev/null
++++ b/docs/ADR/ADR-W07-002-health-from-chat.md
+@@ -0,0 +1,33 @@
++# ADR-W07-002-health-from-chat
++
++- **Status:** accepted
++- **Onda:** W07
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++W5 grava `health_samples` só em `secrets:test`. A status bar não refletia falhas reais de chat. D11 pede pulso local (latência, taxa de erro, último status) sem telemetria nossa.
++
++## Decisão
++
++Cada conclusão de stream grava um sample: `ok` no `done`, `ok: false` em erro de provider. Abort do usuário **não** conta como falha de provider. Summaries usam as últimas 20 samples por slug, 100% locais. A status bar lê esse resumo; o fallback explícito também.
++
++## Alternativas consideradas
++
++- **Só teste manual:** deixa “Claude fora” invisível no uso real.
++- **Heartbeat periódico ao provider:** gasta cota e não é o pulso das requests do usuário.
++
++## Consequências
++
++- Positivas: health espelha o último send; D11 e fallback compartilham a mesma fonte.
++- Negativas: providers sem tráfego recente ficam “sem amostra”.
++- Riscos aceitos: taxa de erro das últimas 20, não janela temporal.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 7, D11)
++- `docs/reviews/W07/REVIEW.md`
++- ADR-W05-004 (teste de conexão e health_samples)
+diff --git a/docs/ADR/ADR-W07-003-explicit-fallback.md b/docs/ADR/ADR-W07-003-explicit-fallback.md
+new file mode 100644
+index 0000000..f57a029
+--- /dev/null
++++ b/docs/ADR/ADR-W07-003-explicit-fallback.md
+@@ -0,0 +1,34 @@
++# ADR-W07-003-explicit-fallback
++
++- **Status:** accepted
++- **Onda:** W07
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++O princípio do produto proíbe fallback silencioso de modelo. Wave 7 pede “Claude fora → tentar GPT?” usando health. Trocar o adapter no main sem confirmação mudaria custo e destino dos tokens.
++
++## Decisão
++
++Nunca o main retenta noutro provider. No evento `chat:error`, o main pode incluir `suggestProviderSlug`, `suggestKeyId` e `suggestModel` (id de catálogo, nunca secret). A UI pergunta. Só um `chat:send` posterior (regenerate no assistente falho) usa a outra chave.
++
++Sugestão: outra chave **ativa** de **outro** slug; prefere o último sample `ok`, depois sem amostra, nunca o provider que acabou de falhar.
++
++## Alternativas consideradas
++
++- **Retry automático noutro provider:** silent fallback — recusado.
++- **Mesmo provider, outro modelo:** ainda muda custo; W7 sugere outro slug com health melhor.
++
++## Consequências
++
++- Positivas: confirmação explícita; IPC sem secrets.
++- Negativas: se só existe uma chave, não há sugestão.
++- Riscos aceitos: o modelo sugerido é o primeiro do catálogo daquele provider, não o “equivalente”.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 7, D11)
++- `docs/reviews/W07/REVIEW.md`
+diff --git a/docs/ADR/ADR-W07-004-debug-meta-no-auth.md b/docs/ADR/ADR-W07-004-debug-meta-no-auth.md
+new file mode 100644
+index 0000000..c49b17b
+--- /dev/null
++++ b/docs/ADR/ADR-W07-004-debug-meta-no-auth.md
+@@ -0,0 +1,33 @@
++# ADR-W07-004-debug-meta-no-auth
++
++- **Status:** accepted
++- **Onda:** W07
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++A tela Debug/Observability precisa de meta da request (retries, estimativa, decisão de cap) sem vazar Authorization, packet completo ou conteúdo da conversa.
++
++## Decisão
++
++O main guarda **em memória** o último snapshot: provider slug, model id, retries, código de erro, token estimate, custo estimado, decisão de cap, overflow. Sem headers, sem body, sem keys. IPC `debug:getLatest`. Reinício do processo apaga o snapshot (não é persistência).
++
++## Alternativas consideradas
++
++- **Logar o packet redigido na UI:** ainda é conteúdo de conversa numa tela de debug.
++- **SQLite de telemetria:** fora de onda; W7 é o último send.
++
++## Consequências
++
++- Positivas: diagnóstico sem secrets; some ao restart.
++- Negativas: só o último send; sem histórico.
++- Riscos aceitos: debug é local e opt-in pela navegação, não um reporter.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 7)
++- `docs/reviews/W07/REVIEW.md`
++- ADR-W00-003 (CSP / IPC)
+diff --git a/docs/ADR/ADR-W07-005-retry-transient-only.md b/docs/ADR/ADR-W07-005-retry-transient-only.md
+new file mode 100644
+index 0000000..8c42ad4
+--- /dev/null
++++ b/docs/ADR/ADR-W07-005-retry-transient-only.md
+@@ -0,0 +1,34 @@
++# ADR-W07-005-retry-transient-only
++
++- **Status:** accepted
++- **Onda:** W07
++- **Data:** 2026-09-17
++- **Deciders:** agent / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++Timeout e rate-limit são ruído de rede. Retry cego após tokens já emitidos duplicaria conteúdo e receipts. Auth, quota, overflow e abort não devem ser retentados.
++
++## Decisão
++
++Até 2 retries (3 tentativas) só para `timeout`, `rate_limit` e `network`, e **somente se nenhum delta** foi emitido. Backoff `400ms * 3^attempt`. Abort cancela o sleep. Auth/quota/overflow/unknown/aborted falham na hora. Retry é o **mesmo** adapter e modelo — não é fallback.
++
++## Alternativas consideradas
++
++- **Retry após parcial:** corrompe a bolha e o flush crash-safe.
++- **Retry de auth:** martela chave inválida.
++
++## Consequências
++
++- Positivas: TTFT mais resiliente; sem duplicar tokens na UI.
++- Negativas: falha no primeiro byte depois de um delta curto não retenta.
++- Riscos aceitos: backoff fixo, sem jitter.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 7)
++- `docs/reviews/W07/REVIEW.md`
++- ADR-W02-003 (crash-safe stream)
++- ADR-W07-003 (fallback explícito é outro mecanismo)
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index ba05988..3bbc238 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -63,3 +63,8 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider
+ | [ADR-W06-003](./ADR-W06-003-compile-trim-context-window.md) | W06 | Compactar histórico só no packet | accepted |
+ | [ADR-W06-004](./ADR-W06-004-plaintext-conversation-tags.md) | W06 | Nomes de tags em plaintext | accepted |
+ | [ADR-W06-005](./ADR-W06-005-model-switch-via-compiler.md) | W06 | Troca de modelo no mesmo fio via Compiler | accepted |
++| [ADR-W07-001](./ADR-W07-001-spend-caps-hard-stop.md) | W07 | Spend caps hard-stop request/day/global | accepted |
++| [ADR-W07-002](./ADR-W07-002-health-from-chat.md) | W07 | Health samples a partir do chat | accepted |
++| [ADR-W07-003](./ADR-W07-003-explicit-fallback.md) | W07 | Fallback de provider só com confirmação | accepted |
++| [ADR-W07-004](./ADR-W07-004-debug-meta-no-auth.md) | W07 | Debug snapshot sem auth/headers | accepted |
++| [ADR-W07-005](./ADR-W07-005-retry-transient-only.md) | W07 | Retry só transiente e antes do 1º token | accepted |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index bccbdb9..f430a9e 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave
+ 
+ | Field | Value |
+ |---|---|
+-| Wave | **W07** |
++| Wave | **W08** |
+ | Marco | B — MVP |
+ | State | `pending` |
+-| Last completed | **W06** |
+-| Next action | Wave 7 — Receipts UI + spend caps + provider health |
++| Last completed | **W07** |
++| Next action | Wave 8 — onboarding <90s + installer + ship MVP |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -20,30 +20,32 @@ None.
+ 
+ ## Open residual risks
+ 
+-- W00–W06 não revalidaram a janela Electron com chaves reais após o último gate (e2e usa mock).
++- W00–W07 não revalidaram a janela Electron com chaves reais após o último gate (e2e usa mock).
+ - macOS não exercitado.
+ - Dev CSP com `unsafe-eval` para HMR (ADR-W00-003).
+ - `better-sqlite3` tem um binário só: `pnpm dev` recompila para Electron; `pnpm test` no `db` restaura o ABI do Node.
+ - Busca W6 decripta no main e **não** popula `messages_fts` (ADR-W06-001). Índice FTS5 continua vazio; O(n) local.
+ - Tags e `preferred_*` em plaintext (ADR-W06-004).
+ - Redaction regex não cobre todos os formatos de chave colados na conversa (export e logs).
+-- Caps (W7) ainda não hard-stopam `chat:send` (incluindo regenerate/edit/compact).
+-- Falhas de chat não escrevem `health_samples` (só `secrets:test`).
+-- Zustand ainda não foi introduzido; W0–W6 usam `useState` (barulho vs stack travada).
++- Zustand ainda não foi introduzido; W0–W7 usam `useState` (barulho vs stack travada).
+ - `AI_HUB_E2E=1` só liga mock se o app **não** está empacotado; unpackaged + env ainda é o caminho CI.
+ - `messages.update` IPC ainda muta user in-place (UI W4 já não usa).
+ - Labels de ramo em plaintext no SQLite (ADR-W04-004).
+-- Custom / uncatalogued: compact/preview usam janela 128k estimada.
++- Custom / uncatalogued: compact/preview usam janela 128k estimada; sem preço no catálogo o request-cap por estimativa é skip (ADR-W07-001).
+ - Coerce de modelo no mesmo provider quando o id sai do catálogo (W5).
+ - Schema 0001 ainda tem `ON DELETE CASCADE` em `conversations.project_id`; o app anula antes de apagar.
++- Caps projeto/provider ficam para W18; request/day/global já hard-stopam `chat:send`.
++- Estimativa de output usa `maxTokens` ou 1024 tokens.
++- Gemini 429 pode mapear para `rate_limit` (retry transiente) em vez de `quota`.
+ 
+ ## Notes for the next session
+ 
+-- W07: receipts visíveis, spend caps hard-stop, health na status bar. Todo send já passa por `chat:send` (incl. compact). Não popular FTS plaintext.
++- W07 fechada: receipts + modal, caps hard-stop, health na status bar (com errorRate), retry transiente, fallback explícito, debug sem auth.
++- Não popular FTS plaintext. Não começar W08 sem o utilizador pedir.
+ 
+ ## Last review / ADR
+ 
+ | Kind | Path |
+ |---|---|
+-| Review | `docs/reviews/W06/REVIEW.md` |
+-| Latest ADR | `docs/ADR/ADR-W06-005-model-switch-via-compiler.md` |
++| Review | `docs/reviews/W07/REVIEW.md` |
++| Latest ADR | `docs/ADR/ADR-W07-005-retry-transient-only.md` |
+diff --git a/packages/ai-gateway/src/index.ts b/packages/ai-gateway/src/index.ts
+index fa27b4a..9f1130a 100644
+--- a/packages/ai-gateway/src/index.ts
++++ b/packages/ai-gateway/src/index.ts
+@@ -13,6 +13,7 @@ export {
+   type CrashSafeStreamResult,
+ } from "./crash-safe";
+ export { GatewayError, GatewayStreamError, gatewayErrorCode, isGatewayError } from "./errors";
++export { isTransientGatewayCode, retryBackoffMs, sleepAbortable, withTransientRetry, TRANSIENT_GATEWAY_CODES } from "./retry";
+ export { createAnthropicAdapter, type AnthropicAdapterOptions } from "./anthropic-adapter";
+ export { createGeminiAdapter, type GeminiAdapterOptions } from "./gemini-adapter";
+ export { createGroqAdapter, GROQ_BASE_URL } from "./groq-adapter";
+diff --git a/packages/ai-gateway/src/retry.test.ts b/packages/ai-gateway/src/retry.test.ts
+new file mode 100644
+index 0000000..339210d
+--- /dev/null
++++ b/packages/ai-gateway/src/retry.test.ts
+@@ -0,0 +1,80 @@
++import { describe, expect, it } from "vitest";
++import { GatewayError } from "./errors";
++import { isTransientGatewayCode, retryBackoffMs, sleepAbortable, withTransientRetry } from "./retry";
++
++describe("transient retry helpers", () => {
++  it("classifies only timeout, rate_limit, and network as transient", () => {
++    expect(isTransientGatewayCode("timeout")).toBe(true);
++    expect(isTransientGatewayCode("rate_limit")).toBe(true);
++    expect(isTransientGatewayCode("network")).toBe(true);
++    expect(isTransientGatewayCode("auth")).toBe(false);
++    expect(isTransientGatewayCode("quota")).toBe(false);
++    expect(isTransientGatewayCode("context_overflow")).toBe(false);
++    expect(isTransientGatewayCode("aborted")).toBe(false);
++  });
++
++  it("uses exponential backoff", () => {
++    expect(retryBackoffMs(0)).toBe(400);
++    expect(retryBackoffMs(1)).toBe(1200);
++    expect(retryBackoffMs(2)).toBe(3600);
++  });
++
++  it("aborts sleep when the signal fires", async () => {
++    const abort = new AbortController();
++    const pending = sleepAbortable(5_000, abort.signal);
++    abort.abort();
++    await expect(pending).rejects.toBeInstanceOf(GatewayError);
++  });
++
++  it("retries transient failures only before the first byte", async () => {
++    const abort = new AbortController();
++    let attempts = 0;
++    let streamed = false;
++    const value = await withTransientRetry({
++      maxAttempts: 3,
++      signal: abort.signal,
++      didStream: () => streamed,
++      delayMs: () => 0,
++      run: async () => {
++        attempts += 1;
++        if (attempts < 3) {
++          throw new GatewayError("timeout", "gateway:timeout");
++        }
++        return "ok";
++      },
++    });
++    expect(value).toBe("ok");
++    expect(attempts).toBe(3);
++
++    streamed = true;
++    attempts = 0;
++    await expect(
++      withTransientRetry({
++        maxAttempts: 3,
++        signal: abort.signal,
++        didStream: () => streamed,
++        run: async () => {
++          attempts += 1;
++          throw new GatewayError("timeout", "gateway:timeout");
++        },
++      }),
++    ).rejects.toMatchObject({ code: "timeout" });
++    expect(attempts).toBe(1);
++
++    streamed = false;
++    attempts = 0;
++    await expect(
++      withTransientRetry({
++        maxAttempts: 3,
++        signal: abort.signal,
++        didStream: () => streamed,
++        delayMs: () => 0,
++        run: async () => {
++          attempts += 1;
++          throw new GatewayError("auth", "gateway:auth");
++        },
++      }),
++    ).rejects.toMatchObject({ code: "auth" });
++    expect(attempts).toBe(1);
++  });
++});
+diff --git a/packages/ai-gateway/src/retry.ts b/packages/ai-gateway/src/retry.ts
+new file mode 100644
+index 0000000..c4368f4
+--- /dev/null
++++ b/packages/ai-gateway/src/retry.ts
+@@ -0,0 +1,62 @@
++import type { GatewayErrorCode } from "@ai-hub/shared";
++import { GatewayError, gatewayErrorCode } from "./errors";
++
++export const TRANSIENT_GATEWAY_CODES: readonly GatewayErrorCode[] = ["timeout", "rate_limit", "network"];
++
++export function isTransientGatewayCode(code: GatewayErrorCode): boolean {
++  return TRANSIENT_GATEWAY_CODES.includes(code);
++}
++
++export function retryBackoffMs(attempt: number): number {
++  return 400 * 3 ** attempt;
++}
++
++export async function withTransientRetry<T>(input: {
++  maxAttempts: number;
++  signal: AbortSignal;
++  didStream: () => boolean;
++  onRetry?: (attempt: number, code: GatewayErrorCode) => void | Promise<void>;
++  delayMs?: (attempt: number) => number;
++  run: () => Promise<T>;
++}): Promise<T> {
++  let lastError: unknown = new GatewayError("unknown", "gateway:unknown");
++  for (let attempt = 0; attempt < input.maxAttempts; attempt += 1) {
++    try {
++      return await input.run();
++    } catch (error) {
++      lastError = error;
++      const code: GatewayErrorCode = input.signal.aborted ? "aborted" : gatewayErrorCode(error);
++      if (
++        input.didStream() ||
++        !isTransientGatewayCode(code) ||
++        input.signal.aborted ||
++        attempt === input.maxAttempts - 1
++      ) {
++        throw error;
++      }
++      await input.onRetry?.(attempt + 1, code);
++      const wait = (input.delayMs ?? retryBackoffMs)(attempt);
++      if (wait > 0) {
++        await sleepAbortable(wait, input.signal);
++      }
++    }
++  }
++  throw lastError;
++}
++
++export async function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
++  if (signal.aborted) {
++    throw new GatewayError("aborted", "gateway:aborted");
++  }
++  await new Promise<void>((resolve, reject) => {
++    const timer = setTimeout(() => {
++      signal.removeEventListener("abort", onAbort);
++      resolve();
++    }, ms);
++    const onAbort = (): void => {
++      clearTimeout(timer);
++      reject(new GatewayError("aborted", "gateway:aborted"));
++    };
++    signal.addEventListener("abort", onAbort, { once: true });
++  });
++}
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index 4e5ef79..7ae56ce 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -1,5 +1,5 @@
+ export { applyMigrations } from "./migrate";
+-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL } from "./migrations";
++export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL } from "./migrations";
+ export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
+ export {
+   HubRepos,
+@@ -15,6 +15,8 @@ export {
+   type ProviderSecretRecord,
+   type ReceiptRecord,
+   type HealthSampleRecord,
++  type SpendCapRecord,
++  type SpendCapOverrideRecord,
+   type WorkspaceSessionRecord,
+ } from "./repos";
+ export { schema } from "./schema";
+diff --git a/packages/db/src/migrations.ts b/packages/db/src/migrations.ts
+index ab816f4..26b4a0c 100644
+--- a/packages/db/src/migrations.ts
++++ b/packages/db/src/migrations.ts
+@@ -140,9 +140,14 @@ ALTER TABLE projects ADD COLUMN preferred_provider TEXT;
+ CREATE UNIQUE INDEX IF NOT EXISTS conversation_tags_pk ON conversation_tags(conversation_id, tag_id);
+ `;
+ 
++export const MIGRATION_0005_SQL = `
++CREATE UNIQUE INDEX IF NOT EXISTS spend_caps_scope_idx ON spend_caps(scope);
++`;
++
+ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 1, sql: MIGRATION_0001_SQL },
+   { version: 2, sql: MIGRATION_0002_SQL },
+   { version: 3, sql: MIGRATION_0003_SQL },
+   { version: 4, sql: MIGRATION_0004_SQL },
++  { version: 5, sql: MIGRATION_0005_SQL },
+ ];
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index 93963b4..f45471f 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -115,7 +115,7 @@ describe("hub database", () => {
+       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
+       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
+       applyMigrations(second.sqlite);
+-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(4);
++      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(5);
+       second.close();
+     } finally {
+       rmSync(dir, { recursive: true, force: true });
+@@ -500,4 +500,46 @@ describe("hub database", () => {
+     expect(hits[0]?.snippet).toContain("[REDACTED]");
+     hub.close();
+   });
++
++  it("upserts spend caps by scope and sums receipt costs", () => {
++    const { hub } = openTestDb();
++    hub.repos.upsertSpendCap("request", "1.000000");
++    hub.repos.upsertSpendCap("day", "5.000000");
++    expect(hub.repos.listSpendCaps().map((item) => item.scope).sort()).toEqual(["day", "request"]);
++    hub.repos.upsertSpendCap("request", null);
++    expect(hub.repos.listSpendCaps().map((item) => item.scope)).toEqual(["day"]);
++    const project = hub.repos.createProject("Spend");
++    const conversation = hub.repos.createConversation(project.id, "Thread");
++    const assistant = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "assistant",
++      content: "hi",
++      parentId: null,
++      branchId: null,
++    });
++    hub.repos.createReceipt({
++      messageId: assistant.id,
++      provider: "openai",
++      model: "gpt-4o-mini",
++      tokensIn: 10,
++      tokensOut: 4,
++      latencyMs: 20,
++      costUsd: "0.250000",
++      errorCode: null,
++    });
++    expect(hub.repos.sumReceiptCostUsd({ conversationId: conversation.id })).toBe("0.250000");
++    expect(hub.repos.sumReceiptCostUsd({ projectId: project.id })).toBe("0.250000");
++    expect(hub.repos.sumReceiptCostUsd({})).toBe("0.250000");
++    hub.repos.appendSpendCapOverride({
++      at: "2026-09-17T00:00:00.000Z",
++      scope: "request",
++      limitUsd: "0",
++      estimatedUsd: "0.250000",
++      conversationId: conversation.id,
++      model: "gpt-4o-mini",
++      provider: "openai",
++    });
++    expect(hub.repos.listSpendCapOverrides()).toHaveLength(1);
++    hub.close();
++  });
+ });
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index a13b90c..4ba51bc 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -1,5 +1,5 @@
+ import { randomUUID } from "node:crypto";
+-import { and, eq, isNull, ne } from "drizzle-orm";
++import { and, desc, eq, gte, isNull, ne } from "drizzle-orm";
+ import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
+ import {
+   decryptUtf8,
+@@ -20,6 +20,7 @@ import {
+   providerKeys,
+   providers,
+   settings,
++  spendCaps,
+   tags,
+   type schema,
+ } from "./schema";
+@@ -115,6 +116,23 @@ export interface HealthSampleRecord {
+   createdAt: string;
+ }
+ 
++export interface SpendCapRecord {
++  id: string;
++  scope: string;
++  limitUsd: string;
++  createdAt: string;
++}
++
++export interface SpendCapOverrideRecord {
++  at: string;
++  scope: string;
++  limitUsd: string;
++  estimatedUsd: string | null;
++  conversationId: string;
++  model: string;
++  provider: string;
++}
++
+ export interface ProviderSecretRecord {
+   id: string;
+   providerSlug: string;
+@@ -139,6 +157,7 @@ const APPEARANCE_KEY = "appearance";
+ const SESSION_KEY = "workspace-session";
+ const BRANCH_LABELS_PREFIX = "branch-labels:";
+ const CUSTOM_BASE_URL_PREFIX = "custom-base-url:";
++const SPEND_CAP_OVERRIDES_KEY = "spend-cap-overrides";
+ const DEFAULT_SESSION: WorkspaceSessionRecord = {
+   projectId: null,
+   conversationId: null,
+@@ -191,6 +210,26 @@ function endpointUrlForDto(raw: string | null): string | null {
+   }
+ }
+ 
++function parseUsdMicros(value: string | null): number {
++  if (value === null || value.length === 0) {
++    return 0;
++  }
++  const match = /^(\d+)(?:\.(\d{1,6}))?$/.exec(value);
++  if (!match) {
++    return 0;
++  }
++  const whole = Number(match[1]);
++  const frac = (match[2] ?? "").padEnd(6, "0");
++  return whole * 1_000_000 + Number(frac);
++}
++
++function microsToUsdText(micros: number): string {
++  const abs = Math.abs(Math.trunc(micros));
++  const whole = Math.floor(abs / 1_000_000);
++  const frac = String(abs % 1_000_000).padStart(6, "0");
++  return `${micros < 0 ? "-" : ""}${whole}.${frac}`;
++}
++
+ function iso(ms: number): string {
+   return new Date(ms).toISOString();
+ }
+@@ -1092,6 +1131,145 @@ export class HubRepos {
+       }));
+   }
+ 
++  listRecentHealthSamples(limit = 400): HealthSampleRecord[] {
++    return this.db
++      .select()
++      .from(healthSamples)
++      .orderBy(desc(healthSamples.createdAt))
++      .limit(limit)
++      .all()
++      .map((row) => ({
++        id: row.id,
++        providerSlug: row.providerSlug,
++        ok: row.ok === 1,
++        latencyMs: row.latencyMs,
++        createdAt: iso(row.createdAt),
++      }));
++  }
++
++  listSpendCaps(): SpendCapRecord[] {
++    return this.db
++      .select()
++      .from(spendCaps)
++      .all()
++      .map((row) => ({
++        id: row.id,
++        scope: row.scope,
++        limitUsd: row.limitUsd,
++        createdAt: iso(row.createdAt),
++      }));
++  }
++
++  upsertSpendCap(scope: string, limitUsd: string | null): void {
++    const existing = this.db.select().from(spendCaps).where(eq(spendCaps.scope, scope)).get();
++    if (limitUsd === null) {
++      if (existing) {
++        this.db.delete(spendCaps).where(eq(spendCaps.id, existing.id)).run();
++      }
++      return;
++    }
++    const now = Date.now();
++    if (existing) {
++      this.db.update(spendCaps).set({ limitUsd }).where(eq(spendCaps.id, existing.id)).run();
++      return;
++    }
++    this.db
++      .insert(spendCaps)
++      .values({
++        id: randomUUID(),
++        scope,
++        limitUsd,
++        createdAt: now,
++      })
++      .run();
++  }
++
++  sumReceiptCostUsd(filter: {
++    conversationId?: string | null;
++    projectId?: string | null;
++    sinceMs?: number;
++  }): string {
++    const clauses = [];
++    if (filter.sinceMs !== undefined) {
++      clauses.push(gte(messageReceipts.createdAt, filter.sinceMs));
++    }
++    if (filter.conversationId) {
++      clauses.push(eq(messages.conversationId, filter.conversationId));
++    }
++    if (filter.projectId) {
++      clauses.push(eq(conversations.projectId, filter.projectId));
++    }
++    const query = this.db
++      .select({
++        costUsd: messageReceipts.costUsd,
++      })
++      .from(messageReceipts)
++      .innerJoin(messages, eq(messages.id, messageReceipts.messageId))
++      .innerJoin(conversations, eq(conversations.id, messages.conversationId));
++    const rows = clauses.length > 0 ? query.where(and(...clauses)).all() : query.all();
++    let micros = 0;
++    for (const row of rows) {
++      micros += parseUsdMicros(row.costUsd);
++    }
++    return microsToUsdText(micros);
++  }
++
++  listSpendCapOverrides(): SpendCapOverrideRecord[] {
++    const row = this.db.select().from(settings).where(eq(settings.key, SPEND_CAP_OVERRIDES_KEY)).get();
++    if (!row) {
++      return [];
++    }
++    try {
++      const parsed: unknown = JSON.parse(row.value);
++      if (!Array.isArray(parsed)) {
++        return [];
++      }
++      return parsed.filter((item): item is SpendCapOverrideRecord => {
++        if (typeof item !== "object" || item === null) {
++          return false;
++        }
++        const record = item as Partial<SpendCapOverrideRecord>;
++        return (
++          typeof record.at === "string" &&
++          typeof record.scope === "string" &&
++          typeof record.limitUsd === "string" &&
++          (record.estimatedUsd === null || typeof record.estimatedUsd === "string") &&
++          typeof record.conversationId === "string" &&
++          typeof record.model === "string" &&
++          typeof record.provider === "string"
++        );
++      });
++    } catch {
++      return [];
++    }
++  }
++
++  appendSpendCapOverride(entry: SpendCapOverrideRecord): void {
++    const stripped: SpendCapOverrideRecord = {
++      at: entry.at,
++      scope: entry.scope,
++      limitUsd: entry.limitUsd,
++      estimatedUsd: entry.estimatedUsd,
++      conversationId: entry.conversationId,
++      model: entry.model,
++      provider: entry.provider,
++    };
++    const next = [stripped, ...this.listSpendCapOverrides()].slice(0, 200);
++    const now = Date.now();
++    this.db
++      .insert(settings)
++      .values({
++        key: SPEND_CAP_OVERRIDES_KEY,
++        value: JSON.stringify(next),
++        updatedAt: now,
++      })
++      .onConflictDoUpdate({
++        target: settings.key,
++        set: { value: JSON.stringify(next), updatedAt: now },
++      })
++      .run();
++  }
++
+   async listProviderKeys(): Promise<ProviderKeyRecord[]> {
+     const rows = this.db.select().from(providerKeys).all();
+     const catalog = this.listProviders();
+diff --git a/packages/shared/src/fallback.ts b/packages/shared/src/fallback.ts
+new file mode 100644
+index 0000000..6bc3271
+--- /dev/null
++++ b/packages/shared/src/fallback.ts
+@@ -0,0 +1,54 @@
++import { catalogModelsForProvider } from "./model-catalog";
++import type { HealthSummary } from "./health";
++
++export interface FallbackKeyLike {
++  id: string;
++  providerSlug: string;
++  status: "active" | "invalid";
++}
++
++export interface FallbackSuggestion {
++  keyId: string;
++  providerSlug: string;
++  model: string;
++}
++
++function scoreSummary(summary: HealthSummary | undefined): number {
++  if (!summary || summary.lastOk === null) {
++    return 1;
++  }
++  if (summary.lastOk) {
++    return 2;
++  }
++  return 0;
++}
++
++export function suggestFallbackProvider(input: {
++  failedProvider: string;
++  keys: readonly FallbackKeyLike[];
++  summaries: readonly HealthSummary[];
++}): FallbackSuggestion | null {
++  const bySlug = new Map(input.summaries.map((item) => [item.providerSlug, item]));
++  const candidates = input.keys.filter(
++    (key) => key.status === "active" && key.providerSlug !== input.failedProvider,
++  );
++  if (candidates.length === 0) {
++    return null;
++  }
++  const ranked = [...candidates].sort((left, right) => {
++    const scoreDiff = scoreSummary(bySlug.get(right.providerSlug)) - scoreSummary(bySlug.get(left.providerSlug));
++    if (scoreDiff !== 0) {
++      return scoreDiff;
++    }
++    return left.providerSlug.localeCompare(right.providerSlug);
++  });
++  const chosen = ranked[0];
++  if (!chosen) {
++    return null;
++  }
++  const model = catalogModelsForProvider(chosen.providerSlug)[0]?.id;
++  if (!model) {
++    return null;
++  }
++  return { keyId: chosen.id, providerSlug: chosen.providerSlug, model };
++}
+diff --git a/packages/shared/src/gateway.test.ts b/packages/shared/src/gateway.test.ts
+index 7b0ef50..7ffcb1c 100644
+--- a/packages/shared/src/gateway.test.ts
++++ b/packages/shared/src/gateway.test.ts
+@@ -134,14 +134,34 @@ describe("chat contracts", () => {
+     expect(parsed.compactHistory).toBe(true);
+   });
+ 
+-  it("parses a chunk event", () => {
++  it("accepts allowOnce on send", () => {
++    const parsed = chatSendInputSchema.parse({
++      mode: "send",
++      conversationId: "11111111-1111-4111-8111-111111111111",
++      providerKeyId: "22222222-2222-4222-8222-222222222222",
++      model: "gpt-4o-mini",
++      content: "hello",
++      allowOnce: true,
++    });
++    expect(parsed.allowOnce).toBe(true);
++  });
++
++  it("parses a chat error event with an explicit fallback suggestion and no secret", () => {
+     const event = chatEventSchema.parse({
+-      type: "chunk",
++      type: "error",
+       runId: "11111111-1111-4111-8111-111111111111",
+       messageId: "22222222-2222-4222-8222-222222222222",
+-      text: "Hi",
++      code: "timeout",
++      suggestProviderSlug: "openai",
++      suggestKeyId: "33333333-3333-4333-8333-333333333333",
++      suggestModel: "gpt-4o-mini",
+     });
+-    expect(event.type).toBe("chunk");
++    expect(event.type).toBe("error");
++    if (event.type !== "error") {
++      return;
++    }
++    expect(event.suggestProviderSlug).toBe("openai");
++    expect("secret" in event).toBe(false);
+   });
+ 
+   it("parses a receipt without a secret field", () => {
+diff --git a/packages/shared/src/gateway.ts b/packages/shared/src/gateway.ts
+index 3b69dff..e1d3140 100644
+--- a/packages/shared/src/gateway.ts
++++ b/packages/shared/src/gateway.ts
+@@ -65,6 +65,7 @@ const chatSendBaseSchema = z.object({
+   maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
+   extraSystem: z.string().max(20_000).optional(),
+   compactHistory: z.boolean().optional(),
++  allowOnce: z.boolean().optional(),
+ });
+ 
+ export const chatSendInputSchema = z.discriminatedUnion("mode", [
+diff --git a/packages/shared/src/health.test.ts b/packages/shared/src/health.test.ts
+new file mode 100644
+index 0000000..4f8478a
+--- /dev/null
++++ b/packages/shared/src/health.test.ts
+@@ -0,0 +1,72 @@
++import { describe, expect, it } from "vitest";
++import { suggestFallbackProvider } from "./fallback";
++import { summarizeProviderHealth } from "./health";
++import { classifyHubIpcError } from "./hub-error";
++
++describe("provider health summaries", () => {
++  it("uses the latest N samples per slug and sorts slugs", () => {
++    const summaries = summarizeProviderHealth(
++      [
++        { providerSlug: "openai", ok: true, latencyMs: 80, createdAt: "2026-09-17T01:00:00.000Z" },
++        { providerSlug: "anthropic", ok: false, latencyMs: 400, createdAt: "2026-09-17T02:00:00.000Z" },
++        { providerSlug: "openai", ok: false, latencyMs: 200, createdAt: "2026-09-17T03:00:00.000Z" },
++      ],
++      20,
++    );
++    expect(summaries.map((item) => item.providerSlug)).toEqual(["anthropic", "openai"]);
++    const openai = summaries.find((item) => item.providerSlug === "openai");
++    expect(openai?.lastOk).toBe(false);
++    expect(openai?.errorRate).toBe(0.5);
++    expect(openai?.sampleCount).toBe(2);
++  });
++});
++
++describe("explicit fallback", () => {
++  it("never suggests the failed provider and prefers a healthy slug", () => {
++    const suggestion = suggestFallbackProvider({
++      failedProvider: "anthropic",
++      keys: [
++        { id: "11111111-1111-4111-8111-111111111111", providerSlug: "anthropic", status: "active" },
++        { id: "22222222-2222-4222-8222-222222222222", providerSlug: "openai", status: "active" },
++        { id: "33333333-3333-4333-8333-333333333333", providerSlug: "groq", status: "invalid" },
++      ],
++      summaries: [
++        { providerSlug: "openai", lastOk: true, lastLatencyMs: 90, errorRate: 0, sampleCount: 3 },
++        { providerSlug: "groq", lastOk: true, lastLatencyMs: 20, errorRate: 0, sampleCount: 1 },
++      ],
++    });
++    expect(suggestion?.providerSlug).toBe("openai");
++    expect(suggestion?.keyId).toBe("22222222-2222-4222-8222-222222222222");
++    expect(suggestion?.model).toBe("gpt-4o-mini");
++  });
++
++  it("returns null when the only keys belong to the failed provider", () => {
++    expect(
++      suggestFallbackProvider({
++        failedProvider: "openai",
++        keys: [{ id: "11111111-1111-4111-8111-111111111111", providerSlug: "openai", status: "active" }],
++        summaries: [],
++      }),
++    ).toBeNull();
++  });
++});
++
++describe("hub IPC error taxonomy", () => {
++  it("classifies cap, unknown model, and gateway codes", () => {
++    expect(classifyHubIpcError("Error: cap_exceeded:day")).toEqual({
++      kind: "cap",
++      scope: "day",
++      code: null,
++    });
++    expect(classifyHubIpcError("unknown_model")).toEqual({
++      kind: "unknown_model",
++      scope: null,
++      code: null,
++    });
++    expect(classifyHubIpcError("gateway:auth")).toEqual({
++      kind: "gateway",
++      scope: null,
++      code: "auth",
++    });
++  });
++});
+diff --git a/packages/shared/src/health.ts b/packages/shared/src/health.ts
+new file mode 100644
+index 0000000..3cd53df
+--- /dev/null
++++ b/packages/shared/src/health.ts
+@@ -0,0 +1,44 @@
++export interface HealthSampleLike {
++  providerSlug: string;
++  ok: boolean;
++  latencyMs: number | null;
++  createdAt: string;
++}
++
++export interface HealthSummary {
++  providerSlug: string;
++  lastOk: boolean | null;
++  lastLatencyMs: number | null;
++  errorRate: number;
++  sampleCount: number;
++}
++
++export const HEALTH_WINDOW = 20;
++
++export function summarizeProviderHealth(
++  samples: readonly HealthSampleLike[],
++  lastN = HEALTH_WINDOW,
++): HealthSummary[] {
++  const grouped = new Map<string, HealthSampleLike[]>();
++  const ordered = [...samples].sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
++  for (const sample of ordered) {
++    const bucket = grouped.get(sample.providerSlug) ?? [];
++    if (bucket.length < lastN) {
++      bucket.push(sample);
++      grouped.set(sample.providerSlug, bucket);
++    }
++  }
++  return [...grouped.entries()]
++    .sort(([left], [right]) => left.localeCompare(right))
++    .map(([providerSlug, window]) => {
++      const latest = window[0] ?? null;
++      const failures = window.filter((item) => !item.ok).length;
++      return {
++        providerSlug,
++        lastOk: latest ? latest.ok : null,
++        lastLatencyMs: latest ? latest.latencyMs : null,
++        errorRate: window.length === 0 ? 0 : failures / window.length,
++        sampleCount: window.length,
++      };
++    });
++}
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index 47d5578..b2248fa 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -26,6 +26,12 @@ import type {
+   ProviderDto,
+   SearchHit,
+   SearchInput,
++  SpendCapDto,
++  SpendCapSetInput,
++  HealthSummaryDto,
++  CostsAggregateInput,
++  CostsAggregateResult,
++  DebugSnapshot,
+   ProviderKeyDto,
+   SecretsSaveInput,
+   SecretsTestInput,
+@@ -86,6 +92,23 @@ export interface HubSearchApi {
+   query: (input: SearchInput) => Promise<SearchHit[]>;
+ }
+ 
++export interface HubSpendCapsApi {
++  get: () => Promise<SpendCapDto[]>;
++  set: (input: SpendCapSetInput) => Promise<SpendCapDto[]>;
++}
++
++export interface HubHealthApi {
++  summary: () => Promise<HealthSummaryDto[]>;
++}
++
++export interface HubCostsApi {
++  aggregate: (input: CostsAggregateInput) => Promise<CostsAggregateResult>;
++}
++
++export interface HubDebugApi {
++  getLatest: () => Promise<DebugSnapshot | null>;
++}
++
+ export interface HubChatApi {
+   send: (input: ChatSendInput) => Promise<ChatSendResult>;
+   abort: (input: ChatAbortInput) => Promise<void>;
+@@ -103,6 +126,10 @@ export interface HubApi {
+   providers: HubProvidersApi;
+   secrets: HubSecretsApi;
+   search: HubSearchApi;
++  spendCaps: HubSpendCapsApi;
++  health: HubHealthApi;
++  costs: HubCostsApi;
++  debug: HubDebugApi;
+   chat: HubChatApi;
+ }
+ 
+diff --git a/packages/shared/src/hub-error.ts b/packages/shared/src/hub-error.ts
+new file mode 100644
+index 0000000..0b34455
+--- /dev/null
++++ b/packages/shared/src/hub-error.ts
+@@ -0,0 +1,49 @@
++import type { GatewayErrorCode } from "./gateway";
++import { parseSpendCapError, type SpendCapScope } from "./spend-caps";
++
++export type HubIpcErrorKind =
++  | "cap"
++  | "unknown_model"
++  | "gateway"
++  | "generic";
++
++export interface HubIpcError {
++  kind: HubIpcErrorKind;
++  scope: SpendCapScope | null;
++  code: GatewayErrorCode | null;
++}
++
++const GATEWAY_CODES: readonly GatewayErrorCode[] = [
++  "timeout",
++  "rate_limit",
++  "auth",
++  "context_overflow",
++  "quota",
++  "network",
++  "aborted",
++  "unknown",
++];
++
++function isGatewayCode(value: string): value is GatewayErrorCode {
++  return (GATEWAY_CODES as readonly string[]).includes(value);
++}
++
++export function classifyHubIpcError(message: string): HubIpcError {
++  const cap = parseSpendCapError(message);
++  if (cap) {
++    return { kind: "cap", scope: cap, code: null };
++  }
++  if (message.includes("unknown_model")) {
++    return { kind: "unknown_model", scope: null, code: null };
++  }
++  const gateway = /gateway:(timeout|rate_limit|auth|context_overflow|quota|network|aborted|unknown)/.exec(
++    message,
++  );
++  if (gateway && isGatewayCode(gateway[1] ?? "")) {
++    return { kind: "gateway", scope: null, code: gateway[1] as GatewayErrorCode };
++  }
++  if (message.includes("context_overflow")) {
++    return { kind: "gateway", scope: null, code: "context_overflow" };
++  }
++  return { kind: "generic", scope: null, code: null };
++}
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index e39778d..b1e3b8d 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -9,8 +9,30 @@ export {
+   type HubSearchApi,
+   type HubSecretsApi,
+   type HubSettingsApi,
++  type HubSpendCapsApi,
++  type HubHealthApi,
++  type HubCostsApi,
++  type HubDebugApi,
+   type HubWindowApi,
+ } from "./hub-api";
++export {
++  evaluateSpendCaps,
++  parseSpendCapError,
++  SpendCapError,
++  SPEND_CAP_SCOPES,
++  SPEND_CAP_WARN_RATIO,
++  DEFAULT_ESTIMATED_OUTPUT_TOKENS,
++  addUsd,
++  usdToMicros,
++  microsToUsd,
++  isSpendCapScope,
++  type SpendCapScope,
++  type SpendCapLimits,
++  type SpendCapEvaluation,
++} from "./spend-caps";
++export { summarizeProviderHealth, HEALTH_WINDOW, type HealthSampleLike, type HealthSummary } from "./health";
++export { suggestFallbackProvider, type FallbackKeyLike, type FallbackSuggestion } from "./fallback";
++export { classifyHubIpcError, type HubIpcError, type HubIpcErrorKind } from "./hub-error";
+ export { IpcChannel, type IpcChannelName } from "./ipc-channels";
+ export {
+   activePath,
+@@ -58,6 +80,15 @@ export {
+   searchHitSchema,
+   searchInputSchema,
+   searchResultSchema,
++  spendCapDtoSchema,
++  spendCapListResultSchema,
++  spendCapSetInputSchema,
++  healthSummarySchema,
++  healthSummaryListSchema,
++  costsAggregateInputSchema,
++  costsAggregateResultSchema,
++  debugSnapshotSchema,
++  debugSnapshotResultSchema,
+   providerDtoSchema,
+   providerKeyDtoSchema,
+   providerKeyListResultSchema,
+@@ -97,6 +128,12 @@ export {
+   type ProviderDto,
+   type SearchHit,
+   type SearchInput,
++  type SpendCapDto,
++  type SpendCapSetInput,
++  type HealthSummaryDto,
++  type CostsAggregateInput,
++  type CostsAggregateResult,
++  type DebugSnapshot,
+   type ProviderKeyDto,
+   type SecretsSaveInput,
+   type SecretsTestInput,
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index 26f185a..7c0409e 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -15,6 +15,11 @@ export const IpcChannel = {
+   conversationsSetBranchLabel: "conversations:setBranchLabel",
+   conversationsSetTags: "conversations:setTags",
+   searchQuery: "search:query",
++  spendCapsGet: "spendCaps:get",
++  spendCapsSet: "spendCaps:set",
++  healthSummary: "health:summary",
++  costsAggregate: "costs:aggregate",
++  debugGetLatest: "debug:getLatest",
+   messagesList: "messages:list",
+   messagesCreate: "messages:create",
+   messagesUpdate: "messages:update",
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index a6b01d5..87dcdf5 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -1,11 +1,14 @@
+ import { describe, expect, it } from "vitest";
+ import {
+   conversationExportDocumentSchema,
++  debugSnapshotSchema,
+   emptyIpcPayloadSchema,
+   ipcAckResultSchema,
+   messageCreateInputSchema,
+   messageDtoSchema,
+   messageUpdateInputSchema,
++  packetPreviewInputSchema,
++  packetPreviewResultSchema,
+   providerKeyDtoSchema,
+   projectCreateInputSchema,
+   projectDtoSchema,
+@@ -259,3 +262,55 @@ describe("project and search contracts", () => {
+     expect(() => searchHitSchema.parse({ ...hit, snippet: "x".repeat(401) })).toThrow();
+   });
+ });
++
++describe("wave 7 contracts", () => {
++  it("rejects secrets on a debug snapshot", () => {
++    const snapshot = {
++      at: "2026-09-17T00:00:00.000Z",
++      provider: "openai",
++      model: "gpt-4o-mini",
++      retries: 1,
++      lastErrorCode: "timeout" as const,
++      tokenEstimate: 40,
++      estimatedCostUsd: "0.000010",
++      capDecision: "ok" as const,
++      capScope: null,
++      overflow: false,
++    };
++    expect(debugSnapshotSchema.parse(snapshot).provider).toBe("openai");
++    expect(() => debugSnapshotSchema.parse({ ...snapshot, authorization: "Bearer sk-test" })).toThrow();
++  });
++
++  it("requires estimate and cap fields on packet preview", () => {
++    const parsed = packetPreviewResultSchema.parse({
++      tokenEstimate: 12,
++      contextWindow: 128000,
++      overflow: false,
++      compacted: false,
++      excludedCount: 0,
++      estimatedCostUsd: "0.000001",
++      capWarnings: ["request"],
++      capBlocked: null,
++    });
++    expect(parsed.capWarnings).toEqual(["request"]);
++    expect(() =>
++      packetPreviewResultSchema.parse({
++        tokenEstimate: 12,
++        contextWindow: 128000,
++        overflow: false,
++        compacted: false,
++        excludedCount: 0,
++      }),
++    ).toThrow();
++    expect(() =>
++      packetPreviewInputSchema.parse({
++        conversationId: "11111111-1111-4111-8111-111111111111",
++        model: "gpt-4o-mini",
++        providerSlug: "openai",
++        pendingContent: "Hello",
++        maxTokens: 256,
++        secret: "sk-testfixtureABCDEFGH",
++      }),
++    ).toThrow();
++  });
++});
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index 9131d5f..37749b0 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -2,6 +2,8 @@ import { z } from "zod";
+ import { localeSchema, themeModeSchema } from "./appearance";
+ import { gatewayErrorCodeSchema, packetV0Schema, receiptDtoSchema } from "./gateway";
+ 
++export const spendCapScopeSchema = z.enum(["request", "day", "global"]);
++
+ export const emptyIpcPayloadSchema = z.object({}).strict();
+ 
+ export type EmptyIpcPayload = z.infer<typeof emptyIpcPayloadSchema>;
+@@ -154,6 +156,8 @@ export const packetPreviewInputSchema = z
+     model: z.string().min(1).max(128),
+     providerSlug: z.string().min(1).max(64),
+     compact: z.boolean().optional(),
++    pendingContent: z.string().max(100_000).optional(),
++    maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
+   })
+   .strict();
+ 
+@@ -166,6 +170,9 @@ export const packetPreviewResultSchema = z
+     overflow: z.boolean(),
+     compacted: z.boolean(),
+     excludedCount: z.number().int().nonnegative(),
++    estimatedCostUsd: z.string().nullable(),
++    capWarnings: z.array(spendCapScopeSchema),
++    capBlocked: spendCapScopeSchema.nullable(),
+   })
+   .strict();
+ 
+@@ -340,6 +347,9 @@ export const chatEventSchema = z.discriminatedUnion("type", [
+     runId: z.string().uuid(),
+     messageId: z.string().uuid(),
+     code: gatewayErrorCodeSchema,
++    suggestProviderSlug: z.string().min(1).max(64).nullable(),
++    suggestKeyId: z.string().uuid().nullable(),
++    suggestModel: z.string().min(1).max(128).nullable(),
+   }),
+ ]);
+ 
+@@ -412,3 +422,79 @@ export const conversationExportDocumentSchema = z
+   .strict();
+ 
+ export type ConversationExportDocument = z.infer<typeof conversationExportDocumentSchema>;
++
++export type SpendCapScopeDto = z.infer<typeof spendCapScopeSchema>;
++
++export const usdAmountSchema = z.string().regex(/^\d+(\.\d{1,6})?$/).max(20);
++
++export const spendCapDtoSchema = z
++  .object({
++    scope: spendCapScopeSchema,
++    limitUsd: usdAmountSchema.nullable(),
++  })
++  .strict();
++
++export type SpendCapDto = z.infer<typeof spendCapDtoSchema>;
++
++export const spendCapListResultSchema = z.array(spendCapDtoSchema).max(3);
++
++export const spendCapSetInputSchema = z
++  .object({
++    caps: z.array(spendCapDtoSchema).max(3),
++  })
++  .strict();
++
++export type SpendCapSetInput = z.infer<typeof spendCapSetInputSchema>;
++
++export const healthSummarySchema = z
++  .object({
++    providerSlug: z.string().min(1).max(64),
++    lastOk: z.boolean().nullable(),
++    lastLatencyMs: z.number().int().nullable(),
++    errorRate: z.number().min(0).max(1),
++    sampleCount: z.number().int().nonnegative(),
++  })
++  .strict();
++
++export type HealthSummaryDto = z.infer<typeof healthSummarySchema>;
++
++export const healthSummaryListSchema = z.array(healthSummarySchema).max(32);
++
++export const costsAggregateInputSchema = z
++  .object({
++    conversationId: z.string().uuid().nullable(),
++    projectId: z.string().uuid().nullable(),
++  })
++  .strict();
++
++export type CostsAggregateInput = z.infer<typeof costsAggregateInputSchema>;
++
++export const costsAggregateResultSchema = z
++  .object({
++    conversationUsd: z.string().nullable(),
++    projectUsd: z.string().nullable(),
++    dayUsd: z.string(),
++    globalUsd: z.string(),
++  })
++  .strict();
++
++export type CostsAggregateResult = z.infer<typeof costsAggregateResultSchema>;
++
++export const debugSnapshotSchema = z
++  .object({
++    at: isoTimestampSchema,
++    provider: z.string().min(1).max(64),
++    model: z.string().min(1).max(128),
++    retries: z.number().int().nonnegative(),
++    lastErrorCode: gatewayErrorCodeSchema.nullable(),
++    tokenEstimate: z.number().int().nonnegative(),
++    estimatedCostUsd: z.string().nullable(),
++    capDecision: z.enum(["ok", "warn", "block", "override"]),
++    capScope: spendCapScopeSchema.nullable(),
++    overflow: z.boolean(),
++  })
++  .strict();
++
++export type DebugSnapshot = z.infer<typeof debugSnapshotSchema>;
++
++export const debugSnapshotResultSchema = debugSnapshotSchema.nullable();
+diff --git a/packages/shared/src/spend-caps.test.ts b/packages/shared/src/spend-caps.test.ts
+new file mode 100644
+index 0000000..206fce1
+--- /dev/null
++++ b/packages/shared/src/spend-caps.test.ts
+@@ -0,0 +1,74 @@
++import { describe, expect, it } from "vitest";
++import { evaluateSpendCaps, parseSpendCapError, SpendCapError, usdToMicros } from "./spend-caps";
++
++describe("spend caps", () => {
++  it("treats a missing limit as unlimited", () => {
++    const result = evaluateSpendCaps({
++      estimatedRequestUsd: "1.000000",
++      daySpentUsd: "9.000000",
++      globalSpentUsd: "99.000000",
++      limits: {},
++    });
++    expect(result.blocked).toBeNull();
++    expect(result.warnings).toEqual([]);
++  });
++
++  it("warns at 80% and blocks at 100%", () => {
++    const warn = evaluateSpendCaps({
++      estimatedRequestUsd: "8.000000",
++      daySpentUsd: "0.000000",
++      globalSpentUsd: "0.000000",
++      limits: { request: "10.000000" },
++    });
++    expect(warn.blocked).toBeNull();
++    expect(warn.warnings).toEqual(["request"]);
++
++    const block = evaluateSpendCaps({
++      estimatedRequestUsd: "10.000000",
++      daySpentUsd: "0.000000",
++      globalSpentUsd: "0.000000",
++      limits: { request: "10.000000" },
++    });
++    expect(block.blocked).toBe("request");
++  });
++
++  it("blocks a zero request cap when the estimate is positive", () => {
++    const result = evaluateSpendCaps({
++      estimatedRequestUsd: "0.000001",
++      daySpentUsd: "0.000000",
++      globalSpentUsd: "0.000000",
++      limits: { request: "0" },
++    });
++    expect(result.blocked).toBe("request");
++  });
++
++  it("skips the request cap when there is no catalog estimate", () => {
++    const result = evaluateSpendCaps({
++      estimatedRequestUsd: null,
++      daySpentUsd: "0.000000",
++      globalSpentUsd: "0.000000",
++      limits: { request: "0" },
++    });
++    expect(result.blocked).toBeNull();
++  });
++
++  it("adds the estimate onto day and global spend", () => {
++    const result = evaluateSpendCaps({
++      estimatedRequestUsd: "1.000000",
++      daySpentUsd: "4.500000",
++      globalSpentUsd: "9.000000",
++      limits: { day: "5.000000", global: "20.000000" },
++    });
++    expect(result.blocked).toBe("day");
++    expect(result.dayUsd).toBe("5.500000");
++    expect(result.globalUsd).toBe("10.000000");
++  });
++
++  it("parses a SpendCapError message even when Electron wraps it", () => {
++    const error = new SpendCapError("global");
++    expect(parseSpendCapError(`Error invoking remote method 'chat:send': Error: ${error.message}`)).toBe(
++      "global",
++    );
++    expect(usdToMicros("1.250000")).toBe(1_250_000);
++  });
++});
+diff --git a/packages/shared/src/spend-caps.ts b/packages/shared/src/spend-caps.ts
+new file mode 100644
+index 0000000..d874810
+--- /dev/null
++++ b/packages/shared/src/spend-caps.ts
+@@ -0,0 +1,101 @@
++export const SPEND_CAP_SCOPES = ["request", "day", "global"] as const;
++
++export type SpendCapScope = (typeof SPEND_CAP_SCOPES)[number];
++
++const MICROS = 1_000_000;
++export const SPEND_CAP_WARN_RATIO = 0.8;
++export const DEFAULT_ESTIMATED_OUTPUT_TOKENS = 1024;
++
++export class SpendCapError extends Error {
++  readonly scope: SpendCapScope;
++
++  constructor(scope: SpendCapScope) {
++    super(`cap_exceeded:${scope}`);
++    this.name = "SpendCapError";
++    this.scope = scope;
++  }
++}
++
++export function isSpendCapScope(value: string): value is SpendCapScope {
++  return (SPEND_CAP_SCOPES as readonly string[]).includes(value);
++}
++
++export function usdToMicros(value: string): number {
++  const match = /^(\d+)(?:\.(\d{1,6}))?$/.exec(value);
++  if (!match) {
++    throw new Error("Invalid USD amount");
++  }
++  const whole = Number(match[1]);
++  const frac = (match[2] ?? "").padEnd(6, "0");
++  return whole * MICROS + Number(frac);
++}
++
++export function microsToUsd(micros: number): string {
++  const sign = micros < 0 ? "-" : "";
++  const abs = Math.abs(Math.trunc(micros));
++  const whole = Math.floor(abs / MICROS);
++  const frac = String(abs % MICROS).padStart(6, "0");
++  return `${sign}${whole}.${frac}`;
++}
++
++export function addUsd(left: string, right: string): string {
++  return microsToUsd(usdToMicros(left) + usdToMicros(right));
++}
++
++export type SpendCapLimits = Partial<Record<SpendCapScope, string>>;
++
++export interface SpendCapEvaluation {
++  blocked: SpendCapScope | null;
++  warnings: SpendCapScope[];
++  requestUsd: string;
++  dayUsd: string;
++  globalUsd: string;
++}
++
++export function evaluateSpendCaps(input: {
++  estimatedRequestUsd: string | null;
++  daySpentUsd: string;
++  globalSpentUsd: string;
++  limits: SpendCapLimits;
++}): SpendCapEvaluation {
++  const estimate = input.estimatedRequestUsd ?? "0.000000";
++  const requestUsd = estimate;
++  const dayUsd = addUsd(input.daySpentUsd, estimate);
++  const globalUsd = addUsd(input.globalSpentUsd, estimate);
++  const usage: Record<SpendCapScope, string> = {
++    request: requestUsd,
++    day: dayUsd,
++    global: globalUsd,
++  };
++  const warnings: SpendCapScope[] = [];
++  let blocked: SpendCapScope | null = null;
++
++  for (const scope of SPEND_CAP_SCOPES) {
++    const limit = input.limits[scope];
++    if (limit === undefined) {
++      continue;
++    }
++    if (scope === "request" && input.estimatedRequestUsd === null) {
++      continue;
++    }
++    const used = usdToMicros(usage[scope]);
++    const cap = usdToMicros(limit);
++    if (used >= cap) {
++      blocked = blocked ?? scope;
++      continue;
++    }
++    if (cap > 0 && used / cap >= SPEND_CAP_WARN_RATIO) {
++      warnings.push(scope);
++    }
++  }
++
++  return { blocked, warnings, requestUsd, dayUsd, globalUsd };
++}
++
++export function parseSpendCapError(message: string): SpendCapScope | null {
++  const match = /cap_exceeded:(request|day|global)/.exec(message);
++  if (!match) {
++    return null;
++  }
++  return match[1] as SpendCapScope;
++}
