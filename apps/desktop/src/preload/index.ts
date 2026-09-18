@@ -18,7 +18,11 @@ import {
   conversationExportInputSchema,
   conversationExportResultSchema,
   conversationTagsSetInputSchema,
+  costsAggregateInputSchema,
+  costsAggregateResultSchema,
+  debugSnapshotResultSchema,
   emptyIpcPayloadSchema,
+  healthSummaryListSchema,
   idInputSchema,
   ipcAckResultSchema,
   messageCreateInputSchema,
@@ -40,6 +44,8 @@ import {
   secretsSaveInputSchema,
   secretsTestInputSchema,
   secretsTestResultSchema,
+  spendCapListResultSchema,
+  spendCapSetInputSchema,
   windowIsMaximizedResultSchema,
   workspaceSessionSchema,
 } from "@ai-hub/shared";
@@ -190,6 +196,24 @@ const hub: HubApi = {
   },
   search: {
     query: (input) => invokeParsed(IpcChannel.searchQuery, input, searchInputSchema, searchResultSchema),
+  },
+  spendCaps: {
+    get: () =>
+      invokeParsed(IpcChannel.spendCapsGet, empty, emptyIpcPayloadSchema, spendCapListResultSchema),
+    set: (input) =>
+      invokeParsed(IpcChannel.spendCapsSet, input, spendCapSetInputSchema, spendCapListResultSchema),
+  },
+  health: {
+    summary: () =>
+      invokeParsed(IpcChannel.healthSummary, empty, emptyIpcPayloadSchema, healthSummaryListSchema),
+  },
+  costs: {
+    aggregate: (input) =>
+      invokeParsed(IpcChannel.costsAggregate, input, costsAggregateInputSchema, costsAggregateResultSchema),
+  },
+  debug: {
+    getLatest: () =>
+      invokeParsed(IpcChannel.debugGetLatest, empty, emptyIpcPayloadSchema, debugSnapshotResultSchema),
   },
   chat: {
     send: (input) => invokeParsed(IpcChannel.chatSend, input, chatSendInputSchema, chatSendResultSchema),
