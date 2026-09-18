@@ -74,3 +74,6 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W08-004](./ADR-W08-004-crash-reporter-opt-in-local.md) | W08 | Crash reporter opt-in, dumps locais | accepted |
 | [ADR-W08-005](./ADR-W08-005-composer-secret-hint.md) | W08 | Aviso de secret no composer via shared | accepted |
 | [ADR-W09-001](./ADR-W09-001-run-modes-and-agent-orchestration-waves.md) | W09 | Mapa W21 run modes + W24 orquestração (plano) | accepted |
+| [ADR-W09-002](./ADR-W09-002-import-identity-and-receipt-source.md) | W09 | Identidade de import + receipt `source` | accepted |
+| [ADR-W09-003](./ADR-W09-003-imported-inbox-not-sentinel-project.md) | W09 | Inbox Importadas virtual, sem projeto sentinela | accepted |
+| [ADR-W09-004](./ADR-W09-004-vendor-parsers-and-opaque-ticket.md) | W09 | Parsers no shared; ticket opaco; Gemini best-effort | accepted |
