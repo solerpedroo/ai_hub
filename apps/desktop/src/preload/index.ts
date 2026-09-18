@@ -14,6 +14,7 @@ import {
   conversationCreateInputSchema,
   conversationListInputSchema,
   conversationListResultSchema,
+  conversationMoveInputSchema,
   conversationDtoSchema,
   conversationExportInputSchema,
   conversationExportResultSchema,
@@ -23,6 +24,11 @@ import {
   debugSnapshotResultSchema,
   emptyIpcPayloadSchema,
   healthSummaryListSchema,
+  importCancelInputSchema,
+  importEventSchema,
+  importPickResultSchema,
+  importStartInputSchema,
+  importStartResultSchema,
   appPrefsSchema,
   appPrefsPatchSchema,
   updateCheckResultSchema,
@@ -158,6 +164,8 @@ const hub: HubApi = {
         conversationTagsSetInputSchema,
         conversationDtoSchema,
       ),
+    move: (input) =>
+      invokeParsed(IpcChannel.conversationsMove, input, conversationMoveInputSchema, conversationDtoSchema),
   },
   messages: {
     list: (input) =>
@@ -246,6 +254,26 @@ const hub: HubApi = {
       ipcRenderer.on(IpcChannel.chatEvent, wrapped);
       return () => {
         ipcRenderer.removeListener(IpcChannel.chatEvent, wrapped);
+      };
+    },
+  },
+  import: {
+    pickFile: () =>
+      invokeParsed(IpcChannel.importPickFile, empty, emptyIpcPayloadSchema, importPickResultSchema),
+    start: (input) =>
+      invokeParsed(IpcChannel.importStart, input, importStartInputSchema, importStartResultSchema),
+    cancel: (input) => invokeAckWith(IpcChannel.importCancel, input, importCancelInputSchema),
+    onEvent: (listener) => {
+      const wrapped = (_event: unknown, payload: unknown): void => {
+        try {
+          listener(importEventSchema.parse(payload));
+        } catch (error) {
+          rethrowIpcError(error);
+        }
+      };
+      ipcRenderer.on(IpcChannel.importEvent, wrapped);
+      return () => {
+        ipcRenderer.removeListener(IpcChannel.importEvent, wrapped);
       };
     },
   },
