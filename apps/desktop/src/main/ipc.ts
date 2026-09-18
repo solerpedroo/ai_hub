@@ -16,7 +16,11 @@ import {
   conversationListInputSchema,
   conversationListResultSchema,
   conversationTagsSetInputSchema,
+  costsAggregateInputSchema,
+  costsAggregateResultSchema,
+  debugSnapshotResultSchema,
   emptyIpcPayloadSchema,
+  healthSummaryListSchema,
   idInputSchema,
   ipcAckResultSchema,
   messageCreateInputSchema,
@@ -38,16 +42,22 @@ import {
   secretsSaveInputSchema,
   secretsTestInputSchema,
   secretsTestResultSchema,
+  spendCapListResultSchema,
+  spendCapSetInputSchema,
+  SPEND_CAP_SCOPES,
+  summarizeProviderHealth,
   windowIsMaximizedResultSchema,
   workspaceSessionSchema,
 } from "@ai-hub/shared";
 import { safeErrorMessage } from "@ai-hub/security";
 import { abortChat, sendChat } from "./chat-session";
 import { exportConversation } from "./conversation-export";
+import { getLatestDebugSnapshot } from "./debug-snapshot";
 import { toMessageDto } from "./message-dto";
 import { previewPacket } from "./packet-preview";
 import { getHubDatabase } from "./persistence";
 import { testProviderKey } from "./provider-health";
+import { localDayStartMs } from "./spend-guard";
 
 function registerHandler<TIn, TOut>(
   channel: string,
@@ -271,6 +281,73 @@ export function registerWorkspaceIpc(): void {
     packetPreviewInputSchema,
     packetPreviewResultSchema,
     (input) => previewPacket(input),
+  );
+
+  registerHandler(IpcChannel.spendCapsGet, emptyIpcPayloadSchema, spendCapListResultSchema, () => {
+    const rows = getHubDatabase().repos.listSpendCaps();
+    return SPEND_CAP_SCOPES.map((scope) => ({
+      scope,
+      limitUsd: rows.find((row) => row.scope === scope)?.limitUsd ?? null,
+    }));
+  });
+
+  registerHandler(
+    IpcChannel.spendCapsSet,
+    spendCapSetInputSchema,
+    spendCapListResultSchema,
+    (input) => {
+      const repos = getHubDatabase().repos;
+      for (const cap of input.caps) {
+        repos.upsertSpendCap(cap.scope, cap.limitUsd);
+      }
+      const rows = repos.listSpendCaps();
+      return SPEND_CAP_SCOPES.map((scope) => ({
+        scope,
+        limitUsd: rows.find((row) => row.scope === scope)?.limitUsd ?? null,
+      }));
+    },
+  );
+
+  registerHandler(IpcChannel.healthSummary, emptyIpcPayloadSchema, healthSummaryListSchema, async () => {
+    const repos = getHubDatabase().repos;
+    const samples = summarizeProviderHealth(repos.listRecentHealthSamples());
+    const bySlug = new Map(samples.map((item) => [item.providerSlug, item]));
+    const keys = await repos.listProviderKeys();
+    const slugs = [...new Set([...keys.map((key) => key.providerSlug), ...bySlug.keys()])].sort();
+    return slugs.map((providerSlug) => {
+      const existing = bySlug.get(providerSlug);
+      if (existing) {
+        return existing;
+      }
+      return {
+        providerSlug,
+        lastOk: null,
+        lastLatencyMs: null,
+        errorRate: 0,
+        sampleCount: 0,
+      };
+    });
+  });
+
+  registerHandler(
+    IpcChannel.costsAggregate,
+    costsAggregateInputSchema,
+    costsAggregateResultSchema,
+    (input) => {
+      const repos = getHubDatabase().repos;
+      return {
+        conversationUsd: input.conversationId
+          ? repos.sumReceiptCostUsd({ conversationId: input.conversationId })
+          : null,
+        projectUsd: input.projectId ? repos.sumReceiptCostUsd({ projectId: input.projectId }) : null,
+        dayUsd: repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() }),
+        globalUsd: repos.sumReceiptCostUsd({}),
+      };
+    },
+  );
+
+  registerHandler(IpcChannel.debugGetLatest, emptyIpcPayloadSchema, debugSnapshotResultSchema, () =>
+    getLatestDebugSnapshot(),
   );
 }
 
