@@ -1,5 +1,6 @@
 import { type FormEvent, type JSX, type KeyboardEvent, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
+import { looksLikePastedSecret, redactPastedSecrets } from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
 
 export function ChatComposer({
@@ -22,6 +23,7 @@ export function ChatComposer({
   const { t } = useTranslation();
   const areaRef = useRef<HTMLTextAreaElement>(null);
   const busy = streaming || sending;
+  const secretWarning = looksLikePastedSecret(value);
 
   useEffect(() => {
     areaRef.current?.focus();
@@ -69,7 +71,21 @@ export function ChatComposer({
         }}
       />
       <div className="flex items-center justify-between gap-2">
-        <p className="text-[11px] text-muted-foreground">{t("workspace.composer.hint")}</p>
+        {secretWarning ? (
+          <p className="text-[11px] text-destructive" role="status" data-testid="composer-secret-warning">
+            {t("workspace.composer.secretWarning")}{" "}
+            <button
+              type="button"
+              className="underline"
+              data-testid="composer-secret-redact"
+              onClick={() => onChange(redactPastedSecrets(value))}
+            >
+              {t("workspace.composer.secretRedact")}
+            </button>
+          </p>
+        ) : (
+          <p className="text-[11px] text-muted-foreground">{t("workspace.composer.hint")}</p>
+        )}
         {streaming ? (
           <Button
             type="button"
