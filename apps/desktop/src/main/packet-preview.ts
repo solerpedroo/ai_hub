@@ -1,8 +1,9 @@
-import { compileActivePath } from "@ai-hub/ai-gateway";
+import { compileActivePathDetailed, mergePacketWithTail } from "@ai-hub/ai-gateway";
 import { randomUUID } from "node:crypto";
 import {
   findCatalogModel,
   packetPreviewResultSchema,
+  portablePacketV1Schema,
   type PacketPreviewInput,
   type PacketPreviewResult,
 } from "@ai-hub/shared";
@@ -26,42 +27,101 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
       ? input.pendingContent.trim()
       : null;
   const leaf = path.at(-1);
-  const messages = [
-    ...path.map((item) => ({
-      id: item.id,
-      parentId: item.parentId,
-      isActiveBranch: item.isActiveBranch,
-      createdAt: item.createdAt,
-      role: item.role,
-      content: item.content,
-      status: item.status,
-    })),
-    ...(pending
-      ? [
-          {
-            id: randomUUID(),
-            parentId: leaf?.id ?? null,
-            isActiveBranch: true,
-            createdAt: new Date().toISOString(),
-            role: "user" as const,
-            content: pending,
-            status: "complete" as const,
-          },
-        ]
-      : []),
-  ];
-  const compiled = {
-    projectInstructions: project?.instructions ?? null,
-    extraSystem,
-    messages,
-  };
-  const packet = compileActivePath(
-    input.compact === true ? { ...compiled, maxTokenBudget: contextWindow } : compiled,
-  );
+  const pendingRow = pending
+    ? {
+        id: randomUUID(),
+        parentId: leaf?.id ?? null,
+        isActiveBranch: true,
+        createdAt: new Date().toISOString(),
+        role: "user" as const,
+        content: pending,
+        status: "complete" as const,
+        pinned: false,
+        branchId: leaf?.branchId ?? randomUUID(),
+      }
+    : null;
+  const privacyMode = input.privacyMode ?? "standard";
+  const appliedId = conversation.activePacketId;
+  const applied = appliedId ? repos.getContextPacket(appliedId) : null;
+  const budget = input.compact === true ? contextWindow : undefined;
+
+  let tokenEstimate = 0;
+  let excludedCount = 0;
+  let included: PacketPreviewResult["included"] = [];
+  let omitted: PacketPreviewResult["omitted"] = [];
+  let resolvedPrivacy = privacyMode;
+
+  if (applied && applied.projectId === conversation.projectId) {
+    const envelope = portablePacketV1Schema.parse(JSON.parse(applied.payloadJson) as unknown);
+    resolvedPrivacy = envelope.privacyMode;
+    const appliedAt = conversation.packetAppliedAt;
+    const tail = [
+      ...path.filter((item) => appliedAt !== null && item.createdAt >= appliedAt),
+      ...(pendingRow ? [pendingRow] : []),
+    ];
+    const merged = mergePacketWithTail(
+      envelope.payload,
+      tail.map((item) => ({
+        id: item.id,
+        role: item.role,
+        content: item.content,
+        status: item.status,
+        ...("pinned" in item && item.pinned ? { pinned: true } : {}),
+      })),
+      budget,
+    );
+    tokenEstimate = merged.packet.tokenEstimate;
+    excludedCount = merged.packet.excluded.length;
+    included = merged.included;
+    omitted = merged.omitted;
+  } else {
+    const all = repos.listMessages(input.conversationId);
+    const messages = [
+      ...all.map((item) => ({
+        id: item.id,
+        parentId: item.parentId,
+        isActiveBranch: item.isActiveBranch,
+        createdAt: item.createdAt,
+        role: item.role,
+        content: item.content,
+        status: item.status,
+        branchId: item.branchId,
+        ...(item.pinned ? { pinned: true } : {}),
+      })),
+      ...(pendingRow
+        ? [
+            {
+              id: pendingRow.id,
+              parentId: pendingRow.parentId,
+              isActiveBranch: true,
+              createdAt: pendingRow.createdAt,
+              role: pendingRow.role,
+              content: pendingRow.content,
+              status: pendingRow.status,
+              branchId: pendingRow.branchId,
+            },
+          ]
+        : []),
+    ];
+    const compiled = {
+      projectInstructions: project?.instructions ?? null,
+      extraSystem,
+      messages,
+      privacyMode,
+    };
+    const detailed = compileActivePathDetailed(
+      budget !== undefined ? { ...compiled, maxTokenBudget: budget } : compiled,
+    );
+    tokenEstimate = detailed.packet.tokenEstimate;
+    excludedCount = detailed.packet.excluded.length;
+    included = detailed.included;
+    omitted = detailed.omitted;
+  }
+
   const estimatedCostUsd = estimateOutgoingCostUsd(
     input.model,
     input.providerSlug,
-    packet.tokenEstimate,
+    tokenEstimate,
     input.maxTokens ?? null,
   );
   const cap = evaluateOutgoingCaps({
@@ -71,13 +131,19 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
     limits: spendCapLimitsFromRows(repos.listSpendCaps()),
   });
   return packetPreviewResultSchema.parse({
-    tokenEstimate: packet.tokenEstimate,
+    tokenEstimate,
     contextWindow,
-    overflow: packet.tokenEstimate > contextWindow,
-    compacted: input.compact === true && packet.excluded.length > 0,
-    excludedCount: packet.excluded.length,
+    overflow: tokenEstimate > contextWindow,
+    compacted: input.compact === true && excludedCount > 0,
+    excludedCount,
     estimatedCostUsd,
     capWarnings: cap.warnings,
     capBlocked: cap.blocked,
+    included,
+    omitted,
+    destinationModel: input.model,
+    destinationProvider: input.providerSlug,
+    privacyMode: resolvedPrivacy,
+    appliedPacketId: applied && applied.projectId === conversation.projectId ? applied.id : null,
   });
 }
