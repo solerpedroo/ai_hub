@@ -6,9 +6,11 @@ import {
   findCatalogModel,
   type BranchLabels,
   type CatalogModel,
+  type ContextPacketDto,
   type ConversationDto,
   type MessageDto,
   type PacketPreviewResult,
+  type PacketPrivacyMode,
   type ProjectDto,
   type ProjectUpdateInput,
   type ProviderKeyDto,
@@ -16,6 +18,7 @@ import {
 import { ChatComposer } from "@/components/chat/chat-composer";
 import { ConversationTree } from "@/components/chat/conversation-tree";
 import { MessageBubble } from "@/components/chat/message-bubble";
+import { PacketPanel } from "@/components/chat/packet-panel";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -68,6 +71,15 @@ export function HomeView({
   showAllowOnce,
   onAllowOnce,
   onComposerDraft,
+  onPin,
+  packets,
+  privacyMode,
+  onPrivacyMode,
+  onCompilePacket,
+  onExportPacket,
+  onImportPacket,
+  onApplyPacket,
+  onClearPacket,
 }: {
   project: ProjectDto | null;
   importedInbox: boolean;
@@ -114,6 +126,15 @@ export function HomeView({
   showAllowOnce: boolean;
   onAllowOnce: () => void;
   onComposerDraft: (value: string) => void;
+  onPin: (id: string, pinned: boolean) => Promise<void>;
+  packets: ContextPacketDto[];
+  privacyMode: PacketPrivacyMode;
+  onPrivacyMode: (value: PacketPrivacyMode) => void;
+  onCompilePacket: () => Promise<void>;
+  onExportPacket: (packetId: string) => Promise<void>;
+  onImportPacket: () => Promise<void>;
+  onApplyPacket: (packetId: string) => Promise<void>;
+  onClearPacket: () => Promise<void>;
 }): JSX.Element {
   const { t } = useTranslation();
   const [title, setTitle] = useState("");
@@ -370,6 +391,7 @@ export function HomeView({
             onChange={(event) => setTitle(event.target.value)}
             placeholder={t("workspace.conversationPlaceholder")}
             aria-label={t("workspace.conversationPlaceholder")}
+            data-testid="workspace-new-conversation-title"
           />
           <Button type="submit" size="sm" className="h-7" data-testid="workspace-new-conversation">
             {t("workspace.newConversation")}
@@ -499,6 +521,20 @@ export function HomeView({
                     {t("workspace.packet.badge", { n: packetPreview.tokenEstimate })}
                   </span>
                 ) : null}
+                <PacketPanel
+                  packetPreview={packetPreview}
+                  packets={packets}
+                  projectId={project?.id ?? null}
+                  appliedPacketId={selectedConversation?.activePacketId ?? null}
+                  privacyMode={privacyMode}
+                  busy={busy}
+                  onPrivacyMode={onPrivacyMode}
+                  onCompile={onCompilePacket}
+                  onExport={onExportPacket}
+                  onImport={onImportPacket}
+                  onApply={onApplyPacket}
+                  onClear={onClearPacket}
+                />
                 {packetPreview?.estimatedCostUsd ? (
                   <span className="text-[11px] text-muted-foreground" data-testid="send-estimate">
                     {t("workspace.estimate", { usd: packetPreview.estimatedCostUsd })}
@@ -629,6 +665,9 @@ export function HomeView({
                       onEditingChange={setEditing}
                       onActivateSibling={(id) => {
                         void onActivate(id);
+                      }}
+                      onPin={(pinned) => {
+                        void onPin(message.id, pinned);
                       }}
                     />
                   ))}
