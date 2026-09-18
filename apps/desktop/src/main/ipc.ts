@@ -15,6 +15,7 @@ import {
   conversationExportResultSchema,
   conversationListInputSchema,
   conversationListResultSchema,
+  conversationMoveInputSchema,
   conversationTagsSetInputSchema,
   costsAggregateInputSchema,
   costsAggregateResultSchema,
@@ -25,6 +26,10 @@ import {
   appPrefsPatchSchema,
   updateCheckResultSchema,
   idInputSchema,
+  importCancelInputSchema,
+  importPickResultSchema,
+  importStartInputSchema,
+  importStartResultSchema,
   ipcAckResultSchema,
   messageCreateInputSchema,
   messageDtoSchema,
@@ -57,6 +62,7 @@ import { abortChat, sendChat } from "./chat-session";
 import { exportConversation } from "./conversation-export";
 import { applyCrashReporterOptIn } from "./crash-reporter";
 import { getLatestDebugSnapshot } from "./debug-snapshot";
+import { cancelImportJob, pickImportFile, startImportJob } from "./import-job";
 import { toMessageDto } from "./message-dto";
 import { previewPacket } from "./packet-preview";
 import { getHubDatabase } from "./persistence";
@@ -121,7 +127,7 @@ export function registerWorkspaceIpc(): void {
     conversationListResultSchema,
     (input) =>
       getHubDatabase()
-        .repos.listConversations(input.projectId)
+        .repos.listConversations(input.projectId, input.inbox ?? "avulsas")
         .map((row) => conversationDtoSchema.parse(row)),
   );
 
@@ -173,6 +179,25 @@ export function registerWorkspaceIpc(): void {
         getHubDatabase().repos.setConversationTags(input.conversationId, input.names),
       ),
   );
+
+  registerHandler(
+    IpcChannel.conversationsMove,
+    conversationMoveInputSchema,
+    conversationDtoSchema,
+    (input) => conversationDtoSchema.parse(getHubDatabase().repos.moveConversation(input.conversationId, input.projectId)),
+  );
+
+  registerHandler(IpcChannel.importPickFile, emptyIpcPayloadSchema, importPickResultSchema, (_input, event) =>
+    pickImportFile(event.sender),
+  );
+
+  registerHandler(IpcChannel.importStart, importStartInputSchema, importStartResultSchema, (input, event) =>
+    startImportJob(input, event.sender),
+  );
+
+  registerHandler(IpcChannel.importCancel, importCancelInputSchema, ipcAckResultSchema, (input) => {
+    cancelImportJob(input.jobId);
+  });
 
   registerHandler(IpcChannel.searchQuery, searchInputSchema, searchResultSchema, (input) =>
     getHubDatabase().repos.searchWorkspace(input.query),
@@ -249,6 +274,7 @@ export function registerWorkspaceIpc(): void {
         temperature: input.temperature ?? 1,
         maxTokens: input.maxTokens ?? null,
         extraSystem: input.extraSystem ?? "",
+        importedInbox: input.importedInbox === true,
       });
     },
   );
