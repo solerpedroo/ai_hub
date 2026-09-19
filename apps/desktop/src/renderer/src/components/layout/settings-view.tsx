@@ -3,8 +3,11 @@ import { useTranslation } from "react-i18next";
 import type {
   AppLocale,
   AppPrefs,
+  MonthlyCostsResult,
   ProviderDto,
   ProviderKeyDto,
+  ProjectDto,
+  ScopedSpendCapDto,
   SecretsTestResult,
   SpendCapDto,
   ThemeMode,
@@ -41,6 +44,12 @@ export function SettingsView({
   const [prefs, setPrefs] = useState<AppPrefs | null>(null);
   const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [monthlyCosts, setMonthlyCosts] = useState<MonthlyCostsResult | null>(null);
+  const [projects, setProjects] = useState<ProjectDto[]>([]);
+  const [scopedCaps, setScopedCaps] = useState<ScopedSpendCapDto[]>([]);
+  const [capDimension, setCapDimension] = useState<"project" | "provider">("project");
+  const [capSubject, setCapSubject] = useState("");
+  const [scopedCapLimit, setScopedCapLimit] = useState("");
   const generalRef = useRef<HTMLHeadingElement>(null);
   const providerRef = useRef<HTMLSelectElement>(null);
   const capRef = useRef<HTMLInputElement>(null);
@@ -87,6 +96,15 @@ export function SettingsView({
           setError(t("workspace.error.generic"));
         }
       });
+    void window.hub.projects.list().then((list) => {
+      if (!cancelled) {
+        setProjects(list);
+        if (list[0]) setCapSubject((current) => current || list[0]?.id || "");
+      }
+    }).catch(() => undefined);
+    void window.hub.scopedSpendCaps.get().then((list) => {
+      if (!cancelled) setScopedCaps(list);
+    }).catch(() => undefined);
     void window.hub.secrets
       .list()
       .then((list) => {
@@ -128,6 +146,13 @@ export function SettingsView({
           setError(t("workspace.error.generic"));
         }
       });
+    const now = new Date();
+    const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    void window.hub.costs.monthly({ month }).then((result) => {
+      if (!cancelled) setMonthlyCosts(result);
+    }).catch(() => {
+      if (!cancelled) setError(t("workspace.error.generic"));
+    });
     return () => {
       cancelled = true;
     };
@@ -162,6 +187,30 @@ export function SettingsView({
         </h1>
         <p className="mt-1 text-muted-foreground">{t("settings.hint")}</p>
       </div>
+      <section className="flex flex-col gap-2">
+        <h2 className="text-[12px] font-medium">{t("costTracker.title")}</h2>
+        {monthlyCosts ? (
+          <>
+            <p className="text-muted-foreground" data-testid="cost-tracker-summary">
+              {t("costTracker.summary", { month: monthlyCosts.month, requests: monthlyCosts.requests, tokens: monthlyCosts.tokens, usd: monthlyCosts.costUsd })}
+            </p>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <div>
+                <h3 className="text-[12px] font-medium">{t("costTracker.models")}</h3>
+                <ul className="text-[11px] text-muted-foreground">
+                  {monthlyCosts.byModel.map((row) => <li key={row.key}>{row.key} · {row.requests} · ${row.costUsd}</li>)}
+                </ul>
+              </div>
+              <div>
+                <h3 className="text-[12px] font-medium">{t("costTracker.projects")}</h3>
+                <ul className="text-[11px] text-muted-foreground">
+                  {monthlyCosts.byProject.map((row) => <li key={row.key}>{row.key} · {row.requests} · ${row.costUsd}</li>)}
+                </ul>
+              </div>
+            </div>
+          </>
+        ) : <p className="text-muted-foreground">{t("costTracker.loading")}</p>}
+      </section>
       <section className="flex flex-col gap-2">
         <p className="text-[12px] font-medium">{t("theme.label")}</p>
         <div className="flex gap-2">
@@ -374,7 +423,53 @@ export function SettingsView({
         ) : null}
       </section>
       <section className="flex flex-col gap-2">
-        <h2 className="text-[12px] font-medium">{t("privacy.title")}</h2>
+        <h2 className="text-[12px] font-medium">{t("caps.scoped.title")}</h2>
+        <p className="text-[11px] text-muted-foreground">{t("caps.scoped.hint")}</p>
+        <div className="flex flex-wrap gap-2">
+          <select value={capDimension} onChange={(event) => { const dimension = event.target.value as "project" | "provider"; setCapDimension(dimension); const next = dimension === "project" ? projects[0]?.id ?? "" : keys[0]?.providerSlug ?? ""; setCapSubject(next); setScopedCapLimit(""); }}>
+            <option value="project">{t("caps.scoped.project")}</option>
+            <option value="provider">{t("caps.scoped.provider")}</option>
+          </select>
+          <select value={capSubject} onChange={(event) => { const subjectId = event.target.value; setCapSubject(subjectId); setScopedCapLimit(scopedCaps.find((item) => item.dimension === capDimension && item.subjectId === subjectId)?.limitUsd ?? ""); }}>
+            {(capDimension === "project" ? projects.map((item) => ({ id: item.id, label: item.name })) : [...new Map(keys.map((item) => [item.providerSlug, { id: item.providerSlug, label: item.providerSlug }])).values()]).map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+          </select>
+          <Input value={scopedCapLimit} placeholder={t("caps.unlimited")} inputMode="decimal" onChange={(event) => setScopedCapLimit(event.target.value)} />
+          <Button type="button" onClick={() => { if (!capSubject || (scopedCapLimit && !/^\d+(\.\d{1,6})?$/.test(scopedCapLimit))) { setError(t("workspace.error.generic")); return; } const cap = { dimension: capDimension, subjectId: capSubject, limitUsd: scopedCapLimit || null }; void window.hub.scopedSpendCaps.set({ caps: [cap] }).then(setScopedCaps).then(() => setCapsNotice(t("caps.saved"))).catch(() => setError(t("workspace.error.generic"))); }}>{t("caps.save")}</Button>
+        </div>
+      </section>
+      <section className="flex flex-col gap-2">
+        <h2 className="text-[12px] font-medium">{t("privacy.center.title")}</h2>
+        <p className="text-muted-foreground">{t("privacy.center.hint")}</p>
+        <label className="flex flex-col gap-1 text-[12px]">
+          {t("privacy.center.mode")}
+          <select
+            value={prefs?.privacyMode ?? "normal"}
+            onChange={(event) => {
+              const privacyMode = event.target.value as AppPrefs["privacyMode"];
+              void window.hub.prefs.set({ privacyMode }).then(setPrefs).catch(() => setError(t("workspace.error.generic")));
+            }}
+          >
+            {(["private", "normal", "maximum"] as const).map((mode) => <option key={mode} value={mode}>{t(`privacy.mode.${mode}`)}</option>)}
+          </select>
+        </label>
+        <p className="text-[11px] text-muted-foreground">{t(`privacy.modeDetail.${prefs?.privacyMode ?? "normal"}`)}</p>
+        <h3 className="text-[12px] font-medium">{t("privacy.firewall")}</h3>
+        {(["secret", "token", "email", "cpf", "prompt_injection"] as const).map((kind) => (
+          <label key={kind} className="flex items-center justify-between gap-2 text-[12px]">
+            {t(`privacy.kind.${kind}`)}
+            <select
+              value={prefs?.firewallPolicy[kind] ?? "mask"}
+              onChange={(event) => {
+                if (!prefs) return;
+                const firewallPolicy = { ...prefs.firewallPolicy, [kind]: event.target.value as "block" | "mask" | "allow" };
+                void window.hub.prefs.set({ firewallPolicy }).then(setPrefs).catch(() => setError(t("workspace.error.generic")));
+              }}
+            >
+              {(kind === "secret" || kind === "token" ? ["block", "mask"] : ["block", "mask", "allow"] as const).map((action) => <option key={action} value={action}>{t(`privacy.action.${action}`)}</option>)}
+            </select>
+          </label>
+        ))}
+        <h3 className="mt-2 text-[12px] font-medium">{t("privacy.crash.title")}</h3>
         <p className="text-muted-foreground">{t("privacy.hint")}</p>
         <label className="flex items-center gap-2 text-[13px]">
           <input
