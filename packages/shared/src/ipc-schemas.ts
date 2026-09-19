@@ -980,3 +980,102 @@ export const conversationToProjectResultSchema = z
 
 export type ConversationToProjectResult = z.infer<typeof conversationToProjectResultSchema>;
 
+export const promptFolderSchema = z.enum(["development", "studies", "work"]);
+
+export type PromptFolderDto = z.infer<typeof promptFolderSchema>;
+
+export const promptDtoSchema = z
+  .object({
+    id: z.string().uuid(),
+    folder: promptFolderSchema,
+    title: z.string().min(1).max(120),
+    body: z.string().min(1).max(16_000),
+    factoryId: z.string().min(1).max(40).nullable(),
+    createdAt: isoTimestampSchema,
+    updatedAt: isoTimestampSchema,
+  })
+  .strict();
+
+export type PromptDto = z.infer<typeof promptDtoSchema>;
+
+export const promptListResultSchema = z.array(promptDtoSchema).max(200);
+
+export const promptCreateInputSchema = z
+  .object({
+    folder: promptFolderSchema,
+    title: z.string().trim().min(1).max(120),
+    body: z.string().trim().min(1).max(16_000),
+  })
+  .strict();
+
+export type PromptCreateInput = z.infer<typeof promptCreateInputSchema>;
+
+export const promptUpdateInputSchema = z
+  .object({
+    id: z.string().uuid(),
+    folder: promptFolderSchema.optional(),
+    title: z.string().trim().min(1).max(120).optional(),
+    body: z.string().trim().min(1).max(16_000).optional(),
+  })
+  .strict();
+
+export type PromptUpdateInput = z.infer<typeof promptUpdateInputSchema>;
+
+export const promptResolveInputSchema = z
+  .object({
+    promptId: z.string().uuid(),
+    projectId: z.string().uuid().nullable(),
+  })
+  .strict();
+
+export type PromptResolveInput = z.infer<typeof promptResolveInputSchema>;
+
+export const promptResolveResultSchema = z
+  .object({
+    id: z.string().uuid(),
+    title: z.string().min(1).max(120),
+    text: z.string().min(1).max(16_000),
+  })
+  .strict();
+
+export type PromptResolveResult = z.infer<typeof promptResolveResultSchema>;
+
+export const playgroundSlotInputSchema = z
+  .object({
+    providerKeyId: z.string().uuid(),
+    model: z.string().min(1).max(128),
+  })
+  .strict();
+
+export const playgroundRunInputSchema = z
+  .object({
+    projectId: z.string().uuid().nullable(),
+    content: z.string().trim().min(1).max(100_000),
+    promptId: z.string().uuid().optional(),
+    slots: z.array(playgroundSlotInputSchema).min(2).max(4),
+    privacyMode: packetPrivacyModeSchema.optional(),
+    extraSystem: z.string().max(20_000).optional(),
+    temperature: z.number().min(0).max(2).optional(),
+    maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
+  })
+  .strict();
+
+export type PlaygroundRunInput = z.infer<typeof playgroundRunInputSchema>;
+
+export const playgroundRunSlotSchema = z
+  .object({
+    providerKeyId: z.string().uuid(),
+    model: z.string().min(1).max(128),
+    send: chatSendResultSchema,
+  })
+  .strict();
+
+export const playgroundRunResultSchema = z
+  .object({
+    content: z.string().min(1).max(100_000),
+    slots: z.array(playgroundRunSlotSchema).min(2).max(4),
+  })
+  .strict();
+
+export type PlaygroundRunResult = z.infer<typeof playgroundRunResultSchema>;
+
