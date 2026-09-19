@@ -9,6 +9,12 @@ export interface CompilerMessage {
   pinned?: boolean;
 }
 
+export interface CompilerFile {
+  id: string;
+  name: string;
+  text: string;
+}
+
 export interface CompileInput {
   projectInstructions: string | null;
   extraSystem: string | null;
@@ -16,6 +22,7 @@ export interface CompileInput {
   maxTokenBudget?: number;
   privacyMode?: PacketPrivacyMode;
   inactiveSummaries?: InactiveBranchSummaries | null;
+  files?: CompilerFile[];
 }
 
 type PacketRow = {
@@ -125,6 +132,17 @@ export function compilePacketDetailed(input: CompileInput): CompileDetailedResul
     included.push(sliceFor("extra-system", null, extra));
   }
 
+  for (const file of input.files ?? []) {
+    const block = `Attached file: ${file.name}\n${file.text}`;
+    systemParts.push(block);
+    included.push({
+      kind: "file",
+      id: file.id,
+      label: clipPacketLabel(`Attached file: ${file.name}`, 200),
+      tokens: tokenEstimateFromChars(block.length),
+    });
+  }
+
   const inactive = input.inactiveSummaries ?? null;
   if (inactive && inactive.block.trim().length > 0) {
     if (privacyMode === "strict") {
@@ -196,12 +214,38 @@ export function compilePacket(input: CompileInput): ProviderAgnosticPacket {
   return compilePacketDetailed(input).packet;
 }
 
+export function appendFilesToPacket(
+  packet: ProviderAgnosticPacket,
+  files: CompilerFile[],
+): { packet: ProviderAgnosticPacket; included: PacketSlice[] } {
+  if (files.length === 0) {
+    return { packet, included: [] };
+  }
+  const blocks = files.map((file) => `Attached file: ${file.name}\n${file.text}`);
+  const extra = blocks.join("\n\n");
+  const system = packet.system.length > 0 ? `${packet.system}\n\n${extra}` : extra;
+  return {
+    packet: packetV0Schema.parse({
+      ...packet,
+      system,
+      tokenEstimate: packet.tokenEstimate + tokenEstimateFromChars(extra.length),
+    }),
+    included: files.map((file) => ({
+      kind: "file" as const,
+      id: file.id,
+      label: clipPacketLabel(`Attached file: ${file.name}`, 200),
+      tokens: tokenEstimateFromChars(`Attached file: ${file.name}\n${file.text}`.length),
+    })),
+  };
+}
+
 export function compileActivePathDetailed(input: {
   projectInstructions: string | null;
   extraSystem: string | null;
   messages: CompilerGraphMessage[];
   maxTokenBudget?: number;
   privacyMode?: PacketPrivacyMode;
+  files?: CompilerFile[];
 }): CompileDetailedResult {
   const compiled: CompileInput = {
     projectInstructions: input.projectInstructions,
@@ -214,6 +258,9 @@ export function compileActivePathDetailed(input: {
   }
   if (input.privacyMode !== undefined) {
     compiled.privacyMode = input.privacyMode;
+  }
+  if (input.files !== undefined) {
+    compiled.files = input.files;
   }
   return compilePacketDetailed(compiled);
 }
