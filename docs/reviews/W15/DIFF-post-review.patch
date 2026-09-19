@@ -1,0 +1,468 @@
+﻿diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts
+index 7bbe8cc..5844969 100644
+--- a/apps/desktop/src/main/chat-session.ts
++++ b/apps/desktop/src/main/chat-session.ts
+@@ -129,6 +129,12 @@ export function abortChat(runId: string): void {
+   runs.get(runId)?.abort.abort();
+ }
+ 
++export async function waitForChatRun(runId: string): Promise<void> {
++  while (runs.has(runId)) {
++    await new Promise((resolve) => setTimeout(resolve, 25));
++  }
++}
++
+ function compilerMessages(rows: MessageRecord[]): CompilerMessage[] {
+   return rows.map((item) => ({
+     id: item.id,
+diff --git a/apps/desktop/src/main/mentions.ts b/apps/desktop/src/main/mentions.ts
+index 3335123..e2f55b1 100644
+--- a/apps/desktop/src/main/mentions.ts
++++ b/apps/desktop/src/main/mentions.ts
+@@ -11,6 +11,7 @@ import {
+   type MentionRef,
+   type PacketPrivacyMode,
+ } from "@ai-hub/shared";
++import { interpolateStoredPrompt } from "./prompt-vars";
+ 
+ export function resolveSendMentions(
+   repos: HubRepos,
+@@ -72,6 +73,16 @@ export function resolveSendMentions(
+         mentions.push(mention);
+         continue;
+       }
++      if (ref.type === "prompt") {
++        const mention = resolvePromptMention(repos, projectId, ref, remaining);
++        if (seen.has(`prompt:${mention.id}`)) {
++          continue;
++        }
++        seen.add(`prompt:${mention.id}`);
++        usedTokens += mentionTokenEstimate(mention.text.length);
++        mentions.push(mention);
++        continue;
++      }
+       if (ref.type === "conversation") {
+         const mention = resolveConversationMention(repos, projectId, currentConversationId, ref, remaining);
+         if (mention) {
+@@ -130,6 +141,37 @@ function resolveMemoryMention(
+   };
+ }
+ 
++function resolvePromptMention(
++  repos: HubRepos,
++  projectId: string | null,
++  ref: MentionRef,
++  remainingTokens: number,
++): CompilerMention {
++  const prompts = repos.listPrompts();
++  const match = ref.id
++    ? prompts.find((item) => item.id === ref.id)
++    : prompts.find((item) => {
++        const query = (ref.query ?? "").toLowerCase();
++        const factory = (item.factoryId ?? "").toLowerCase().replace(/-/g, " ");
++        return (
++          item.title.toLowerCase().includes(query) ||
++          factory.includes(query) ||
++          (item.factoryId ?? "").toLowerCase() === query
++        );
++      });
++  if (!match) {
++    throw new Error("mentions:not_found");
++  }
++  const text = redactSecrets(interpolateStoredPrompt(repos, match.body, projectId));
++  const maxChars = Math.max(4, remainingTokens * 4);
++  return {
++    kind: "prompt",
++    id: match.id,
++    name: match.title,
++    text: text.length > maxChars ? `${text.slice(0, maxChars - 1)}ÔÇª` : text,
++  };
++}
++
+ function resolveProjectFile(
+   repos: HubRepos,
+   projectId: string | null,
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index f2be8bc..a9a00d7 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -35,6 +35,7 @@ import { HomeView } from "@/components/layout/home-view";
+ import { SettingsView } from "@/components/layout/settings-view";
+ import { DebugView } from "@/components/layout/debug-view";
+ import { ImportView } from "@/components/layout/import-view";
++import { PromptsView } from "@/components/layout/prompts-view";
+ import { OnboardingView } from "@/components/layout/onboarding-view";
+ import {
+   ChromeCommandPalette,
+@@ -165,6 +166,7 @@ export function App(): JSX.Element {
+   const [costs, setCosts] = useState<CostsAggregateResult | null>(null);
+   const [showAllowOnce, setShowAllowOnce] = useState(false);
+   const [composerDraft, setComposerDraft] = useState("");
++  const [composerInsert, setComposerInsert] = useState<string | null>(null);
+   const [attachedFiles, setAttachedFiles] = useState<ProjectFileDto[]>([]);
+   const [mentionRefs, setMentionRefs] = useState<MentionRef[]>([]);
+   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+@@ -399,7 +401,7 @@ export function App(): JSX.Element {
+   ]);
+ 
+   useEffect(() => {
+-    if (view !== "home") {
++    if (view !== "home" && view !== "prompts") {
+       return;
+     }
+     void loadKeys()
+@@ -1190,6 +1192,8 @@ export function App(): JSX.Element {
+                 void sendToModel({ ...pending, allowOnce: true });
+               }}
+               onComposerDraft={reportComposerDraft}
++              composerInsert={composerInsert}
++              onComposerInsertConsumed={() => setComposerInsert(null)}
+               onPin={async (id, pinned) => {
+                 try {
+                   const updated = await window.hub.messages.pin({ id, pinned });
+@@ -1352,6 +1356,16 @@ export function App(): JSX.Element {
+             />
+           ) : view === "debug" ? (
+             <DebugView />
++          ) : view === "prompts" ? (
++            <PromptsView
++              project={selectedProject}
++              providerKeys={providerKeys}
++              privacyMode={privacyMode}
++              onInsertIntoComposer={(text) => {
++                setComposerInsert(text);
++                setView("home");
++              }}
++            />
+           ) : view === "import" ? (
+             <ImportView
+               projects={projects}
+@@ -1487,6 +1501,7 @@ export function App(): JSX.Element {
+         onSettings={() => openSettings("general")}
+         onDebug={() => navigateToView("debug")}
+         onImport={() => navigateToView("import")}
++        onPrompts={() => navigateToView("prompts")}
+         onShortcuts={() => setShortcutsOpen(true)}
+       />
+     </div>
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index ac4713a..33896ec 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -23,6 +23,7 @@ import {
+   type ProjectDto,
+   type ProjectUpdateInput,
+   type ProjectFileDto,
++  type PromptDto,
+   type ProviderKeyDto,
+ } from "@ai-hub/shared";
+ import {
+@@ -127,6 +128,8 @@ export function HomeView({
+   onMentionsChange,
+   onDuplicateConversation,
+   onPromoteConversation,
++  composerInsert,
++  onComposerInsertConsumed,
+ }: {
+   project: ProjectDto | null;
+   importedInbox: boolean;
+@@ -191,6 +194,8 @@ export function HomeView({
+   onAttachFolder: () => Promise<void>;
+   onRemoveFile: (id: string) => Promise<void>;
+   onDropFiles: (files: File[]) => Promise<void>;
++  composerInsert: string | null;
++  onComposerInsertConsumed: () => void;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const modifier = window.hub.platform === "darwin" ? "Ôîÿ" : "Ctrl";
+@@ -206,6 +211,7 @@ export function HomeView({
+   const [memoryOpen, setMemoryOpen] = useState(false);
+   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+   const [projectMemories, setProjectMemories] = useState<ProjectMemoryDto[]>([]);
++  const [libraryPrompts, setLibraryPrompts] = useState<PromptDto[]>([]);
+   const [memoryOptedOut, setMemoryOptedOut] = useState(false);
+   const [memorySuggestions, setMemorySuggestions] = useState<string[]>([]);
+   const [conversationWorkspace, setConversationWorkspace] = useState<ConversationWorkspaceDto | null>(
+@@ -274,6 +280,40 @@ export function HomeView({
+             available: conversation !== undefined && conversation.id !== selectedConversationId,
+           };
+         }
++        if (item.type === "memory") {
++          const memory = projectMemories.find(
++            (row) =>
++              row.title.toLowerCase() === item.query.toLowerCase() ||
++              row.body.toLowerCase().includes(item.query.toLowerCase()),
++          );
++          return {
++            type: item.type,
++            id: memory?.id ?? null,
++            query: item.query,
++            label: memory?.title ?? item.query,
++            excerpt: memory?.body.slice(0, 120) ?? item.query,
++            tokens: memory ? Math.ceil(memory.body.length / 4) : 0,
++            available: memory !== undefined,
++          };
++        }
++        if (item.type === "prompt") {
++          const prompt = libraryPrompts.find((row) => {
++            const label = row.factoryId ? t(`prompts.factory.${row.factoryId}`) : row.title;
++            return (
++              row.title.toLowerCase() === item.query.toLowerCase() ||
++              label.toLowerCase() === item.query.toLowerCase()
++            );
++          });
++          return {
++            type: item.type,
++            id: prompt?.id ?? null,
++            query: item.query,
++            label: prompt?.title ?? item.query,
++            excerpt: prompt?.body.slice(0, 120) ?? item.query,
++            tokens: prompt ? Math.ceil(prompt.body.length / 4) : 0,
++            available: prompt !== undefined,
++          };
++        }
+         if (item.type === "packet") {
+           const packet = packets.find(
+             (row) =>
+@@ -315,6 +355,15 @@ export function HomeView({
+     onMentionsChange([]);
+   }, [onComposerDraft, onMentionsChange, selectedConversationId]);
+ 
++  useEffect(() => {
++    if (!composerInsert) {
++      return;
++    }
++    setDraft(composerInsert);
++    onComposerDraft(composerInsert);
++    onComposerInsertConsumed();
++  }, [composerInsert, onComposerDraft, onComposerInsertConsumed]);
++
+   useEffect(() => {
+     void window.hub.files
+       .list({ projectId: project?.id ?? null })
+@@ -322,6 +371,13 @@ export function HomeView({
+       .catch(() => setProjectFiles([]));
+   }, [attachedFiles, project?.id]);
+ 
++  useEffect(() => {
++    void window.hub.prompts
++      .list()
++      .then(setLibraryPrompts)
++      .catch(() => setLibraryPrompts([]));
++  }, []);
++
+   useEffect(() => {
+     if (!project) {
+       setProjectMemories([]);
+@@ -1278,6 +1334,32 @@ export function HomeView({
+                       );
+                       return;
+                     }
++                    if (parts.type === "prompt") {
++                      setMentionSuggestions(
++                        libraryPrompts
++                          .filter((item) => {
++                            const label = item.factoryId
++                              ? t(`prompts.factory.${item.factoryId}`)
++                              : item.title;
++                            return (
++                              label.toLowerCase().includes(query) ||
++                              item.title.toLowerCase().includes(query) ||
++                              item.body.toLowerCase().includes(query)
++                            );
++                          })
++                          .slice(0, 8)
++                          .map((item) => ({
++                            type: "prompt" as const,
++                            id: item.id,
++                            query: item.title,
++                            label: item.factoryId ? t(`prompts.factory.${item.factoryId}`) : item.title,
++                            excerpt: item.body.slice(0, 120),
++                            tokens: Math.ceil(item.body.length / 4),
++                            available: true,
++                          })),
++                      );
++                      return;
++                    }
+                     if (parts.type === "conversation") {
+                       setMentionSuggestions(
+                         conversations
+diff --git a/docs/IMPLEMENTATION_PLAN.md b/docs/IMPLEMENTATION_PLAN.md
+index ec69da7..57fdc86 100644
+--- a/docs/IMPLEMENTATION_PLAN.md
++++ b/docs/IMPLEMENTATION_PLAN.md
+@@ -686,12 +686,12 @@ O que **n├úo** entra no MVP (W0ÔÇôW8), mesmo sendo tentador: RAG, Council, MCP,
+ 
+ **Sub-tasks:**
+ 
+-- [ ] Library com pastas (Desenvolvimento, Estudos, Trabalho)
+-- [ ] Vari├íveis `{{project}}`, `{{language}}`, `{{goal}}`
+-- [ ] Inserir prompt no composer; `@prompt`
+-- [ ] Playground: mesmo prompt em N modelos, lado a lado
+-- [ ] Salvar a melhor vers├úo na library
+-- [ ] Prompts de f├íbrica: code review, debug, resumo, professor
++- [x] Library com pastas (Desenvolvimento, Estudos, Trabalho)
++- [x] Vari├íveis `{{project}}`, `{{language}}`, `{{goal}}`
++- [x] Inserir prompt no composer; `@prompt`
++- [x] Playground: mesmo prompt em N modelos, lado a lado
++- [x] Salvar a melhor vers├úo na library
++- [x] Prompts de f├íbrica: code review, debug, resumo, professor
+ 
+ **DoD:** playground em 2 modelos; vencedor salvo; prompt com vari├íveis resolve contra o projeto ativo.
+ 
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index e748016..ef7ccba 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -19,10 +19,13 @@ export {
+   type HubPacketsApi,
+   type HubMemoryApi,
+   type HubWorkspaceApi,
++  type HubPromptsApi,
++  type HubPlaygroundApi,
+   type HubWindowApi,
+ } from "./hub-api";
+ export {
+   evaluateSpendCaps,
++  evaluatePlaygroundCaps,
+   parseSpendCapError,
+   SpendCapError,
+   SPEND_CAP_SCOPES,
+@@ -57,6 +60,16 @@ export {
+   type MentionType,
+   type ParsedMention,
+ } from "./mentions";
++export {
++  FACTORY_PROMPTS,
++  interpolatePrompt,
++  isPromptFolder,
++  PROMPT_FOLDERS,
++  PROMPT_VARIABLE_NAMES,
++  type PromptFolder,
++  type PromptVariableName,
++  type PromptVariableValues,
++} from "./prompts";
+ export {
+   shouldShowOnboarding,
+   sortProvidersForWizard,
+@@ -93,6 +106,16 @@ export {
+   conversationListResultSchema,
+   conversationMoveInputSchema,
+   conversationToProjectResultSchema,
++  promptDtoSchema,
++  promptFolderSchema,
++  promptListResultSchema,
++  promptCreateInputSchema,
++  promptUpdateInputSchema,
++  promptResolveInputSchema,
++  promptResolveResultSchema,
++  playgroundRunInputSchema,
++  playgroundRunResultSchema,
++  playgroundSlotInputSchema,
+   emptyIpcPayloadSchema,
+   idInputSchema,
+   ipcAckResultSchema,
+@@ -192,6 +215,14 @@ export {
+   type ConversationListInput,
+   type ConversationMoveInput,
+   type ConversationToProjectResult,
++  type PromptDto,
++  type PromptFolderDto,
++  type PromptCreateInput,
++  type PromptUpdateInput,
++  type PromptResolveInput,
++  type PromptResolveResult,
++  type PlaygroundRunInput,
++  type PlaygroundRunResult,
+   type EmptyIpcPayload,
+   type IdInput,
+   type MessageCreateInput,
+diff --git a/packages/shared/src/spend-caps.test.ts b/packages/shared/src/spend-caps.test.ts
+index 206fce1..c5281d5 100644
+--- a/packages/shared/src/spend-caps.test.ts
++++ b/packages/shared/src/spend-caps.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it } from "vitest";
+-import { evaluateSpendCaps, parseSpendCapError, SpendCapError, usdToMicros } from "./spend-caps";
++import { evaluatePlaygroundCaps, evaluateSpendCaps, parseSpendCapError, SpendCapError, usdToMicros } from "./spend-caps";
+ 
+ describe("spend caps", () => {
+   it("treats a missing limit as unlimited", () => {
+@@ -72,3 +72,35 @@ describe("spend caps", () => {
+     expect(usdToMicros("1.250000")).toBe(1_250_000);
+   });
+ });
++
++describe("evaluatePlaygroundCaps", () => {
++  it("blocks when the summed N estimates exceed the remaining day cap", () => {
++    const result = evaluatePlaygroundCaps({
++      estimates: ["0.600000", "0.600000"],
++      daySpentUsd: "0.000000",
++      globalSpentUsd: "0.000000",
++      limits: { day: "1.000000" },
++    });
++    expect(result.blocked).toBe("day");
++  });
++
++  it("fails closed when a USD cap is set and any slot has no catalog estimate", () => {
++    const result = evaluatePlaygroundCaps({
++      estimates: ["0.100000", null],
++      daySpentUsd: "0.000000",
++      globalSpentUsd: "0.000000",
++      limits: { day: "10.000000" },
++    });
++    expect(result.blocked).toBe("day");
++  });
++
++  it("allows two estimates when no cap is configured", () => {
++    const result = evaluatePlaygroundCaps({
++      estimates: ["0.600000", null],
++      daySpentUsd: "0.000000",
++      globalSpentUsd: "0.000000",
++      limits: {},
++    });
++    expect(result.blocked).toBeNull();
++  });
++});
+diff --git a/packages/shared/src/spend-caps.ts b/packages/shared/src/spend-caps.ts
+index d874810..65bbffd 100644
+--- a/packages/shared/src/spend-caps.ts
++++ b/packages/shared/src/spend-caps.ts
+@@ -92,6 +92,37 @@ export function evaluateSpendCaps(input: {
+   return { blocked, warnings, requestUsd, dayUsd, globalUsd };
+ }
+ 
++export function evaluatePlaygroundCaps(input: {
++  estimates: readonly (string | null)[];
++  daySpentUsd: string;
++  globalSpentUsd: string;
++  limits: SpendCapLimits;
++}): SpendCapEvaluation {
++  const hasUsdCap = SPEND_CAP_SCOPES.some((scope) => input.limits[scope] !== undefined);
++  if (hasUsdCap && input.estimates.some((item) => item === null)) {
++    const blocked = SPEND_CAP_SCOPES.find((scope) => input.limits[scope] !== undefined) ?? "request";
++    return {
++      blocked,
++      warnings: [],
++      requestUsd: "0.000000",
++      dayUsd: input.daySpentUsd,
++      globalUsd: input.globalSpentUsd,
++    };
++  }
++  let combined = "0.000000";
++  for (const item of input.estimates) {
++    if (item !== null) {
++      combined = addUsd(combined, item);
++    }
++  }
++  return evaluateSpendCaps({
++    estimatedRequestUsd: input.estimates.length === 0 ? null : combined,
++    daySpentUsd: input.daySpentUsd,
++    globalSpentUsd: input.globalSpentUsd,
++    limits: input.limits,
++  });
++}
++
+ export function parseSpendCapError(message: string): SpendCapScope | null {
+   const match = /cap_exceeded:(request|day|global)/.exec(message);
+   if (!match) {
