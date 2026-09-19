@@ -125,7 +125,7 @@ describe("hub database", () => {
       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
       applyMigrations(second.sqlite);
-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(11);
+      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(12);
       second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -718,6 +718,49 @@ describe("hub database", () => {
     hub.repos.createConversation(project.id, "Chat");
     hub.repos.createConversation(project.id, "Playground · gpt-4o-mini", "playground");
     expect(hub.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Chat"]);
+    hub.close();
+  });
+
+  it("stores skills encrypted and seeds factory once", () => {
+    const { hub } = openTestDb();
+    hub.repos.ensureFactorySkills([
+      {
+        factoryId: "code-review",
+        folder: "development",
+        title: "Code Review",
+        description: "Review a diff",
+        preferredModel: null,
+        prompt: "Review {{project}}",
+        steps: [{ id: "summary", title: "Summary", section: "Summarize." }],
+        defaultMentions: [],
+      },
+    ]);
+    hub.repos.ensureFactorySkills([
+      {
+        factoryId: "code-review",
+        folder: "development",
+        title: "Code Review",
+        description: "Review a diff",
+        preferredModel: null,
+        prompt: "Review {{project}}",
+        steps: [{ id: "summary", title: "Summary", section: "Summarize." }],
+        defaultMentions: [],
+      },
+    ]);
+    expect(hub.repos.listSkills()).toHaveLength(1);
+    const custom = hub.repos.createSkill({
+      folder: "work",
+      title: "Prep",
+      description: "Meeting prep",
+      prompt: "Prepare {{project}}",
+      preferredModel: null,
+      defaultMentions: [{ type: "file", query: "diff" }],
+      steps: [{ id: "agenda", title: "Agenda", section: "List items." }],
+    });
+    expect(dumpAllText(hub.sqlite)).not.toContain("Meeting prep");
+    expect(dumpAllText(hub.sqlite)).not.toContain("Prepare {{project}}");
+    expect(hub.repos.getSkill(custom.id)?.prompt).toBe("Prepare {{project}}");
+    expect(hub.repos.getSkill(custom.id)?.defaultMentions).toEqual([{ type: "file", query: "diff" }]);
     hub.close();
   });
 
