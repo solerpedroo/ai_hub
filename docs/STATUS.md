@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave 
 
 | Field | Value |
 |---|---|
-| Wave | **W18** |
+| Wave | **W19** |
 | Marco | C — V1 |
-| State | `pending` |
-| Last completed | **W17** |
-| Next action | Start Wave 18 (Privacy Center + Context Firewall + Cost Tracker) |
+| State | `complete` |
+| Last completed | **W18** |
+| Next action | Start Wave 19 (Desktop superpowers) |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
@@ -45,12 +45,12 @@ None.
 ## Notes for the next session
 
 - W17 fechada. Skills cifradas; `/skill` + `@skill`; contrato `tools: []` para W23.
-- W18: Privacy Center + Context Firewall + Cost Tracker. Caps por projeto/provider.
+- W18 fechada: Privacy Center, Context Firewall, Cost Tracker e caps por projeto/provider.
 - Não implementar MCP, agentes, Council, Quick AI overlay.
 
 ## Last review / ADR
 
 | Kind | Path |
 |---|---|
-| Review | `docs/reviews/W17/REVIEW.md` |
-| Latest ADR | `docs/ADR/ADR-W17-003-skills-encrypted-library.md` |
+| Review | `docs/reviews/W18/REVIEW.md` |
+| Latest ADR | `docs/ADR/ADR-W18-001-effective-privacy-policy.md` |
