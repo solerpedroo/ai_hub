@@ -180,6 +180,7 @@ export const packetPreviewInputSchema = z
     pendingContent: z.string().max(100_000).optional(),
     maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
     privacyMode: packetPrivacyModeSchema.optional(),
+    fileIds: z.array(z.string().uuid()).max(8).optional(),
   })
   .strict();
 
@@ -744,4 +745,83 @@ export const messagePinInputSchema = z
   .strict();
 
 export type MessagePinInput = z.infer<typeof messagePinInputSchema>;
+
+export const projectFileKindSchema = z.enum([
+  "pdf",
+  "docx",
+  "text",
+  "code",
+  "csv",
+  "image",
+  "folder-summary",
+]);
+
+export type ProjectFileKind = z.infer<typeof projectFileKindSchema>;
+
+export const projectFileDtoSchema = z
+  .object({
+    id: z.string().uuid(),
+    projectId: z.string().uuid().nullable(),
+    name: z.string().min(1).max(260),
+    kind: projectFileKindSchema,
+    mime: z.string().min(1).max(128),
+    byteSize: z.number().int().nonnegative(),
+    tokenEstimate: z.number().int().nonnegative(),
+    excerpt: z.string().max(400),
+    truncated: z.boolean(),
+    visionRequired: z.boolean(),
+    createdAt: isoTimestampSchema,
+  })
+  .strict();
+
+export type ProjectFileDto = z.infer<typeof projectFileDtoSchema>;
+
+export const projectFileListInputSchema = z
+  .object({
+    projectId: z.string().uuid().nullable(),
+  })
+  .strict();
+
+export type ProjectFileListInput = z.infer<typeof projectFileListInputSchema>;
+
+export const projectFileListResultSchema = z.array(projectFileDtoSchema).max(100);
+
+export const filesIngestPathsInputSchema = z
+  .object({
+    projectId: z.string().uuid().nullable(),
+    items: z
+      .array(
+        z
+          .object({
+            path: z.string().min(1).max(1024),
+            name: z.string().min(1).max(260),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(8),
+  })
+  .strict();
+
+export type FilesIngestPathsInput = z.infer<typeof filesIngestPathsInputSchema>;
+
+export const filesAttachKindSchema = z.enum(["file", "folder"]);
+
+export const filesAttachInputSchema = z
+  .object({
+    projectId: z.string().uuid().nullable(),
+    kind: filesAttachKindSchema,
+  })
+  .strict();
+
+export type FilesAttachInput = z.infer<typeof filesAttachInputSchema>;
+
+export const filesRemoveInputSchema = z
+  .object({
+    id: z.string().uuid(),
+    projectId: z.string().uuid().nullable(),
+  })
+  .strict();
+
+export type FilesRemoveInput = z.infer<typeof filesRemoveInputSchema>;
 
