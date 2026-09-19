@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluateSpendCaps, parseSpendCapError, SpendCapError, usdToMicros } from "./spend-caps";
+import { evaluatePlaygroundCaps, evaluateSpendCaps, parseSpendCapError, SpendCapError, usdToMicros } from "./spend-caps";
 
 describe("spend caps", () => {
   it("treats a missing limit as unlimited", () => {
@@ -70,5 +70,37 @@ describe("spend caps", () => {
       "global",
     );
     expect(usdToMicros("1.250000")).toBe(1_250_000);
+  });
+});
+
+describe("evaluatePlaygroundCaps", () => {
+  it("blocks when the summed N estimates exceed the remaining day cap", () => {
+    const result = evaluatePlaygroundCaps({
+      estimates: ["0.600000", "0.600000"],
+      daySpentUsd: "0.000000",
+      globalSpentUsd: "0.000000",
+      limits: { day: "1.000000" },
+    });
+    expect(result.blocked).toBe("day");
+  });
+
+  it("fails closed when a USD cap is set and any slot has no catalog estimate", () => {
+    const result = evaluatePlaygroundCaps({
+      estimates: ["0.100000", null],
+      daySpentUsd: "0.000000",
+      globalSpentUsd: "0.000000",
+      limits: { day: "10.000000" },
+    });
+    expect(result.blocked).toBe("day");
+  });
+
+  it("allows two estimates when no cap is configured", () => {
+    const result = evaluatePlaygroundCaps({
+      estimates: ["0.600000", null],
+      daySpentUsd: "0.000000",
+      globalSpentUsd: "0.000000",
+      limits: {},
+    });
+    expect(result.blocked).toBeNull();
   });
 });
