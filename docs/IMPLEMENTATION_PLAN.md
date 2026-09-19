@@ -686,12 +686,12 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 
 **Sub-tasks:**
 
-- [ ] Library com pastas (Desenvolvimento, Estudos, Trabalho)
-- [ ] Variáveis `{{project}}`, `{{language}}`, `{{goal}}`
-- [ ] Inserir prompt no composer; `@prompt`
-- [ ] Playground: mesmo prompt em N modelos, lado a lado
-- [ ] Salvar a melhor versão na library
-- [ ] Prompts de fábrica: code review, debug, resumo, professor
+- [x] Library com pastas (Desenvolvimento, Estudos, Trabalho)
+- [x] Variáveis `{{project}}`, `{{language}}`, `{{goal}}`
+- [x] Inserir prompt no composer; `@prompt`
+- [x] Playground: mesmo prompt em N modelos, lado a lado
+- [x] Salvar a melhor versão na library
+- [x] Prompts de fábrica: code review, debug, resumo, professor
 
 **DoD:** playground em 2 modelos; vencedor salvo; prompt com variáveis resolve contra o projeto ativo.
 
