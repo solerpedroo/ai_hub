@@ -57,6 +57,8 @@ export function ChromeCommandPalette({
   onDebug,
   onImport,
   onPrompts,
+  onSkills,
+  onRunSkill,
   onShortcuts,
 }: {
   projects: ProjectDto[];
@@ -78,6 +80,8 @@ export function ChromeCommandPalette({
   onDebug: () => void;
   onImport: () => void;
   onPrompts: () => void;
+  onSkills: () => void;
+  onRunSkill: (query: string) => void;
   onShortcuts: () => void;
 }): JSX.Element {
   const { t } = useTranslation();
@@ -168,6 +172,18 @@ export function ChromeCommandPalette({
       label: t("command.prompts"),
       keywords: "prompt library playground prompts biblioteca",
       run: onPrompts,
+    },
+    {
+      id: "skills",
+      label: t("command.skills"),
+      keywords: "skill workflow skills fluxos code review",
+      run: onSkills,
+    },
+    {
+      id: "run-skill-code-review",
+      label: t("command.runSkill", { name: t("skills.factory.code-review") }),
+      keywords: "run skill code review executar skill",
+      run: () => onRunSkill("Code Review"),
     },
     {
       id: "imported",
