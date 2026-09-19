@@ -1,0 +1,2442 @@
+diff --git a/apps/desktop/e2e/files.spec.ts b/apps/desktop/e2e/files.spec.ts
+new file mode 100644
+index 0000000..056e359
+--- /dev/null
++++ b/apps/desktop/e2e/files.spec.ts
+@@ -0,0 +1,90 @@
++import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
++import { createRequire } from "node:module";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { _electron as electron, expect, test, type ElectronApplication } from "@playwright/test";
++
++const require = createRequire(import.meta.url);
++const electronBinary = require("electron") as string;
++const appRoot = path.join(fileURLToPath(new URL("..", import.meta.url)));
++
++function minimalPdf(text: string): Buffer {
++  const stream = `BT /F1 12 Tf 72 720 Td (${text}) Tj ET`;
++  const body = `${stream.length}\nstream\n${stream}\nendstream`;
++  const objects = [
++    "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj",
++    "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj",
++    "3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj",
++    `4 0 obj << /Length ${stream.length} >> ${body} endobj`,
++    "5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj",
++  ];
++  return Buffer.from(`%PDF-1.1\n${objects.join("\n")}\n`, "latin1");
++}
++
++async function launchHub(env: Record<string, string>): Promise<ElectronApplication> {
++  return electron.launch({
++    executablePath: electronBinary,
++    args: [path.join(appRoot, "out/main/index.js")],
++    cwd: appRoot,
++    env: {
++      ...process.env,
++      AI_HUB_E2E: "1",
++      NODE_ENV: "production",
++      ...env,
++    },
++  });
++}
++
++test("attaches a PDF and asks to summarize section 3", async () => {
++  const dir = mkdtempSync(path.join(tmpdir(), "ai-hub-pdf-"));
++  const pdf = path.join(dir, "spec.pdf");
++  writeFileSync(pdf, minimalPdf("Section 3: payments use PostgreSQL"));
++  const app = await launchHub({ AI_HUB_E2E_ATTACH_FILE: pdf });
++  try {
++    const window = await app.firstWindow();
++    const composer = window.getByTestId("chat-composer");
++    await composer.waitFor({ state: "visible", timeout: 30_000 });
++    await window.getByTestId("files-attach").click();
++    await expect(window.getByTestId("files-chip")).toContainText("spec.pdf");
++    await expect(window.getByTestId("files-token-warning")).toBeVisible();
++    await composer.fill("resuma a se├º├úo 3");
++    await composer.press("Enter");
++    await expect(window.getByTestId("message-user")).toContainText("resuma a se├º├úo 3");
++    await expect(window.getByTestId("message-assistant")).toHaveAttribute("data-status", "complete", {
++      timeout: 30_000,
++    });
++  } finally {
++    await app.close();
++  }
++});
++
++test("attaches a Node folder and detects the stack", async () => {
++  const dir = mkdtempSync(path.join(tmpdir(), "ai-hub-node-"));
++  writeFileSync(
++    path.join(dir, "package.json"),
++    JSON.stringify({
++      name: "demo-app",
++      packageManager: "pnpm@10.0.0",
++      dependencies: { react: "19.0.0" },
++    }),
++  );
++  writeFileSync(path.join(dir, "README.md"), "Hello Node workspace");
++  mkdirSync(path.join(dir, "src"));
++  writeFileSync(path.join(dir, "src", "index.ts"), "export {}\n");
++  const app = await launchHub({ AI_HUB_E2E_ATTACH_FOLDER: dir });
++  try {
++    const window = await app.firstWindow();
++    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
++    await window.getByTestId("files-attach-folder").click();
++    await expect(window.getByTestId("files-chip")).toContainText(path.basename(dir));
++    await expect(window.getByTestId("files-chip")).toBeVisible();
++    await window.getByTestId("chat-composer").fill("qual ├® a stack?");
++    await window.getByTestId("chat-composer").press("Enter");
++    await expect(window.getByTestId("message-assistant")).toHaveAttribute("data-status", "complete", {
++      timeout: 30_000,
++    });
++  } finally {
++    await app.close();
++  }
++});
+diff --git a/apps/desktop/electron.vite.config.ts b/apps/desktop/electron.vite.config.ts
+index 4475bc0..8ee5f9d 100644
+--- a/apps/desktop/electron.vite.config.ts
++++ b/apps/desktop/electron.vite.config.ts
+@@ -7,6 +7,7 @@ const db = resolve(__dirname, "../../packages/db/src");
+ const gateway = resolve(__dirname, "../../packages/ai-gateway/src");
+ const securityIndex = resolve(__dirname, "../../packages/security/src/index.ts");
+ const securityKeytar = resolve(__dirname, "../../packages/security/src/keytar-store.ts");
++const files = resolve(__dirname, "../../packages/files/src");
+ 
+ const mainAliases = {
+   "@ai-hub/shared/import": resolve(__dirname, "../../packages/shared/src/import/index.ts"),
+@@ -15,13 +16,14 @@ const mainAliases = {
+   "@ai-hub/ai-gateway": gateway,
+   "@ai-hub/security/keytar": securityKeytar,
+   "@ai-hub/security": securityIndex,
++  "@ai-hub/files": files,
+ };
+ 
+ export default defineConfig({
+   main: {
+     plugins: [
+       externalizeDepsPlugin({
+-        exclude: ["@ai-hub/shared", "@ai-hub/db", "@ai-hub/security", "@ai-hub/ai-gateway"],
++        exclude: ["@ai-hub/shared", "@ai-hub/db", "@ai-hub/security", "@ai-hub/ai-gateway", "@ai-hub/files"],
+       }),
+     ],
+     resolve: {
+diff --git a/apps/desktop/package.json b/apps/desktop/package.json
+index e55ce45..c4a6153 100644
+--- a/apps/desktop/package.json
++++ b/apps/desktop/package.json
+@@ -19,6 +19,7 @@
+   "dependencies": {
+     "@ai-hub/ai-gateway": "workspace:*",
+     "@ai-hub/db": "workspace:*",
++    "@ai-hub/files": "workspace:*",
+     "@ai-hub/security": "workspace:*",
+     "@ai-hub/shared": "workspace:*",
+     "@electron-toolkit/utils": "^4.0.0",
+diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts
+index 9c711fe..a923cfe 100644
+--- a/apps/desktop/src/main/chat-session.ts
++++ b/apps/desktop/src/main/chat-session.ts
+@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
+ import type { WebContents } from "electron";
+ import {
+   composeReceipt,
++  appendFilesToPacket,
+   compileActivePath,
+   compilePacket,
+   consumeCrashSafeStream,
+@@ -40,6 +41,7 @@ import {
+ import { recordDebugSnapshot } from "./debug-snapshot";
+ import { isE2eMode } from "./e2e-mode";
+ import { toMessageDto } from "./message-dto";
++import { loadSendAttachments } from "./files";
+ import { getHubDatabase } from "./persistence";
+ import { estimateOutgoingCostUsd, evaluateOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
+ 
+@@ -332,7 +334,21 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+   }
+ 
+   const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
+-  const packet = compileOutgoing(input, project?.instructions ?? null, compileRows, key.providerSlug, conversation);
++  const catalogForVision = findCatalogModel(input.model, key.providerSlug);
++  const attachments = loadSendAttachments(
++    input.fileIds,
++    conversation.projectId,
++    catalogForVision?.vision === true,
++    "send",
++  );
++  const compiled = compileOutgoing(
++    input,
++    project?.instructions ?? null,
++    compileRows,
++    key.providerSlug,
++    conversation,
++  );
++  const packet = appendFilesToPacket(compiled, attachments.files).packet;
+   if (packet.messages.length === 0) {
+     throw new Error("Add a user message before sending");
+   }
+@@ -468,6 +484,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+               signal: run.abort.signal,
+               temperature: input.temperature ?? 1,
+               maxTokens: input.maxTokens ?? null,
++              ...(attachments.images.length > 0 ? { images: attachments.images } : {}),
+             }),
+             onDelta: (text) => {
+               streamed = true;
+diff --git a/apps/desktop/src/main/files.ts b/apps/desktop/src/main/files.ts
+new file mode 100644
+index 0000000..5bea800
+--- /dev/null
++++ b/apps/desktop/src/main/files.ts
+@@ -0,0 +1,267 @@
++import { readdir, readFile, stat } from "node:fs/promises";
++import { basename, relative, resolve, sep } from "node:path";
++import { dialog, BrowserWindow, type OpenDialogOptions, type WebContents } from "electron";
++import {
++  MAX_FILE_BYTES,
++  MAX_FILES_PER_SEND,
++  MAX_FOLDER_DEPTH,
++  MAX_FOLDER_FILES,
++  classifyFileName,
++  extractFile,
++  summarizeFolder,
++  type FolderFileInput,
++} from "@ai-hub/files";
++import type { CompilerFile, ChatImagePart } from "@ai-hub/ai-gateway";
++import { redactSecrets } from "@ai-hub/security";
++import type { ProjectFileRecord } from "@ai-hub/db";
++import {
++  projectFileDtoSchema,
++  type FilesAttachInput,
++  type FilesIngestPathsInput,
++  type ProjectFileDto,
++} from "@ai-hub/shared";
++import { isE2eMode } from "./e2e-mode";
++import { getHubDatabase } from "./persistence";
++
++const SKIP_DIRS = new Set([
++  "node_modules",
++  ".git",
++  "dist",
++  "out",
++  ".turbo",
++  "coverage",
++  ".next",
++  ".cache",
++]);
++
++function tokenEstimate(text: string, hasImage: boolean): number {
++  return Math.ceil(text.length / 4) + (hasImage ? 1_000 : 0);
++}
++
++function excerptOf(text: string): string {
++  const clipped = redactSecrets(text).replace(/\s+/g, " ").trim();
++  return clipped.length <= 400 ? clipped : `${clipped.slice(0, 399)}ÔÇª`;
++}
++
++export function toProjectFileDto(row: ProjectFileRecord): ProjectFileDto {
++  return projectFileDtoSchema.parse({
++    id: row.id,
++    projectId: row.projectId,
++    name: row.name,
++    kind: row.kind,
++    mime: row.mime,
++    byteSize: row.byteSize,
++    tokenEstimate: row.tokenEstimate,
++    excerpt: excerptOf(row.extract || (row.kind === "image" ? row.name : "")),
++    truncated: row.truncated,
++    visionRequired: row.kind === "image",
++    createdAt: row.createdAt,
++  });
++}
++
++async function persistExtract(input: {
++  projectId: string | null;
++  name: string;
++  bytes: Uint8Array;
++}): Promise<ProjectFileRecord> {
++  const extracted = await extractFile(input.bytes, input.name);
++  const text = redactSecrets(extracted.text);
++  const imageJson = extracted.image ? JSON.stringify(extracted.image) : null;
++  return getHubDatabase().repos.createProjectFile({
++    projectId: input.projectId,
++    name: input.name,
++    kind: extracted.kind,
++    mime: extracted.mime,
++    byteSize: input.bytes.byteLength,
++    tokenEstimate: tokenEstimate(text, extracted.image !== null),
++    extract: text,
++    imageJson,
++    truncated: extracted.truncated,
++  });
++}
++
++async function persistFolder(projectId: string | null, root: string): Promise<ProjectFileRecord> {
++  const entries: FolderFileInput[] = [];
++  const visit = async (dir: string, depth: number): Promise<void> => {
++    if (depth > MAX_FOLDER_DEPTH || entries.length >= MAX_FOLDER_FILES) {
++      return;
++    }
++    const names = await readdir(dir);
++    for (const name of names) {
++      if (entries.length >= MAX_FOLDER_FILES) {
++        return;
++      }
++      if (SKIP_DIRS.has(name)) {
++        continue;
++      }
++      const full = resolve(dir, name);
++      const info = await stat(full);
++      const relativePath = relative(root, full).split(sep).join("/");
++      if (info.isDirectory()) {
++        entries.push({ relativePath });
++        await visit(full, depth + 1);
++        continue;
++      }
++      if (!info.isFile() || info.size > MAX_FILE_BYTES) {
++        continue;
++      }
++      const kind = classifyFileName(name);
++      if (kind === "unsupported" || kind === "image" || kind === "pdf" || kind === "docx") {
++        entries.push({ relativePath });
++        continue;
++      }
++      const content = await readFile(full, "utf8");
++      entries.push({ relativePath, content: content.slice(0, 20_000) });
++    }
++  };
++  await visit(root, 0);
++  const summary = summarizeFolder({ rootName: basename(root), files: entries });
++  const text = redactSecrets(summary.text);
++  return getHubDatabase().repos.createProjectFile({
++    projectId,
++    name: basename(root),
++    kind: "folder-summary",
++    mime: "text/plain",
++    byteSize: text.length,
++    tokenEstimate: tokenEstimate(text, false),
++    extract: text,
++    truncated: false,
++  });
++}
++
++async function ingestResolved(projectId: string | null, target: string): Promise<ProjectFileRecord> {
++  const info = await stat(target);
++  if (info.isDirectory()) {
++    return persistFolder(projectId, target);
++  }
++  if (!info.isFile()) {
++    throw new Error("files:unsupported");
++  }
++  if (info.size > MAX_FILE_BYTES) {
++    throw new Error("files:too_large");
++  }
++  const bytes = await readFile(target);
++  return persistExtract({ projectId, name: basename(target), bytes });
++}
++
++export async function ingestDroppedPaths(input: FilesIngestPathsInput): Promise<ProjectFileDto[]> {
++  if (input.items.length > MAX_FILES_PER_SEND) {
++    throw new Error("files:limit");
++  }
++  const created: ProjectFileDto[] = [];
++  for (const item of input.items) {
++    const target = resolve(item.path);
++    created.push(toProjectFileDto(await ingestResolved(input.projectId, target)));
++  }
++  return created;
++}
++
++export async function attachFromDialog(
++  input: FilesAttachInput,
++  sender: WebContents,
++): Promise<ProjectFileDto[]> {
++  const fileFixture = process.env.AI_HUB_E2E_ATTACH_FILE;
++  const folderFixture = process.env.AI_HUB_E2E_ATTACH_FOLDER;
++  if (isE2eMode() && input.kind === "file" && fileFixture && fileFixture.trim().length > 0) {
++    return [toProjectFileDto(await ingestResolved(input.projectId, resolve(fileFixture)))];
++  }
++  if (isE2eMode() && input.kind === "folder" && folderFixture && folderFixture.trim().length > 0) {
++    return [toProjectFileDto(await ingestResolved(input.projectId, resolve(folderFixture)))];
++  }
++  const window = BrowserWindow.fromWebContents(sender);
++  const options: OpenDialogOptions =
++    input.kind === "folder"
++      ? { properties: ["openDirectory"] }
++      : {
++          properties: ["openFile", "multiSelections"],
++          filters: [
++            { name: "Documents", extensions: ["pdf", "docx", "txt", "md", "csv"] },
++            { name: "Code", extensions: ["ts", "tsx", "js", "json", "py", "rs", "go"] },
++            { name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif"] },
++          ],
++        };
++  const choice = window
++    ? await dialog.showOpenDialog(window, options)
++    : await dialog.showOpenDialog(options);
++  if (choice.canceled || choice.filePaths.length === 0) {
++    return [];
++  }
++  if (choice.filePaths.length > MAX_FILES_PER_SEND) {
++    throw new Error("files:limit");
++  }
++  const created: ProjectFileDto[] = [];
++  for (const selected of choice.filePaths) {
++    created.push(toProjectFileDto(await ingestResolved(input.projectId, selected)));
++  }
++  return created;
++}
++
++export function listProjectFileDtos(projectId: string | null): ProjectFileDto[] {
++  return getHubDatabase().repos.listProjectFiles(projectId).map(toProjectFileDto);
++}
++
++export function removeProjectFile(id: string): void {
++  getHubDatabase().repos.removeProjectFile(id);
++}
++
++export function loadSendAttachments(
++  fileIds: string[] | undefined,
++  projectId: string | null,
++  vision: boolean,
++  mode: "preview" | "send",
++): { files: CompilerFile[]; images: ChatImagePart[] } {
++  if (!fileIds || fileIds.length === 0) {
++    return { files: [], images: [] };
++  }
++  if (fileIds.length > MAX_FILES_PER_SEND) {
++    throw new Error("files:limit");
++  }
++  const repos = getHubDatabase().repos;
++  const files: CompilerFile[] = [];
++  const images: ChatImagePart[] = [];
++  const seen = new Set<string>();
++  for (const id of fileIds) {
++    if (seen.has(id)) {
++      continue;
++    }
++    seen.add(id);
++    const row = repos.getProjectFile(id);
++    if (!row) {
++      throw new Error("files:unsupported");
++    }
++    if (row.projectId !== projectId) {
++      throw new Error("files:project_mismatch");
++    }
++    if (row.kind === "image") {
++      if (!vision && mode === "send") {
++        throw new Error("files:vision_required");
++      }
++      if (row.imageJson && vision) {
++        const parsed = JSON.parse(row.imageJson) as { mime?: unknown; data?: unknown };
++        if (
++          typeof parsed.mime === "string" &&
++          typeof parsed.data === "string" &&
++          (parsed.mime === "image/png" ||
++            parsed.mime === "image/jpeg" ||
++            parsed.mime === "image/webp" ||
++            parsed.mime === "image/gif")
++        ) {
++          images.push({ mime: parsed.mime, data: parsed.data });
++        }
++      }
++      files.push({
++        id: row.id,
++        name: row.name,
++        text: redactSecrets(`[Image: ${row.name}]`),
++      });
++      continue;
++    }
++    files.push({
++      id: row.id,
++      name: row.name,
++      text: redactSecrets(row.extract),
++    });
++  }
++  return { files, images };
++}
++
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index 68da176..4ce1279 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -46,6 +46,10 @@ import {
+   packetsExportResultSchema,
+   packetsImportInputSchema,
+   packetsListInputSchema,
++  projectFileListInputSchema,
++  projectFileListResultSchema,
++  filesAttachInputSchema,
++  filesIngestPathsInputSchema,
+   contextPacketDtoSchema,
+   contextPacketListResultSchema,
+   projectCreateInputSchema,
+@@ -81,6 +85,7 @@ import {
+   listProjectPackets,
+   pickPacketFile,
+ } from "./packet-file";
++import { attachFromDialog, ingestDroppedPaths, listProjectFileDtos, removeProjectFile } from "./files";
+ import { previewPacket } from "./packet-preview";
+ import { getHubDatabase } from "./persistence";
+ import { testProviderKey } from "./provider-health";
+@@ -368,6 +373,31 @@ export function registerWorkspaceIpc(): void {
+     (input) => previewPacket(input),
+   );
+ 
++  registerHandler(
++    IpcChannel.filesList,
++    projectFileListInputSchema,
++    projectFileListResultSchema,
++    (input) => listProjectFileDtos(input.projectId),
++  );
++
++  registerHandler(
++    IpcChannel.filesAttach,
++    filesAttachInputSchema,
++    projectFileListResultSchema,
++    (input, event) => attachFromDialog(input, event.sender),
++  );
++
++  registerHandler(
++    IpcChannel.filesIngestPaths,
++    filesIngestPathsInputSchema,
++    projectFileListResultSchema,
++    (input) => ingestDroppedPaths(input),
++  );
++
++  registerHandler(IpcChannel.filesRemove, idInputSchema, ipcAckResultSchema, (input) => {
++    removeProjectFile(input.id);
++  });
++
+   registerHandler(IpcChannel.spendCapsGet, emptyIpcPayloadSchema, spendCapListResultSchema, () => {
+     const rows = getHubDatabase().repos.listSpendCaps();
+     return SPEND_CAP_SCOPES.map((scope) => ({
+diff --git a/apps/desktop/src/main/packet-preview.ts b/apps/desktop/src/main/packet-preview.ts
+index 68f8d81..588cb20 100644
+--- a/apps/desktop/src/main/packet-preview.ts
++++ b/apps/desktop/src/main/packet-preview.ts
+@@ -1,4 +1,4 @@
+-import { compileActivePathDetailed, mergePacketWithTail } from "@ai-hub/ai-gateway";
++import { appendFilesToPacket, compileActivePathDetailed, mergePacketWithTail } from "@ai-hub/ai-gateway";
+ import { randomUUID } from "node:crypto";
+ import {
+   findCatalogModel,
+@@ -7,6 +7,7 @@ import {
+   type PacketPreviewInput,
+   type PacketPreviewResult,
+ } from "@ai-hub/shared";
++import { loadSendAttachments } from "./files";
+ import { getHubDatabase } from "./persistence";
+ import { estimateOutgoingCostUsd, evaluateOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
+ 
+@@ -117,6 +118,26 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
+     included = detailed.included;
+     omitted = detailed.omitted;
+   }
++  const attachments = loadSendAttachments(
++    input.fileIds,
++    conversation.projectId,
++    catalog?.vision === true,
++    "preview",
++  );
++  if (attachments.files.length > 0) {
++    const withFiles = appendFilesToPacket(
++      {
++        version: 1,
++        system: "",
++        messages: [],
++        tokenEstimate: 0,
++        excluded: [],
++      },
++      attachments.files,
++    );
++    tokenEstimate += withFiles.packet.tokenEstimate;
++    included = [...included, ...withFiles.included].slice(0, 200);
++  }
+ 
+   const estimatedCostUsd = estimateOutgoingCostUsd(
+     input.model,
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index cb58cd3..1eb5004 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -1,4 +1,4 @@
+-import { contextBridge, ipcRenderer } from "electron";
++import { contextBridge, ipcRenderer, webUtils } from "electron";
+ import { ZodError, type ZodType } from "zod";
+ import {
+   IpcChannel,
+@@ -49,6 +49,10 @@ import {
+   packetsExportResultSchema,
+   packetsImportInputSchema,
+   packetsListInputSchema,
++  projectFileListInputSchema,
++  projectFileListResultSchema,
++  filesAttachInputSchema,
++  filesIngestPathsInputSchema,
+   contextPacketDtoSchema,
+   contextPacketListResultSchema,
+   projectCreateInputSchema,
+@@ -304,6 +308,40 @@ const hub: HubApi = {
+     clear: (input) =>
+       invokeParsed(IpcChannel.packetsClear, input, packetsClearInputSchema, conversationDtoSchema),
+   },
++  files: {
++    list: (input) =>
++      invokeParsed(
++        IpcChannel.filesList,
++        input,
++        projectFileListInputSchema,
++        projectFileListResultSchema,
++      ),
++    attach: (input) =>
++      invokeParsed(IpcChannel.filesAttach, input, filesAttachInputSchema, projectFileListResultSchema),
++    ingestDropped: (input) =>
++      invokeParsed(
++        IpcChannel.filesIngestPaths,
++        input,
++        filesIngestPathsInputSchema,
++        projectFileListResultSchema,
++      ),
++    fromDrop: (input) => {
++      const list = Array.isArray(input.files) ? input.files : [];
++      const items = list.flatMap((item) => {
++        if (typeof File !== "undefined" && item instanceof File) {
++          return [{ path: webUtils.getPathForFile(item), name: item.name }];
++        }
++        return [];
++      });
++      return invokeParsed(
++        IpcChannel.filesIngestPaths,
++        { projectId: input.projectId, items },
++        filesIngestPathsInputSchema,
++        projectFileListResultSchema,
++      );
++    },
++    remove: (input) => invokeAckWith(IpcChannel.filesRemove, input, idInputSchema),
++  },
+ };
+ 
+ contextBridge.exposeInMainWorld("hub", hub);
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index 4a29267..3e9fc50 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -15,6 +15,7 @@ import type {
+   PacketPrivacyMode,
+   ProjectDto,
+   ProjectUpdateInput,
++  ProjectFileDto,
+   ProviderKeyDto,
+   SearchHit,
+ } from "@ai-hub/shared";
+@@ -76,6 +77,21 @@ function workspaceErrorText(
+   if (classified.kind === "unknown_model") {
+     return { text: t("workspace.error.unknownModel"), cap: false };
+   }
++  if (message.includes("files:vision_required")) {
++    return { text: t("files.error.vision"), cap: false };
++  }
++  if (message.includes("files:too_large")) {
++    return { text: t("files.error.tooLarge"), cap: false };
++  }
++  if (message.includes("files:unsupported")) {
++    return { text: t("files.error.unsupported"), cap: false };
++  }
++  if (message.includes("files:project_mismatch")) {
++    return { text: t("files.error.projectMismatch"), cap: false };
++  }
++  if (message.includes("files:limit")) {
++    return { text: t("files.error.limit"), cap: false };
++  }
+   if (
+     classified.kind === "gateway" &&
+     classified.code &&
+@@ -129,6 +145,7 @@ export function App(): JSX.Element {
+   const [costs, setCosts] = useState<CostsAggregateResult | null>(null);
+   const [showAllowOnce, setShowAllowOnce] = useState(false);
+   const [composerDraft, setComposerDraft] = useState("");
++  const [attachedFiles, setAttachedFiles] = useState<ProjectFileDto[]>([]);
+   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+   const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
+   const [fallback, setFallback] = useState<{
+@@ -446,6 +463,9 @@ export function App(): JSX.Element {
+           ...(extra !== undefined ? { extraSystem: extra } : {}),
+           ...(pending !== undefined ? { pendingContent: pending } : {}),
+           ...(maxTokens !== null ? { maxTokens } : {}),
++          ...(attachedFiles.length > 0
++            ? { fileIds: attachedFiles.map((file) => file.id) }
++            : {}),
+         })
+         .then(setPacketPreview)
+         .catch(fail);
+@@ -464,6 +484,7 @@ export function App(): JSX.Element {
+     selectedModel,
+     privacyMode,
+     activePacketId,
++    attachedFiles,
+   ]);
+ 
+   useEffect(() => {
+@@ -660,6 +681,7 @@ export function App(): JSX.Element {
+       abortIfLeaving(null);
+       setSelectedProjectId(id);
+       setImportedInbox(false);
++      setAttachedFiles([]);
+       setSelectedConversationId(null);
+       setMessages([]);
+       setBranchLabels({});
+@@ -818,6 +840,7 @@ export function App(): JSX.Element {
+           onSelectImportedInbox={() => {
+             abortIfLeaving(null);
+             setSelectedProjectId(null);
++            setAttachedFiles([]);
+             setImportedInbox(true);
+             setSelectedConversationId(null);
+             setMessages([]);
+@@ -909,6 +932,9 @@ export function App(): JSX.Element {
+                   maxTokens,
+                   extraSystem,
+                   compactHistory,
++                  ...(attachedFiles.length > 0
++                    ? { fileIds: attachedFiles.map((file) => file.id) }
++                    : {}),
+                 });
+               }}
+               onAbort={async () => {
+@@ -1203,6 +1229,67 @@ export function App(): JSX.Element {
+                 }
+               }}
+               onOpenCaps={() => openSettings("caps")}
++              attachedFiles={attachedFiles}
++              onAttachFile={async () => {
++                try {
++                  const created = await window.hub.files.attach({
++                    projectId: selectedProjectId,
++                    kind: "file",
++                  });
++                  setAttachedFiles((current) =>
++                    [...current, ...created.filter((item) => !current.some((row) => row.id === item.id))].slice(
++                      0,
++                      8,
++                    ),
++                  );
++                  setError(null);
++                } catch {
++                  fail();
++                }
++              }}
++              onAttachFolder={async () => {
++                try {
++                  const created = await window.hub.files.attach({
++                    projectId: selectedProjectId,
++                    kind: "folder",
++                  });
++                  setAttachedFiles((current) =>
++                    [...current, ...created.filter((item) => !current.some((row) => row.id === item.id))].slice(
++                      0,
++                      8,
++                    ),
++                  );
++                  setError(null);
++                } catch {
++                  fail();
++                }
++              }}
++              onRemoveFile={async (id) => {
++                try {
++                  await window.hub.files.remove({ id });
++                  setAttachedFiles((current) => current.filter((item) => item.id !== id));
++                  setError(null);
++                } catch {
++                  fail();
++                }
++              }}
++              onDropFiles={async (files) => {
++                try {
++                  const created = await window.hub.files.fromDrop({
++                    projectId: selectedProjectId,
++                    files,
++                  });
++                  setAttachedFiles((current) =>
++                    [...current, ...created.filter((item) => !current.some((row) => row.id === item.id))].slice(
++                      0,
++                      8,
++                    ),
++                  );
++                  setError(null);
++                } catch {
++                  fail();
++                }
++              }}
+             />
+           ) : view === "debug" ? (
+             <DebugView />
+diff --git a/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx b/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
+index 4b01f75..1959182 100644
+--- a/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
++++ b/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
+@@ -29,6 +29,7 @@ export function ChatComposer({
+   onSend,
+   onAbort,
+   onSlashCommand,
++  onFilesDrop,
+   streaming,
+   sending,
+   disabled,
+@@ -38,6 +39,7 @@ export function ChatComposer({
+   onSend: () => void;
+   onAbort: () => void;
+   onSlashCommand: (command: SlashCommandId) => void;
++  onFilesDrop: (files: File[]) => void;
+   streaming: boolean;
+   sending: boolean;
+   disabled: boolean;
+@@ -108,6 +110,18 @@ export function ChatComposer({
+             ? `slash-command-${slashCommands[selectedSlashIndex] ?? slashCommands[0]}`
+             : undefined
+         }
++        onDragOver={(event) => {
++          if (event.dataTransfer.types.includes("Files")) {
++            event.preventDefault();
++          }
++        }}
++        onDrop={(event) => {
++          if (event.dataTransfer.files.length === 0) {
++            return;
++          }
++          event.preventDefault();
++          onFilesDrop([...event.dataTransfer.files]);
++        }}
+         onChange={(event) => onChange(event.target.value)}
+         onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
+           if (event.key === "Escape" && streaming) {
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index 9137c7a..b2a0a9f 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -13,6 +13,7 @@ import {
+   type PacketPrivacyMode,
+   type ProjectDto,
+   type ProjectUpdateInput,
++  type ProjectFileDto,
+   type ProviderKeyDto,
+ } from "@ai-hub/shared";
+ import { ChatComposer, type SlashCommandId } from "@/components/chat/chat-composer";
+@@ -90,6 +91,11 @@ export function HomeView({
+   onApplyPacket,
+   onClearPacket,
+   onOpenCaps,
++  attachedFiles,
++  onAttachFile,
++  onAttachFolder,
++  onRemoveFile,
++  onDropFiles,
+ }: {
+   project: ProjectDto | null;
+   importedInbox: boolean;
+@@ -146,6 +152,11 @@ export function HomeView({
+   onApplyPacket: (packetId: string) => Promise<void>;
+   onClearPacket: () => Promise<void>;
+   onOpenCaps: () => void;
++  attachedFiles: ProjectFileDto[];
++  onAttachFile: () => Promise<void>;
++  onAttachFolder: () => Promise<void>;
++  onRemoveFile: (id: string) => Promise<void>;
++  onDropFiles: (files: File[]) => Promise<void>;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const modifier = window.hub.platform === "darwin" ? "Ôîÿ" : "Ctrl";
+@@ -805,6 +816,75 @@ export function HomeView({
+                     aria-label={t("workspace.extraSystem")}
+                   />
+                 </label>
++                <div className="flex flex-col gap-1.5">
++                  <div className="flex flex-wrap items-center gap-1.5">
++                    <Button
++                      type="button"
++                      size="sm"
++                      variant="outline"
++                      data-testid="files-attach"
++                      disabled={busy || editing}
++                      onClick={() => {
++                        void onAttachFile();
++                      }}
++                    >
++                      {t("files.attach")}
++                    </Button>
++                    <Button
++                      type="button"
++                      size="sm"
++                      variant="outline"
++                      data-testid="files-attach-folder"
++                      disabled={busy || editing}
++                      onClick={() => {
++                        void onAttachFolder();
++                      }}
++                    >
++                      {t("files.attachFolder")}
++                    </Button>
++                  </div>
++                  {attachedFiles.length > 0 ? (
++                    <ul className="flex flex-col gap-1" data-testid="files-attached">
++                      {attachedFiles.map((file) => (
++                        <li
++                          key={file.id}
++                          className="flex items-center justify-between gap-2 rounded-md border px-2 py-1 text-[12px]"
++                          data-testid="files-chip"
++                        >
++                          <span className="min-w-0 truncate">
++                            {file.name}
++                            <span className="ml-2 text-muted-foreground">
++                              {t("files.tokens", { n: file.tokenEstimate })}
++                            </span>
++                            {file.visionRequired ? (
++                              <span className="ml-2 text-muted-foreground">
++                                {t("files.visionHint")}
++                              </span>
++                            ) : null}
++                          </span>
++                          <Button
++                            type="button"
++                            size="sm"
++                            variant="ghost"
++                            data-testid="files-remove"
++                            onClick={() => {
++                              void onRemoveFile(file.id);
++                            }}
++                          >
++                            {t("files.remove")}
++                          </Button>
++                        </li>
++                      ))}
++                    </ul>
++                  ) : null}
++                  {attachedFiles.length > 0 ? (
++                    <p className="text-[11px] text-muted-foreground" data-testid="files-token-warning">
++                      {t("files.tokenWarning", {
++                        n: attachedFiles.reduce((sum, file) => sum + file.tokenEstimate, 0),
++                      })}
++                    </p>
++                  ) : null}
++                </div>
+                 <ChatComposer
+                   key={selectedConversationId}
+                   value={draft}
+@@ -831,6 +911,9 @@ export function HomeView({
+                     void onAbort();
+                   }}
+                   onSlashCommand={runSlashCommand}
++                  onFilesDrop={(files) => {
++                    void onDropFiles(files);
++                  }}
+                 />
+               </div>
+               {treeOpen ? (
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index bbbc1ba..2ce9c9e 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -105,6 +105,17 @@
+   "workspace.error.chat": "The model request failed ({{code}}).",
+   "workspace.error.cap": "Spend cap reached ({{scope}}). This send was not started.",
+   "workspace.error.unknownModel": "That model is not in the local catalog for this provider.",
++  "files.attach": "Attach file",
++  "files.attachFolder": "Attach folder",
++  "files.remove": "Remove",
++  "files.tokens": "~{{n}} tokens",
++  "files.visionHint": "Needs a vision model",
++  "files.tokenWarning": "These files add ~{{n}} tokens before the message is sent.",
++  "files.error.vision": "This model cannot read images. Pick one marked Vision or remove the image.",
++  "files.error.tooLarge": "That file is over the 8 MB limit.",
++  "files.error.unsupported": "That file type is not supported.",
++  "files.error.projectMismatch": "That file belongs to another project.",
++  "files.error.limit": "You can attach up to 8 files per send.",
+   "workspace.error.timeout": "The provider timed out. Retry or try another model.",
+   "workspace.error.rate_limit": "The provider is rate-limiting this key. Wait and retry.",
+   "workspace.error.auth": "The provider rejected this key. Check it in Settings.",
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index 7e4b5ac..1519c40 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -105,6 +105,17 @@
+   "workspace.error.chat": "A chamada ao modelo falhou ({{code}}).",
+   "workspace.error.cap": "Teto de gasto atingido ({{scope}}). Este envio n├úo come├ºou.",
+   "workspace.error.unknownModel": "Este modelo n├úo est├í no cat├ílogo local deste provedor.",
++  "files.attach": "Anexar arquivo",
++  "files.attachFolder": "Anexar pasta",
++  "files.remove": "Remover",
++  "files.tokens": "~{{n}} tokens",
++  "files.visionHint": "Precisa de modelo com vision",
++  "files.tokenWarning": "Estes arquivos somam ~{{n}} tokens antes do envio.",
++  "files.error.vision": "Este modelo n├úo l├¬ imagens. Escolha um marcado Vision ou remova a imagem.",
++  "files.error.tooLarge": "Esse arquivo passa do limite de 8 MB.",
++  "files.error.unsupported": "Esse tipo de arquivo n├úo ├® suportado.",
++  "files.error.projectMismatch": "Esse arquivo pertence a outro projeto.",
++  "files.error.limit": "D├í para anexar no m├íximo 8 arquivos por envio.",
+   "workspace.error.timeout": "O provedor estourou o tempo. Tente de novo ou troque o modelo.",
+   "workspace.error.rate_limit": "O provedor est├í limitando esta chave. Espere e tente de novo.",
+   "workspace.error.auth": "O provedor recusou esta chave. Verifique em Configura├º├Áes.",
+diff --git a/apps/desktop/tsconfig.node.json b/apps/desktop/tsconfig.node.json
+index ba03c9d..6db947d 100644
+--- a/apps/desktop/tsconfig.node.json
++++ b/apps/desktop/tsconfig.node.json
+@@ -11,7 +11,8 @@
+       "@ai-hub/db": ["../../packages/db/src/index.ts"],
+       "@ai-hub/ai-gateway": ["../../packages/ai-gateway/src/index.ts"],
+       "@ai-hub/security/keytar": ["../../packages/security/src/keytar-store.ts"],
+-      "@ai-hub/security": ["../../packages/security/src/index.ts"]
++      "@ai-hub/security": ["../../packages/security/src/index.ts"],
++      "@ai-hub/files": ["../../packages/files/src/index.ts"]
+     }
+   },
+   "include": [
+@@ -22,7 +23,8 @@
+     "../../packages/shared/src/**/*.json",
+     "../../packages/db/src/**/*.ts",
+     "../../packages/ai-gateway/src/**/*.ts",
+-    "../../packages/security/src/**/*.ts"
++    "../../packages/security/src/**/*.ts",
++    "../../packages/files/src/**/*.ts"
+   ],
+   "exclude": ["../../packages/**/*.test.ts"]
+ }
+diff --git a/docs/ADR/ADR-W12-001-files-package-and-encrypted-extract.md b/docs/ADR/ADR-W12-001-files-package-and-encrypted-extract.md
+new file mode 100644
+index 0000000..3813ad8
+--- /dev/null
++++ b/docs/ADR/ADR-W12-001-files-package-and-encrypted-extract.md
+@@ -0,0 +1,33 @@
++# ADR-W12-001-files-package-and-encrypted-extract
++
++- **Status:** accepted
++- **Onda:** W12
++- **Data:** 2026-09-18
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++A Wave 12 precisa extrair texto, guardar arquivos no projeto e injet├í-los no send. O renderer n├úo pode usar `fs`. O utilizador vai largar c├│digo e documentos privados.
++
++## Decis├úo
++
++Nasce `packages/files` s├│ com extra├º├úo e resumo de pasta (sem I/O). O main l├¬ o disco, redige, cifra o extract com `encryptUtf8` e grava em `project_files`. O renderer s├│ v├¬ DTOs (nome, kind, tokens, excerpt). Paths n├úo atravessam o IPC de volta.
++
++## Alternativas consideradas
++
++- **Tudo no main, sem pacote:** viola o plano (ÔÇ£`files` nasce quando a onda precisarÔÇØ).
++- **Blobs plaintext em `userData`:** rejeitado ÔÇö o trust boundary j├í cifra conversas.
++
++## Consequ├¬ncias
++
++- Positivas: testes de extra├º├úo sem Electron; um s├¡tio para PDF/DOCX.
++- Negativas: migration 8; envelope v1 do packet **n├úo** leva o extract (W10).
++- Riscos aceitos: nome do ficheiro fica em plaintext (como tags W6).
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 12
++- `docs/ADR/ADR-W01-001-envelope-encryption-at-rest.md`
++- `docs/reviews/W12/REVIEW.md`
+diff --git a/docs/ADR/ADR-W12-002-files-inject-as-compiler-slices.md b/docs/ADR/ADR-W12-002-files-inject-as-compiler-slices.md
+new file mode 100644
+index 0000000..306c2a7
+--- /dev/null
++++ b/docs/ADR/ADR-W12-002-files-inject-as-compiler-slices.md
+@@ -0,0 +1,33 @@
++# ADR-W12-002-files-inject-as-compiler-slices
++
++- **Status:** accepted
++- **Onda:** W12
++- **Data:** 2026-09-18
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++W13 ├® `@file`. W12 precisa injetar anexos no pr├│ximo send sem inventar mentions. O packet port├ítil v1 n├úo inclui arquivos.
++
++## Decis├úo
++
++Anexos s├úo IDs no `chat:send` / preview (`fileIds`). O compiler acrescenta fatias `file` ao system. Export/apply de packet **n├úo** recebe `files`. Caps continuam a medir o packet j├í com o texto anexado.
++
++## Alternativas consideradas
++
++- **Concatenar no `content` do utilizador:** o texto vis├¡vel vira dump (o que W13 pro├¡be).
++- **Meter arquivos no envelope v1:** rejeitado (ADR-W10-001).
++
++## Consequ├¬ncias
++
++- Positivas: preview mostra tokens do anexo; `@file` (W13) pode reusar a mesma fatia.
++- Negativas: anexos s├úo por send, n├úo viajam no packet exportado.
++- Riscos aceitos: merge com packet aplicado acrescenta files *depois* do envelope.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Waves 12ÔÇô13
++- `docs/ADR/ADR-W10-001-portable-packet-json-v1.md`
++- `docs/reviews/W12/REVIEW.md`
+diff --git a/docs/ADR/ADR-W12-003-vision-images-on-stream-not-packet.md b/docs/ADR/ADR-W12-003-vision-images-on-stream-not-packet.md
+new file mode 100644
+index 0000000..2700630
+--- /dev/null
++++ b/docs/ADR/ADR-W12-003-vision-images-on-stream-not-packet.md
+@@ -0,0 +1,32 @@
++# ADR-W12-003-vision-images-on-stream-not-packet
++
++- **Status:** accepted
++- **Onda:** W12
++- **Data:** 2026-09-18
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++Imagens precisam ir ao provider se o cat├ílogo marcar `vision`. O `packetV0` ├® texto e entra no debug/export. Meter base64 no packet vazaria no snapshot e no `.aihub-packet.json`.
++
++## Decis├úo
++
++Imagens viajam em `ChatStreamRequest.images`, n├úo no `ProviderAgnosticPacket`. O main recusa o send se houver imagem e `catalog.vision === false` (gate W5). Adapters montam a parte multimodal s├│ nesse request.
++
++## Alternativas consideradas
++
++- **Campo `images` no packet v0:** polui export e debug.
++- **OCR local e s├│ texto:** fora do DoD; vision ├® o requisito.
++
++## Consequ├¬ncias
++
++- Positivas: packet/export/debug continuam texto; mock e2e ignora imagens.
++- Negativas: cada adapter precisa do ramo de imagem.
++- Riscos aceitos: JPEG/PNG/WebP/GIF s├│; sem TIFF/HEIC nesta onda.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 12 / W5 catalog
++- `docs/reviews/W12/REVIEW.md`
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index 93dfbe9..3caeb9c 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -82,3 +82,6 @@ N├úo escrever ADR de detalhe cosm├®tica. Se mexe em seguran├ºa, custo, provider
+ | [ADR-W10-003](./ADR-W10-003-deterministic-inactive-summary-and-pins.md) | W10 | Resumo de ramos inativos sem LLM; pins no compact | accepted |
+ | [ADR-W11-001](./ADR-W11-001-slash-commands-local-ui.md) | W11 | Slash commands s├úo a├º├Áes locais, n├úo send | accepted |
+ | [ADR-W11-002](./ADR-W11-002-palette-reuses-w6-search.md) | W11 | Paleta reusa busca W6; FTS5 continua vazio | accepted |
++| [ADR-W12-001](./ADR-W12-001-files-package-and-encrypted-extract.md) | W12 | Pacote `files` + extract cifrado | accepted |
++| [ADR-W12-002](./ADR-W12-002-files-inject-as-compiler-slices.md) | W12 | Anexos entram como fatias do compiler, n├úo no packet v1 | accepted |
++| [ADR-W12-003](./ADR-W12-003-vision-images-on-stream-not-packet.md) | W12 | Imagens no stream, n├úo no packet; gate `vision` | accepted |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 77dd5a1..3f01eeb 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave
+ |---|---|
+ | Wave | **W12** |
+ | Marco | C ÔÇö V1 |
+-| State | `pending` |
++| State | `review` |
+ | Last completed | **W11** |
+-| Next action | W12.1: drag/drop + extra├º├úo de texto (PDF, DOCX, TXT, MD, CSV, imagens, c├│digo) |
++| Next action | Wave-close gate W12 (review independente + REVIEW.md) |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -38,7 +38,8 @@ None.
+ 
+ ## Notes for the next session
+ 
+-- W11 fechada. Pr├│xima: **W12 Arquivos e multimodal b├ísico** (drag/drop, extra├º├úo, vision gate W5, pasta ÔåÆ resumo v1, limite + redactor).
++- W12 em progresso: `packages/files`, `project_files` (migration 8), anexos no compiler, imagens no stream.
++- N├úo implementar @-mentions (W13), RAG, MCP, agentes, run modes.
+ - N├úo implementar @-mentions (W13), RAG, MCP, agentes, run modes.
+ - Slash `/` ├® UI local (ADR-W11-001). N├úo mandar comandos conhecidos a `chat:send`.
+ - Composer j├í tem listbox de slash; W12 n├úo pode tapar o teclado no drop.
+diff --git a/packages/ai-gateway/src/adapter.ts b/packages/ai-gateway/src/adapter.ts
+index 2a5c4f6..3d977ad 100644
+--- a/packages/ai-gateway/src/adapter.ts
++++ b/packages/ai-gateway/src/adapter.ts
+@@ -10,6 +10,11 @@ export interface ProviderCapabilities {
+   tools: boolean;
+ }
+ 
++export interface ChatImagePart {
++  mime: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
++  data: string;
++}
++
+ export interface ChatStreamRequest {
+   secret: string;
+   model: string;
+@@ -17,6 +22,7 @@ export interface ChatStreamRequest {
+   signal: AbortSignal;
+   temperature?: number;
+   maxTokens?: number | null;
++  images?: ChatImagePart[];
+ }
+ 
+ export type ChatStreamEvent =
+diff --git a/packages/ai-gateway/src/anthropic-adapter.ts b/packages/ai-gateway/src/anthropic-adapter.ts
+index 27c23a6..6a63eb4 100644
+--- a/packages/ai-gateway/src/anthropic-adapter.ts
++++ b/packages/ai-gateway/src/anthropic-adapter.ts
+@@ -84,13 +84,31 @@ function classifyTransport(error: unknown, userSignal: AbortSignal, timeout: Abo
+   throw new GatewayError("network", message);
+ }
+ 
+-function packetToAnthropic(packet: ProviderAgnosticPacket): {
++function packetToAnthropic(
++  packet: ProviderAgnosticPacket,
++  images?: ChatStreamRequest["images"],
++): {
+   system: string | undefined;
+-  messages: Array<{ role: "user" | "assistant"; content: string }>;
++  messages: Array<{ role: "user" | "assistant"; content: unknown }>;
+ } {
++  const lastUser = [...packet.messages].reverse().find((item) => item.role === "user");
+   return {
+     system: packet.system.length > 0 ? packet.system : undefined,
+-    messages: packet.messages.map((message) => ({ role: message.role, content: message.content })),
++    messages: packet.messages.map((message) => {
++      if (images && images.length > 0 && lastUser && message === lastUser) {
++        return {
++          role: message.role,
++          content: [
++            { type: "text", text: message.content },
++            ...images.map((image) => ({
++              type: "image",
++              source: { type: "base64", media_type: image.mime, data: image.data },
++            })),
++          ],
++        };
++      }
++      return { role: message.role, content: message.content };
++    }),
+   };
+ }
+ 
+@@ -146,7 +164,7 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): P
+       }
+     },
+     async *chatStream(input: ChatStreamRequest): AsyncIterable<ChatStreamEvent> {
+-      const converted = packetToAnthropic(input.packet);
++      const converted = packetToAnthropic(input.packet, input.images);
+       const body: Record<string, unknown> = {
+         model: input.model,
+         stream: true,
+diff --git a/packages/ai-gateway/src/compiler.test.ts b/packages/ai-gateway/src/compiler.test.ts
+index b8d2448..2e1ba77 100644
+--- a/packages/ai-gateway/src/compiler.test.ts
++++ b/packages/ai-gateway/src/compiler.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it } from "vitest";
+-import { compileActivePath, compilePacket, mergePacketWithTail } from "./compiler";
++import { compileActivePath, compilePacket, compilePacketDetailed, mergePacketWithTail } from "./compiler";
+ 
+ describe("compilePacket", () => {
+   it("joins project instructions and skips streaming messages", () => {
+@@ -39,6 +39,31 @@ describe("compilePacket", () => {
+     );
+   });
+ 
++  it("injects attached files into the system packet and preview slices", () => {
++    const detailed = compilePacketDetailed({
++      projectInstructions: null,
++      extraSystem: null,
++      files: [
++        {
++          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
++          name: "spec.pdf",
++          text: "Section 3: payments",
++        },
++      ],
++      messages: [
++        {
++          id: "11111111-1111-4111-8111-111111111111",
++          role: "user",
++          content: "resuma a se├º├úo 3",
++          status: "complete",
++        },
++      ],
++    });
++    expect(detailed.packet.system).toContain("Attached file: spec.pdf");
++    expect(detailed.packet.system).toContain("Section 3: payments");
++    expect(detailed.included.some((item) => item.kind === "file")).toBe(true);
++  });
++
+   it("never puts an apiKey field on the packet", () => {
+     const packet = compilePacket({
+       projectInstructions: null,
+diff --git a/packages/ai-gateway/src/compiler.ts b/packages/ai-gateway/src/compiler.ts
+index e00eed6..bf09aa5 100644
+--- a/packages/ai-gateway/src/compiler.ts
++++ b/packages/ai-gateway/src/compiler.ts
+@@ -9,6 +9,12 @@ export interface CompilerMessage {
+   pinned?: boolean;
+ }
+ 
++export interface CompilerFile {
++  id: string;
++  name: string;
++  text: string;
++}
++
+ export interface CompileInput {
+   projectInstructions: string | null;
+   extraSystem: string | null;
+@@ -16,6 +22,7 @@ export interface CompileInput {
+   maxTokenBudget?: number;
+   privacyMode?: PacketPrivacyMode;
+   inactiveSummaries?: InactiveBranchSummaries | null;
++  files?: CompilerFile[];
+ }
+ 
+ type PacketRow = {
+@@ -125,6 +132,12 @@ export function compilePacketDetailed(input: CompileInput): CompileDetailedResul
+     included.push(sliceFor("extra-system", null, extra));
+   }
+ 
++  for (const file of input.files ?? []) {
++    const block = `Attached file: ${file.name}\n${file.text}`;
++    systemParts.push(block);
++    included.push(sliceFor("file", file.id, block));
++  }
++
+   const inactive = input.inactiveSummaries ?? null;
+   if (inactive && inactive.block.trim().length > 0) {
+     if (privacyMode === "strict") {
+@@ -196,12 +209,33 @@ export function compilePacket(input: CompileInput): ProviderAgnosticPacket {
+   return compilePacketDetailed(input).packet;
+ }
+ 
++export function appendFilesToPacket(
++  packet: ProviderAgnosticPacket,
++  files: CompilerFile[],
++): { packet: ProviderAgnosticPacket; included: PacketSlice[] } {
++  if (files.length === 0) {
++    return { packet, included: [] };
++  }
++  const blocks = files.map((file) => `Attached file: ${file.name}\n${file.text}`);
++  const extra = blocks.join("\n\n");
++  const system = packet.system.length > 0 ? `${packet.system}\n\n${extra}` : extra;
++  return {
++    packet: packetV0Schema.parse({
++      ...packet,
++      system,
++      tokenEstimate: packet.tokenEstimate + tokenEstimateFromChars(extra.length),
++    }),
++    included: files.map((file) => sliceFor("file", file.id, `Attached file: ${file.name}\n${file.text}`)),
++  };
++}
++
+ export function compileActivePathDetailed(input: {
+   projectInstructions: string | null;
+   extraSystem: string | null;
+   messages: CompilerGraphMessage[];
+   maxTokenBudget?: number;
+   privacyMode?: PacketPrivacyMode;
++  files?: CompilerFile[];
+ }): CompileDetailedResult {
+   const compiled: CompileInput = {
+     projectInstructions: input.projectInstructions,
+@@ -215,6 +249,9 @@ export function compileActivePathDetailed(input: {
+   if (input.privacyMode !== undefined) {
+     compiled.privacyMode = input.privacyMode;
+   }
++  if (input.files !== undefined) {
++    compiled.files = input.files;
++  }
+   return compilePacketDetailed(compiled);
+ }
+ 
+diff --git a/packages/ai-gateway/src/gemini-adapter.ts b/packages/ai-gateway/src/gemini-adapter.ts
+index 0da878e..b4ba4ff 100644
+--- a/packages/ai-gateway/src/gemini-adapter.ts
++++ b/packages/ai-gateway/src/gemini-adapter.ts
+@@ -80,16 +80,28 @@ function classifyTransport(error: unknown, userSignal: AbortSignal, timeout: Abo
+   throw new GatewayError("network", message);
+ }
+ 
+-function packetToGemini(packet: ProviderAgnosticPacket): {
++function packetToGemini(
++  packet: ProviderAgnosticPacket,
++  images?: ChatStreamRequest["images"],
++): {
+   systemInstruction: { parts: Array<{ text: string }> } | undefined;
+-  contents: Array<{ role: "user" | "model"; parts: Array<{ text: string }> }>;
++  contents: Array<{ role: "user" | "model"; parts: Array<Record<string, unknown>> }>;
+ } {
++  const lastUser = [...packet.messages].reverse().find((item) => item.role === "user");
+   return {
+     systemInstruction: packet.system.length > 0 ? { parts: [{ text: packet.system }] } : undefined,
+-    contents: packet.messages.map((message) => ({
+-      role: message.role === "assistant" ? "model" : "user",
+-      parts: [{ text: message.content }],
+-    })),
++    contents: packet.messages.map((message) => {
++      const parts: Array<Record<string, unknown>> = [{ text: message.content }];
++      if (images && images.length > 0 && lastUser && message === lastUser) {
++        for (const image of images) {
++          parts.push({ inline_data: { mime_type: image.mime, data: image.data } });
++        }
++      }
++      return {
++        role: message.role === "assistant" ? "model" : "user",
++        parts,
++      };
++    }),
+   };
+ }
+ 
+@@ -153,7 +165,7 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): Provide
+       }
+     },
+     async *chatStream(input: ChatStreamRequest): AsyncIterable<ChatStreamEvent> {
+-      const converted = packetToGemini(input.packet);
++      const converted = packetToGemini(input.packet, input.images);
+       const generationConfig: Record<string, unknown> = {
+         temperature: input.temperature ?? 1,
+       };
+diff --git a/packages/ai-gateway/src/index.ts b/packages/ai-gateway/src/index.ts
+index 146612c..46008b9 100644
+--- a/packages/ai-gateway/src/index.ts
++++ b/packages/ai-gateway/src/index.ts
+@@ -1,4 +1,5 @@
+ export type {
++  ChatImagePart,
+   ChatStreamEvent,
+   ChatStreamRequest,
+   ModelRef,
+@@ -10,10 +11,12 @@ export {
+   compileActivePathDetailed,
+   compilePacket,
+   compilePacketDetailed,
++  appendFilesToPacket,
+   mergePacketWithTail,
+   summarizeInactiveBranches,
+   type CompileDetailedResult,
+   type CompileInput,
++  type CompilerFile,
+   type CompilerGraphMessage,
+   type CompilerMessage,
+   type InactiveBranchSummaries,
+diff --git a/packages/ai-gateway/src/openai-adapter.ts b/packages/ai-gateway/src/openai-adapter.ts
+index 8d72d91..4f5650a 100644
+--- a/packages/ai-gateway/src/openai-adapter.ts
++++ b/packages/ai-gateway/src/openai-adapter.ts
+@@ -39,12 +39,34 @@ function readNumber(value: unknown): number | null {
+   return typeof value === "number" && Number.isFinite(value) ? value : null;
+ }
+ 
+-function packetMessages(packet: ProviderAgnosticPacket): Array<{ role: string; content: string }> {
+-  const messages: Array<{ role: string; content: string }> = [];
++function packetMessages(
++  packet: ProviderAgnosticPacket,
++  images: ChatStreamRequest["images"],
++): Array<{ role: string; content: unknown }> {
++  const messages: Array<{ role: string; content: unknown }> = [];
+   if (packet.system.length > 0) {
+     messages.push({ role: "system", content: packet.system });
+   }
++  const lastUser = [...packet.messages].reverse().find((item) => item.role === "user");
+   for (const message of packet.messages) {
++    if (
++      images &&
++      images.length > 0 &&
++      lastUser &&
++      message === lastUser
++    ) {
++      messages.push({
++        role: message.role,
++        content: [
++          { type: "text", text: message.content },
++          ...images.map((image) => ({
++            type: "image_url",
++            image_url: { url: `data:${image.mime};base64,${image.data}` },
++          })),
++        ],
++      });
++      continue;
++    }
+     messages.push({ role: message.role, content: message.content });
+   }
+   return messages;
+@@ -186,7 +208,7 @@ export function createOpenAICompatibleAdapter(
+         model: input.model,
+         stream: true,
+         stream_options: { include_usage: true },
+-        messages: packetMessages(input.packet),
++        messages: packetMessages(input.packet, input.images),
+         temperature: input.temperature ?? 1,
+       };
+       if (input.maxTokens !== undefined && input.maxTokens !== null) {
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index 23cce20..0a663be 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -1,5 +1,5 @@
+ export { applyMigrations } from "./migrate";
+-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL } from "./migrations";
++export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL } from "./migrations";
+ export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
+ export {
+   HubRepos,
+@@ -21,5 +21,6 @@ export {
+   type AppPrefsRecord,
+   type ContextPacketRecord,
+   type ContextPacketStored,
++  type ProjectFileRecord,
+ } from "./repos";
+ export { schema } from "./schema";
+diff --git a/packages/db/src/migrations.ts b/packages/db/src/migrations.ts
+index 946e75c..2d4fd9f 100644
+--- a/packages/db/src/migrations.ts
++++ b/packages/db/src/migrations.ts
+@@ -162,6 +162,23 @@ ALTER TABLE conversations ADD COLUMN packet_applied_at INTEGER;
+ ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+ `;
+ 
++export const MIGRATION_0008_SQL = `
++CREATE TABLE project_files (
++  id TEXT PRIMARY KEY,
++  project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
++  name TEXT NOT NULL,
++  kind TEXT NOT NULL,
++  mime TEXT NOT NULL,
++  byte_size INTEGER NOT NULL,
++  token_estimate INTEGER NOT NULL,
++  extract_cipher TEXT NOT NULL,
++  image_cipher TEXT,
++  truncated INTEGER NOT NULL DEFAULT 0,
++  created_at INTEGER NOT NULL
++);
++CREATE INDEX project_files_project_idx ON project_files(project_id);
++`;
++
+ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 1, sql: MIGRATION_0001_SQL },
+   { version: 2, sql: MIGRATION_0002_SQL },
+@@ -170,4 +187,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 5, sql: MIGRATION_0005_SQL },
+   { version: 6, sql: MIGRATION_0006_SQL },
+   { version: 7, sql: MIGRATION_0007_SQL },
++  { version: 8, sql: MIGRATION_0008_SQL },
+ ];
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index 865bc37..a6963e1 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -125,7 +125,7 @@ describe("hub database", () => {
+       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
+       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
+       applyMigrations(second.sqlite);
+-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(7);
++      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(8);
+       second.close();
+     } finally {
+       rmSync(dir, { recursive: true, force: true });
+@@ -633,4 +633,26 @@ describe("hub database", () => {
+     expect(moved.packetAppliedAt).toBeNull();
+     hub.close();
+   });
++
++  it("stores project file extracts encrypted and lists by project", () => {
++    const { hub } = openTestDb();
++    const project = hub.repos.createProject("Docs");
++    const file = hub.repos.createProjectFile({
++      projectId: project.id,
++      name: "spec.md",
++      kind: "text",
++      mime: "text/plain",
++      byteSize: 12,
++      tokenEstimate: 3,
++      extract: "Section 3 secret-doc",
++      truncated: false,
++    });
++    expect(file.extract).toBe("Section 3 secret-doc");
++    expect(dumpAllText(hub.sqlite)).not.toContain("secret-doc");
++    expect(hub.repos.listProjectFiles(project.id).map((item) => item.name)).toEqual(["spec.md"]);
++    expect(hub.repos.listProjectFiles(null)).toEqual([]);
++    hub.repos.removeProjectFile(file.id);
++    expect(hub.repos.getProjectFile(file.id)).toBeNull();
++    hub.close();
++  });
+ });
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 8c1270f..ff79ee5 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -17,6 +17,7 @@ import {
+   healthSamples,
+   contextPackets,
+   importJobs,
++  projectFiles,
+   messageReceipts,
+   messages,
+   projects,
+@@ -149,6 +150,20 @@ export interface ContextPacketStored extends ContextPacketRecord {
+   payloadJson: string;
+ }
+ 
++export interface ProjectFileRecord {
++  id: string;
++  projectId: string | null;
++  name: string;
++  kind: string;
++  mime: string;
++  byteSize: number;
++  tokenEstimate: number;
++  extract: string;
++  imageJson: string | null;
++  truncated: boolean;
++  createdAt: string;
++}
++
+ export interface SpendCapOverrideRecord {
+   at: string;
+   scope: string;
+@@ -1776,6 +1791,89 @@ export class HubRepos {
+     return updated;
+   }
+ 
++  createProjectFile(input: {
++    projectId: string | null;
++    name: string;
++    kind: string;
++    mime: string;
++    byteSize: number;
++    tokenEstimate: number;
++    extract: string;
++    imageJson?: string | null;
++    truncated: boolean;
++  }): ProjectFileRecord {
++    if (input.projectId) {
++      const project = this.getProject(input.projectId);
++      if (!project) {
++        throw new Error("Project not found");
++      }
++    }
++    const id = randomUUID();
++    const now = Date.now();
++    this.db
++      .insert(projectFiles)
++      .values({
++        id,
++        projectId: input.projectId,
++        name: input.name.slice(0, 260),
++        kind: input.kind,
++        mime: input.mime,
++        byteSize: input.byteSize,
++        tokenEstimate: input.tokenEstimate,
++        extractCipher: encryptUtf8(input.extract, this.masterKey),
++        imageCipher:
++          input.imageJson !== undefined && input.imageJson !== null
++            ? encryptUtf8(input.imageJson, this.masterKey)
++            : null,
++        truncated: input.truncated ? 1 : 0,
++        createdAt: now,
++      })
++      .run();
++    const created = this.getProjectFile(id);
++    if (!created) {
++      throw new Error("File not found");
++    }
++    return created;
++  }
++
++  getProjectFile(id: string): ProjectFileRecord | null {
++    const row = this.db.select().from(projectFiles).where(eq(projectFiles.id, id)).get();
++    if (!row) {
++      return null;
++    }
++    return this.toProjectFile(row);
++  }
++
++  listProjectFiles(projectId: string | null): ProjectFileRecord[] {
++    const rows =
++      projectId === null
++        ? this.db.select().from(projectFiles).where(isNull(projectFiles.projectId)).all()
++        : this.db.select().from(projectFiles).where(eq(projectFiles.projectId, projectId)).all();
++    return rows
++      .map((row) => this.toProjectFile(row))
++      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
++  }
++
++  removeProjectFile(id: string): void {
++    this.db.delete(projectFiles).where(eq(projectFiles.id, id)).run();
++  }
++
++  private toProjectFile(row: typeof projectFiles.$inferSelect): ProjectFileRecord {
++    return {
++      id: row.id,
++      projectId: row.projectId,
++      name: row.name,
++      kind: row.kind,
++      mime: row.mime,
++      byteSize: row.byteSize,
++      tokenEstimate: row.tokenEstimate,
++      extract: decryptUtf8(row.extractCipher, this.masterKey),
++      imageJson: row.imageCipher ? decryptUtf8(row.imageCipher, this.masterKey) : null,
++      truncated: row.truncated === 1,
++      createdAt: new Date(row.createdAt).toISOString(),
++    };
++  }
++
+   setMessagePinned(id: string, pinned: boolean): MessageRecord {
+     const row = this.db.select().from(messages).where(eq(messages.id, id)).get();
+     if (!row) {
+diff --git a/packages/db/src/schema.ts b/packages/db/src/schema.ts
+index 9e00872..8167d0f 100644
+--- a/packages/db/src/schema.ts
++++ b/packages/db/src/schema.ts
+@@ -128,6 +128,20 @@ export const contextPackets = sqliteTable("context_packets", {
+   version: integer("version", { mode: "number" }).notNull().default(1),
+ });
+ 
++export const projectFiles = sqliteTable("project_files", {
++  id: text("id").primaryKey(),
++  projectId: text("project_id"),
++  name: text("name").notNull(),
++  kind: text("kind").notNull(),
++  mime: text("mime").notNull(),
++  byteSize: integer("byte_size", { mode: "number" }).notNull(),
++  tokenEstimate: integer("token_estimate", { mode: "number" }).notNull(),
++  extractCipher: text("extract_cipher").notNull(),
++  imageCipher: text("image_cipher"),
++  truncated: integer("truncated", { mode: "number" }).notNull().default(0),
++  createdAt: integer("created_at", { mode: "number" }).notNull(),
++});
++
+ export const schema = {
+   projects,
+   conversations,
+@@ -142,4 +156,5 @@ export const schema = {
+   healthSamples,
+   importJobs,
+   contextPackets,
++  projectFiles,
+ };
+diff --git a/packages/files/package.json b/packages/files/package.json
+new file mode 100644
+index 0000000..2763ecb
+--- /dev/null
++++ b/packages/files/package.json
+@@ -0,0 +1,23 @@
++{
++  "name": "@ai-hub/files",
++  "version": "0.0.0",
++  "private": true,
++  "type": "module",
++  "exports": {
++    ".": {
++      "types": "./src/index.ts",
++      "default": "./src/index.ts"
++    }
++  },
++  "scripts": {
++    "typecheck": "tsc --noEmit -p tsconfig.json",
++    "lint": "eslint src --max-warnings 0",
++    "test": "vitest run"
++  },
++  "dependencies": {
++    "mammoth": "^1.9.1"
++  },
++  "devDependencies": {
++    "vitest": "^3.2.4"
++  }
++}
+diff --git a/packages/files/src/extract-pdf.ts b/packages/files/src/extract-pdf.ts
+new file mode 100644
+index 0000000..0907925
+--- /dev/null
++++ b/packages/files/src/extract-pdf.ts
+@@ -0,0 +1,33 @@
++function decodePdfLiteral(raw: string): string {
++  return raw
++    .replace(/\\n/g, "\n")
++    .replace(/\\r/g, "\r")
++    .replace(/\\t/g, "\t")
++    .replace(/\\\(/g, "(")
++    .replace(/\\\)/g, ")")
++    .replace(/\\\\/g, "\\");
++}
++
++export function extractPdfText(bytes: Uint8Array): string {
++  const raw = Buffer.from(bytes).toString("latin1");
++  const chunks: string[] = [];
++  const tj = raw.matchAll(/\(((?:\\.|[^\\)])*)\)\s*Tj/g);
++  for (const match of tj) {
++    const literal = match[1];
++    if (literal) {
++      chunks.push(decodePdfLiteral(literal));
++    }
++  }
++  const arrays = raw.matchAll(/\[(.*?)\]\s*TJ/gs);
++  for (const match of arrays) {
++    const body = match[1] ?? "";
++    const parts = body.matchAll(/\(((?:\\.|[^\\)])*)\)/g);
++    for (const part of parts) {
++      const literal = part[1];
++      if (literal) {
++        chunks.push(decodePdfLiteral(literal));
++      }
++    }
++  }
++  return chunks.join(" ").replace(/\s+/g, " ").trim();
++}
+diff --git a/packages/files/src/extract.test.ts b/packages/files/src/extract.test.ts
+new file mode 100644
+index 0000000..5cf9d3b
+--- /dev/null
++++ b/packages/files/src/extract.test.ts
+@@ -0,0 +1,57 @@
++import { describe, expect, it } from "vitest";
++import { classifyFileName, extractFile } from "./extract";
++import { extractPdfText } from "./extract-pdf";
++
++export function minimalPdf(text: string): Uint8Array {
++  const stream = `BT /F1 12 Tf 72 720 Td (${text}) Tj ET`;
++  const body = `${stream.length}\nstream\n${stream}\nendstream`;
++  const objects = [
++    "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj",
++    "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj",
++    "3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj",
++    `4 0 obj << /Length ${stream.length} >> ${body} endobj`,
++    "5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj",
++  ];
++  const header = "%PDF-1.1\n";
++  const joined = `${header}${objects.join("\n")}\n`;
++  return Buffer.from(joined, "latin1");
++}
++
++describe("extractFile", () => {
++  it("classifies common names", () => {
++    expect(classifyFileName("notes.md")).toBe("text");
++    expect(classifyFileName("data.csv")).toBe("csv");
++    expect(classifyFileName("app.ts")).toBe("code");
++    expect(classifyFileName("shot.png")).toBe("image");
++    expect(classifyFileName("virus.exe")).toBe("unsupported");
++  });
++
++  it("extracts utf8 markdown and redacts nothing by itself", async () => {
++    const result = await extractFile(Buffer.from("# Hello\nworld"), "readme.md");
++    expect(result.kind).toBe("text");
++    expect(result.text).toContain("Hello");
++    expect(result.image).toBeNull();
++  });
++
++  it("extracts PDF literals used in the DoD fixture", async () => {
++    const bytes = minimalPdf("Section 3: payments use PostgreSQL");
++    expect(extractPdfText(bytes)).toContain("Section 3: payments use PostgreSQL");
++    const result = await extractFile(bytes, "spec.pdf");
++    expect(result.kind).toBe("pdf");
++    expect(result.text).toContain("Section 3");
++  });
++
++  it("keeps image bytes as base64 and no text", async () => {
++    const png = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 1]);
++    const result = await extractFile(png, "dot.png");
++    expect(result.kind).toBe("image");
++    expect(result.text).toBe("");
++    expect(result.image?.mime).toBe("image/png");
++    expect(result.image?.data.length).toBeGreaterThan(0);
++  });
++
++  it("rejects empty and unknown types", async () => {
++    await expect(extractFile(new Uint8Array(), "a.md")).rejects.toThrow("files:unsupported");
++    await expect(extractFile(Buffer.from("x"), "a.bin")).rejects.toThrow("files:unsupported");
++  });
++});
+diff --git a/packages/files/src/extract.ts b/packages/files/src/extract.ts
+new file mode 100644
+index 0000000..94d825a
+--- /dev/null
++++ b/packages/files/src/extract.ts
+@@ -0,0 +1,143 @@
++import mammoth from "mammoth";
++import { extractPdfText } from "./extract-pdf";
++import {
++  MAX_EXTRACT_CHARS,
++  MAX_FILE_BYTES,
++  type ExtractResult,
++  type FileKind,
++  type ImageMime,
++} from "./types";
++
++const IMAGE_EXT: Record<string, ImageMime> = {
++  ".png": "image/png",
++  ".jpg": "image/jpeg",
++  ".jpeg": "image/jpeg",
++  ".webp": "image/webp",
++  ".gif": "image/gif",
++};
++
++const CODE_EXT = new Set([
++  ".ts",
++  ".tsx",
++  ".js",
++  ".jsx",
++  ".mjs",
++  ".cjs",
++  ".py",
++  ".rs",
++  ".go",
++  ".java",
++  ".kt",
++  ".swift",
++  ".rb",
++  ".php",
++  ".cs",
++  ".cpp",
++  ".c",
++  ".h",
++  ".hpp",
++  ".json",
++  ".yml",
++  ".yaml",
++  ".toml",
++  ".html",
++  ".css",
++  ".scss",
++  ".sql",
++  ".sh",
++  ".ps1",
++]);
++
++function extensionOf(fileName: string): string {
++  const index = fileName.lastIndexOf(".");
++  return index >= 0 ? fileName.slice(index).toLowerCase() : "";
++}
++
++function clip(text: string): { text: string; truncated: boolean } {
++  if (text.length <= MAX_EXTRACT_CHARS) {
++    return { text, truncated: false };
++  }
++  return { text: text.slice(0, MAX_EXTRACT_CHARS), truncated: true };
++}
++
++function decodeText(bytes: Uint8Array): string {
++  const sample = bytes.subarray(0, Math.min(bytes.length, 800));
++  let zeros = 0;
++  for (const byte of sample) {
++    if (byte === 0) {
++      zeros += 1;
++    }
++  }
++  if (zeros > 8) {
++    throw new Error("files:unsupported");
++  }
++  return Buffer.from(bytes).toString("utf8").replace(/^\uFEFF/, "");
++}
++
++export function classifyFileName(fileName: string): FileKind | "unsupported" {
++  const ext = extensionOf(fileName);
++  if (ext === ".pdf") {
++    return "pdf";
++  }
++  if (ext === ".docx") {
++    return "docx";
++  }
++  if (ext === ".csv") {
++    return "csv";
++  }
++  if (ext === ".txt" || ext === ".md" || ext === ".markdown") {
++    return "text";
++  }
++  if (IMAGE_EXT[ext]) {
++    return "image";
++  }
++  if (CODE_EXT.has(ext)) {
++    return "code";
++  }
++  return "unsupported";
++}
++
++export async function extractFile(bytes: Uint8Array, fileName: string): Promise<ExtractResult> {
++  if (bytes.byteLength === 0) {
++    throw new Error("files:unsupported");
++  }
++  if (bytes.byteLength > MAX_FILE_BYTES) {
++    throw new Error("files:too_large");
++  }
++  const kind = classifyFileName(fileName);
++  if (kind === "unsupported") {
++    throw new Error("files:unsupported");
++  }
++  if (kind === "image") {
++    const ext = extensionOf(fileName);
++    const mime = IMAGE_EXT[ext];
++    if (!mime) {
++      throw new Error("files:unsupported");
++    }
++    return {
++      kind,
++      text: "",
++      truncated: false,
++      mime,
++      image: { mime, data: Buffer.from(bytes).toString("base64") },
++    };
++  }
++  if (kind === "pdf") {
++    const clipped = clip(extractPdfText(bytes));
++    return { kind, text: clipped.text, truncated: clipped.truncated, mime: "application/pdf", image: null };
++  }
++  if (kind === "docx") {
++    const result = await mammoth.extractRawText({ buffer: Buffer.from(bytes) });
++    const clipped = clip(result.value.trim());
++    return {
++      kind,
++      text: clipped.text,
++      truncated: clipped.truncated,
++      mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
++      image: null,
++    };
++  }
++  const clipped = clip(decodeText(bytes));
++  const mime = kind === "csv" ? "text/csv" : "text/plain";
++  return { kind, text: clipped.text, truncated: clipped.truncated, mime, image: null };
++}
+diff --git a/packages/files/src/folder-summary.test.ts b/packages/files/src/folder-summary.test.ts
+new file mode 100644
+index 0000000..25ba8bc
+--- /dev/null
++++ b/packages/files/src/folder-summary.test.ts
+@@ -0,0 +1,29 @@
++import { describe, expect, it } from "vitest";
++import { summarizeFolder } from "./folder-summary";
++
++describe("summarizeFolder", () => {
++  it("detects a Node stack from package.json and README", () => {
++    const summary = summarizeFolder({
++      rootName: "demo",
++      files: [
++        {
++          relativePath: "package.json",
++          content: JSON.stringify({
++            name: "demo-app",
++            packageManager: "pnpm@10.0.0",
++            dependencies: { react: "19.0.0" },
++          }),
++        },
++        { relativePath: "README.md", content: "Hello Node workspace" },
++        { relativePath: "src/index.ts", content: "export {}" },
++        { relativePath: "pnpm-lock.yaml", content: "lockfileVersion: 9" },
++      ],
++    });
++    expect(summary.stack).toBe("Node.js");
++    expect(summary.text).toContain("Stack: Node.js");
++    expect(summary.text).toContain("Package manager: pnpm");
++    expect(summary.text).toContain("react");
++    expect(summary.text).toContain("Hello Node workspace");
++    expect(summary.text).toContain("src");
++  });
++});
+diff --git a/packages/files/src/folder-summary.ts b/packages/files/src/folder-summary.ts
+new file mode 100644
+index 0000000..8285e79
+--- /dev/null
++++ b/packages/files/src/folder-summary.ts
+@@ -0,0 +1,93 @@
++import type { FolderFileInput, FolderSummary } from "./types";
++
++function hasFile(files: FolderFileInput[], name: string): boolean {
++  const needle = name.toLowerCase();
++  return files.some((item) => item.relativePath.replace(/\\/g, "/").toLowerCase().endsWith(needle));
++}
++
++function readFile(files: FolderFileInput[], name: string): string {
++  const needle = name.toLowerCase();
++  const match = files.find((item) => item.relativePath.replace(/\\/g, "/").toLowerCase().endsWith(needle));
++  return match?.content?.trim() ?? "";
++}
++
++function detectStack(files: FolderFileInput[]): string {
++  if (hasFile(files, "package.json")) {
++    return "Node.js";
++  }
++  if (hasFile(files, "pyproject.toml") || hasFile(files, "requirements.txt")) {
++    return "Python";
++  }
++  if (hasFile(files, "cargo.toml")) {
++    return "Rust";
++  }
++  if (hasFile(files, "go.mod")) {
++    return "Go";
++  }
++  return "unknown";
++}
++
++function parsePackageJson(raw: string): { name: string; deps: string[]; managerHint: string } {
++  try {
++    const parsed = JSON.parse(raw) as {
++      name?: unknown;
++      dependencies?: unknown;
++      devDependencies?: unknown;
++      packageManager?: unknown;
++    };
++    const name = typeof parsed.name === "string" ? parsed.name : "";
++    const deps = [
++      ...Object.keys(parsed.dependencies && typeof parsed.dependencies === "object" ? parsed.dependencies : {}),
++      ...Object.keys(
++        parsed.devDependencies && typeof parsed.devDependencies === "object" ? parsed.devDependencies : {},
++      ),
++    ].slice(0, 24);
++    const managerHint =
++      typeof parsed.packageManager === "string"
++        ? parsed.packageManager.split("@")[0] ?? parsed.packageManager
++        : "";
++    return { name, deps, managerHint };
++  } catch {
++    return { name: "", deps: [], managerHint: "" };
++  }
++}
++
++function architecture(files: FolderFileInput[]): string {
++  const tops = new Set<string>();
++  for (const item of files) {
++    const normalized = item.relativePath.replace(/\\/g, "/");
++    const first = normalized.split("/")[0];
++    if (first && first !== ".") {
++      tops.add(first);
++    }
++  }
++  return [...tops].sort().slice(0, 16).join(", ");
++}
++
++export function summarizeFolder(input: {
++  rootName: string;
++  files: FolderFileInput[];
++}): FolderSummary {
++  const stack = detectStack(input.files);
++  const pkg = parsePackageJson(readFile(input.files, "package.json"));
++  const readme = readFile(input.files, "readme.md") || readFile(input.files, "readme");
++  const manager =
++    pkg.managerHint ||
++    (hasFile(input.files, "pnpm-lock.yaml")
++      ? "pnpm"
++      : hasFile(input.files, "yarn.lock")
++        ? "yarn"
++        : hasFile(input.files, "package-lock.json")
++          ? "npm"
++          : "");
++  const lines = [
++    "Project summary v1",
++    `Name: ${pkg.name || input.rootName}`,
++    `Stack: ${stack}`,
++    manager ? `Package manager: ${manager}` : null,
++    pkg.deps.length > 0 ? `Dependencies: ${pkg.deps.join(", ")}` : null,
++    `Architecture: ${architecture(input.files) || "(flat)"}`,
++    readme ? `README:\n${readme.slice(0, 4_000)}` : "README: (none)",
++  ].filter((line): line is string => line !== null);
++  return { text: lines.join("\n"), stack };
++}
+diff --git a/packages/files/src/index.ts b/packages/files/src/index.ts
+new file mode 100644
+index 0000000..bb11c27
+--- /dev/null
++++ b/packages/files/src/index.ts
+@@ -0,0 +1,17 @@
++export {
++  FILE_KINDS,
++  IMAGE_MIMES,
++  MAX_EXTRACT_CHARS,
++  MAX_FILE_BYTES,
++  MAX_FILES_PER_SEND,
++  MAX_FOLDER_DEPTH,
++  MAX_FOLDER_FILES,
++  type ExtractResult,
++  type FileKind,
++  type FolderFileInput,
++  type FolderSummary,
++  type ImageMime,
++} from "./types";
++export { classifyFileName, extractFile } from "./extract";
++export { extractPdfText } from "./extract-pdf";
++export { summarizeFolder } from "./folder-summary";
+diff --git a/packages/files/src/types.ts b/packages/files/src/types.ts
+new file mode 100644
+index 0000000..34ec5e8
+--- /dev/null
++++ b/packages/files/src/types.ts
+@@ -0,0 +1,44 @@
++export const MAX_FILE_BYTES = 8 * 1024 * 1024;
++export const MAX_EXTRACT_CHARS = 80_000;
++export const MAX_FILES_PER_SEND = 8;
++export const MAX_FOLDER_FILES = 40;
++export const MAX_FOLDER_DEPTH = 4;
++
++export const FILE_KINDS = [
++  "pdf",
++  "docx",
++  "text",
++  "code",
++  "csv",
++  "image",
++  "folder-summary",
++] as const;
++
++export type FileKind = (typeof FILE_KINDS)[number];
++
++export const IMAGE_MIMES = ["image/png", "image/jpeg", "image/webp", "image/gif"] as const;
++
++export type ImageMime = (typeof IMAGE_MIMES)[number];
++
++export interface ExtractResult {
++  kind: FileKind;
++  text: string;
++  truncated: boolean;
++  mime: string;
++  image:
++    | {
++        mime: ImageMime;
++        data: string;
++      }
++    | null;
++}
++
++export interface FolderFileInput {
++  relativePath: string;
++  content?: string;
++}
++
++export interface FolderSummary {
++  text: string;
++  stack: string;
++}
+diff --git a/packages/files/tsconfig.json b/packages/files/tsconfig.json
+new file mode 100644
+index 0000000..60e3669
+--- /dev/null
++++ b/packages/files/tsconfig.json
+@@ -0,0 +1,9 @@
++{
++  "extends": "../../tsconfig.base.json",
++  "compilerOptions": {
++    "noEmit": true,
++    "types": ["node"]
++  },
++  "include": ["src"],
++  "exclude": ["src/**/*.test.ts"]
++}
+diff --git a/packages/shared/src/gateway.test.ts b/packages/shared/src/gateway.test.ts
+index ab9e92e..81d8877 100644
+--- a/packages/shared/src/gateway.test.ts
++++ b/packages/shared/src/gateway.test.ts
+@@ -69,6 +69,21 @@ describe("chat contracts", () => {
+     ).toThrow();
+   });
+ 
++  it("accepts fileIds on send without extra keys", () => {
++    const parsed = chatSendInputSchema.parse({
++      mode: "send",
++      conversationId: "11111111-1111-4111-8111-111111111111",
++      providerKeyId: "22222222-2222-4222-8222-222222222222",
++      model: "gpt-4o-mini",
++      content: "resuma a se├º├úo 3",
++      fileIds: ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"],
++    });
++    expect(parsed.mode).toBe("send");
++    if (parsed.mode === "send") {
++      expect(parsed.fileIds).toEqual(["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]);
++    }
++  });
++
+   it("accepts a continue send without content", () => {
+     const parsed = chatSendInputSchema.parse({
+       mode: "continue",
+diff --git a/packages/shared/src/gateway.ts b/packages/shared/src/gateway.ts
+index 2ed568c..0560b91 100644
+--- a/packages/shared/src/gateway.ts
++++ b/packages/shared/src/gateway.ts
+@@ -68,6 +68,7 @@ const chatSendBaseSchema = z.object({
+   compactHistory: z.boolean().optional(),
+   allowOnce: z.boolean().optional(),
+   privacyMode: z.enum(["standard", "strict"]).optional(),
++  fileIds: z.array(z.string().uuid()).max(8).optional(),
+ });
+ 
+ export const chatSendInputSchema = z.discriminatedUnion("mode", [
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index 713d63d..c91aba1 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -50,6 +50,10 @@ import type {
+   PacketsImportInput,
+   PacketsListInput,
+   MessagePinInput,
++  ProjectFileDto,
++  ProjectFileListInput,
++  FilesAttachInput,
++  FilesIngestPathsInput,
+   ProviderKeyDto,
+   SecretsSaveInput,
+   SecretsTestInput,
+@@ -155,6 +159,14 @@ export interface HubPacketsApi {
+   clear: (input: PacketsClearInput) => Promise<ConversationDto>;
+ }
+ 
++export interface HubFilesApi {
++  list: (input: ProjectFileListInput) => Promise<ProjectFileDto[]>;
++  attach: (input: FilesAttachInput) => Promise<ProjectFileDto[]>;
++  ingestDropped: (input: FilesIngestPathsInput) => Promise<ProjectFileDto[]>;
++  fromDrop: (input: { projectId: string | null; files: unknown }) => Promise<ProjectFileDto[]>;
++  remove: (input: IdInput) => Promise<void>;
++}
++
+ export interface HubChatApi {
+   send: (input: ChatSendInput) => Promise<ChatSendResult>;
+   abort: (input: ChatAbortInput) => Promise<void>;
+@@ -181,6 +193,7 @@ export interface HubApi {
+   chat: HubChatApi;
+   import: HubImportApi;
+   packets: HubPacketsApi;
++  files: HubFilesApi;
+ }
+ 
+ export type { AppLocale, ThemeMode };
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index c0ab0f1..47eb992 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -86,6 +86,12 @@ export {
+   messageUpdateInputSchema,
+   packetPreviewInputSchema,
+   packetPreviewResultSchema,
++  projectFileDtoSchema,
++  projectFileKindSchema,
++  projectFileListInputSchema,
++  projectFileListResultSchema,
++  filesAttachInputSchema,
++  filesIngestPathsInputSchema,
+   projectCreateInputSchema,
+   projectDtoSchema,
+   projectListResultSchema,
+@@ -193,6 +199,11 @@ export {
+   type PacketsApplyInput,
+   type PacketsClearInput,
+   type MessagePinInput,
++  type ProjectFileDto,
++  type ProjectFileKind,
++  type ProjectFileListInput,
++  type FilesAttachInput,
++  type FilesIngestPathsInput,
+   type ProviderKeyDto,
+   type SecretsSaveInput,
+   type SecretsTestInput,
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index 4a4f0fb..52be70a 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -53,6 +53,10 @@ export const IpcChannel = {
+   packetsImport: "packets:import",
+   packetsApply: "packets:apply",
+   packetsClear: "packets:clear",
++  filesList: "files:list",
++  filesAttach: "files:attach",
++  filesIngestPaths: "files:ingestPaths",
++  filesRemove: "files:remove",
+ } as const;
+ 
+ export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index 25c58ed..6c7b9a3 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -180,6 +180,7 @@ export const packetPreviewInputSchema = z
+     pendingContent: z.string().max(100_000).optional(),
+     maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
+     privacyMode: packetPrivacyModeSchema.optional(),
++    fileIds: z.array(z.string().uuid()).max(8).optional(),
+   })
+   .strict();
+ 
+@@ -745,3 +746,73 @@ export const messagePinInputSchema = z
+ 
+ export type MessagePinInput = z.infer<typeof messagePinInputSchema>;
+ 
++export const projectFileKindSchema = z.enum([
++  "pdf",
++  "docx",
++  "text",
++  "code",
++  "csv",
++  "image",
++  "folder-summary",
++]);
++
++export type ProjectFileKind = z.infer<typeof projectFileKindSchema>;
++
++export const projectFileDtoSchema = z
++  .object({
++    id: z.string().uuid(),
++    projectId: z.string().uuid().nullable(),
++    name: z.string().min(1).max(260),
++    kind: projectFileKindSchema,
++    mime: z.string().min(1).max(128),
++    byteSize: z.number().int().nonnegative(),
++    tokenEstimate: z.number().int().nonnegative(),
++    excerpt: z.string().max(400),
++    truncated: z.boolean(),
++    visionRequired: z.boolean(),
++    createdAt: isoTimestampSchema,
++  })
++  .strict();
++
++export type ProjectFileDto = z.infer<typeof projectFileDtoSchema>;
++
++export const projectFileListInputSchema = z
++  .object({
++    projectId: z.string().uuid().nullable(),
++  })
++  .strict();
++
++export type ProjectFileListInput = z.infer<typeof projectFileListInputSchema>;
++
++export const projectFileListResultSchema = z.array(projectFileDtoSchema).max(100);
++
++export const filesIngestPathsInputSchema = z
++  .object({
++    projectId: z.string().uuid().nullable(),
++    items: z
++      .array(
++        z
++          .object({
++            path: z.string().min(1).max(1024),
++            name: z.string().min(1).max(260),
++          })
++          .strict(),
++      )
++      .min(1)
++      .max(8),
++  })
++  .strict();
++
++export type FilesIngestPathsInput = z.infer<typeof filesIngestPathsInputSchema>;
++
++export const filesAttachKindSchema = z.enum(["file", "folder"]);
++
++export const filesAttachInputSchema = z
++  .object({
++    projectId: z.string().uuid().nullable(),
++    kind: filesAttachKindSchema,
++  })
++  .strict();
++
++export type FilesAttachInput = z.infer<typeof filesAttachInputSchema>;
++
+diff --git a/packages/shared/src/portable-packet.ts b/packages/shared/src/portable-packet.ts
+index 1a9f2cb..7c39f15 100644
+--- a/packages/shared/src/portable-packet.ts
++++ b/packages/shared/src/portable-packet.ts
+@@ -12,6 +12,7 @@ export const packetSliceKindSchema = z.enum([
+   "message",
+   "old-message",
+   "privacy",
++  "file",
+ ]);
+ 
+ export type PacketSliceKind = z.infer<typeof packetSliceKindSchema>;
