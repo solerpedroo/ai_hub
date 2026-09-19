@@ -16,7 +16,7 @@ export interface CompilerFile {
 }
 
 export interface CompilerMention {
-  kind: "conversation" | "packet";
+  kind: "conversation" | "packet" | "memory" | "rag";
   id: string;
   name: string;
   text: string;
@@ -247,9 +247,20 @@ export function appendFilesToPacket(
 }
 
 function mentionHeading(mention: CompilerMention): string {
-  return mention.kind === "conversation"
-    ? `Mentioned conversation: ${mention.name}`
-    : `Mentioned packet: ${mention.name}`;
+  switch (mention.kind) {
+    case "conversation":
+      return `Mentioned conversation: ${mention.name}`;
+    case "packet":
+      return `Mentioned packet: ${mention.name}`;
+    case "memory":
+      return `Project memory: ${mention.name}`;
+    case "rag":
+      return `Retrieved chunk: ${mention.name}`;
+    default: {
+      const _never: never = mention.kind;
+      return String(_never);
+    }
+  }
 }
 
 export function appendMentionsToPacket(
