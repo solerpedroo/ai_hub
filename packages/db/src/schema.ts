@@ -21,6 +21,7 @@ export const conversations = sqliteTable("conversations", {
   externalId: text("external_id"),
   activePacketId: text("active_packet_id"),
   packetAppliedAt: integer("packet_applied_at", { mode: "number" }),
+  kind: text("kind").notNull().default("chat"),
 });
 
 export const messages = sqliteTable("messages", {
@@ -178,6 +179,16 @@ export const conversationTasks = sqliteTable("conversation_tasks", {
   createdAt: integer("created_at", { mode: "number" }).notNull(),
 });
 
+export const prompts = sqliteTable("prompts", {
+  id: text("id").primaryKey(),
+  folder: text("folder").notNull(),
+  titleCipher: text("title_cipher").notNull(),
+  bodyCipher: text("body_cipher").notNull(),
+  factoryId: text("factory_id"),
+  createdAt: integer("created_at", { mode: "number" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "number" }).notNull(),
+});
+
 export const schema = {
   projects,
   conversations,
@@ -197,4 +208,5 @@ export const schema = {
   fileChunks,
   conversationWorkspace,
   conversationTasks,
+  prompts,
 };
