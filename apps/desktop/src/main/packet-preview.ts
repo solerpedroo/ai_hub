@@ -1,4 +1,4 @@
-import { compileActivePathDetailed, mergePacketWithTail } from "@ai-hub/ai-gateway";
+import { appendFilesToPacket, compileActivePathDetailed, mergePacketWithTail } from "@ai-hub/ai-gateway";
 import { randomUUID } from "node:crypto";
 import {
   findCatalogModel,
@@ -7,6 +7,7 @@ import {
   type PacketPreviewInput,
   type PacketPreviewResult,
 } from "@ai-hub/shared";
+import { loadSendAttachments } from "./files";
 import { getHubDatabase } from "./persistence";
 import { estimateOutgoingCostUsd, evaluateOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
 
@@ -116,6 +117,26 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
     excludedCount = detailed.packet.excluded.length;
     included = detailed.included;
     omitted = detailed.omitted;
+  }
+  const attachments = loadSendAttachments(
+    input.fileIds,
+    conversation.projectId,
+    catalog?.vision === true,
+    "preview",
+  );
+  if (attachments.files.length > 0) {
+    const withFiles = appendFilesToPacket(
+      {
+        version: 1,
+        system: "",
+        messages: [],
+        tokenEstimate: 0,
+        excluded: [],
+      },
+      attachments.files,
+    );
+    tokenEstimate += withFiles.packet.tokenEstimate;
+    included = [...included, ...withFiles.included].slice(0, 200);
   }
 
   const estimatedCostUsd = estimateOutgoingCostUsd(
