@@ -159,6 +159,33 @@ describe("compilePacket", () => {
     expect(withPrompt.included[0]?.label).not.toContain("senior");
   });
 
+  it("appends an applied skill slice without leaking the body into the label", () => {
+    const compiled = compilePacket({
+      projectInstructions: null,
+      extraSystem: null,
+      messages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          role: "user",
+          content: "review this",
+          status: "complete",
+        },
+      ],
+    });
+    const withSkill = appendMentionsToPacket(compiled, [
+      {
+        kind: "skill",
+        id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        name: "Code Review",
+        text: "You are a senior code reviewer for E2E.\n## Step 1: Summary\nSummarize.",
+      },
+    ]);
+    expect(withSkill.packet.system).toContain("Applied skill: Code Review");
+    expect(withSkill.included[0]?.kind).toBe("skill");
+    expect(withSkill.included[0]?.label).toBe("Applied skill: Code Review");
+    expect(withSkill.included[0]?.label).not.toContain("senior");
+  });
+
   it("never puts an apiKey field on the packet", () => {
     const packet = compilePacket({
       projectInstructions: null,
