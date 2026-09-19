@@ -36,6 +36,7 @@ import { SettingsView } from "@/components/layout/settings-view";
 import { DebugView } from "@/components/layout/debug-view";
 import { ImportView } from "@/components/layout/import-view";
 import { PromptsView } from "@/components/layout/prompts-view";
+import { SkillsView } from "@/components/layout/skills-view";
 import { OnboardingView } from "@/components/layout/onboarding-view";
 import {
   ChromeCommandPalette,
@@ -167,6 +168,7 @@ export function App(): JSX.Element {
   const [showAllowOnce, setShowAllowOnce] = useState(false);
   const [composerDraft, setComposerDraft] = useState("");
   const [composerInsert, setComposerInsert] = useState<string | null>(null);
+  const [pendingSkill, setPendingSkill] = useState<{ id?: string; query: string } | null>(null);
   const [attachedFiles, setAttachedFiles] = useState<ProjectFileDto[]>([]);
   const [mentionRefs, setMentionRefs] = useState<MentionRef[]>([]);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -401,7 +403,7 @@ export function App(): JSX.Element {
   ]);
 
   useEffect(() => {
-    if (view !== "home" && view !== "prompts") {
+    if (view !== "home" && view !== "prompts" && view !== "skills") {
       return;
     }
     void loadKeys()
@@ -813,6 +815,11 @@ export function App(): JSX.Element {
         window.setTimeout(() => projectInputRef.current?.focus(), 0);
         return;
       }
+      if (event.shiftKey && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        navigateToView("skills");
+        return;
+      }
       if (event.key.toLowerCase() === "n") {
         event.preventDefault();
         void createUntitledChat();
@@ -820,7 +827,7 @@ export function App(): JSX.Element {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [createUntitledChat]);
+  }, [createUntitledChat, navigateToView]);
 
   if (showOnboarding === null) {
     return (
@@ -947,23 +954,59 @@ export function App(): JSX.Element {
               onSelectTemperature={setTemperature}
               onSelectMaxTokens={setMaxTokens}
               onSelectExtraSystem={setExtraSystem}
-              onSend={(content, mentions) => {
+              onSend={async (content, mentions) => {
                 if (!selectedConversationId || !selectedKeyId) {
-                  return Promise.resolve(false);
+                  return false;
                 }
-                setMentionRefs(mentions);
+                let nextMentions = mentions;
+                let model = selectedModel;
+                let providerKeyId = selectedKeyId;
+                const skillRef = mentions.find((item) => item.type === "skill");
+                if (skillRef) {
+                  try {
+                    const resolved = await window.hub.skills.resolve({
+                      projectId: selectedProjectId,
+                      privacyMode,
+                      ...(skillRef.id !== undefined ? { skillId: skillRef.id } : {}),
+                      ...(skillRef.query !== undefined ? { query: skillRef.query } : {}),
+                    });
+                    nextMentions = [
+                      ...resolved.defaultMentions.map((item) => ({
+                        type: item.type,
+                        query: item.query,
+                      })),
+                      ...mentions,
+                    ].slice(0, 8);
+                    if (resolved.preferredModel) {
+                      const sessionKey = providerKeys.find((key) => key.id === selectedKeyId);
+                      if (
+                        sessionKey &&
+                        catalogModelsForProvider(sessionKey.providerSlug).some(
+                          (item) => item.id === resolved.preferredModel,
+                        )
+                      ) {
+                        model = resolved.preferredModel;
+                        setSelectedModel(model);
+                      }
+                    }
+                  } catch {
+                    fail();
+                    return false;
+                  }
+                }
+                setMentionRefs(nextMentions);
                 return sendToModel({
                   mode: "send",
                   conversationId: selectedConversationId,
-                  providerKeyId: selectedKeyId,
-                  model: selectedModel,
+                  providerKeyId,
+                  model,
                   content,
                   temperature,
                   maxTokens,
                   extraSystem,
                   compactHistory,
                   ...fileIdsPayload(attachedFiles),
-                  ...mentionsPayload(mentions),
+                  ...mentionsPayload(nextMentions),
                 });
               }}
               onMentionsChange={setMentionRefs}
@@ -1194,6 +1237,9 @@ export function App(): JSX.Element {
               onComposerDraft={reportComposerDraft}
               composerInsert={composerInsert}
               onComposerInsertConsumed={() => setComposerInsert(null)}
+              pendingSkill={pendingSkill}
+              onPendingSkillConsumed={() => setPendingSkill(null)}
+              onOpenSkills={() => navigateToView("skills")}
               onPin={async (id, pinned) => {
                 try {
                   const updated = await window.hub.messages.pin({ id, pinned });
@@ -1366,6 +1412,13 @@ export function App(): JSX.Element {
                 setView("home");
               }}
             />
+          ) : view === "skills" ? (
+            <SkillsView
+              onRunSkill={(input) => {
+                setPendingSkill(input);
+                setView("home");
+              }}
+            />
           ) : view === "import" ? (
             <ImportView
               projects={projects}
@@ -1502,6 +1555,11 @@ export function App(): JSX.Element {
         onDebug={() => navigateToView("debug")}
         onImport={() => navigateToView("import")}
         onPrompts={() => navigateToView("prompts")}
+        onSkills={() => navigateToView("skills")}
+        onRunSkill={(query) => {
+          setPendingSkill({ query });
+          navigateToView("home");
+        }}
         onShortcuts={() => setShortcutsOpen(true)}
       />
     </div>
