@@ -14,10 +14,14 @@ import {
 import {
   conversations,
   conversationTags,
+  conversationTasks,
+  conversationWorkspace,
   healthSamples,
   contextPackets,
+  fileChunks,
   importJobs,
   projectFiles,
+  projectMemories,
   messageReceipts,
   messages,
   projects,
@@ -164,6 +168,42 @@ export interface ProjectFileRecord {
   createdAt: string;
 }
 
+export interface ProjectMemoryRecord {
+  id: string;
+  projectId: string;
+  title: string;
+  body: string;
+  source: "manual" | "suggested";
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface FileChunkRecord {
+  id: string;
+  fileId: string;
+  projectId: string | null;
+  fileName: string;
+  chunkIndex: number;
+  text: string;
+  embedding: number[];
+  tokenEstimate: number;
+}
+
+export interface ConversationWorkspaceRecord {
+  conversationId: string;
+  summary: string;
+  decisions: string[];
+  updatedAt: string;
+}
+
+export interface ConversationTaskRecord {
+  id: string;
+  conversationId: string;
+  title: string;
+  done: boolean;
+  createdAt: string;
+}
+
 export interface SpendCapOverrideRecord {
   at: string;
   scope: string;
@@ -225,6 +265,7 @@ const SESSION_KEY = "workspace-session";
 const BRANCH_LABELS_PREFIX = "branch-labels:";
 const CUSTOM_BASE_URL_PREFIX = "custom-base-url:";
 const SPEND_CAP_OVERRIDES_KEY = "spend-cap-overrides";
+const MEMORY_OPT_OUT_PREFIX = "memory-opt-out:";
 const DEFAULT_SESSION: WorkspaceSessionRecord = {
   projectId: null,
   conversationId: null,
@@ -1885,6 +1926,350 @@ export class HubRepos {
       throw new Error("Message not found");
     }
     return updated;
+  }
+
+  createProjectMemory(input: {
+    projectId: string;
+    title: string;
+    body: string;
+    source: "manual" | "suggested";
+  }): ProjectMemoryRecord {
+    if (!this.getProject(input.projectId)) {
+      throw new Error("Project not found");
+    }
+    const id = randomUUID();
+    const now = Date.now();
+    this.db
+      .insert(projectMemories)
+      .values({
+        id,
+        projectId: input.projectId,
+        titleCipher: encryptUtf8(input.title.slice(0, 120), this.masterKey),
+        bodyCipher: encryptUtf8(input.body.slice(0, 4_000), this.masterKey),
+        source: input.source,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+    const created = this.getProjectMemory(id);
+    if (!created) {
+      throw new Error("Memory not found");
+    }
+    return created;
+  }
+
+  getProjectMemory(id: string): ProjectMemoryRecord | null {
+    const row = this.db.select().from(projectMemories).where(eq(projectMemories.id, id)).get();
+    return row ? this.toProjectMemory(row) : null;
+  }
+
+  listProjectMemories(projectId: string): ProjectMemoryRecord[] {
+    return this.db
+      .select()
+      .from(projectMemories)
+      .where(eq(projectMemories.projectId, projectId))
+      .all()
+      .map((row) => this.toProjectMemory(row))
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  updateProjectMemory(id: string, patch: { title?: string; body?: string }): ProjectMemoryRecord {
+    const existing = this.getProjectMemory(id);
+    if (!existing) {
+      throw new Error("Memory not found");
+    }
+    this.db
+      .update(projectMemories)
+      .set({
+        titleCipher: encryptUtf8((patch.title ?? existing.title).slice(0, 120), this.masterKey),
+        bodyCipher: encryptUtf8((patch.body ?? existing.body).slice(0, 4_000), this.masterKey),
+        updatedAt: Date.now(),
+      })
+      .where(eq(projectMemories.id, id))
+      .run();
+    const updated = this.getProjectMemory(id);
+    if (!updated) {
+      throw new Error("Memory not found");
+    }
+    return updated;
+  }
+
+  removeProjectMemory(id: string): void {
+    this.db.delete(projectMemories).where(eq(projectMemories.id, id)).run();
+  }
+
+  getMemoryOptOut(projectId: string): boolean {
+    const row = this.db
+      .select()
+      .from(settings)
+      .where(eq(settings.key, `${MEMORY_OPT_OUT_PREFIX}${projectId}`))
+      .get();
+    return row?.value === "1";
+  }
+
+  setMemoryOptOut(projectId: string, optedOut: boolean): void {
+    const key = `${MEMORY_OPT_OUT_PREFIX}${projectId}`;
+    const now = Date.now();
+    if (!optedOut) {
+      this.db.delete(settings).where(eq(settings.key, key)).run();
+      return;
+    }
+    this.db
+      .insert(settings)
+      .values({ key, value: "1", updatedAt: now })
+      .onConflictDoUpdate({
+        target: settings.key,
+        set: { value: "1", updatedAt: now },
+      })
+      .run();
+  }
+
+  replaceFileChunks(
+    fileId: string,
+    projectId: string | null,
+    chunks: { text: string; embedding: number[]; tokenEstimate: number }[],
+  ): void {
+    this.db.delete(fileChunks).where(eq(fileChunks.fileId, fileId)).run();
+    const now = Date.now();
+    chunks.forEach((chunk, index) => {
+      this.db
+        .insert(fileChunks)
+        .values({
+          id: randomUUID(),
+          fileId,
+          projectId,
+          chunkIndex: index,
+          textCipher: encryptUtf8(chunk.text, this.masterKey),
+          embeddingCipher: encryptUtf8(JSON.stringify(chunk.embedding), this.masterKey),
+          tokenEstimate: chunk.tokenEstimate,
+          createdAt: now,
+        })
+        .run();
+    });
+  }
+
+  listFileChunks(projectId: string): FileChunkRecord[] {
+    const rows = this.db.select().from(fileChunks).where(eq(fileChunks.projectId, projectId)).all();
+    return rows.map((row) => this.toFileChunk(row));
+  }
+
+  upsertConversationWorkspace(
+    conversationId: string,
+    summary: string,
+    decisions: string[],
+  ): ConversationWorkspaceRecord {
+    if (!this.getConversation(conversationId)) {
+      throw new Error("Conversation not found");
+    }
+    const now = Date.now();
+    this.db
+      .insert(conversationWorkspace)
+      .values({
+        conversationId,
+        summaryCipher: encryptUtf8(summary.slice(0, 4_000), this.masterKey),
+        decisionsCipher: encryptUtf8(JSON.stringify(decisions.slice(0, 20)), this.masterKey),
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: conversationWorkspace.conversationId,
+        set: {
+          summaryCipher: encryptUtf8(summary.slice(0, 4_000), this.masterKey),
+          decisionsCipher: encryptUtf8(JSON.stringify(decisions.slice(0, 20)), this.masterKey),
+          updatedAt: now,
+        },
+      })
+      .run();
+    const stored = this.getConversationWorkspace(conversationId);
+    if (!stored) {
+      throw new Error("Workspace not found");
+    }
+    return stored;
+  }
+
+  getConversationWorkspace(conversationId: string): ConversationWorkspaceRecord | null {
+    const row = this.db
+      .select()
+      .from(conversationWorkspace)
+      .where(eq(conversationWorkspace.conversationId, conversationId))
+      .get();
+    if (!row) {
+      return null;
+    }
+    let decisions: string[] = [];
+    try {
+      const parsed: unknown = JSON.parse(decryptUtf8(row.decisionsCipher, this.masterKey));
+      if (Array.isArray(parsed)) {
+        decisions = parsed.filter((item): item is string => typeof item === "string");
+      }
+    } catch {
+      decisions = [];
+    }
+    return {
+      conversationId: row.conversationId,
+      summary: decryptUtf8(row.summaryCipher, this.masterKey),
+      decisions,
+      updatedAt: iso(row.updatedAt),
+    };
+  }
+
+  listConversationTasks(conversationId: string): ConversationTaskRecord[] {
+    return this.db
+      .select()
+      .from(conversationTasks)
+      .where(eq(conversationTasks.conversationId, conversationId))
+      .all()
+      .map((row) => this.toConversationTask(row))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  createConversationTask(conversationId: string, title: string): ConversationTaskRecord {
+    if (!this.getConversation(conversationId)) {
+      throw new Error("Conversation not found");
+    }
+    const id = randomUUID();
+    const now = Date.now();
+    this.db
+      .insert(conversationTasks)
+      .values({
+        id,
+        conversationId,
+        titleCipher: encryptUtf8(title.slice(0, 240), this.masterKey),
+        done: 0,
+        createdAt: now,
+      })
+      .run();
+    return {
+      id,
+      conversationId,
+      title: title.slice(0, 240),
+      done: false,
+      createdAt: iso(now),
+    };
+  }
+
+  setConversationTaskDone(id: string, done: boolean): ConversationTaskRecord {
+    const row = this.db.select().from(conversationTasks).where(eq(conversationTasks.id, id)).get();
+    if (!row) {
+      throw new Error("Task not found");
+    }
+    this.db.update(conversationTasks).set({ done: done ? 1 : 0 }).where(eq(conversationTasks.id, id)).run();
+    const updated = this.db.select().from(conversationTasks).where(eq(conversationTasks.id, id)).get();
+    if (!updated) {
+      throw new Error("Task not found");
+    }
+    return this.toConversationTask(updated);
+  }
+
+  removeConversationTask(id: string): void {
+    this.db.delete(conversationTasks).where(eq(conversationTasks.id, id)).run();
+  }
+
+  duplicateConversation(id: string): ConversationRecord {
+    const source = this.getConversation(id);
+    if (!source) {
+      throw new Error("Conversation not found");
+    }
+    const copy = this.createConversation(source.projectId, `Copy of ${source.title}`);
+    const rows = this.db.select().from(messages).where(eq(messages.conversationId, id)).all();
+    const idMap = new Map<string, string>();
+    const branchMap = new Map<string, string>();
+    for (const row of rows) {
+      idMap.set(row.id, randomUUID());
+      if (!branchMap.has(row.branchId)) {
+        branchMap.set(row.branchId, randomUUID());
+      }
+    }
+    for (const row of rows) {
+      const nextId = idMap.get(row.id);
+      const nextBranch = branchMap.get(row.branchId);
+      if (!nextId || !nextBranch) {
+        continue;
+      }
+      this.db
+        .insert(messages)
+        .values({
+          id: nextId,
+          conversationId: copy.id,
+          parentId: row.parentId ? (idMap.get(row.parentId) ?? null) : null,
+          branchId: nextBranch,
+          isActiveBranch: row.isActiveBranch,
+          role: row.role,
+          contentCipher: encryptUtf8(decryptUtf8(row.contentCipher, this.masterKey), this.masterKey),
+          status: row.status,
+          createdAt: row.createdAt,
+          pinned: row.pinned,
+        })
+        .run();
+    }
+    const workspace = this.getConversationWorkspace(id);
+    if (workspace) {
+      this.upsertConversationWorkspace(copy.id, workspace.summary, workspace.decisions);
+    }
+    for (const task of this.listConversationTasks(id)) {
+      const cloned = this.createConversationTask(copy.id, task.title);
+      if (task.done) {
+        this.setConversationTaskDone(cloned.id, true);
+      }
+    }
+    const created = this.getConversation(copy.id);
+    if (!created) {
+      throw new Error("Conversation not found");
+    }
+    return created;
+  }
+
+  promoteConversationToProject(id: string): { project: ProjectRecord; conversation: ConversationRecord } {
+    const source = this.getConversation(id);
+    if (!source) {
+      throw new Error("Conversation not found");
+    }
+    const project = this.createProject(source.title);
+    return { project, conversation: this.moveConversation(id, project.id) };
+  }
+
+  private toProjectMemory(row: typeof projectMemories.$inferSelect): ProjectMemoryRecord {
+    return {
+      id: row.id,
+      projectId: row.projectId,
+      title: decryptUtf8(row.titleCipher, this.masterKey),
+      body: decryptUtf8(row.bodyCipher, this.masterKey),
+      source: row.source === "suggested" ? "suggested" : "manual",
+      createdAt: iso(row.createdAt),
+      updatedAt: iso(row.updatedAt),
+    };
+  }
+
+  private toFileChunk(row: typeof fileChunks.$inferSelect): FileChunkRecord {
+    const file = this.getProjectFile(row.fileId);
+    let embedding: number[] = [];
+    try {
+      const parsed: unknown = JSON.parse(decryptUtf8(row.embeddingCipher, this.masterKey));
+      if (Array.isArray(parsed)) {
+        embedding = parsed.filter((item): item is number => typeof item === "number");
+      }
+    } catch {
+      embedding = [];
+    }
+    return {
+      id: row.id,
+      fileId: row.fileId,
+      projectId: row.projectId,
+      fileName: file?.name ?? "file",
+      chunkIndex: row.chunkIndex,
+      text: decryptUtf8(row.textCipher, this.masterKey),
+      embedding,
+      tokenEstimate: row.tokenEstimate,
+    };
+  }
+
+  private toConversationTask(row: typeof conversationTasks.$inferSelect): ConversationTaskRecord {
+    return {
+      id: row.id,
+      conversationId: row.conversationId,
+      title: decryptUtf8(row.titleCipher, this.masterKey),
+      done: row.done === 1,
+      createdAt: iso(row.createdAt),
+    };
   }
 
   async removeProviderKey(id: string): Promise<void> {
