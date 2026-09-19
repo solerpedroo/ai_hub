@@ -87,8 +87,11 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W12-003](./ADR-W12-003-vision-images-on-stream-not-packet.md) | W12 | Imagens no stream, não no packet; gate `vision` | accepted |
 | [ADR-W12-004](./ADR-W12-004-pdf-flatedecode-inflate.md) | W12 | PDF: inflate FlateDecode + literais Tj | accepted |
 | [ADR-W13-001](./ADR-W13-001-mentions-structured-not-in-user-text.md) | W13 | Menções estruturadas, não no texto do user | accepted |
-| [ADR-W13-002](./ADR-W13-002-mention-stubs-until-later-waves.md) | W13 | `@prompt`/`@skill` stub; `@memory` superseded by W14-002 | accepted |
+| [ADR-W13-002](./ADR-W13-002-mention-stubs-until-later-waves.md) | W13 | `@skill` stub; `@prompt` superseded by W15-002 | accepted |
 | [ADR-W13-003](./ADR-W13-003-mention-token-cap-excludes-files.md) | W13 | Cap de menção não inclui `@file` | accepted |
 | [ADR-W14-001](./ADR-W14-001-local-hashed-embeddings.md) | W14 | Embeddings locais hashed; pacote `memory` | accepted |
 | [ADR-W14-002](./ADR-W14-002-memories-in-packet-strict-excludes.md) | W14 | Memórias no packet; `strict` exclui | accepted |
 | [ADR-W14-003](./ADR-W14-003-workspace-local-no-llm.md) | W14 | Workspace por extração local, sem LLM | accepted |
+| [ADR-W15-001](./ADR-W15-001-prompt-library-encrypted.md) | W15 | Library global cifrada + pastas + factory | accepted |
+| [ADR-W15-002](./ADR-W15-002-prompt-variables-and-mention.md) | W15 | Variáveis + `@prompt` no compiler | accepted |
+| [ADR-W15-003](./ADR-W15-003-playground-n-sends-caps.md) | W15 | Playground = N sends + preflight N× caps | accepted |
