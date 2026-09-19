@@ -1,15 +1,16 @@
 export const SPEND_CAP_SCOPES = ["request", "day", "global"] as const;
 
 export type SpendCapScope = (typeof SPEND_CAP_SCOPES)[number];
+export type CapBlockScope = SpendCapScope | "project" | "provider";
 
 const MICROS = 1_000_000;
 export const SPEND_CAP_WARN_RATIO = 0.8;
 export const DEFAULT_ESTIMATED_OUTPUT_TOKENS = 1024;
 
 export class SpendCapError extends Error {
-  readonly scope: SpendCapScope;
+  readonly scope: CapBlockScope;
 
-  constructor(scope: SpendCapScope) {
+  constructor(scope: CapBlockScope) {
     super(`cap_exceeded:${scope}`);
     this.name = "SpendCapError";
     this.scope = scope;
@@ -62,7 +63,7 @@ export function evaluateSpendCaps(input: {
   const requestUsd = estimate;
   const dayUsd = addUsd(input.daySpentUsd, estimate);
   const globalUsd = addUsd(input.globalSpentUsd, estimate);
-  const usage: Record<SpendCapScope, string> = {
+  const usage: Record<(typeof SPEND_CAP_SCOPES)[number], string> = {
     request: requestUsd,
     day: dayUsd,
     global: globalUsd,
@@ -123,10 +124,10 @@ export function evaluatePlaygroundCaps(input: {
   });
 }
 
-export function parseSpendCapError(message: string): SpendCapScope | null {
-  const match = /cap_exceeded:(request|day|global)/.exec(message);
+export function parseSpendCapError(message: string): CapBlockScope | null {
+  const match = /cap_exceeded:(request|day|global|project|provider)/.exec(message);
   if (!match) {
     return null;
   }
-  return match[1] as SpendCapScope;
+  return match[1] as CapBlockScope;
 }
