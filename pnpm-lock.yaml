@@ -44,6 +44,9 @@ importers:
       '@ai-hub/files':
         specifier: workspace:*
         version: link:../../packages/files
+      '@ai-hub/memory':
+        specifier: workspace:*
+        version: link:../../packages/memory
       '@ai-hub/security':
         specifier: workspace:*
         version: link:../../packages/security
@@ -212,6 +215,12 @@ importers:
       mammoth:
         specifier: ^1.9.1
         version: 1.12.3
+    devDependencies:
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/debug@4.1.13)(@types/node@22.20.3)(jiti@2.7.0)
+
+  packages/memory:
     devDependencies:
       vitest:
         specifier: ^3.2.4
