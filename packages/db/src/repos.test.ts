@@ -125,7 +125,7 @@ describe("hub database", () => {
       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
       applyMigrations(second.sqlite);
-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(8);
+      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(9);
       second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -653,6 +653,38 @@ describe("hub database", () => {
     expect(hub.repos.listProjectFiles(null)).toEqual([]);
     hub.repos.removeProjectFile(file.id);
     expect(hub.repos.getProjectFile(file.id)).toBeNull();
+    hub.close();
+  });
+
+  it("stores project memories encrypted and duplicates a conversation", () => {
+    const { hub } = openTestDb();
+    const project = hub.repos.createProject("Stack");
+    const memory = hub.repos.createProjectMemory({
+      projectId: project.id,
+      title: "DB",
+      body: "usamos PostgreSQL",
+      source: "manual",
+    });
+    expect(dumpAllText(hub.sqlite)).not.toContain("PostgreSQL");
+    expect(hub.repos.listProjectMemories(project.id).map((item) => item.body)).toEqual(["usamos PostgreSQL"]);
+    const conversation = hub.repos.createConversation(project.id, "Chat");
+    hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "user",
+      content: "qual banco?",
+      parentId: null,
+      branchId: null,
+    });
+    hub.repos.upsertConversationWorkspace(conversation.id, "User: qual banco?", ["usamos PostgreSQL"]);
+    const copy = hub.repos.duplicateConversation(conversation.id);
+    expect(copy.id).not.toBe(conversation.id);
+    expect(copy.title).toBe("Copy of Chat");
+    expect(hub.repos.listMessages(copy.id)).toHaveLength(1);
+    const promoted = hub.repos.promoteConversationToProject(copy.id);
+    expect(promoted.project.name).toBe("Copy of Chat");
+    expect(promoted.conversation.projectId).toBe(promoted.project.id);
+    hub.repos.removeProjectMemory(memory.id);
+    expect(hub.repos.getProjectMemory(memory.id)).toBeNull();
     hub.close();
   });
 });
