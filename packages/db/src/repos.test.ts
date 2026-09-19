@@ -125,7 +125,7 @@ describe("hub database", () => {
       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
       applyMigrations(second.sqlite);
-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(10);
+      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(11);
       second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -718,6 +718,52 @@ describe("hub database", () => {
     hub.repos.createConversation(project.id, "Chat");
     hub.repos.createConversation(project.id, "Playground · gpt-4o-mini", "playground");
     expect(hub.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Chat"]);
+    hub.close();
+  });
+
+  it("stores artifacts encrypted, versions a family, and clones them", () => {
+    const { hub } = openTestDb();
+    const project = hub.repos.createProject("Alpha");
+    const conversation = hub.repos.createConversation(project.id, "Chat");
+    const user = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "user",
+      content: "desenhe a arquitetura deste fluxo",
+      parentId: null,
+      branchId: null,
+    });
+    const assistant = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "assistant",
+      content: "```mermaid\nflowchart LR\n  A --> B\n```",
+      parentId: user.id,
+      branchId: user.branchId,
+    });
+    const first = hub.repos.createArtifact({
+      conversationId: conversation.id,
+      sourceMessageId: assistant.id,
+      kind: "mermaid",
+      title: "Mermaid",
+      body: "flowchart LR\n  A --> B",
+    });
+    const second = hub.repos.createArtifact({
+      conversationId: conversation.id,
+      familyId: first.familyId,
+      sourceMessageId: assistant.id,
+      kind: "mermaid",
+      title: "Mermaid",
+      body: "flowchart LR\n  A --> C",
+    });
+    expect(first.version).toBe(1);
+    expect(second.version).toBe(2);
+    expect(dumpAllText(hub.sqlite)).not.toContain("flowchart LR");
+    expect(hub.repos.getArtifact(first.id)?.body).toBe("flowchart LR\n  A --> B");
+    hub.repos.setArtifactFamilyPinned(first.familyId, true);
+    expect(hub.repos.listArtifactsByFamily(first.familyId).every((item) => item.pinned)).toBe(true);
+    const copy = hub.repos.duplicateConversation(conversation.id);
+    expect(hub.repos.listArtifacts(copy.id)).toHaveLength(2);
+    hub.repos.removeConversation(conversation.id);
+    expect(hub.repos.listArtifacts(conversation.id)).toHaveLength(0);
     hub.close();
   });
 });
