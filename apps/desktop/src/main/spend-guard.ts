@@ -48,3 +48,19 @@ export function evaluateOutgoingCaps(input: {
   const result = evaluateSpendCaps(input);
   return { blocked: result.blocked, warnings: result.warnings };
 }
+
+export function evaluateScopedOutgoingCaps(input: {
+  estimatedRequestUsd: string | null;
+  spentUsd: string;
+  limitUsd: string | null;
+  scope: "project" | "provider";
+}): { blocked: "project" | "provider" | null; warnings: ("project" | "provider")[] } {
+  if (input.limitUsd === null || input.estimatedRequestUsd === null) return { blocked: null, warnings: [] };
+  const result = evaluateSpendCaps({
+    estimatedRequestUsd: input.estimatedRequestUsd,
+    daySpentUsd: input.spentUsd,
+    globalSpentUsd: input.spentUsd,
+    limits: { global: input.limitUsd },
+  });
+  return { blocked: result.blocked ? input.scope : null, warnings: result.warnings.length > 0 ? [input.scope] : [] };
+}
