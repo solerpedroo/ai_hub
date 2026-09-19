@@ -54,6 +54,21 @@ import type {
   ProjectFileListInput,
   FilesAttachInput,
   FilesRemoveInput,
+  ProjectMemoryDto,
+  MemoryListInput,
+  MemoryCreateInput,
+  MemoryUpdateInput,
+  MemorySuggestInput,
+  MemorySuggestResult,
+  MemoryOptOutInput,
+  MemorySetOptOutInput,
+  MemoryOptOutState,
+  ConversationWorkspaceDto,
+  WorkspaceConversationInput,
+  WorkspaceAddTaskInput,
+  WorkspaceSetTaskDoneInput,
+  ConversationTaskDto,
+  ConversationToProjectResult,
   ProviderKeyDto,
   SecretsSaveInput,
   SecretsTestInput,
@@ -84,6 +99,8 @@ export interface HubConversationsApi {
   setBranchLabel: (input: BranchLabelSetInput) => Promise<void>;
   setTags: (input: ConversationTagsSetInput) => Promise<ConversationDto>;
   move: (input: ConversationMoveInput) => Promise<ConversationDto>;
+  duplicate: (input: IdInput) => Promise<ConversationDto>;
+  toProject: (input: IdInput) => Promise<ConversationToProjectResult>;
 }
 
 export interface HubMessagesApi {
@@ -166,6 +183,24 @@ export interface HubFilesApi {
   remove: (input: FilesRemoveInput) => Promise<void>;
 }
 
+export interface HubMemoryApi {
+  list: (input: MemoryListInput) => Promise<ProjectMemoryDto[]>;
+  create: (input: MemoryCreateInput) => Promise<ProjectMemoryDto>;
+  update: (input: MemoryUpdateInput) => Promise<ProjectMemoryDto>;
+  remove: (input: IdInput) => Promise<void>;
+  suggest: (input: MemorySuggestInput) => Promise<MemorySuggestResult>;
+  getOptOut: (input: MemoryOptOutInput) => Promise<MemoryOptOutState>;
+  setOptOut: (input: MemorySetOptOutInput) => Promise<MemoryOptOutState>;
+}
+
+export interface HubWorkspaceApi {
+  get: (input: WorkspaceConversationInput) => Promise<ConversationWorkspaceDto>;
+  refresh: (input: WorkspaceConversationInput) => Promise<ConversationWorkspaceDto>;
+  addTask: (input: WorkspaceAddTaskInput) => Promise<ConversationTaskDto>;
+  setTaskDone: (input: WorkspaceSetTaskDoneInput) => Promise<ConversationTaskDto>;
+  removeTask: (input: IdInput) => Promise<void>;
+}
+
 export interface HubChatApi {
   send: (input: ChatSendInput) => Promise<ChatSendResult>;
   abort: (input: ChatAbortInput) => Promise<void>;
@@ -193,6 +228,8 @@ export interface HubApi {
   import: HubImportApi;
   packets: HubPacketsApi;
   files: HubFilesApi;
+  memory: HubMemoryApi;
+  workspace: HubWorkspaceApi;
 }
 
 export type { AppLocale, ThemeMode };
