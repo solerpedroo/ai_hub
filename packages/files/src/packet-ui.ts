@@ -1,6 +1,7 @@
 export function stripAttachedFileBodiesForRenderer(system: string): string {
-  return system.replace(
-    /(Attached file: [^\n]+)(?:\n(?!Attached file:)[\s\S]*?)?(?=(?:\n\nAttached file: )|$)/g,
-    "$1\n[file extract omitted from renderer]",
+  const omitted = system.replace(
+    /((?:Attached file|Mentioned conversation|Mentioned packet): [^\n]+)(?:\n(?!(?:Attached file|Mentioned conversation|Mentioned packet):)[\s\S]*?)?(?=(?:\n\n(?:Attached file|Mentioned conversation|Mentioned packet): )|$)/g,
+    "$1\n[extract omitted from renderer]",
   );
+  return omitted;
 }
