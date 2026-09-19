@@ -1056,6 +1056,37 @@ export function App(): JSX.Element {
                 }
               }}
               onExport={exportConversation}
+              onDuplicateConversation={async () => {
+                if (!selectedConversationId) {
+                  return;
+                }
+                try {
+                  const copy = await window.hub.conversations.duplicate({ id: selectedConversationId });
+                  setError(null);
+                  await loadConversations(selectedProjectId, importedInbox);
+                  setSelectedConversationId(copy.id);
+                  await loadMessages(copy.id);
+                } catch {
+                  fail();
+                }
+              }}
+              onPromoteConversation={async () => {
+                if (!selectedConversationId) {
+                  return;
+                }
+                try {
+                  const result = await window.hub.conversations.toProject({ id: selectedConversationId });
+                  setError(null);
+                  await loadProjects();
+                  setSelectedProjectId(result.project.id);
+                  setImportedInbox(false);
+                  await loadConversations(result.project.id, false);
+                  setSelectedConversationId(result.conversation.id);
+                  await loadMessages(result.conversation.id);
+                } catch {
+                  fail();
+                }
+              }}
               onMoveConversation={async (projectId) => {
                 if (!selectedConversationId) {
                   return;
