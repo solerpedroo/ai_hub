@@ -82,6 +82,11 @@ export const IpcChannel = {
   artifactsSaveVersion: "artifacts:saveVersion",
   artifactsSetPinned: "artifacts:setPinned",
   artifactsExport: "artifacts:export",
+  skillsList: "skills:list",
+  skillsCreate: "skills:create",
+  skillsUpdate: "skills:update",
+  skillsRemove: "skills:remove",
+  skillsResolve: "skills:resolve",
 } as const;
 
 export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
