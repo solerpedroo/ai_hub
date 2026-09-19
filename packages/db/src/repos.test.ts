@@ -125,7 +125,7 @@ describe("hub database", () => {
       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
       applyMigrations(second.sqlite);
-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(7);
+      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(8);
       second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -631,6 +631,28 @@ describe("hub database", () => {
     expect(moved.projectId).toBe(beta.id);
     expect(moved.activePacketId).toBeNull();
     expect(moved.packetAppliedAt).toBeNull();
+    hub.close();
+  });
+
+  it("stores project file extracts encrypted and lists by project", () => {
+    const { hub } = openTestDb();
+    const project = hub.repos.createProject("Docs");
+    const file = hub.repos.createProjectFile({
+      projectId: project.id,
+      name: "spec.md",
+      kind: "text",
+      mime: "text/plain",
+      byteSize: 12,
+      tokenEstimate: 3,
+      extract: "Section 3 secret-doc",
+      truncated: false,
+    });
+    expect(file.extract).toBe("Section 3 secret-doc");
+    expect(dumpAllText(hub.sqlite)).not.toContain("secret-doc");
+    expect(hub.repos.listProjectFiles(project.id).map((item) => item.name)).toEqual(["spec.md"]);
+    expect(hub.repos.listProjectFiles(null)).toEqual([]);
+    hub.repos.removeProjectFile(file.id);
+    expect(hub.repos.getProjectFile(file.id)).toBeNull();
     hub.close();
   });
 });
