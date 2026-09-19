@@ -17,6 +17,7 @@ import {
   healthSamples,
   contextPackets,
   importJobs,
+  projectFiles,
   messageReceipts,
   messages,
   projects,
@@ -147,6 +148,20 @@ export interface ContextPacketRecord {
 
 export interface ContextPacketStored extends ContextPacketRecord {
   payloadJson: string;
+}
+
+export interface ProjectFileRecord {
+  id: string;
+  projectId: string | null;
+  name: string;
+  kind: string;
+  mime: string;
+  byteSize: number;
+  tokenEstimate: number;
+  extract: string;
+  imageJson: string | null;
+  truncated: boolean;
+  createdAt: string;
 }
 
 export interface SpendCapOverrideRecord {
@@ -1774,6 +1789,89 @@ export class HubRepos {
       throw new Error("Conversation not found");
     }
     return updated;
+  }
+
+  createProjectFile(input: {
+    projectId: string | null;
+    name: string;
+    kind: string;
+    mime: string;
+    byteSize: number;
+    tokenEstimate: number;
+    extract: string;
+    imageJson?: string | null;
+    truncated: boolean;
+  }): ProjectFileRecord {
+    if (input.projectId) {
+      const project = this.getProject(input.projectId);
+      if (!project) {
+        throw new Error("Project not found");
+      }
+    }
+    const id = randomUUID();
+    const now = Date.now();
+    this.db
+      .insert(projectFiles)
+      .values({
+        id,
+        projectId: input.projectId,
+        name: input.name.slice(0, 260),
+        kind: input.kind,
+        mime: input.mime,
+        byteSize: input.byteSize,
+        tokenEstimate: input.tokenEstimate,
+        extractCipher: encryptUtf8(input.extract, this.masterKey),
+        imageCipher:
+          input.imageJson !== undefined && input.imageJson !== null
+            ? encryptUtf8(input.imageJson, this.masterKey)
+            : null,
+        truncated: input.truncated ? 1 : 0,
+        createdAt: now,
+      })
+      .run();
+    const created = this.getProjectFile(id);
+    if (!created) {
+      throw new Error("File not found");
+    }
+    return created;
+  }
+
+  getProjectFile(id: string): ProjectFileRecord | null {
+    const row = this.db.select().from(projectFiles).where(eq(projectFiles.id, id)).get();
+    if (!row) {
+      return null;
+    }
+    return this.toProjectFile(row);
+  }
+
+  listProjectFiles(projectId: string | null): ProjectFileRecord[] {
+    const rows =
+      projectId === null
+        ? this.db.select().from(projectFiles).where(isNull(projectFiles.projectId)).all()
+        : this.db.select().from(projectFiles).where(eq(projectFiles.projectId, projectId)).all();
+    return rows
+      .map((row) => this.toProjectFile(row))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  removeProjectFile(id: string): void {
+    this.db.delete(projectFiles).where(eq(projectFiles.id, id)).run();
+  }
+
+  private toProjectFile(row: typeof projectFiles.$inferSelect): ProjectFileRecord {
+    return {
+      id: row.id,
+      projectId: row.projectId,
+      name: row.name,
+      kind: row.kind,
+      mime: row.mime,
+      byteSize: row.byteSize,
+      tokenEstimate: row.tokenEstimate,
+      extract: decryptUtf8(row.extractCipher, this.masterKey),
+      imageJson: row.imageCipher ? decryptUtf8(row.imageCipher, this.masterKey) : null,
+      truncated: row.truncated === 1,
+      createdAt: new Date(row.createdAt).toISOString(),
+    };
   }
 
   setMessagePinned(id: string, pinned: boolean): MessageRecord {
