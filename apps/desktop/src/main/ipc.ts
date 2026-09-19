@@ -67,6 +67,14 @@ import {
   workspaceAddTaskInputSchema,
   workspaceSetTaskDoneInputSchema,
   conversationTaskDtoSchema,
+  promptDtoSchema,
+  promptListResultSchema,
+  promptCreateInputSchema,
+  promptUpdateInputSchema,
+  promptResolveInputSchema,
+  promptResolveResultSchema,
+  playgroundRunInputSchema,
+  playgroundRunResultSchema,
   contextPacketDtoSchema,
   contextPacketListResultSchema,
   projectCreateInputSchema,
@@ -107,6 +115,7 @@ import { suggestMemories } from "@ai-hub/memory";
 import { previewPacket } from "./packet-preview";
 import { getConversationWorkspaceDto, refreshConversationWorkspace } from "./workspace";
 import { getHubDatabase } from "./persistence";
+import { listPromptDtos, resolvePromptDto, runPlayground } from "./playground";
 import { testProviderKey } from "./provider-health";
 import { localDayStartMs } from "./spend-guard";
 import { checkForAppUpdates } from "./updater";
@@ -508,6 +517,45 @@ export function registerWorkspaceIpc(): void {
   registerHandler(IpcChannel.workspaceRemoveTask, idInputSchema, ipcAckResultSchema, (input) => {
     getHubDatabase().repos.removeConversationTask(input.id);
   });
+
+  registerHandler(IpcChannel.promptsList, emptyIpcPayloadSchema, promptListResultSchema, () =>
+    listPromptDtos().map((row) => promptDtoSchema.parse(row)),
+  );
+
+  registerHandler(IpcChannel.promptsCreate, promptCreateInputSchema, promptDtoSchema, (input) =>
+    promptDtoSchema.parse(
+      getHubDatabase().repos.createPrompt({
+        folder: input.folder,
+        title: input.title,
+        body: input.body,
+      }),
+    ),
+  );
+
+  registerHandler(IpcChannel.promptsUpdate, promptUpdateInputSchema, promptDtoSchema, (input) =>
+    promptDtoSchema.parse(
+      getHubDatabase().repos.updatePrompt(input.id, {
+        ...(input.folder !== undefined ? { folder: input.folder } : {}),
+        ...(input.title !== undefined ? { title: input.title } : {}),
+        ...(input.body !== undefined ? { body: input.body } : {}),
+      }),
+    ),
+  );
+
+  registerHandler(IpcChannel.promptsRemove, idInputSchema, ipcAckResultSchema, (input) => {
+    getHubDatabase().repos.removePrompt(input.id);
+  });
+
+  registerHandler(IpcChannel.promptsResolve, promptResolveInputSchema, promptResolveResultSchema, (input) =>
+    promptResolveResultSchema.parse(resolvePromptDto(input.promptId, input.projectId)),
+  );
+
+  registerHandler(
+    IpcChannel.playgroundRun,
+    playgroundRunInputSchema,
+    playgroundRunResultSchema,
+    (input, event) => runPlayground(input, event.sender),
+  );
 
   registerHandler(IpcChannel.spendCapsGet, emptyIpcPayloadSchema, spendCapListResultSchema, () => {
     const rows = getHubDatabase().repos.listSpendCaps();
