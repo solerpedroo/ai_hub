@@ -1,0 +1,1562 @@
+﻿diff --git a/apps/desktop/src/main/artifacts.ts b/apps/desktop/src/main/artifacts.ts
+new file mode 100644
+index 0000000..232f718
+--- /dev/null
++++ b/apps/desktop/src/main/artifacts.ts
+@@ -0,0 +1,204 @@
++import { writeFile } from "node:fs/promises";
++import { BrowserWindow, dialog, protocol, type WebContents } from "electron";
++import type { ArtifactRecord, HubRepos } from "@ai-hub/db";
++import { redactSecrets } from "@ai-hub/security";
++import {
++  ARTIFACT_PROTOCOL,
++  detectArtifacts,
++  siblingsOf,
++  type ArtifactDto,
++  type ArtifactExportInput,
++  type ArtifactExportResult,
++  artifactExportResultSchema,
++} from "@ai-hub/shared";
++import { isE2eMode } from "./e2e-mode";
++import { getHubDatabase } from "./persistence";
++
++export const ARTIFACT_HTML_CSP = [
++  "default-src 'none'",
++  "script-src 'unsafe-inline'",
++  "style-src 'unsafe-inline'",
++  "img-src data:",
++  "font-src data:",
++  "connect-src 'none'",
++  "frame-src 'none'",
++  "object-src 'none'",
++  "base-uri 'none'",
++  "form-action 'none'",
++  "navigate-to 'none'",
++].join("; ");
++
++const ARTIFACT_ID =
++  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
++
++export function toArtifactDto(row: ArtifactRecord): ArtifactDto {
++  return {
++    id: row.id,
++    conversationId: row.conversationId,
++    familyId: row.familyId,
++    sourceMessageId: row.sourceMessageId,
++    kind: row.kind,
++    title: row.title,
++    body: row.body,
++    language: row.language,
++    version: row.version,
++    pinned: row.pinned,
++    createdAt: row.createdAt,
++  };
++}
++
++export function captureMessageArtifacts(repos: HubRepos, messageId: string): ArtifactRecord[] {
++  if (repos.listArtifactsByMessage(messageId).length > 0) {
++    return repos.listArtifactsByMessage(messageId);
++  }
++  const message = repos.getMessage(messageId);
++  if (!message || message.role !== "assistant" || message.status !== "complete") {
++    return [];
++  }
++  const detected = detectArtifacts(message.content);
++  if (detected.length === 0) {
++    return [];
++  }
++  const previous = previousAssistantSibling(repos, message);
++  const previousArts = previous ? repos.listArtifactsByMessage(previous.id) : [];
++  const created: ArtifactRecord[] = [];
++  const usedPrev = new Set<string>();
++  for (const item of detected) {
++    const match = previousArts.find((row) => row.kind === item.kind && !usedPrev.has(row.id));
++    if (match) {
++      usedPrev.add(match.id);
++    }
++    created.push(
++      repos.createArtifact({
++        conversationId: message.conversationId,
++        ...(match ? { familyId: match.familyId } : {}),
++        sourceMessageId: message.id,
++        kind: item.kind,
++        title: redactSecrets(item.title),
++        body: redactSecrets(item.body),
++        language: item.language,
++      }),
++    );
++  }
++  return created;
++}
++
++function previousAssistantSibling(
++  repos: HubRepos,
++  message: { id: string; conversationId: string; createdAt: string },
++): { id: string } | null {
++  const siblings = siblingsOf(repos.listMessages(message.conversationId), message.id)
++    .filter(
++      (item) =>
++        item.id !== message.id &&
++        item.role === "assistant" &&
++        item.status === "complete" &&
++        item.createdAt < message.createdAt,
++    )
++    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
++  return siblings[0] ?? null;
++}
++
++export function wrapArtifactHtml(body: string): string {
++  const csp = `<meta http-equiv="Content-Security-Policy" content="${ARTIFACT_HTML_CSP}">`;
++  const trimmed = body.trim();
++  if (/<html[\s>]/i.test(trimmed)) {
++    if (/<head[\s>]/i.test(trimmed)) {
++      return trimmed.replace(/<head([^>]*)>/i, `<head$1>${csp}`);
++    }
++    return trimmed.replace(/<html([^>]*)>/i, `<html$1><head>${csp}</head>`);
++  }
++  return `<!DOCTYPE html><html><head><meta charset="utf-8">${csp}</head><body>${trimmed}</body></html>`;
++}
++
++export function registerArtifactProtocol(): void {
++  protocol.handle(ARTIFACT_PROTOCOL, (request) => {
++    let id = "";
++    try {
++      id = new URL(request.url).hostname.toLowerCase();
++    } catch {
++      return new Response("Not found", { status: 404, headers: { "content-type": "text/plain" } });
++    }
++    if (!ARTIFACT_ID.test(id)) {
++      return new Response("Not found", { status: 404, headers: { "content-type": "text/plain" } });
++    }
++    const artifact = getHubDatabase().repos.getArtifact(id);
++    if (!artifact || artifact.kind !== "html") {
++      return new Response("Not found", { status: 404, headers: { "content-type": "text/plain" } });
++    }
++    return new Response(wrapArtifactHtml(artifact.body), {
++      status: 200,
++      headers: {
++        "content-type": "text/html; charset=utf-8",
++        "Content-Security-Policy": ARTIFACT_HTML_CSP,
++      },
++    });
++  });
++}
++
++export async function exportArtifact(
++  input: ArtifactExportInput,
++  sender: WebContents,
++): Promise<ArtifactExportResult> {
++  const artifact = getHubDatabase().repos.getArtifact(input.id);
++  if (!artifact) {
++    throw new Error("Artifact not found");
++  }
++  const payload = exportPayload(artifact, input);
++  const fixture = process.env.AI_HUB_E2E_ARTIFACT_FILE;
++  if (isE2eMode() && fixture && fixture.trim().length > 0) {
++    await writeFile(fixture, payload, "utf8");
++    return artifactExportResultSchema.parse({ status: "saved" });
++  }
++  const window = BrowserWindow.fromWebContents(sender);
++  const extension = input.format;
++  const options = {
++    defaultPath: `${filePart(redactSecrets(artifact.title))}.${extension}`,
++    filters: [{ name: extension.toUpperCase(), extensions: [extension] }],
++  };
++  const choice = window
++    ? await dialog.showSaveDialog(window, options)
++    : await dialog.showSaveDialog(options);
++  if (choice.canceled || !choice.filePath) {
++    return artifactExportResultSchema.parse({ status: "cancelled" });
++  }
++  await writeFile(choice.filePath, payload, "utf8");
++  return artifactExportResultSchema.parse({ status: "saved" });
++}
++
++function exportPayload(
++  artifact: ArtifactRecord,
++  input: ArtifactExportInput,
++): string {
++  const body = redactSecrets(artifact.body);
++  if (input.format === "svg") {
++    const svg = input.svg?.trim() ?? "";
++    if (!svg.startsWith("<svg") || artifact.kind !== "mermaid") {
++      throw new Error("Invalid SVG export");
++    }
++    return redactSecrets(svg);
++  }
++  if (input.format === "html") {
++    if (artifact.kind === "html") {
++      return wrapArtifactHtml(body);
++    }
++    return wrapArtifactHtml(`<pre>${escapeHtml(body)}</pre>`);
++  }
++  if (artifact.kind === "code" && artifact.language) {
++    return `\`\`\`${artifact.language}\n${body}\n\`\`\`\n`;
++  }
++  return body.endsWith("\n") ? body : `${body}\n`;
++}
++
++function escapeHtml(value: string): string {
++  return value
++    .replaceAll("&", "&amp;")
++    .replaceAll("<", "&lt;")
++    .replaceAll(">", "&gt;")
++    .replaceAll('"', "&quot;");
++}
++
++function filePart(title: string): string {
++  const cleaned = title.replace(/[<>:"/\\|?*]+/g, " ").trim();
++  return cleaned.length > 0 ? cleaned.slice(0, 80) : "artifact";
++}
+diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts
+index 5844969..a058074 100644
+--- a/apps/desktop/src/main/chat-session.ts
++++ b/apps/desktop/src/main/chat-session.ts
+@@ -43,6 +43,7 @@ import {
+ } from "@ai-hub/shared";
+ import { recordDebugSnapshot } from "./debug-snapshot";
+ import { isE2eMode } from "./e2e-mode";
++import { captureMessageArtifacts } from "./artifacts";
+ import { toMessageDto } from "./message-dto";
+ import { loadSendAttachments } from "./files";
+ import { resolveSendMentions } from "./mentions";
+@@ -551,6 +552,11 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+         },
+       });
+       repos.updateMessage(assistant.id, result.content, "complete");
++      try {
++        captureMessageArtifacts(repos, assistant.id);
++      } catch {
++        // Artifact capture must not flip a completed stream to interrupted.
++      }
+       writeReceipt(assistant.id, run, result.tokensIn, result.tokensOut, result.content.length, null, result.costUsd);
+       repos.recordHealthSample({
+         providerSlug: run.provider,
+diff --git a/apps/desktop/src/main/index.ts b/apps/desktop/src/main/index.ts
+index 2836a6d..ada84b2 100644
+--- a/apps/desktop/src/main/index.ts
++++ b/apps/desktop/src/main/index.ts
+@@ -1,15 +1,30 @@
+ import { join } from "node:path";
+ import { existsSync, mkdtempSync } from "node:fs";
+ import { tmpdir } from "node:os";
+-import { BrowserWindow, app, dialog, session, shell } from "electron";
++import { BrowserWindow, app, dialog, protocol, session, shell } from "electron";
+ import { electronApp, is, optimizer } from "@electron-toolkit/utils";
++import { ARTIFACT_PROTOCOL } from "@ai-hub/shared";
+ import { safeErrorMessage } from "@ai-hub/security";
+ import { registerWindowIpc, registerWorkspaceIpc } from "./ipc";
++import { ARTIFACT_HTML_CSP, registerArtifactProtocol } from "./artifacts";
+ import { applyCrashReporterOptIn } from "./crash-reporter";
+ import { bootPersistence, getHubDatabase } from "./persistence";
+ import { isE2eMode } from "./e2e-mode";
+ import { checkForAppUpdates } from "./updater";
+ 
++protocol.registerSchemesAsPrivileged([
++  {
++    scheme: ARTIFACT_PROTOCOL,
++    privileges: {
++      standard: true,
++      secure: true,
++      supportFetchAPI: false,
++      corsEnabled: false,
++      stream: true,
++    },
++  },
++]);
++
+ if (isE2eMode()) {
+   app.setPath("userData", mkdtempSync(join(tmpdir(), "ai-hub-e2e-")));
+ }
+@@ -22,6 +37,7 @@ function applyContentSecurityPolicy(): void {
+     "img-src 'self' data:",
+     "font-src 'self' data:",
+     "connect-src 'self' ws://localhost:* http://localhost:*",
++    "frame-src 'self' ai-hub-artifact:",
+     "object-src 'none'",
+     "base-uri 'self'",
+     "form-action 'self'",
+@@ -34,6 +50,7 @@ function applyContentSecurityPolicy(): void {
+     "img-src 'self' data:",
+     "font-src 'self' data:",
+     "connect-src 'self'",
++    "frame-src 'self' ai-hub-artifact:",
+     "object-src 'none'",
+     "base-uri 'self'",
+     "form-action 'self'",
+@@ -41,11 +58,20 @@ function applyContentSecurityPolicy(): void {
+ 
+   const policy = is.dev ? developmentCsp : productionCsp;
+ 
++  session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
++    if (details.resourceType === "subFrame" && !isAllowedArtifactFrame(details.url)) {
++      callback({ cancel: true });
++      return;
++    }
++    callback({});
++  });
++
+   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
++    const artifactPreview = details.url.startsWith(`${ARTIFACT_PROTOCOL}:`);
+     callback({
+       responseHeaders: {
+         ...details.responseHeaders,
+-        "Content-Security-Policy": [policy],
++        "Content-Security-Policy": [artifactPreview ? ARTIFACT_HTML_CSP : policy],
+       },
+     });
+   });
+@@ -65,6 +91,17 @@ function isAllowedAppNavigation(url: string): boolean {
+   return parsed.protocol === "file:";
+ }
+ 
++function isAllowedArtifactFrame(url: string): boolean {
++  if (url === "about:blank" || url === "about:srcdoc") {
++    return true;
++  }
++  try {
++    return new URL(url).protocol === `${ARTIFACT_PROTOCOL}:`;
++  } catch {
++    return false;
++  }
++}
++
+ function isAllowedExternalOpen(url: string): boolean {
+   try {
+     return new URL(url).protocol === "https:";
+@@ -86,6 +123,19 @@ function attachNavigationLocks(window: BrowserWindow): void {
+     }
+   });
+ 
++  window.webContents.on("will-frame-navigate", (event) => {
++    const url = event.url;
++    if (event.isMainFrame) {
++      if (!isAllowedAppNavigation(url)) {
++        event.preventDefault();
++      }
++      return;
++    }
++    if (!isAllowedArtifactFrame(url)) {
++      event.preventDefault();
++    }
++  });
++
+   window.webContents.setWindowOpenHandler((details) => {
+     if (isAllowedExternalOpen(details.url)) {
+       void shell.openExternal(details.url);
+@@ -158,6 +208,7 @@ app.whenReady().then(async () => {
+     app.quit();
+     return;
+   }
++  registerArtifactProtocol();
+   registerWorkspaceIpc();
+   applyCrashReporterOptIn(getHubDatabase().repos.getAppPrefs().crashReporterOptIn);
+   void checkForAppUpdates()
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index c2d3e61..08a053d 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -75,6 +75,13 @@ import {
+   promptResolveResultSchema,
+   playgroundRunInputSchema,
+   playgroundRunResultSchema,
++  artifactDtoSchema,
++  artifactListResultSchema,
++  artifactsListInputSchema,
++  artifactSaveVersionInputSchema,
++  artifactPinInputSchema,
++  artifactExportInputSchema,
++  artifactExportResultSchema,
+   contextPacketDtoSchema,
+   contextPacketListResultSchema,
+   projectCreateInputSchema,
+@@ -96,7 +103,7 @@ import {
+   windowIsMaximizedResultSchema,
+   workspaceSessionSchema,
+ } from "@ai-hub/shared";
+-import { safeErrorMessage } from "@ai-hub/security";
++import { redactSecrets, safeErrorMessage } from "@ai-hub/security";
+ import { abortChat, sendChat } from "./chat-session";
+ import { exportConversation } from "./conversation-export";
+ import { applyCrashReporterOptIn } from "./crash-reporter";
+@@ -116,6 +123,7 @@ import { previewPacket } from "./packet-preview";
+ import { getConversationWorkspaceDto, refreshConversationWorkspace } from "./workspace";
+ import { getHubDatabase } from "./persistence";
+ import { listPromptDtos, resolvePromptDto, runPlayground } from "./playground";
++import { exportArtifact, toArtifactDto } from "./artifacts";
+ import { testProviderKey } from "./provider-health";
+ import { localDayStartMs } from "./spend-guard";
+ import { checkForAppUpdates } from "./updater";
+@@ -557,6 +565,65 @@ export function registerWorkspaceIpc(): void {
+     (input, event) => runPlayground(input, event.sender),
+   );
+ 
++  registerHandler(
++    IpcChannel.artifactsList,
++    artifactsListInputSchema,
++    artifactListResultSchema,
++    (input) =>
++      getHubDatabase()
++        .repos.listArtifacts(input.conversationId)
++        .slice(0, 100)
++        .map((row) => artifactDtoSchema.parse(toArtifactDto(row))),
++  );
++
++  registerHandler(IpcChannel.artifactsGet, idInputSchema, artifactDtoSchema, (input) => {
++    const row = getHubDatabase().repos.getArtifact(input.id);
++    if (!row) {
++      throw new Error("Artifact not found");
++    }
++    return artifactDtoSchema.parse(toArtifactDto(row));
++  });
++
++  registerHandler(IpcChannel.artifactsSaveVersion, artifactSaveVersionInputSchema, artifactDtoSchema, (input) => {
++    const current = getHubDatabase().repos.getArtifact(input.id);
++    if (!current) {
++      throw new Error("Artifact not found");
++    }
++    return artifactDtoSchema.parse(
++      toArtifactDto(
++        getHubDatabase().repos.createArtifact({
++          conversationId: current.conversationId,
++          familyId: current.familyId,
++          sourceMessageId: current.sourceMessageId,
++          kind: current.kind,
++          title: redactSecrets(input.title ?? current.title),
++          body: redactSecrets(input.body),
++          language: current.language,
++        }),
++      ),
++    );
++  });
++
++  registerHandler(IpcChannel.artifactsSetPinned, artifactPinInputSchema, artifactDtoSchema, (input) => {
++    const current = getHubDatabase().repos.getArtifact(input.id);
++    if (!current) {
++      throw new Error("Artifact not found");
++    }
++    getHubDatabase().repos.setArtifactFamilyPinned(current.familyId, input.pinned);
++    const updated = getHubDatabase().repos.getArtifact(input.id);
++    if (!updated) {
++      throw new Error("Artifact not found");
++    }
++    return artifactDtoSchema.parse(toArtifactDto(updated));
++  });
++
++  registerHandler(
++    IpcChannel.artifactsExport,
++    artifactExportInputSchema,
++    artifactExportResultSchema,
++    (input, event) => exportArtifact(input, event.sender),
++  );
++
+   registerHandler(IpcChannel.spendCapsGet, emptyIpcPayloadSchema, spendCapListResultSchema, () => {
+     const rows = getHubDatabase().repos.listSpendCaps();
+     return SPEND_CAP_SCOPES.map((scope) => ({
+diff --git a/apps/desktop/src/renderer/src/components/chat/artifact-canvas.tsx b/apps/desktop/src/renderer/src/components/chat/artifact-canvas.tsx
+new file mode 100644
+index 0000000..6dc04de
+--- /dev/null
++++ b/apps/desktop/src/renderer/src/components/chat/artifact-canvas.tsx
+@@ -0,0 +1,271 @@
++import { type JSX, useEffect, useMemo, useRef, useState } from "react";
++import { useTranslation } from "react-i18next";
++import {
++  artifactFrameSrc,
++  detectArtifacts,
++  type ArtifactDto,
++} from "@ai-hub/shared";
++import { MessageMarkdown } from "@/components/chat/message-markdown";
++import { Button } from "@/components/ui/button";
++import { ScrollArea } from "@/components/ui/scroll-area";
++
++export function ArtifactCanvas({
++  artifact,
++  versions,
++  busy,
++  onClose,
++  onSelectVersion,
++  onSaveVersion,
++  onPin,
++  onExport,
++}: {
++  artifact: ArtifactDto;
++  versions: ArtifactDto[];
++  busy: boolean;
++  onClose: () => void;
++  onSelectVersion: (id: string) => void;
++  onSaveVersion: (body: string) => Promise<void>;
++  onPin: (pinned: boolean) => Promise<void>;
++  onExport: (format: "md" | "html" | "svg", svg?: string) => Promise<void>;
++}): JSX.Element {
++  const { t } = useTranslation();
++  const [draft, setDraft] = useState(artifact.body);
++  const [copied, setCopied] = useState(false);
++  const [hasSvg, setHasSvg] = useState(false);
++  const svgRef = useRef<string | null>(null);
++
++  useEffect(() => {
++    setDraft(artifact.body);
++    setHasSvg(false);
++    svgRef.current = null;
++  }, [artifact.id, artifact.body]);
++
++  const dirty = draft !== artifact.body;
++  const family = useMemo(
++    () => versions.filter((item) => item.familyId === artifact.familyId).sort((a, b) => a.version - b.version),
++    [artifact.familyId, versions],
++  );
++
++  return (
++    <aside className="flex min-h-0 w-[42%] min-w-[20rem] shrink-0 flex-col border-l" data-testid="artifact-canvas">
++      <div className="flex items-center justify-between gap-1 border-b px-2 py-1.5">
++        <div className="min-w-0">
++          <p className="truncate text-[12px] font-medium" data-testid="artifact-title">
++            {artifact.title}
++          </p>
++          <p className="text-[11px] text-muted-foreground" data-testid="artifact-kind">
++            {t(`artifacts.kind.${artifact.kind}`)}
++          </p>
++        </div>
++        <div className="flex items-center gap-1">
++          <select
++            className="h-7 rounded-md border bg-background px-1 text-[11px]"
++            data-testid="artifact-version"
++            value={artifact.id}
++            disabled={busy}
++            onChange={(event) => onSelectVersion(event.target.value)}
++          >
++            {family.map((item) => (
++              <option key={item.id} value={item.id}>
++                {t("artifacts.version", { n: item.version })}
++              </option>
++            ))}
++          </select>
++          <Button type="button" size="sm" variant="ghost" data-testid="artifact-close" onClick={onClose}>
++            {t("artifacts.close")}
++          </Button>
++        </div>
++      </div>
++      <div className="flex flex-wrap gap-1 border-b px-2 py-1">
++        <Button
++          type="button"
++          size="sm"
++          variant="outline"
++          data-testid="artifact-copy"
++          onClick={() => {
++            void navigator.clipboard.writeText(draft).then(() => {
++              setCopied(true);
++              window.setTimeout(() => setCopied(false), 1200);
++            });
++          }}
++        >
++          {copied ? t("workspace.copied") : t("workspace.copy")}
++        </Button>
++        <Button
++          type="button"
++          size="sm"
++          variant="outline"
++          data-testid="artifact-save"
++          disabled={busy || !dirty}
++          onClick={() => {
++            void onSaveVersion(draft);
++          }}
++        >
++          {t("artifacts.saveVersion")}
++        </Button>
++        <Button
++          type="button"
++          size="sm"
++          variant="outline"
++          data-testid="artifact-pin"
++          disabled={busy}
++          aria-pressed={artifact.pinned}
++          onClick={() => {
++            void onPin(!artifact.pinned);
++          }}
++        >
++          {artifact.pinned ? t("artifacts.unpin") : t("artifacts.pin")}
++        </Button>
++        <Button
++          type="button"
++          size="sm"
++          variant="outline"
++          data-testid="artifact-export-md"
++          disabled={busy}
++          onClick={() => {
++            void onExport("md");
++          }}
++        >
++          {t("artifacts.exportMd")}
++        </Button>
++        <Button
++          type="button"
++          size="sm"
++          variant="outline"
++          data-testid="artifact-export-html"
++          disabled={busy}
++          onClick={() => {
++            void onExport("html");
++          }}
++        >
++          {t("artifacts.exportHtml")}
++        </Button>
++        {artifact.kind === "mermaid" ? (
++          <Button
++            type="button"
++            size="sm"
++            variant="outline"
++            data-testid="artifact-export-svg"
++            disabled={busy || !hasSvg}
++            onClick={() => {
++              const svg = svgRef.current;
++              if (!svg) {
++                return;
++              }
++              void onExport("svg", svg);
++            }}
++          >
++            {t("artifacts.exportSvg")}
++          </Button>
++        ) : null}
++      </div>
++      <div className="grid min-h-0 flex-1 grid-rows-2">
++        <textarea
++          className="min-h-0 resize-none border-b bg-background p-2 font-mono text-[12px] outline-none"
++          data-testid="artifact-editor"
++          spellCheck={false}
++          value={draft}
++          onChange={(event) => setDraft(event.target.value)}
++        />
++        <ScrollArea className="min-h-0 p-2">
++          {artifact.kind === "mermaid" ? (
++            <MermaidPreview
++              source={draft}
++              onSvg={(svg) => {
++                svgRef.current = svg.length > 0 ? svg : null;
++                setHasSvg(svg.length > 0);
++              }}
++            />
++          ) : artifact.kind === "html" ? (
++            dirty ? (
++              <p className="text-[12px] text-muted-foreground">{t("artifacts.htmlSaveToPreview")}</p>
++            ) : (
++              <iframe
++                sandbox="allow-scripts"
++                src={artifactFrameSrc(artifact.id)}
++                title={artifact.title}
++                className="h-full min-h-[12rem] w-full rounded-md bg-white"
++                data-testid="artifact-html-frame"
++              />
++            )
++          ) : artifact.kind === "code" ? (
++            <MessageMarkdown
++              content={`\`\`\`${artifact.language ?? ""}\n${draft}\n\`\`\``}
++            />
++          ) : (
++            <MessageMarkdown content={draft} />
++          )}
++        </ScrollArea>
++      </div>
++    </aside>
++  );
++}
++
++export function messageHasArtifacts(content: string): boolean {
++  return detectArtifacts(content).length > 0;
++}
++
++function MermaidPreview({
++  source,
++  onSvg,
++}: {
++  source: string;
++  onSvg: (svg: string) => void;
++}): JSX.Element {
++  const { t } = useTranslation();
++  const onSvgRef = useRef(onSvg);
++  onSvgRef.current = onSvg;
++  const [error, setError] = useState<string | null>(null);
++  const [svg, setSvg] = useState<string | null>(null);
++
++  useEffect(() => {
++    let cancelled = false;
++    const timer = window.setTimeout(() => {
++      void (async () => {
++        try {
++          const mermaid = (await import("mermaid")).default;
++          mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "dark" });
++          const id = `mmd${crypto.randomUUID().replace(/-/g, "")}`;
++          const { svg: rendered } = await mermaid.render(id, source);
++          if (cancelled) {
++            return;
++          }
++          setSvg(rendered);
++          onSvgRef.current(rendered);
++          setError(null);
++        } catch {
++          if (!cancelled) {
++            setSvg(null);
++            onSvgRef.current("");
++            setError(t("artifacts.mermaidError"));
++          }
++        }
++      })();
++    }, 250);
++    return () => {
++      cancelled = true;
++      window.clearTimeout(timer);
++    };
++  }, [source, t]);
++
++  const srcDoc = svg
++    ? `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="margin:0">${svg}</body></html>`
++    : "";
++
++  return (
++    <div>
++      {error ? (
++        <p className="text-[12px] text-muted-foreground" data-testid="artifact-mermaid-error">
++          {error}
++        </p>
++      ) : null}
++      <iframe
++        sandbox=""
++        srcDoc={srcDoc}
++        title="Mermaid"
++        className="h-full min-h-[12rem] w-full border-0 bg-transparent"
++        data-testid="artifact-mermaid"
++      />
++    </div>
++  );
++}
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index 33896ec..d768fb6 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -24,6 +24,7 @@ import {
+   type ProjectUpdateInput,
+   type ProjectFileDto,
+   type PromptDto,
++  type ArtifactDto,
+   type ProviderKeyDto,
+ } from "@ai-hub/shared";
+ import {
+@@ -33,6 +34,7 @@ import {
+ } from "@/components/chat/chat-composer";
+ import { ConversationTree } from "@/components/chat/conversation-tree";
+ import { MessageBubble } from "@/components/chat/message-bubble";
++import { ArtifactCanvas } from "@/components/chat/artifact-canvas";
+ import { PacketPanel } from "@/components/chat/packet-panel";
+ import { ConversationWorkspacePanel } from "@/components/workspace/conversation-workspace-panel";
+ import { MemoryPanel } from "@/components/workspace/memory-panel";
+@@ -210,6 +212,10 @@ export function HomeView({
+   const [packetOpen, setPacketOpen] = useState(false);
+   const [memoryOpen, setMemoryOpen] = useState(false);
+   const [workspaceOpen, setWorkspaceOpen] = useState(false);
++  const [artifacts, setArtifacts] = useState<ArtifactDto[]>([]);
++  const [canvasId, setCanvasId] = useState<string | null>(null);
++  const [canvasError, setCanvasError] = useState<string | null>(null);
++  const autoOpenedArtifactRef = useRef<string | null>(null);
+   const [projectMemories, setProjectMemories] = useState<ProjectMemoryDto[]>([]);
+   const [libraryPrompts, setLibraryPrompts] = useState<PromptDto[]>([]);
+   const [memoryOptedOut, setMemoryOptedOut] = useState(false);
+@@ -243,6 +249,7 @@ export function HomeView({
+   const leaf = path[path.length - 1] ?? null;
+   const selectedConversation =
+     conversations.find((item) => item.id === selectedConversationId) ?? null;
++  const canvasArtifact = artifacts.find((item) => item.id === canvasId) ?? null;
+   const providerSlugs = [...new Set(providerKeys.map((item) => item.providerSlug))];
+   const preferredModels = preferredProvider
+     ? catalogModelsForProvider(preferredProvider)
+@@ -397,6 +404,9 @@ export function HomeView({
+   useEffect(() => {
+     if (!selectedConversationId) {
+       setConversationWorkspace(null);
++      setArtifacts([]);
++      setCanvasId(null);
++      autoOpenedArtifactRef.current = null;
+       return;
+     }
+     const last = messages.at(-1);
+@@ -405,6 +415,19 @@ export function HomeView({
+         ? window.hub.workspace.refresh({ conversationId: selectedConversationId })
+         : window.hub.workspace.get({ conversationId: selectedConversationId });
+     void op.then(setConversationWorkspace).catch(() => setConversationWorkspace(null));
++    void window.hub.artifacts
++      .list({ conversationId: selectedConversationId })
++      .then((rows) => {
++        setArtifacts(rows);
++        if (last?.role === "assistant" && last.status === "complete" && autoOpenedArtifactRef.current !== last.id) {
++          const mermaid = rows.find((row) => row.sourceMessageId === last.id && row.kind === "mermaid");
++          if (mermaid) {
++            autoOpenedArtifactRef.current = last.id;
++            setCanvasId(mermaid.id);
++          }
++        }
++      })
++      .catch(() => setArtifacts([]));
+   }, [messages, selectedConversationId]);
+ 
+   useEffect(() => {
+@@ -894,6 +917,26 @@ export function HomeView({
+                 >
+                   {t("workspace.panel.title")}
+                 </Button>
++                <Button
++                  type="button"
++                  size="sm"
++                  variant="outline"
++                  data-testid="canvas-toggle"
++                  aria-pressed={canvasId !== null}
++                  disabled={!selectedConversationId}
++                  onClick={() => {
++                    if (canvasId) {
++                      setCanvasId(null);
++                      return;
++                    }
++                    const latest = artifacts[0];
++                    if (latest) {
++                      setCanvasId(latest.id);
++                    }
++                  }}
++                >
++                  {t("artifacts.canvas")}
++                </Button>
+                 <Button
+                   type="button"
+                   size="sm"
+@@ -1072,6 +1115,15 @@ export function HomeView({
+                           onPin={(pinned) => {
+                             void onPin(message.id, pinned);
+                           }}
++                          onOpenArtifact={(messageId) => {
++                            const match =
++                              artifacts.find(
++                                (item) => item.sourceMessageId === messageId && item.kind === "mermaid",
++                              ) ?? artifacts.find((item) => item.sourceMessageId === messageId);
++                            if (match) {
++                              setCanvasId(match.id);
++                            }
++                          }}
+                         />
+                       ))}
+                     </ol>
+@@ -1446,6 +1498,53 @@ export function HomeView({
+                   }}
+                 />
+               </div>
++              {canvasArtifact ? (
++                <ArtifactCanvas
++                  artifact={canvasArtifact}
++                  versions={artifacts}
++                  busy={busy}
++                  onClose={() => setCanvasId(null)}
++                  onSelectVersion={setCanvasId}
++                  onSaveVersion={async (body) => {
++                    setCanvasError(null);
++                    try {
++                      const next = await window.hub.artifacts.saveVersion({ id: canvasArtifact.id, body });
++                      const rows = selectedConversationId
++                        ? await window.hub.artifacts.list({ conversationId: selectedConversationId })
++                        : [next];
++                      setArtifacts(rows);
++                      setCanvasId(next.id);
++                    } catch {
++                      setCanvasError(t("artifacts.error"));
++                    }
++                  }}
++                  onPin={async (pinned) => {
++                    setCanvasError(null);
++                    try {
++                      const next = await window.hub.artifacts.setPinned({ id: canvasArtifact.id, pinned });
++                      setArtifacts((current) =>
++                        current.map((item) =>
++                          item.familyId === next.familyId ? { ...item, pinned: next.pinned } : item,
++                        ),
++                      );
++                    } catch {
++                      setCanvasError(t("artifacts.error"));
++                    }
++                  }}
++                  onExport={async (format, svg) => {
++                    setCanvasError(null);
++                    try {
++                      await window.hub.artifacts.exportFile({
++                        id: canvasArtifact.id,
++                        format,
++                        ...(svg !== undefined ? { svg } : {}),
++                      });
++                    } catch {
++                      setCanvasError(t("artifacts.error"));
++                    }
++                  }}
++                />
++              ) : null}
+               {memoryOpen && project ? (
+                 <MemoryPanel
+                   memories={projectMemories}
+@@ -1494,6 +1593,7 @@ export function HomeView({
+               {workspaceOpen ? (
+                 <ConversationWorkspacePanel
+                   workspace={conversationWorkspace}
++                  artifacts={artifacts}
+                   busy={busy}
+                   onRefresh={async () => {
+                     if (!selectedConversationId) {
+@@ -1502,7 +1602,9 @@ export function HomeView({
+                     setConversationWorkspace(
+                       await window.hub.workspace.refresh({ conversationId: selectedConversationId }),
+                     );
++                    setArtifacts(await window.hub.artifacts.list({ conversationId: selectedConversationId }));
+                   }}
++                  onOpenArtifact={(id) => setCanvasId(id)}
+                   onAddTask={async (title) => {
+                     if (!selectedConversationId) {
+                       return;
+@@ -1582,6 +1684,11 @@ export function HomeView({
+             ) : null}
+           </div>
+         ) : null}
++        {canvasError ? (
++          <p className="border-t px-3 py-2 text-destructive" role="alert" data-testid="artifact-error">
++            {canvasError}
++          </p>
++        ) : null}
+       </section>
+     </div>
+   );
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 4251053..a66e3fe 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -120,6 +120,7 @@
+   "workspace.panel.decisions": "Decisions",
+   "workspace.panel.pins": "Pins",
+   "workspace.panel.pinCount": "{{n}} pinned messages",
++  "workspace.panel.artifacts": "Artifacts",
+   "workspace.panel.tasks": "Tasks",
+   "workspace.panel.taskPlaceholder": "New task",
+   "workspace.panel.add": "Add",
+@@ -394,5 +395,23 @@
+   "prompts.error.resolve": "Could not resolve variables for the active project.",
+   "prompts.error.run": "Playground run failed. Each model stays on the slot you picked.",
+   "prompts.error.slots": "Pick two different models to run the playground.",
+-  "prompts.error.content": "Write a prompt or select one from the library."
++  "prompts.error.content": "Write a prompt or select one from the library.",
++  "artifacts.canvas": "Canvas",
++  "artifacts.open": "Open canvas",
++  "artifacts.close": "Close",
++  "artifacts.saveVersion": "Save version",
++  "artifacts.pin": "Pin to project",
++  "artifacts.unpin": "Unpin",
++  "artifacts.pinned": "Pinned",
++  "artifacts.version": "v{{n}}",
++  "artifacts.exportMd": "Export MD",
++  "artifacts.exportHtml": "Export HTML",
++  "artifacts.exportSvg": "Export SVG",
++  "artifacts.htmlSaveToPreview": "Save a version to refresh the sandboxed preview.",
++  "artifacts.mermaidError": "Mermaid could not render this diagram.",
++  "artifacts.kind.mermaid": "Mermaid",
++  "artifacts.kind.html": "HTML",
++  "artifacts.kind.markdown": "Markdown",
++  "artifacts.kind.code": "Code",
++  "artifacts.error": "Could not update that artifact."
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index 488c926..b33243e 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -120,6 +120,7 @@
+   "workspace.panel.decisions": "Decis├Áes",
+   "workspace.panel.pins": "Pins",
+   "workspace.panel.pinCount": "{{n}} mensagens fixadas",
++  "workspace.panel.artifacts": "Artefactos",
+   "workspace.panel.tasks": "Tarefas",
+   "workspace.panel.taskPlaceholder": "Nova tarefa",
+   "workspace.panel.add": "Adicionar",
+@@ -394,5 +395,23 @@
+   "prompts.error.resolve": "N├úo foi poss├¡vel resolver as vari├íveis no projeto ativo.",
+   "prompts.error.run": "A corrida do playground falhou. Cada modelo fica no slot que escolheu.",
+   "prompts.error.slots": "Escolha dois modelos para correr o playground.",
+-  "prompts.error.content": "Escreva um prompt ou escolha um da library."
++  "prompts.error.content": "Escreva um prompt ou escolha um da library.",
++  "artifacts.canvas": "Canvas",
++  "artifacts.open": "Abrir canvas",
++  "artifacts.close": "Fechar",
++  "artifacts.saveVersion": "Guardar vers├úo",
++  "artifacts.pin": "Fixar no projeto",
++  "artifacts.unpin": "Desafixar",
++  "artifacts.pinned": "Fixado",
++  "artifacts.version": "v{{n}}",
++  "artifacts.exportMd": "Exportar MD",
++  "artifacts.exportHtml": "Exportar HTML",
++  "artifacts.exportSvg": "Exportar SVG",
++  "artifacts.htmlSaveToPreview": "Guarde uma vers├úo para atualizar o preview em sandbox.",
++  "artifacts.mermaidError": "O Mermaid n├úo conseguiu desenhar este diagrama.",
++  "artifacts.kind.mermaid": "Mermaid",
++  "artifacts.kind.html": "HTML",
++  "artifacts.kind.markdown": "Markdown",
++  "artifacts.kind.code": "C├│digo",
++  "artifacts.error": "N├úo foi poss├¡vel atualizar esse artifact."
+ }
+diff --git a/docs/ADR/ADR-W16-002-html-sandbox-custom-protocol.md b/docs/ADR/ADR-W16-002-html-sandbox-custom-protocol.md
+new file mode 100644
+index 0000000..9cac745
+--- /dev/null
++++ b/docs/ADR/ADR-W16-002-html-sandbox-custom-protocol.md
+@@ -0,0 +1,40 @@
++# ADR-W16-002-html-sandbox-custom-protocol
++
++- **Status:** accepted
++- **Onda:** W16
++- **Data:** 2026-09-19
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++HTML de artifact precisa de preview com scripts de UI, **sem rede e sem Node**. `srcdoc` herda o CSP do renderer (`script-src 'self'` em prod) e bloquearia inline. `dangerouslySetInnerHTML` no React quebraria o sanitize da W03.
++
++## Decis├úo
++
++- Protocolo privilegiado `ai-hub-artifact:` registado **antes** de `app.ready`.
++- Cada preview usa origem ├║nica `ai-hub-artifact://<uuid>/` servida pelo main a partir do body cifrado.
++- CSP do preview: `default-src 'none'` + `script-src`/`style-src 'unsafe-inline'` + `img-src data:` + `connect-src 'none'`.
++- iframe `sandbox="allow-scripts"` (sem `allow-same-origin`, sem popups, sem forms).
++- `will-frame-navigate` + `webRequest.onBeforeRequest` cancelam subframe que n├úo seja `ai-hub-artifact:` / `about:blank` / `about:srcdoc`.
++- CSP do preview inclui `navigate-to 'none'` (defesa extra; Chromium pode ignorar).
++- CSP da janela ganha `frame-src 'self' ai-hub-artifact:`. Pedidos `ai-hub-artifact:` **n├úo** recebem o CSP da app.
++- Mermaid **n├úo** usa este protocolo: lib `mermaid` no renderer com `securityLevel: "strict"`.
++
++## Alternativas consideradas
++
++- **BrowserView / WebContentsView:** isolamento extra, layout split mais fr├ígil nesta onda.
++- **srcdoc + relaxar CSP da app:** enfraquece a janela principal.
++
++## Consequ├¬ncias
++
++- Preview HTML de rascunho n├úo-salvo exige ÔÇ£Guardar vers├úoÔÇØ.
++- Scripts no artifact n├úo acedem a `window.hub`.
++- Mermaid renderiza num iframe `sandbox=""` (`about:srcdoc`), n├úo via `innerHTML` na origem da app.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 16)
++- ADR-W00-003 (CSP da janela)
++- ADR-W03-001 (markdown sanitize no chat)
+diff --git a/docs/ADR/ADR-W16-003-artifact-detector-thresholds.md b/docs/ADR/ADR-W16-003-artifact-detector-thresholds.md
+new file mode 100644
+index 0000000..1a0d9ff
+--- /dev/null
++++ b/docs/ADR/ADR-W16-003-artifact-detector-thresholds.md
+@@ -0,0 +1,35 @@
++# ADR-W16-003-artifact-detector-thresholds
++
++- **Status:** accepted
++- **Onda:** W16
++- **Data:** 2026-09-19
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++O plano pede detector de fence `mermaid` / `html`, ÔÇ£doc longoÔÇØ e ÔÇ£c├│digo >N linhasÔÇØ. Sem limiar o chat inteiro viraria canvas (incluindo ÔÇ£Hello from mockÔÇØ).
++
++## Decis├úo
++
++- `mermaid` e `html`/`htm`/`svg` fenced: **sempre** (se o corpo n├úo for vazio).
++- `markdown`/`md` fenced: se o corpo tiver ÔëÑ 200 caracteres.
++- Outras langs fenced **ou fence sem linguagem**: se tiverem ÔëÑ **12** linhas.
++- Texto residual (fora de fences): Markdown se ÔëÑ **800** caracteres **e** (heading ATX ou ÔëÑ 20 linhas).
++- T├¡tulos: primeiro heading, sen├úo o kind (`Mermaid`, `HTML`, lang, `Markdown`).
++
++## Alternativas consideradas
++
++- **Sempre o message inteiro:** polui o workspace.
++- **S├│ mermaid:** falha o aceite D5 (html/doc/c├│digo).
++
++## Consequ├¬ncias
++
++- Snippets curtos ficam na bolha (highlight W03). O mock e2e s├│ abre canvas no prompt de arquitetura.
++- Limiares s├úo constantes em `packages/shared/src/artifacts.ts`.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 16)
++- ADR-W16-001
+diff --git a/docs/IMPLEMENTATION_PLAN.md b/docs/IMPLEMENTATION_PLAN.md
+index 57fdc86..8ee3b46 100644
+--- a/docs/IMPLEMENTATION_PLAN.md
++++ b/docs/IMPLEMENTATION_PLAN.md
+@@ -704,13 +704,13 @@ O que **n├úo** entra no MVP (W0ÔÇôW8), mesmo sendo tentador: RAG, Council, MCP,
+ 
+ **Sub-tasks:**
+ 
+-- [ ] Detector de artifact na resposta (fence `mermaid`, `html`, doc longo, c├│digo >N linhas)
+-- [ ] Painel split chat | canvas
+-- [ ] Render: Markdown doc, Mermaid, HTML sandbox (sem rede)
+-- [ ] Code artifact: highlight + copy; **sem** execu├º├úo nativa nesta onda
+-- [ ] Versionamento do artifact (v1, v2ÔÇª)
+-- [ ] Pin no projeto; export MD/HTML/SVG (mermaid)
+-- [ ] Abrir artifact antigo a partir do workspace da conversa
++- [x] Detector de artifact na resposta (fence `mermaid`, `html`, doc longo, c├│digo >N linhas)
++- [x] Painel split chat | canvas
++- [x] Render: Markdown doc, Mermaid, HTML sandbox (sem rede)
++- [x] Code artifact: highlight + copy; **sem** execu├º├úo nativa nesta onda
++- [x] Versionamento do artifact (v1, v2ÔÇª)
++- [x] Pin no projeto; export MD/HTML/SVG (mermaid)
++- [x] Abrir artifact antigo a partir do workspace da conversa
+ 
+ **DoD:** ÔÇ£desenhe a arquitetura deste fluxoÔÇØ abre Mermaid edit├ível/versionado ao lado do chat.
+ 
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index ad6bc88..ec8b46f 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -125,7 +125,7 @@ describe("hub database", () => {
+       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
+       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
+       applyMigrations(second.sqlite);
+-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(10);
++      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(11);
+       second.close();
+     } finally {
+       rmSync(dir, { recursive: true, force: true });
+@@ -720,4 +720,50 @@ describe("hub database", () => {
+     expect(hub.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Chat"]);
+     hub.close();
+   });
++
++  it("stores artifacts encrypted, versions a family, and clones them", () => {
++    const { hub } = openTestDb();
++    const project = hub.repos.createProject("Alpha");
++    const conversation = hub.repos.createConversation(project.id, "Chat");
++    const user = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "user",
++      content: "desenhe a arquitetura deste fluxo",
++      parentId: null,
++      branchId: null,
++    });
++    const assistant = hub.repos.createMessage({
++      conversationId: conversation.id,
++      role: "assistant",
++      content: "```mermaid\nflowchart LR\n  A --> B\n```",
++      parentId: user.id,
++      branchId: user.branchId,
++    });
++    const first = hub.repos.createArtifact({
++      conversationId: conversation.id,
++      sourceMessageId: assistant.id,
++      kind: "mermaid",
++      title: "Mermaid",
++      body: "flowchart LR\n  A --> B",
++    });
++    const second = hub.repos.createArtifact({
++      conversationId: conversation.id,
++      familyId: first.familyId,
++      sourceMessageId: assistant.id,
++      kind: "mermaid",
++      title: "Mermaid",
++      body: "flowchart LR\n  A --> C",
++    });
++    expect(first.version).toBe(1);
++    expect(second.version).toBe(2);
++    expect(dumpAllText(hub.sqlite)).not.toContain("flowchart LR");
++    expect(hub.repos.getArtifact(first.id)?.body).toBe("flowchart LR\n  A --> B");
++    hub.repos.setArtifactFamilyPinned(first.familyId, true);
++    expect(hub.repos.listArtifactsByFamily(first.familyId).every((item) => item.pinned)).toBe(true);
++    const copy = hub.repos.duplicateConversation(conversation.id);
++    expect(hub.repos.listArtifacts(copy.id)).toHaveLength(2);
++    hub.repos.removeConversation(conversation.id);
++    expect(hub.repos.listArtifacts(conversation.id)).toHaveLength(0);
++    hub.close();
++  });
+ });
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index a84a66d..084eb2c 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -23,6 +23,7 @@ import {
+   projectFiles,
+   projectMemories,
+   prompts,
++  artifacts,
+   messageReceipts,
+   messages,
+   projects,
+@@ -218,6 +219,22 @@ export interface PromptRecord {
+   updatedAt: string;
+ }
+ 
++export type ArtifactKind = "mermaid" | "html" | "markdown" | "code";
++
++export interface ArtifactRecord {
++  id: string;
++  conversationId: string;
++  familyId: string;
++  sourceMessageId: string | null;
++  kind: ArtifactKind;
++  title: string;
++  body: string;
++  language: string | null;
++  version: number;
++  pinned: boolean;
++  createdAt: string;
++}
++
+ export interface SpendCapOverrideRecord {
+   at: string;
+   scope: string;
+@@ -665,6 +682,7 @@ export class HubRepos {
+   }
+ 
+   removeConversation(id: string): void {
++    this.db.delete(artifacts).where(eq(artifacts.conversationId, id)).run();
+     this.db.delete(conversationTags).where(eq(conversationTags.conversationId, id)).run();
+     this.db.delete(conversations).where(eq(conversations.id, id)).run();
+   }
+@@ -2150,6 +2168,92 @@ export class HubRepos {
+     this.db.delete(prompts).where(eq(prompts.id, id)).run();
+   }
+ 
++  createArtifact(input: {
++    conversationId: string;
++    familyId?: string;
++    sourceMessageId?: string | null;
++    kind: ArtifactKind;
++    title: string;
++    body: string;
++    language?: string | null;
++    pinned?: boolean;
++    version?: number;
++  }): ArtifactRecord {
++    const familyId = input.familyId ?? randomUUID();
++    const existing = this.listArtifactsByFamily(familyId);
++    const version =
++      input.version ??
++      (existing.length === 0 ? 1 : Math.max(...existing.map((item) => item.version)) + 1);
++    const pinned = input.pinned ?? existing[0]?.pinned ?? false;
++    const id = randomUUID();
++    const now = Date.now();
++    this.db
++      .insert(artifacts)
++      .values({
++        id,
++        conversationId: input.conversationId,
++        familyId,
++        sourceMessageId: input.sourceMessageId ?? null,
++        kind: input.kind,
++        titleCipher: encryptUtf8(input.title.slice(0, 120), this.masterKey),
++        bodyCipher: encryptUtf8(input.body.slice(0, 100_000), this.masterKey),
++        language: input.language ?? null,
++        version,
++        pinned: pinned ? 1 : 0,
++        createdAt: now,
++      })
++      .run();
++    const created = this.getArtifact(id);
++    if (!created) {
++      throw new Error("Artifact not found");
++    }
++    return created;
++  }
++
++  getArtifact(id: string): ArtifactRecord | null {
++    const row = this.db.select().from(artifacts).where(eq(artifacts.id, id)).get();
++    return row ? this.toArtifact(row) : null;
++  }
++
++  listArtifacts(conversationId: string): ArtifactRecord[] {
++    return this.db
++      .select()
++      .from(artifacts)
++      .where(eq(artifacts.conversationId, conversationId))
++      .all()
++      .map((row) => this.toArtifact(row))
++      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.version - a.version);
++  }
++
++  listArtifactsByFamily(familyId: string): ArtifactRecord[] {
++    return this.db
++      .select()
++      .from(artifacts)
++      .where(eq(artifacts.familyId, familyId))
++      .all()
++      .map((row) => this.toArtifact(row))
++      .sort((a, b) => a.version - b.version);
++  }
++
++  listArtifactsByMessage(messageId: string): ArtifactRecord[] {
++    return this.db
++      .select()
++      .from(artifacts)
++      .where(eq(artifacts.sourceMessageId, messageId))
++      .all()
++      .map((row) => this.toArtifact(row))
++      .sort((a, b) => a.kind.localeCompare(b.kind) || a.version - b.version);
++  }
++
++  setArtifactFamilyPinned(familyId: string, pinned: boolean): ArtifactRecord[] {
++    this.db
++      .update(artifacts)
++      .set({ pinned: pinned ? 1 : 0 })
++      .where(eq(artifacts.familyId, familyId))
++      .run();
++    return this.listArtifactsByFamily(familyId);
++  }
++
+   replaceFileChunks(
+     fileId: string,
+     projectId: string | null,
+@@ -2337,6 +2441,25 @@ export class HubRepos {
+         this.setConversationTaskDone(cloned.id, true);
+       }
+     }
++    const familyMap = new Map<string, string>();
++    for (const artifact of this.listArtifacts(id)) {
++      let nextFamily = familyMap.get(artifact.familyId);
++      if (!nextFamily) {
++        nextFamily = randomUUID();
++        familyMap.set(artifact.familyId, nextFamily);
++      }
++      this.createArtifact({
++        conversationId: copy.id,
++        familyId: nextFamily,
++        sourceMessageId: artifact.sourceMessageId ? (idMap.get(artifact.sourceMessageId) ?? null) : null,
++        kind: artifact.kind,
++        title: artifact.title,
++        body: artifact.body,
++        language: artifact.language,
++        pinned: artifact.pinned,
++        version: artifact.version,
++      });
++    }
+     const created = this.getConversation(copy.id);
+     if (!created) {
+       throw new Error("Conversation not found");
+@@ -2414,6 +2537,26 @@ export class HubRepos {
+     };
+   }
+ 
++  private toArtifact(row: typeof artifacts.$inferSelect): ArtifactRecord {
++    const kind: ArtifactKind =
++      row.kind === "mermaid" || row.kind === "html" || row.kind === "markdown" || row.kind === "code"
++        ? row.kind
++        : "markdown";
++    return {
++      id: row.id,
++      conversationId: row.conversationId,
++      familyId: row.familyId,
++      sourceMessageId: row.sourceMessageId ?? null,
++      kind,
++      title: decryptUtf8(row.titleCipher, this.masterKey),
++      body: decryptUtf8(row.bodyCipher, this.masterKey),
++      language: row.language ?? null,
++      version: row.version,
++      pinned: row.pinned === 1,
++      createdAt: iso(row.createdAt),
++    };
++  }
++
+   async removeProviderKey(id: string): Promise<void> {
+     const row = this.db.select().from(providerKeys).where(eq(providerKeys.id, id)).get();
+     if (!row) {
+diff --git a/packages/shared/src/artifacts.test.ts b/packages/shared/src/artifacts.test.ts
+new file mode 100644
+index 0000000..f34f95e
+--- /dev/null
++++ b/packages/shared/src/artifacts.test.ts
+@@ -0,0 +1,48 @@
++import { describe, expect, it } from "vitest";
++import {
++  CODE_ARTIFACT_MIN_LINES,
++  detectArtifacts,
++  artifactFrameSrc,
++  MARKDOWN_ARTIFACT_MIN_CHARS,
++} from "./artifacts";
++
++describe("detectArtifacts", () => {
++  it("extracts a mermaid fence regardless of size", () => {
++    const found = detectArtifacts("See this.\n\n```mermaid\nflowchart LR\n  A --> B\n```\n");
++    expect(found).toEqual([
++      {
++        kind: "mermaid",
++        language: null,
++        title: "Mermaid",
++        body: "flowchart LR\n  A --> B",
++      },
++    ]);
++  });
++
++  it("extracts html and long code fences, and a leftover markdown doc", () => {
++    const codeLines = Array.from({ length: CODE_ARTIFACT_MIN_LINES }, (_, index) => `const n${index} = ${index};`);
++    const heading = "# Architecture\n\n";
++    const prose = "x".repeat(MARKDOWN_ARTIFACT_MIN_CHARS);
++    const content = `${heading}${prose}\n\n\`\`\`html\n<div>Hi</div>\n\`\`\`\n\n\`\`\`ts\n${codeLines.join("\n")}\n\`\`\`\n`;
++    const found = detectArtifacts(content);
++    expect(found.map((item) => item.kind)).toEqual(["html", "code", "markdown"]);
++    expect(found[0]?.body).toContain("<div>Hi</div>");
++    expect(found[1]?.language).toBe("ts");
++    expect(found[2]?.title).toBe("Architecture");
++  });
++
++  it("ignores tiny code fences and short prose", () => {
++    expect(detectArtifacts("Hello from mock")).toEqual([]);
++    expect(detectArtifacts("```ts\nconst x = 1;\n```")).toEqual([]);
++    const unlabeled = Array.from({ length: CODE_ARTIFACT_MIN_LINES }, (_, index) => `line ${index}`).join("\n");
++    expect(detectArtifacts(`\`\`\`\n${unlabeled}\n\`\`\``)[0]?.kind).toBe("code");
++  });
++});
++
++describe("artifactFrameSrc", () => {
++  it("uses a unique host per artifact id", () => {
++    expect(artifactFrameSrc("11111111-1111-4111-8111-111111111111")).toBe(
++      "ai-hub-artifact://11111111-1111-4111-8111-111111111111/",
++    );
++  });
++});
+diff --git a/packages/shared/src/artifacts.ts b/packages/shared/src/artifacts.ts
+new file mode 100644
+index 0000000..ead5ea4
+--- /dev/null
++++ b/packages/shared/src/artifacts.ts
+@@ -0,0 +1,135 @@
++export const ARTIFACT_KINDS = ["mermaid", "html", "markdown", "code"] as const;
++
++export type ArtifactKind = (typeof ARTIFACT_KINDS)[number];
++
++export const ARTIFACT_PROTOCOL = "ai-hub-artifact";
++
++export const CODE_ARTIFACT_MIN_LINES = 12;
++export const MARKDOWN_ARTIFACT_MIN_CHARS = 800;
++export const FENCED_MARKDOWN_MIN_CHARS = 200;
++
++export interface DetectedArtifact {
++  kind: ArtifactKind;
++  language: string | null;
++  title: string;
++  body: string;
++}
++
++const FENCE = /```([a-zA-Z0-9_+-]*)[ \t]*\r?\n([\s\S]*?)```/g;
++const HTML_LANGS = new Set(["html", "htm", "svg"]);
++const MARKDOWN_LANGS = new Set(["markdown", "md"]);
++
++export function isArtifactKind(value: string): value is ArtifactKind {
++  return (ARTIFACT_KINDS as readonly string[]).includes(value);
++}
++
++export function artifactFrameSrc(id: string): string {
++  return `${ARTIFACT_PROTOCOL}://${id}/`;
++}
++
++export function detectArtifacts(content: string): DetectedArtifact[] {
++  const found: DetectedArtifact[] = [];
++  const consumed: Array<{ start: number; end: number }> = [];
++  const fence = new RegExp(FENCE.source, "g");
++  let match: RegExpExecArray | null = fence.exec(content);
++  while (match) {
++    const rawLang = (match[1] ?? "").toLowerCase();
++    const body = (match[2] ?? "").replace(/\n$/, "");
++    const start = match.index;
++    const end = start + match[0].length;
++    consumed.push({ start, end });
++    const detected = classifyFence(rawLang, body);
++    if (detected) {
++      found.push(detected);
++    }
++    match = fence.exec(content);
++  }
++  const remainder = stripRanges(content, consumed).trim();
++  if (remainder.length >= MARKDOWN_ARTIFACT_MIN_CHARS && looksLikeMarkdownDoc(remainder)) {
++    found.push({
++      kind: "markdown",
++      language: null,
++      title: artifactTitle("markdown", null, remainder),
++      body: remainder,
++    });
++  }
++  return found;
++}
++
++function classifyFence(lang: string, body: string): DetectedArtifact | null {
++  const trimmed = body.trim();
++  if (trimmed.length === 0) {
++    return null;
++  }
++  if (lang === "mermaid") {
++    return {
++      kind: "mermaid",
++      language: null,
++      title: artifactTitle("mermaid", null, body),
++      body,
++    };
++  }
++  if (HTML_LANGS.has(lang)) {
++    return {
++      kind: "html",
++      language: lang === "svg" ? "svg" : "html",
++      title: artifactTitle("html", lang, body),
++      body,
++    };
++  }
++  if (MARKDOWN_LANGS.has(lang) && trimmed.length >= FENCED_MARKDOWN_MIN_CHARS) {
++    return {
++      kind: "markdown",
++      language: null,
++      title: artifactTitle("markdown", null, body),
++      body,
++    };
++  }
++  const lines = body.split(/\r?\n/).length;
++  if (!MARKDOWN_LANGS.has(lang) && lines >= CODE_ARTIFACT_MIN_LINES) {
++    const language = lang.length > 0 ? lang.slice(0, 40) : null;
++    return {
++      kind: "code",
++      language,
++      title: artifactTitle("code", language, body),
++      body,
++    };
++  }
++  return null;
++}
++
++function looksLikeMarkdownDoc(text: string): boolean {
++  return /^#{1,6}\s+\S/m.test(text) || text.split(/\r?\n/).length >= 20;
++}
++
++export function artifactTitle(kind: ArtifactKind, language: string | null, body: string): string {
++  const heading = /^#{1,6}\s+(.+)$/m.exec(body);
++  if (heading?.[1]) {
++    return heading[1].trim().slice(0, 80);
++  }
++  if (kind === "mermaid") {
++    return "Mermaid";
++  }
++  if (kind === "html") {
++    return language === "svg" ? "SVG" : "HTML";
++  }
++  if (kind === "code") {
++    return language ? language.slice(0, 40) : "Code";
++  }
++  return "Markdown";
++}
++
++function stripRanges(content: string, ranges: Array<{ start: number; end: number }>): string {
++  if (ranges.length === 0) {
++    return content;
++  }
++  const ordered = [...ranges].sort((a, b) => a.start - b.start);
++  let cursor = 0;
++  let out = "";
++  for (const range of ordered) {
++    out += content.slice(cursor, range.start);
++    cursor = range.end;
++  }
++  out += content.slice(cursor);
++  return out;
++}
