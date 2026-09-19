@@ -651,12 +651,12 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 
 **Sub-tasks:**
 
-- [ ] Trigger `@` no composer com autocomplete
-- [ ] Tipos: `@file`, `@conversation`, `@memory` (stub até W14), `@prompt` (W15), `@skill` (W17), `@packet` (W10)
-- [ ] Chip visual; backspace remove menção e o contexto
-- [ ] Preview lateral: trecho + tokens estimados
-- [ ] Compiler injeta menções de forma estruturada (não concatena no texto do usuário)
-- [ ] Cap de tokens de menções; aviso se estourar
+- [x] Trigger `@` no composer com autocomplete
+- [x] Tipos: `@file`, `@conversation`, `@memory` (stub até W14), `@prompt` (W15), `@skill` (W17), `@packet` (W10)
+- [x] Chip visual; backspace remove menção e o contexto
+- [x] Preview lateral: trecho + tokens estimados
+- [x] Compiler injeta menções de forma estruturada (não concatena no texto do usuário)
+- [x] Cap de tokens de menções; aviso se estourar
 
 **DoD:** `@file:README.md o que este repo faz?` injeta só aquele arquivo; o texto visível não vira um dump.
 
