@@ -15,6 +15,7 @@ import type {
   PacketPrivacyMode,
   ProjectDto,
   ProjectUpdateInput,
+  ProjectFileDto,
   ProviderKeyDto,
   SearchHit,
 } from "@ai-hub/shared";
@@ -76,6 +77,21 @@ function workspaceErrorText(
   if (classified.kind === "unknown_model") {
     return { text: t("workspace.error.unknownModel"), cap: false };
   }
+  if (message.includes("files:vision_required")) {
+    return { text: t("files.error.vision"), cap: false };
+  }
+  if (message.includes("files:too_large")) {
+    return { text: t("files.error.tooLarge"), cap: false };
+  }
+  if (message.includes("files:unsupported")) {
+    return { text: t("files.error.unsupported"), cap: false };
+  }
+  if (message.includes("files:project_mismatch")) {
+    return { text: t("files.error.projectMismatch"), cap: false };
+  }
+  if (message.includes("files:limit")) {
+    return { text: t("files.error.limit"), cap: false };
+  }
   if (
     classified.kind === "gateway" &&
     classified.code &&
@@ -84,6 +100,10 @@ function workspaceErrorText(
     return { text: t(`workspace.error.${classified.code}`), cap: false };
   }
   return { text: t("workspace.error.generic"), cap: false };
+}
+
+function fileIdsPayload(files: ProjectFileDto[]): { fileIds: string[] } | Record<string, never> {
+  return files.length > 0 ? { fileIds: files.map((file) => file.id) } : {};
 }
 
 function chatEventErrorText(t: TFunction, code: GatewayErrorCode): string {
@@ -129,6 +149,7 @@ export function App(): JSX.Element {
   const [costs, setCosts] = useState<CostsAggregateResult | null>(null);
   const [showAllowOnce, setShowAllowOnce] = useState(false);
   const [composerDraft, setComposerDraft] = useState("");
+  const [attachedFiles, setAttachedFiles] = useState<ProjectFileDto[]>([]);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
   const [fallback, setFallback] = useState<{
@@ -446,6 +467,7 @@ export function App(): JSX.Element {
           ...(extra !== undefined ? { extraSystem: extra } : {}),
           ...(pending !== undefined ? { pendingContent: pending } : {}),
           ...(maxTokens !== null ? { maxTokens } : {}),
+          ...fileIdsPayload(attachedFiles),
         })
         .then(setPacketPreview)
         .catch(fail);
@@ -464,6 +486,7 @@ export function App(): JSX.Element {
     selectedModel,
     privacyMode,
     activePacketId,
+    attachedFiles,
   ]);
 
   useEffect(() => {
@@ -544,10 +567,12 @@ export function App(): JSX.Element {
         privacyMode,
         ...(extra !== undefined ? { extraSystem: extra } : {}),
         ...(maxTokens !== null ? { maxTokens } : {}),
+        ...fileIdsPayload(attachedFiles),
       })
       .then(setFallbackPreview)
       .catch(() => setFallbackPreview(null));
   }, [
+    attachedFiles,
     compactHistory,
     extraSystem,
     fallback,
@@ -660,6 +685,7 @@ export function App(): JSX.Element {
       abortIfLeaving(null);
       setSelectedProjectId(id);
       setImportedInbox(false);
+      setAttachedFiles([]);
       setSelectedConversationId(null);
       setMessages([]);
       setBranchLabels({});
@@ -818,6 +844,7 @@ export function App(): JSX.Element {
           onSelectImportedInbox={() => {
             abortIfLeaving(null);
             setSelectedProjectId(null);
+            setAttachedFiles([]);
             setImportedInbox(true);
             setSelectedConversationId(null);
             setMessages([]);
@@ -909,6 +936,7 @@ export function App(): JSX.Element {
                   maxTokens,
                   extraSystem,
                   compactHistory,
+                  ...fileIdsPayload(attachedFiles),
                 });
               }}
               onAbort={async () => {
@@ -934,6 +962,7 @@ export function App(): JSX.Element {
                   temperature,
                   maxTokens,
                   extraSystem,
+                  ...fileIdsPayload(attachedFiles),
                 });
               }}
               onContinue={async () => {
@@ -948,6 +977,7 @@ export function App(): JSX.Element {
                   temperature,
                   maxTokens,
                   extraSystem,
+                  ...fileIdsPayload(attachedFiles),
                 });
               }}
               onEditUser={async (id, content) => {
@@ -964,6 +994,7 @@ export function App(): JSX.Element {
                   temperature,
                   maxTokens,
                   extraSystem,
+                  ...fileIdsPayload(attachedFiles),
                 });
               }}
               onActivate={async (id) => {
@@ -1203,6 +1234,71 @@ export function App(): JSX.Element {
                 }
               }}
               onOpenCaps={() => openSettings("caps")}
+              attachedFiles={attachedFiles}
+              onAttachFile={async () => {
+                try {
+                  const created = await window.hub.files.attach({
+                    projectId: selectedProjectId,
+                    kind: "file",
+                  });
+                  setAttachedFiles((current) =>
+                    [...current, ...created.filter((item) => !current.some((row) => row.id === item.id))].slice(
+                      0,
+                      8,
+                    ),
+                  );
+                  setError(null);
+                } catch (error) {
+                  const mapped = workspaceErrorText(t, error);
+                  setError(mapped.text);
+                }
+              }}
+              onAttachFolder={async () => {
+                try {
+                  const created = await window.hub.files.attach({
+                    projectId: selectedProjectId,
+                    kind: "folder",
+                  });
+                  setAttachedFiles((current) =>
+                    [...current, ...created.filter((item) => !current.some((row) => row.id === item.id))].slice(
+                      0,
+                      8,
+                    ),
+                  );
+                  setError(null);
+                } catch (error) {
+                  const mapped = workspaceErrorText(t, error);
+                  setError(mapped.text);
+                }
+              }}
+              onRemoveFile={async (id) => {
+                try {
+                  await window.hub.files.remove({ id, projectId: selectedProjectId });
+                  setAttachedFiles((current) => current.filter((item) => item.id !== id));
+                  setError(null);
+                } catch (error) {
+                  const mapped = workspaceErrorText(t, error);
+                  setError(mapped.text);
+                }
+              }}
+              onDropFiles={async (files) => {
+                try {
+                  const created = await window.hub.files.fromDrop({
+                    projectId: selectedProjectId,
+                    files,
+                  });
+                  setAttachedFiles((current) =>
+                    [...current, ...created.filter((item) => !current.some((row) => row.id === item.id))].slice(
+                      0,
+                      8,
+                    ),
+                  );
+                  setError(null);
+                } catch (error) {
+                  const mapped = workspaceErrorText(t, error);
+                  setError(mapped.text);
+                }
+              }}
             />
           ) : view === "debug" ? (
             <DebugView />
@@ -1287,6 +1383,7 @@ export function App(): JSX.Element {
                       temperature,
                       maxTokens,
                       extraSystem,
+                      ...fileIdsPayload(attachedFiles),
                     });
                   }}
                 >
