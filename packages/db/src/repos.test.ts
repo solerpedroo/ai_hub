@@ -36,6 +36,20 @@ describe("hub database", () => {
     hub.close();
   });
 
+  it("persists project/provider caps independently", () => {
+    const { hub } = openTestDb();
+    const project = hub.repos.createProject("Scoped");
+    hub.repos.upsertScopedSpendCap("project", project.id, "2.000000");
+    hub.repos.upsertScopedSpendCap("provider", "openai", "3.000000");
+    expect(hub.repos.listScopedSpendCaps()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ dimension: "project", subjectId: project.id, limitUsd: "2.000000" }),
+      expect.objectContaining({ dimension: "provider", subjectId: "openai", limitUsd: "3.000000" }),
+    ]));
+    hub.repos.upsertScopedSpendCap("project", project.id, null);
+    expect(hub.repos.listScopedSpendCaps().some((item) => item.dimension === "project")).toBe(false);
+    hub.close();
+  });
+
   it("stores ciphertext, not plaintext names", () => {
     const { hub } = openTestDb();
     hub.repos.createProject("SecretProjectName");
