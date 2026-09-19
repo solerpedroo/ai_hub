@@ -19,6 +19,7 @@
   "dependencies": {
     "@ai-hub/ai-gateway": "workspace:*",
     "@ai-hub/db": "workspace:*",
+    "@ai-hub/files": "workspace:*",
     "@ai-hub/security": "workspace:*",
     "@ai-hub/shared": "workspace:*",
     "@electron-toolkit/utils": "^4.0.0",
