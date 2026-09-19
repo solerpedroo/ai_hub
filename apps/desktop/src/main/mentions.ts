@@ -11,6 +11,7 @@ import {
   type MentionRef,
   type PacketPrivacyMode,
 } from "@ai-hub/shared";
+import { interpolateStoredPrompt } from "./prompt-vars";
 
 export function resolveSendMentions(
   repos: HubRepos,
@@ -72,6 +73,16 @@ export function resolveSendMentions(
         mentions.push(mention);
         continue;
       }
+      if (ref.type === "prompt") {
+        const mention = resolvePromptMention(repos, projectId, ref, remaining);
+        if (seen.has(`prompt:${mention.id}`)) {
+          continue;
+        }
+        seen.add(`prompt:${mention.id}`);
+        usedTokens += mentionTokenEstimate(mention.text.length);
+        mentions.push(mention);
+        continue;
+      }
       if (ref.type === "conversation") {
         const mention = resolveConversationMention(repos, projectId, currentConversationId, ref, remaining);
         if (mention) {
@@ -124,6 +135,37 @@ function resolveMemoryMention(
   const maxChars = Math.max(4, remainingTokens * 4);
   return {
     kind: "memory",
+    id: match.id,
+    name: match.title,
+    text: text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text,
+  };
+}
+
+function resolvePromptMention(
+  repos: HubRepos,
+  projectId: string | null,
+  ref: MentionRef,
+  remainingTokens: number,
+): CompilerMention {
+  const prompts = repos.listPrompts();
+  const match = ref.id
+    ? prompts.find((item) => item.id === ref.id)
+    : prompts.find((item) => {
+        const query = (ref.query ?? "").toLowerCase();
+        const factory = (item.factoryId ?? "").toLowerCase().replace(/-/g, " ");
+        return (
+          item.title.toLowerCase().includes(query) ||
+          factory.includes(query) ||
+          (item.factoryId ?? "").toLowerCase() === query
+        );
+      });
+  if (!match) {
+    throw new Error("mentions:not_found");
+  }
+  const text = redactSecrets(interpolateStoredPrompt(repos, match.body, projectId));
+  const maxChars = Math.max(4, remainingTokens * 4);
+  return {
+    kind: "prompt",
     id: match.id,
     name: match.title,
     text: text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text,
