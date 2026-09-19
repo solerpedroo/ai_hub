@@ -10,6 +10,11 @@ export interface ProviderCapabilities {
   tools: boolean;
 }
 
+export interface ChatImagePart {
+  mime: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+  data: string;
+}
+
 export interface ChatStreamRequest {
   secret: string;
   model: string;
@@ -17,6 +22,7 @@ export interface ChatStreamRequest {
   signal: AbortSignal;
   temperature?: number;
   maxTokens?: number | null;
+  images?: ChatImagePart[];
 }
 
 export type ChatStreamEvent =
