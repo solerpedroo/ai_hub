@@ -1,0 +1,450 @@
+diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts index 31953dd..5e9bd0a 100644 --- a/apps/desktop/src/main/chat-session.ts +++ b/apps/desktop/src/main/chat-session.ts @@ -3,6 +3,7 @@ import type { WebContents } from "electron";  import {    composeReceipt,    appendFilesToPacket, +  appendMentionsToPacket,    compileActivePath,    compilePacket,    consumeCrashSafeStream, @@ -27,6 +28,7 @@ import {    chatEventSchema,    findCatalogModel,    IpcChannel, +  mentionVisibleContent,    packetV0Schema,    portablePacketV1Schema,    SpendCapError, @@ -43,6 +45,7 @@ import { recordDebugSnapshot } from "./debug-snapshot";  import { isE2eMode } from "./e2e-mode";  import { toMessageDto } from "./message-dto";  import { loadSendAttachments } from "./files"; +import { resolveSendMentions } from "./mentions";  import { getHubDatabase } from "./persistence";  import { estimateOutgoingCostUsd, evaluateOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";   @@ -268,13 +271,14 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi      case "send": {        const leaf = activePath(existing).at(-1);        const branchId = leaf?.branchId ?? randomUUID(); -      const draft = pendingUser(input.conversationId, input.content, leaf?.id ?? null, branchId); +      const content = mentionVisibleContent(input.content) || input.content; +      const draft = pendingUser(input.conversationId, content, leaf?.id ?? null, branchId);        compileRows = [...existing, draft];        persistUser = () =>          repos.createMessage({            conversationId: input.conversationId,            role: "user", -          content: input.content, +          content,            parentId: leaf?.id ?? null,            branchId: leaf?.branchId ?? null,          }); @@ -316,7 +320,8 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi          throw new Error("User message not found");        }        const branchId = randomUUID(); -      const draft = pendingUser(input.conversationId, input.content, target.parentId, branchId); +      const content = mentionVisibleContent(input.content) || input.content; +      const draft = pendingUser(input.conversationId, content, target.parentId, branchId);        compileRows = existing          .map((item) => (item.id === target.id ? { ...item, isActiveBranch: false } : item))          .concat(draft); @@ -324,7 +329,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi          repos.createMessage({            conversationId: input.conversationId,            role: "user", -          content: input.content, +          content,            parentId: target.parentId,            branchId,          }); @@ -340,8 +345,15 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi      const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;    const catalogForVision = findCatalogModel(input.model, key.providerSlug); +  const resolvedMentions = resolveSendMentions( +    repos, +    input.mentions, +    conversation.projectId, +    input.conversationId, +  ); +  const fileIds = [...new Set([...(input.fileIds ?? []), ...resolvedMentions.fileIds])];    const attachments = loadSendAttachments( -    input.fileIds, +    fileIds,      conversation.projectId,      catalogForVision?.vision === true,      "send", @@ -353,7 +365,8 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi      key.providerSlug,      conversation,    ); -  const packet = appendFilesToPacket(compiled, attachments.files).packet; +  const withFiles = appendFilesToPacket(compiled, attachments.files); +  const packet = appendMentionsToPacket(withFiles.packet, resolvedMentions.mentions).packet;    if (packet.messages.length === 0) {      throw new Error("Add a user message before sending");    } diff --git a/apps/desktop/src/main/packet-preview.ts b/apps/desktop/src/main/packet-preview.ts index 588cb20..91e7562 100644 --- a/apps/desktop/src/main/packet-preview.ts +++ b/apps/desktop/src/main/packet-preview.ts @@ -1,4 +1,9 @@ -import { appendFilesToPacket, compileActivePathDetailed, mergePacketWithTail } from "@ai-hub/ai-gateway"; +import { +  appendFilesToPacket, +  appendMentionsToPacket, +  compileActivePathDetailed, +  mergePacketWithTail, +} from "@ai-hub/ai-gateway";  import { randomUUID } from "node:crypto";  import {    findCatalogModel, @@ -8,6 +13,7 @@ import {    type PacketPreviewResult,  } from "@ai-hub/shared";  import { loadSendAttachments } from "./files"; +import { resolveSendMentions } from "./mentions";  import { getHubDatabase } from "./persistence";  import { estimateOutgoingCostUsd, evaluateOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";   @@ -118,26 +124,30 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {      included = detailed.included;      omitted = detailed.omitted;    } +  const resolvedMentions = resolveSendMentions( +    repos, +    input.mentions, +    conversation.projectId, +    input.conversationId, +  ); +  const fileIds = [...new Set([...(input.fileIds ?? []), ...resolvedMentions.fileIds])];    const attachments = loadSendAttachments( -    input.fileIds, +    fileIds,      conversation.projectId,      catalog?.vision === true,      "preview",    ); -  if (attachments.files.length > 0) { -    const withFiles = appendFilesToPacket( -      { -        version: 1, -        system: "", -        messages: [], -        tokenEstimate: 0, -        excluded: [], -      }, -      attachments.files, -    ); -    tokenEstimate += withFiles.packet.tokenEstimate; -    included = [...included, ...withFiles.included].slice(0, 200); -  } +  const dummyPacket = { +    version: 1 as const, +    system: "", +    messages: [], +    tokenEstimate: 0, +    excluded: [], +  }; +  const filesOnly = appendFilesToPacket(dummyPacket, attachments.files); +  const mentionsOnly = appendMentionsToPacket(dummyPacket, resolvedMentions.mentions); +  tokenEstimate += filesOnly.packet.tokenEstimate + mentionsOnly.packet.tokenEstimate; +  included = [...included, ...filesOnly.included, ...mentionsOnly.included].slice(0, 200);      const estimatedCostUsd = estimateOutgoingCostUsd(      input.model, diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx index e548301..9e771e5 100644 --- a/apps/desktop/src/renderer/src/App.tsx +++ b/apps/desktop/src/renderer/src/App.tsx @@ -10,6 +10,7 @@ import type {    CostsAggregateResult,    GatewayErrorCode,    HealthSummaryDto, +  MentionRef,    MessageDto,    PacketPreviewResult,    PacketPrivacyMode, @@ -92,6 +93,15 @@ function workspaceErrorText(    if (message.includes("files:limit")) {      return { text: t("files.error.limit"), cap: false };    } +  if (message.includes("mentions:unavailable")) { +    return { text: t("mentions.error.unavailable"), cap: false }; +  } +  if (message.includes("mentions:not_found")) { +    return { text: t("mentions.error.notFound"), cap: false }; +  } +  if (message.includes("mentions:limit")) { +    return { text: t("mentions.error.limit"), cap: false }; +  }    if (      classified.kind === "gateway" &&      classified.code && @@ -106,6 +116,12 @@ function fileIdsPayload(files: ProjectFileDto[]): { fileIds: string[] } | Record    return files.length > 0 ? { fileIds: files.map((file) => file.id) } : {};  }   +function mentionsPayload( +  mentions: MentionRef[], +): { mentions: MentionRef[] } | Record<string, never> { +  return mentions.length > 0 ? { mentions } : {}; +} +  function chatEventErrorText(t: TFunction, code: GatewayErrorCode): string {    if (GATEWAY_ERROR_KEYS.has(code)) {      return t(`workspace.error.${code}`); @@ -150,6 +166,7 @@ export function App(): JSX.Element {    const [showAllowOnce, setShowAllowOnce] = useState(false);    const [composerDraft, setComposerDraft] = useState("");    const [attachedFiles, setAttachedFiles] = useState<ProjectFileDto[]>([]); +  const [mentionRefs, setMentionRefs] = useState<MentionRef[]>([]);    const [shortcutsOpen, setShortcutsOpen] = useState(false);    const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");    const [fallback, setFallback] = useState<{ @@ -468,6 +485,7 @@ export function App(): JSX.Element {            ...(pending !== undefined ? { pendingContent: pending } : {}),            ...(maxTokens !== null ? { maxTokens } : {}),            ...fileIdsPayload(attachedFiles), +          ...mentionsPayload(mentionRefs),          })          .then(setPacketPreview)          .catch(fail); @@ -487,6 +505,7 @@ export function App(): JSX.Element {      privacyMode,      activePacketId,      attachedFiles, +    mentionRefs,    ]);      useEffect(() => { @@ -568,6 +587,7 @@ export function App(): JSX.Element {          ...(extra !== undefined ? { extraSystem: extra } : {}),          ...(maxTokens !== null ? { maxTokens } : {}),          ...fileIdsPayload(attachedFiles), +        ...mentionsPayload(mentionRefs),        })        .then(setFallbackPreview)        .catch(() => setFallbackPreview(null)); @@ -577,6 +597,7 @@ export function App(): JSX.Element {      extraSystem,      fallback,      maxTokens, +    mentionRefs,      privacyMode,      selectedConversationId,    ]); @@ -686,6 +707,7 @@ export function App(): JSX.Element {        setSelectedProjectId(id);        setImportedInbox(false);        setAttachedFiles([]); +      setMentionRefs([]);        setSelectedConversationId(null);        setMessages([]);        setBranchLabels({}); @@ -845,6 +867,7 @@ export function App(): JSX.Element {              abortIfLeaving(null);              setSelectedProjectId(null);              setAttachedFiles([]); +      setMentionRefs([]);              setImportedInbox(true);              setSelectedConversationId(null);              setMessages([]); @@ -922,10 +945,11 @@ export function App(): JSX.Element {                onSelectTemperature={setTemperature}                onSelectMaxTokens={setMaxTokens}                onSelectExtraSystem={setExtraSystem} -              onSend={(content) => { +              onSend={(content, mentions) => {                  if (!selectedConversationId || !selectedKeyId) {                    return Promise.resolve(false);                  } +                setMentionRefs(mentions);                  return sendToModel({                    mode: "send",                    conversationId: selectedConversationId, @@ -937,8 +961,10 @@ export function App(): JSX.Element {                    extraSystem,                    compactHistory,                    ...fileIdsPayload(attachedFiles), +                  ...mentionsPayload(mentions),                  });                }} +              onMentionsChange={setMentionRefs}                onAbort={async () => {                  if (!run || run.conversationId !== selectedConversationId) {                    return; @@ -963,6 +989,7 @@ export function App(): JSX.Element {                    maxTokens,                    extraSystem,                    ...fileIdsPayload(attachedFiles), +                  ...mentionsPayload(mentionRefs),                  });                }}                onContinue={async () => { @@ -978,6 +1005,7 @@ export function App(): JSX.Element {                    maxTokens,                    extraSystem,                    ...fileIdsPayload(attachedFiles), +                  ...mentionsPayload(mentionRefs),                  });                }}                onEditUser={async (id, content) => { @@ -995,6 +1023,7 @@ export function App(): JSX.Element {                    maxTokens,                    extraSystem,                    ...fileIdsPayload(attachedFiles), +                  ...mentionsPayload(mentionRefs),                  });                }}                onActivate={async (id) => { @@ -1272,14 +1301,7 @@ export function App(): JSX.Element {                  }                }}                onRemoveFile={async (id) => { -                try { -                  await window.hub.files.remove({ id, projectId: selectedProjectId }); -                  setAttachedFiles((current) => current.filter((item) => item.id !== id)); -                  setError(null); -                } catch (error) { -                  const mapped = workspaceErrorText(t, error); -                  setError(mapped.text); -                } +                setAttachedFiles((current) => current.filter((item) => item.id !== id));                }}                onDropFiles={async (files) => {                  try { @@ -1384,6 +1406,7 @@ export function App(): JSX.Element {                        maxTokens,                        extraSystem,                        ...fileIdsPayload(attachedFiles), +                  ...mentionsPayload(mentionRefs),                      });                    }}                  > diff --git a/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx b/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx index 1959182..2254439 100644 --- a/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx +++ b/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx @@ -7,11 +7,26 @@ import {    useState,  } from "react";  import { useTranslation } from "react-i18next"; -import { looksLikePastedSecret, redactPastedSecrets } from "@ai-hub/shared"; +import { +  looksLikePastedSecret, +  mentionTriggerIn, +  redactPastedSecrets, +  type MentionType, +} from "@ai-hub/shared";  import { Button } from "@/components/ui/button";    export type SlashCommandId = "model" | "clear" | "compact" | "packet" | "cap";   +export interface MentionSuggestion { +  type: MentionType; +  id: string | null; +  query: string; +  label: string; +  excerpt: string; +  tokens: number; +  available: boolean; +} +  const SLASH_COMMANDS: SlashCommandId[] = ["model", "clear", "compact", "packet", "cap"];    export function matchKnownSlashCommand(draft: string): SlashCommandId | null { @@ -30,6 +45,11 @@ export function ChatComposer({    onAbort,    onSlashCommand,    onFilesDrop, +  mentionSuggestions, +  onMentionQuery, +  onPickMention, +  onRemoveLastMention, +  hasMentions,    streaming,    sending,    disabled, @@ -40,6 +60,11 @@ export function ChatComposer({    onAbort: () => void;    onSlashCommand: (command: SlashCommandId) => void;    onFilesDrop: (files: File[]) => void; +  mentionSuggestions: MentionSuggestion[]; +  onMentionQuery: (typed: string | null) => void; +  onPickMention: (item: MentionSuggestion, replace: { start: number; end: number }) => void; +  onRemoveLastMention: () => void; +  hasMentions: boolean;    streaming: boolean;    sending: boolean;    disabled: boolean; @@ -48,6 +73,9 @@ export function ChatComposer({    const areaRef = useRef<HTMLTextAreaElement>(null);    const [selectedSlashIndex, setSelectedSlashIndex] = useState(0);    const [slashDismissed, setSlashDismissed] = useState(false); +  const [selectedMentionIndex, setSelectedMentionIndex] = useState(0); +  const [mentionDismissed, setMentionDismissed] = useState(false); +  const [caret, setCaret] = useState(0);    const busy = streaming || sending;    const secretWarning = looksLikePastedSecret(value);    const slashQuery = @@ -58,6 +86,10 @@ export function ChatComposer({          (command) => slashQuery !== null && command.startsWith(slashQuery),        );    const slashOpen = slashCommands.length > 0 && !busy; +  const trigger = mentionTriggerIn(value, caret); +  const mentionOpen = +    !slashOpen && !mentionDismissed && !busy && trigger !== null && mentionSuggestions.length > 0; +  const canSubmit = value.trim().length > 0 || hasMentions;      useEffect(() => {      areaRef.current?.focus(); @@ -66,10 +98,25 @@ export function ChatComposer({    useEffect(() => {      setSelectedSlashIndex(0);      setSlashDismissed(false); +    setSelectedMentionIndex(0); +    setMentionDismissed(false);    }, [value]);   +  const onMentionQueryRef = useRef(onMentionQuery); +  onMentionQueryRef.current = onMentionQuery; +  useEffect(() => { +    onMentionQueryRef.current(trigger?.typed ?? null); +  }, [trigger?.typed]); + +  const syncCaret = (): void => { +    const node = areaRef.current; +    if (node) { +      setCaret(node.selectionStart); +    } +  }; +    const submit = (): void => { -    if (busy || disabled || value.trim().length === 0) { +    if (busy || disabled || !canSubmit) {        return;      }      const command = matchKnownSlashCommand(value); @@ -103,12 +150,16 @@ export function ChatComposer({          className="min-h-[4.5rem] w-full resize-none rounded-md border border-input bg-background px-2.5 py-2 text-[13px] shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"          placeholder={t("workspace.composer.placeholder")}          aria-autocomplete="list" -        aria-controls={slashOpen ? "slash-command-list" : undefined} -        aria-expanded={slashOpen} +        aria-controls={ +          slashOpen ? "slash-command-list" : mentionOpen ? "mention-list" : undefined +        } +        aria-expanded={slashOpen || mentionOpen}          aria-activedescendant={            slashOpen              ? `slash-command-${slashCommands[selectedSlashIndex] ?? slashCommands[0]}` -            : undefined +            : mentionOpen +              ? `mention-option-${selectedMentionIndex}` +              : undefined          }          onDragOver={(event) => {            if (event.dataTransfer.types.includes("Files")) { @@ -122,7 +173,13 @@ export function ChatComposer({            event.preventDefault();            onFilesDrop([...event.dataTransfer.files]);          }} -        onChange={(event) => onChange(event.target.value)} +        onChange={(event) => { +          onChange(event.target.value); +          setCaret(event.target.selectionStart); +        }} +        onClick={syncCaret} +        onKeyUp={syncCaret} +        onSelect={syncCaret}          onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {            if (event.key === "Escape" && streaming) {              event.preventDefault(); @@ -155,6 +212,36 @@ export function ChatComposer({              setSlashDismissed(true);              return;            } +          if (mentionOpen && event.key === "ArrowDown") { +            event.preventDefault(); +            setSelectedMentionIndex((current) => (current + 1) % mentionSuggestions.length); +            return; +          } +          if (mentionOpen && event.key === "ArrowUp") { +            event.preventDefault(); +            setSelectedMentionIndex( +              (current) => (current - 1 + mentionSuggestions.length) % mentionSuggestions.length, +            ); +            return; +          } +          if (mentionOpen && (event.key === "Enter" || event.key === "Tab") && trigger) { +            event.preventDefault(); +            const item = mentionSuggestions[selectedMentionIndex] ?? mentionSuggestions[0]; +            if (item) { +              onPickMention(item, { start: trigger.start, end: caret }); +            } +            return; +          } +          if (mentionOpen && event.key === "Escape") { +            event.preventDefault(); +            setMentionDismissed(true); +            return; +          } +          if (event.key === "Backspace" && caret === 0 && value.length === 0 && hasMentions) { +            event.preventDefault(); +            onRemoveLastMention(); +            return; +          }            if (event.key === "Enter" && !event.shiftKey) {              event.preventDefault();              submit(); @@ -191,6 +278,40 @@ export function ChatComposer({            ))}          </div>        ) : null} +      {mentionOpen ? ( +        <div +          id="mention-list" +          role="listbox" +          className="overflow-hidden rounded-md border bg-popover p-1 shadow-md" +          data-testid="mention-list" +        > +          {mentionSuggestions.map((item, index) => ( +            <button +              key={`${item.type}-${item.id ?? item.query}-${index}`} +              id={`mention-option-${index}`} +              type="button" +              role="option" +              aria-selected={index === selectedMentionIndex} +              className="flex w-full flex-col gap-0.5 rounded-sm px-2 py-1.5 text-left text-[12px] hover:bg-accent aria-selected:bg-accent" +              data-testid={`mention-option-${item.type}`} +              onMouseDown={(event) => event.preventDefault()} +              onClick={() => { +                if (trigger) { +                  onPickMention(item, { start: trigger.start, end: caret }); +                } +              }} +            > +              <span className="font-mono"> +                @{item.type} +                {item.query ? `:${item.query}` : ""} +              </span> +              <span className="text-muted-foreground"> +                {item.available ? item.label : t("mentions.stub")} +              </span> +            </button> +          ))} +        </div> +      ) : null}        <div className="flex items-center justify-between gap-2">          {secretWarning ? (            <p @@ -228,7 +349,7 @@ export function ChatComposer({            <Button              type="submit"              data-testid="chat-send" -            disabled={disabled || sending || value.trim().length === 0} +            disabled={disabled || sending || !canSubmit}            >              {t("workspace.composer.send")}            </Button> diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx index bc015f4..1560781 100644 --- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx +++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx @@ -4,10 +4,17 @@ import {    activePath,    catalogModelsForProvider,    findCatalogModel, +  isMentionStubType, +  MAX_MENTION_TOKENS, +  mentionQueryParts, +  mentionVisibleContent, +  MENTION_TYPES, +  parseMentionTokens,    type BranchLabels,    type CatalogModel,    type ContextPacketDto,    type ConversationDto, +  type MentionRef,    type MessageDto,    type PacketPreviewResult,    type PacketPrivacyMode, @@ -16,7 +23,11 @@ import {    type ProjectFileDto,    type ProviderKeyDto,  } from "@ai-hub/shared"; -import { ChatComposer, type SlashCommandId } from "@/components/chat/chat-composer"; +import { +  ChatComposer, +  type MentionSuggestion, +  type SlashCommandId, +} from "@/components/chat/chat-composer";  import { ConversationTree } from "@/components/chat/conversation-tree";  import { MessageBubble } from "@/components/chat/message-bubble";  import { PacketPanel } from "@/components/chat/packet-panel"; @@ -35,6 +46,19 @@ const PROJECT_COLORS = [    "#0891b2",  ] as const;   +function mentionRefsFrom(chips: MentionSuggestion[], draft: string): MentionRef[] { +  const fromChips = chips.map((chip) => +    chip.id ? { type: chip.type, id: chip.id } : { type: chip.type, query: chip.query || chip.label }, +  ); +  const fromText = parseMentionTokens(draft).mentions.map((item) => ({ +    type: item.type, +    query: item.query, +  })); +  return [...fromChips, ...fromText] +    .filter((item) => ("id" in item && item.id.length > 0) || ("query" in item && item.query.length > 0)) +    .slice(0, 8); +} +  export function HomeView({    project,    importedInbox, @@ -96,6 +120,7 @@ export function HomeView({    onAttachFolder,    onRemoveFile,    onDropFiles, +  onMentionsChange,  }: {    project: ProjectDto | null;    importedInbox: boolean; @@ -121,7 +146,8 @@ export function HomeView({    onSelectTemperature: (value: number) => void;    onSelectMaxTokens: (value: number | null) => void;    onSelectExtraSystem: (value: string) => void; -  onSend: (content: string) => Promise<boolean>; +  onSend: (content: string, mentions: MentionRef[]) => Promise<boolean>; +  onMentionsChange: (mentions: MentionRef[]) => void;    onAbort: () => Promise<void>;    onRegenerate: (messageId: string) => Promise<void>;    onContinue: () => Promise<void>; @@ -162,6 +188,10 @@ export function HomeView({    const modifier = window.hub.platform === "darwin" ? "Ôîÿ" : "Ctrl";    const [title, setTitle] = useState("");    const [draft, setDraft] = useState(""); +  const [mentionChips, setMentionChips] = useState<MentionSuggestion[]>([]); +  const [mentionSuggestions, setMentionSuggestions] = useState<MentionSuggestion[]>([]); +  const [projectFiles, setProjectFiles] = useState<ProjectFileDto[]>([]); +  const mentionQueryRef = useRef<string | null>(null);    const [editing, setEditing] = useState(false);    const [treeOpen, setTreeOpen] = useState(false);    const [packetOpen, setPacketOpen] = useState(false); @@ -202,8 +232,21 @@ export function HomeView({      setPacketOpen(false);      setTagDraft("");      setDraft(""); +    setMentionChips([]);      onComposerDraft(""); -  }, [onComposerDraft, selectedConversationId]); +    onMentionsChange([]); +  }, [onComposerDraft, onMentionsChange, selectedConversationId]); + +  useEffect(() => { +    void window.hub.files +      .list({ projectId: project?.id ?? null }) +      .then(setProjectFiles) +      .catch(() => setProjectFiles([])); +  }, [attachedFiles, project?.id]); + +  useEffect(() => { +    onMentionsChange(mentionRefsFrom(mentionChips, draft)); +  }, [draft, mentionChips, onMentionsChange]);      useEffect(() => {      setProjectName(project?.name ?? ""); @@ -890,6 +933,61 @@ export function HomeView({                        })}                      </p>                    ) : null} +                  {mentionChips.length > 0 ? ( +                    <ul className="flex flex-col gap-1" data-testid="mention-chips"> +                      {mentionChips.map((chip, index) => ( +                        <li +                          key={`${chip.type}-${chip.id ?? chip.query}-${index}`} +                          className="flex items-center justify-between gap-2 rounded-md border px-2 py-1 text-[12px]" +                          data-testid="mention-chip" +                        > +                          <span className="min-w-0 truncate"> +                            @{chip.type}:{chip.query || chip.label} +                            <span className="ml-2 text-muted-foreground"> +                              {t("mentions.tokens", { n: chip.tokens })} +                            </span> +                            {!chip.available ? ( +                              <span className="ml-2 text-muted-foreground">{t("mentions.stub")}</span> +                            ) : null} +                          </span> +                          <Button +                            type="button" +                            size="sm" +                            variant="ghost" +                            data-testid="mention-remove" +                            onClick={() => { +                              setMentionChips((current) => current.filter((_, item) => item !== index)); +                            }} +                          > +                            {t("mentions.remove")} +                          </Button> +                        </li> +                      ))} +                    </ul> +                  ) : null} +                  {mentionChips.length > 0 ? ( +                    <div className="flex flex-col gap-1" data-testid="mention-preview"> +                      <p className="text-[11px] font-medium">{t("mentions.preview")}</p> +                      {mentionChips.map((chip, index) => ( +                        <p key={`preview-${chip.type}-${chip.id ?? chip.query}-${index}`} className="text-[11px] text-muted-foreground"> +                          {chip.excerpt || chip.label} ┬À {t("mentions.tokens", { n: chip.tokens })} +                        </p> +                      ))} +                      {(() => { +                        const n = mentionChips.reduce((sum, chip) => sum + chip.tokens, 0); +                        return ( +                          <p +                            className="text-[11px] text-muted-foreground" +                            data-testid="mention-token-warning" +                          > +                            {n > MAX_MENTION_TOKENS +                              ? t("mentions.tokenOver", { cap: MAX_MENTION_TOKENS }) +                              : t("mentions.tokenWarning", { n, cap: MAX_MENTION_TOKENS })} +                          </p> +                        ); +                      })()} +                    </div> +                  ) : null}                  </div>                  <ChatComposer                    key={selectedConversationId} @@ -901,17 +999,137 @@ export function HomeView({                    streaming={streaming}                    sending={sending}                    disabled={!hasKey || editing} +                  hasMentions={mentionChips.length > 0} +                  mentionSuggestions={mentionSuggestions} +                  onMentionQuery={(typed) => { +                    mentionQueryRef.current = typed; +                    if (!typed) { +                      setMentionSuggestions([]); +                      return; +                    } +                    const parts = mentionQueryParts(typed); +                    if (parts.kind === "types") { +                      setMentionSuggestions( +                        MENTION_TYPES.filter((item) => item.startsWith(parts.prefix)).map((type) => ({ +                          type, +                          id: null, +                          query: "", +                          label: t(`mentions.type.${type}`), +                          excerpt: isMentionStubType(type) ? t("mentions.stub") : t(`mentions.type.${type}`), +                          tokens: 0, +                          available: !isMentionStubType(type), +                        })), +                      ); +                      return; +                    } +                    if (isMentionStubType(parts.type)) { +                      setMentionSuggestions([ +                        { +                          type: parts.type, +                          id: null, +                          query: parts.query, +                          label: t(`mentions.type.${parts.type}`), +                          excerpt: t("mentions.stub"), +                          tokens: 0, +                          available: false, +                        }, +                      ]); +                      return; +                    } +                    const query = parts.query.toLowerCase(); +                    if (parts.type === "file") { +                      setMentionSuggestions( +                        projectFiles +                          .filter((file) => file.name.toLowerCase().includes(query)) +                          .slice(0, 8) +                          .map((file) => ({ +                            type: "file" as const, +                            id: file.id, +                            query: file.name, +                            label: file.name, +                            excerpt: file.excerpt, +                            tokens: file.tokenEstimate, +                            available: true, +                          })), +                      ); +                      return; +                    } +                    if (parts.type === "conversation") { +                      setMentionSuggestions( +                        conversations +                          .filter( +                            (item) => +                              item.id !== selectedConversationId && +                              item.title.toLowerCase().includes(query), +                          ) +                          .slice(0, 8) +                          .map((item) => ({ +                            type: "conversation" as const, +                            id: item.id, +                            query: item.title, +                            label: item.title, +                            excerpt: item.title, +                            tokens: 0, +                            available: true, +                          })), +                      ); +                      return; +                    } +                    setMentionSuggestions( +                      packets +                        .filter((item) => { +                          const hay = `${item.origin.conversationLabel} ${item.origin.projectLabel}`.toLowerCase(); +                          return hay.includes(query); +                        }) +                        .slice(0, 8) +                        .map((item) => ({ +                          type: "packet" as const, +                          id: item.id, +                          query: item.origin.conversationLabel, +                          label: `${item.origin.projectLabel} / ${item.origin.conversationLabel}`, +                          excerpt: item.origin.conversationLabel, +                          tokens: item.tokenEstimate ?? 0, +                          available: true, +                        })), +                    ); +                  }} +                  onPickMention={(item, replace) => { +                    const nextDraft = `${draft.slice(0, replace.start)}${draft.slice(replace.end)}`; +                    if (!item.query && item.id === null) { +                      const inserted = `${nextDraft.slice(0, replace.start)}@${item.type}:${nextDraft.slice(replace.start)}`; +                      setDraft(inserted); +                      onComposerDraft(inserted); +                      return; +                    } +                    setDraft(nextDraft); +                    onComposerDraft(nextDraft); +                    setMentionChips((current) => +                      [...current, item].filter( +                        (chip, index, all) => +                          all.findIndex((row) => row.type === chip.type && row.id === chip.id && row.query === chip.query) === +                          index, +                      ), +                    ); +                  }} +                  onRemoveLastMention={() => { +                    setMentionChips((current) => current.slice(0, -1)); +                  }}                    onSend={() => { -                    const next = draft.trim(); -                    if (!next) { +                    const mentions = mentionRefsFrom(mentionChips, draft); +                    const next = mentionVisibleContent(draft); +                    if (!next && mentions.length === 0) {                        return;                      } -                    void onSend(next).then((ok) => { -                      if (ok) { -                        setDraft(""); -                        onComposerDraft(""); -                      } -                    }); +                    void onSend(next || mentionChips.map((chip) => `@${chip.type}:${chip.query}`).join(" "), mentions).then( +                      (ok) => { +                        if (ok) { +                          setDraft(""); +                          setMentionChips([]); +                          onComposerDraft(""); +                          onMentionsChange([]); +                        } +                      }, +                    );                    }}                    onAbort={() => {                      void onAbort(); diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json index 5030585..73fb8d4 100644 --- a/apps/desktop/src/renderer/src/locales/en.json +++ b/apps/desktop/src/renderer/src/locales/en.json @@ -94,6 +94,25 @@    "workspace.packet.kind.message": "Message",    "workspace.packet.kind.old-message": "Old message",    "workspace.packet.kind.privacy": "Privacy", +  "workspace.packet.kind.file": "File", +  "workspace.packet.kind.conversation": "Conversation", +  "workspace.packet.kind.packet": "Packet", +  "mentions.remove": "Remove", +  "mentions.tokens": "~{{n}} tokens", +  "mentions.preview": "Will inject", +  "mentions.tokenWarning": "Mentions add ~{{n}} tokens (cap {{cap}}).", +  "mentions.tokenOver": "Mentions exceed the {{cap}} token cap. Oldest extra context will be dropped.", +  "mentions.stub": "Available in a later wave", +  "mentions.type.file": "File in this project", +  "mentions.type.conversation": "Another conversation", +  "mentions.type.memory": "Project memory", +  "mentions.type.prompt": "Prompt library", +  "mentions.type.skill": "Skill", +  "mentions.type.packet": "Saved packet", +  "mentions.empty": "No matches", +  "mentions.error.unavailable": "That mention type is not available yet.", +  "mentions.error.notFound": "That mention could not be resolved in this project.", +  "mentions.error.limit": "You can mention up to 8 items per send.",    "workspace.pin": "Pin",    "workspace.unpin": "Unpin",    "workspace.overflow": "This thread is over the {{window}} token window (~{{estimate}} estimated). Compact drops oldest turns from the next packet; the tree stays.", diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json index 4043822..c3cfa84 100644 --- a/apps/desktop/src/renderer/src/locales/pt-BR.json +++ b/apps/desktop/src/renderer/src/locales/pt-BR.json @@ -94,6 +94,25 @@    "workspace.packet.kind.message": "Mensagem",    "workspace.packet.kind.old-message": "Mensagem antiga",    "workspace.packet.kind.privacy": "Privacidade", +  "workspace.packet.kind.file": "Arquivo", +  "workspace.packet.kind.conversation": "Conversa", +  "workspace.packet.kind.packet": "Pacote", +  "mentions.remove": "Remover", +  "mentions.tokens": "~{{n}} tokens", +  "mentions.preview": "Vai injetar", +  "mentions.tokenWarning": "As men├º├Áes somam ~{{n}} tokens (teto {{cap}}).", +  "mentions.tokenOver": "As men├º├Áes passam do teto de {{cap}} tokens. O contexto extra mais antigo ser├í cortado.", +  "mentions.stub": "Dispon├¡vel numa onda posterior", +  "mentions.type.file": "Arquivo deste projeto", +  "mentions.type.conversation": "Outra conversa", +  "mentions.type.memory": "Mem├│ria do projeto", +  "mentions.type.prompt": "Biblioteca de prompts", +  "mentions.type.skill": "Skill", +  "mentions.type.packet": "Pacote salvo", +  "mentions.empty": "Nada encontrado", +  "mentions.error.unavailable": "Esse tipo de men├º├úo ainda n├úo est├í dispon├¡vel.", +  "mentions.error.notFound": "Essa men├º├úo n├úo existe neste projeto.", +  "mentions.error.limit": "D├í para mencionar no m├íximo 8 itens por envio.",    "workspace.pin": "Fixar",    "workspace.unpin": "Desafixar",    "workspace.overflow": "Este fio passa da janela de {{window}} tokens (~{{estimate}} estimados). Compactar tira os turnos antigos do pr├│ximo packet; a ├írvore permanece.", diff --git a/docs/ADR/README.md b/docs/ADR/README.md index 53cb1af..ef2af95 100644 --- a/docs/ADR/README.md +++ b/docs/ADR/README.md @@ -86,3 +86,5 @@ N├úo escrever ADR de detalhe cosm├®tica. Se mexe em seguran├ºa, custo, provider  | [ADR-W12-002](./ADR-W12-002-files-inject-as-compiler-slices.md) | W12 | Anexos entram como fatias do compiler, n├úo no packet v1 | accepted |  | [ADR-W12-003](./ADR-W12-003-vision-images-on-stream-not-packet.md) | W12 | Imagens no stream, n├úo no packet; gate `vision` | accepted |  | [ADR-W12-004](./ADR-W12-004-pdf-flatedecode-inflate.md) | W12 | PDF: inflate FlateDecode + literais Tj | accepted | +| [ADR-W13-001](./ADR-W13-001-mentions-structured-not-in-user-text.md) | W13 | Men├º├Áes estruturadas, n├úo no texto do user | accepted | +| [ADR-W13-002](./ADR-W13-002-mention-stubs-until-later-waves.md) | W13 | `@memory`/`@prompt`/`@skill` s├úo stub | accepted | diff --git a/docs/STATUS.md b/docs/STATUS.md index 40bb374..38df50e 100644 --- a/docs/STATUS.md +++ b/docs/STATUS.md @@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave  |---|---|  | Wave | **W13** |  | Marco | C ÔÇö V1 | -| State | `pending` | +| State | `review` |  | Last completed | **W12** | -| Next action | Start Wave 13 (@-mentions) | +| Next action | Wave-close gate W13 (review independente + REVIEW.md) |    `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.   @@ -39,10 +39,9 @@ None.    ## Notes for the next session   -- W12 fechada. N├úo implementar @-mentions at├® arrancar W13. -- W13 `@file` deve reusar `project_files` + `fileIds` + `assertFileAttachmentAccess` (n├úo novo store). -- Slash `/` ├® UI local (ADR-W11-001). Composer j├í tem listbox; `@` ├® outro trigger. -- Packet v1 **n├úo** leva extract de ficheiros (ADR-W12-002). Imagens s├│ no stream (ADR-W12-003). +- W13 implementada (ainda sem close gate): `@file` reusa `project_files` + `fileIds`. `@memory`/`@prompt`/`@skill` s├úo stub. +- Slash `/` continua a├º├úo local (ADR-W11-001). `@` ├® outro trigger. +- N├úo implementar RAG, mem├│ria persistida, prompt library, skills, MCP, agentes.    ## Last review / ADR   diff --git a/packages/ai-gateway/src/compiler.test.ts b/packages/ai-gateway/src/compiler.test.ts index 302508a..7c080fe 100644 --- a/packages/ai-gateway/src/compiler.test.ts +++ b/packages/ai-gateway/src/compiler.test.ts @@ -1,5 +1,11 @@  import { describe, expect, it } from "vitest"; -import { compileActivePath, compilePacket, compilePacketDetailed, mergePacketWithTail } from "./compiler"; +import { +  appendMentionsToPacket, +  compileActivePath, +  compilePacket, +  compilePacketDetailed, +  mergePacketWithTail, +} from "./compiler";    describe("compilePacket", () => {    it("joins project instructions and skips streaming messages", () => { @@ -66,6 +72,33 @@ describe("compilePacket", () => {      expect(fileSlice?.label).not.toContain("payments");    });   +  it("appends conversation mentions without putting the body in the slice label", () => { +    const compiled = compilePacket({ +      projectInstructions: null, +      extraSystem: null, +      messages: [ +        { +          id: "11111111-1111-4111-8111-111111111111", +          role: "user", +          content: "compare with the other thread", +          status: "complete", +        }, +      ], +    }); +    const withMentions = appendMentionsToPacket(compiled, [ +      { +        kind: "conversation", +        id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", +        name: "Old thread", +        text: "user: we use PostgreSQL", +      }, +    ]); +    expect(withMentions.packet.system).toContain("Mentioned conversation: Old thread"); +    expect(withMentions.packet.system).toContain("PostgreSQL"); +    expect(withMentions.included[0]?.label).toBe("Mentioned conversation: Old thread"); +    expect(withMentions.included[0]?.label).not.toContain("PostgreSQL"); +  }); +    it("never puts an apiKey field on the packet", () => {      const packet = compilePacket({        projectInstructions: null, diff --git a/packages/ai-gateway/src/compiler.ts b/packages/ai-gateway/src/compiler.ts index a59b1e9..628c2e1 100644 --- a/packages/ai-gateway/src/compiler.ts +++ b/packages/ai-gateway/src/compiler.ts @@ -15,6 +15,13 @@ export interface CompilerFile {    text: string;  }   +export interface CompilerMention { +  kind: "conversation" | "packet"; +  id: string; +  name: string; +  text: string; +} +  export interface CompileInput {    projectInstructions: string | null;    extraSystem: string | null; @@ -239,6 +246,37 @@ export function appendFilesToPacket(    };  }   +function mentionHeading(mention: CompilerMention): string { +  return mention.kind === "conversation" +    ? `Mentioned conversation: ${mention.name}` +    : `Mentioned packet: ${mention.name}`; +} + +export function appendMentionsToPacket( +  packet: ProviderAgnosticPacket, +  mentions: CompilerMention[], +): { packet: ProviderAgnosticPacket; included: PacketSlice[] } { +  if (mentions.length === 0) { +    return { packet, included: [] }; +  } +  const blocks = mentions.map((mention) => `${mentionHeading(mention)}\n${mention.text}`); +  const extra = blocks.join("\n\n"); +  const system = packet.system.length > 0 ? `${packet.system}\n\n${extra}` : extra; +  return { +    packet: packetV0Schema.parse({ +      ...packet, +      system, +      tokenEstimate: packet.tokenEstimate + tokenEstimateFromChars(extra.length), +    }), +    included: mentions.map((mention) => ({ +      kind: mention.kind, +      id: mention.id, +      label: clipPacketLabel(mentionHeading(mention), 200), +      tokens: tokenEstimateFromChars(`${mentionHeading(mention)}\n${mention.text}`.length), +    })), +  }; +} +  export function compileActivePathDetailed(input: {    projectInstructions: string | null;    extraSystem: string | null; diff --git a/packages/ai-gateway/src/index.ts b/packages/ai-gateway/src/index.ts index 46008b9..a03a306 100644 --- a/packages/ai-gateway/src/index.ts +++ b/packages/ai-gateway/src/index.ts @@ -12,11 +12,13 @@ export {    compilePacket,    compilePacketDetailed,    appendFilesToPacket, +  appendMentionsToPacket,    mergePacketWithTail,    summarizeInactiveBranches,    type CompileDetailedResult,    type CompileInput,    type CompilerFile, +  type CompilerMention,    type CompilerGraphMessage,    type CompilerMessage,    type InactiveBranchSummaries, diff --git a/packages/files/src/packet-ui.test.ts b/packages/files/src/packet-ui.test.ts index 5ca572d..cdde5f0 100644 --- a/packages/files/src/packet-ui.test.ts +++ b/packages/files/src/packet-ui.test.ts @@ -6,7 +6,7 @@ describe("stripAttachedFileBodiesForRenderer", () => {      const system = "Be brief.\n\nAttached file: spec.pdf\nSection 3 secret-doc\nmore";      const stripped = stripAttachedFileBodiesForRenderer(system);      expect(stripped).toContain("Attached file: spec.pdf"); -    expect(stripped).toContain("[file extract omitted from renderer]"); +    expect(stripped).toContain("[extract omitted from renderer]");      expect(stripped).not.toContain("secret-doc");    });  }); diff --git a/packages/files/src/packet-ui.ts b/packages/files/src/packet-ui.ts index b7ac62f..ed6d2ef 100644 --- a/packages/files/src/packet-ui.ts +++ b/packages/files/src/packet-ui.ts @@ -1,6 +1,7 @@  export function stripAttachedFileBodiesForRenderer(system: string): string { -  return system.replace( -    /(Attached file: [^\n]+)(?:\n(?!Attached file:)[\s\S]*?)?(?=(?:\n\nAttached file: )|$)/g, -    "$1\n[file extract omitted from renderer]", +  const omitted = system.replace( +    /((?:Attached file|Mentioned conversation|Mentioned packet): [^\n]+)(?:\n(?!(?:Attached file|Mentioned conversation|Mentioned packet):)[\s\S]*?)?(?=(?:\n\n(?:Attached file|Mentioned conversation|Mentioned packet): )|$)/g, +    "$1\n[extract omitted from renderer]",    ); +  return omitted;  } diff --git a/packages/shared/src/gateway.test.ts b/packages/shared/src/gateway.test.ts index 81d8877..8e1cf3e 100644 --- a/packages/shared/src/gateway.test.ts +++ b/packages/shared/src/gateway.test.ts @@ -69,6 +69,21 @@ describe("chat contracts", () => {      ).toThrow();    });   +  it("accepts mentions on send without extra keys", () => { +    const parsed = chatSendInputSchema.parse({ +      mode: "send", +      conversationId: "11111111-1111-4111-8111-111111111111", +      providerKeyId: "22222222-2222-4222-8222-222222222222", +      model: "gpt-4o-mini", +      content: "o que este repo faz?", +      mentions: [{ type: "file", query: "README.md" }], +    }); +    expect(parsed.mode).toBe("send"); +    if (parsed.mode === "send") { +      expect(parsed.mentions).toEqual([{ type: "file", query: "README.md" }]); +    } +  }); +    it("accepts fileIds on send without extra keys", () => {      const parsed = chatSendInputSchema.parse({        mode: "send", diff --git a/packages/shared/src/gateway.ts b/packages/shared/src/gateway.ts index 0560b91..c06282c 100644 --- a/packages/shared/src/gateway.ts +++ b/packages/shared/src/gateway.ts @@ -58,6 +58,27 @@ export const receiptDtoSchema = z.object({    export type ReceiptDto = z.infer<typeof receiptDtoSchema>;   +export const mentionTypeSchema = z.enum([ +  "file", +  "conversation", +  "memory", +  "prompt", +  "skill", +  "packet", +]); + +export const mentionRefSchema = z +  .object({ +    type: mentionTypeSchema, +    id: z.string().uuid().optional(), +    query: z.string().min(1).max(260).optional(), +  }) +  .strict(); + +export const mentionRefListSchema = z.array(mentionRefSchema).max(8); + +export type MentionRef = z.infer<typeof mentionRefSchema>; +  const chatSendBaseSchema = z.object({    conversationId: z.string().uuid(),    providerKeyId: z.string().uuid(), @@ -69,6 +90,7 @@ const chatSendBaseSchema = z.object({    allowOnce: z.boolean().optional(),    privacyMode: z.enum(["standard", "strict"]).optional(),    fileIds: z.array(z.string().uuid()).max(8).optional(), +  mentions: mentionRefListSchema.optional(),  });    export const chatSendInputSchema = z.discriminatedUnion("mode", [ diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts index 8be1e0f..f7449e3 100644 --- a/packages/shared/src/index.ts +++ b/packages/shared/src/index.ts @@ -38,6 +38,23 @@ export { summarizeProviderHealth, HEALTH_WINDOW, type HealthSampleLike, type Hea  export { suggestFallbackProvider, type FallbackKeyLike, type FallbackSuggestion } from "./fallback";  export { classifyHubIpcError, type HubIpcError, type HubIpcErrorKind } from "./hub-error";  export { looksLikePastedSecret, redactPastedSecrets } from "./secret-paste"; +export { +  MAX_MENTIONS_PER_SEND, +  MAX_MENTION_TOKENS, +  MENTION_STUB_TYPES, +  MENTION_TYPES, +  isMentionStubType, +  isMentionType, +  mentionTokenEstimate, +  mentionQueryParts, +  mentionTriggerIn, +  mentionVisibleContent, +  parseMentionTokens, +  type MentionParseResult, +  type MentionStubType, +  type MentionType, +  type ParsedMention, +} from "./mentions";  export {    shouldShowOnboarding,    sortProvidersForWizard, @@ -215,6 +232,9 @@ export {  export {    chatAbortInputSchema,    chatSendInputSchema, +  mentionRefListSchema, +  mentionRefSchema, +  mentionTypeSchema,    catalogModelsForProvider,    estimateCostUsd,    findCatalogModel, @@ -226,6 +246,7 @@ export {    type CatalogModel,    type ChatAbortInput,    type ChatSendInput, +  type MentionRef,    type GatewayErrorCode,    type ModelCatalog,    type PacketMessage, diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts index ac42e7b..4d6d85f 100644 --- a/packages/shared/src/ipc-schemas.ts +++ b/packages/shared/src/ipc-schemas.ts @@ -1,6 +1,11 @@  import { z } from "zod";  import { localeSchema, themeModeSchema } from "./appearance"; -import { gatewayErrorCodeSchema, packetV0Schema, receiptDtoSchema } from "./gateway"; +import { +  gatewayErrorCodeSchema, +  mentionRefListSchema, +  packetV0Schema, +  receiptDtoSchema, +} from "./gateway";  import {    packetPrivacyModeSchema,    packetSliceSchema, @@ -181,6 +186,7 @@ export const packetPreviewInputSchema = z      maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),      privacyMode: packetPrivacyModeSchema.optional(),      fileIds: z.array(z.string().uuid()).max(8).optional(), +    mentions: mentionRefListSchema.optional(),    })    .strict();   diff --git a/packages/shared/src/portable-packet.ts b/packages/shared/src/portable-packet.ts index 7c39f15..dff71a4 100644 --- a/packages/shared/src/portable-packet.ts +++ b/packages/shared/src/portable-packet.ts @@ -13,6 +13,8 @@ export const packetSliceKindSchema = z.enum([    "old-message",    "privacy",    "file", +  "conversation", +  "packet",  ]);    export type PacketSliceKind = z.infer<typeof packetSliceKindSchema>;
+diff --git a/apps/desktop/e2e/mentions.spec.ts b/apps/desktop/e2e/mentions.spec.ts
+new file mode 100644
+index 0000000..00eb2fd
+--- /dev/null
++++ b/apps/desktop/e2e/mentions.spec.ts
+@@ -0,0 +1,50 @@
++import { mkdtempSync, writeFileSync } from "node:fs";
++import { createRequire } from "node:module";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { _electron as electron, expect, test, type ElectronApplication } from "@playwright/test";
++
++const require = createRequire(import.meta.url);
++const electronBinary = require("electron") as string;
++const appRoot = path.join(fileURLToPath(new URL("..", import.meta.url)));
++
++async function launchHub(env: Record<string, string>): Promise<ElectronApplication> {
++  return electron.launch({
++    executablePath: electronBinary,
++    args: [path.join(appRoot, "out/main/index.js")],
++    cwd: appRoot,
++    env: {
++      ...process.env,
++      AI_HUB_E2E: "1",
++      NODE_ENV: "production",
++      ...env,
++    },
++  });
++}
++
++test("types @file:README.md and does not dump the file in the visible message", async () => {
++  const dir = mkdtempSync(path.join(tmpdir(), "ai-hub-mention-"));
++  const readme = path.join(dir, "README.md");
++  writeFileSync(readme, "# Secret dump body\nthis repo uses PostgreSQL\n");
++  const app = await launchHub({ AI_HUB_E2E_ATTACH_FILE: readme });
++  try {
++    const window = await app.firstWindow();
++    const composer = window.getByTestId("chat-composer");
++    await composer.waitFor({ state: "visible", timeout: 30_000 });
++    await window.getByTestId("files-attach").click();
++    await expect(window.getByTestId("files-chip")).toContainText("README.md");
++    await window.getByTestId("files-remove").click();
++    await expect(window.getByTestId("files-chip")).toHaveCount(0);
++    await composer.fill("@file:README.md o que este repo faz?");
++    await composer.press("Enter");
++    const user = window.getByTestId("message-user");
++    await expect(user).toContainText("o que este repo faz?");
++    await expect(user).not.toContainText("Secret dump body");
++    await expect(window.getByTestId("message-assistant")).toHaveAttribute("data-status", "complete", {
++      timeout: 30_000,
++    });
++  } finally {
++    await app.close();
++  }
++});
+
+diff --git a/apps/desktop/src/main/mentions.ts b/apps/desktop/src/main/mentions.ts
+new file mode 100644
+index 0000000..91fd3fe
+--- /dev/null
++++ b/apps/desktop/src/main/mentions.ts
+@@ -0,0 +1,161 @@
++import type { CompilerMention } from "@ai-hub/ai-gateway";
++import type { HubRepos } from "@ai-hub/db";
++import { redactSecrets } from "@ai-hub/security";
++import {
++  MAX_MENTION_TOKENS,
++  MAX_MENTIONS_PER_SEND,
++  isMentionStubType,
++  mentionTokenEstimate,
++  portablePacketV1Schema,
++  type MentionRef,
++} from "@ai-hub/shared";
++
++export function resolveSendMentions(
++  repos: HubRepos,
++  refs: MentionRef[] | undefined,
++  projectId: string | null,
++  currentConversationId: string,
++): { fileIds: string[]; mentions: CompilerMention[] } {
++  if (!refs || refs.length === 0) {
++    return { fileIds: [], mentions: [] };
++  }
++  if (refs.length > MAX_MENTIONS_PER_SEND) {
++    throw new Error("mentions:limit");
++  }
++  const fileIds: string[] = [];
++  const mentions: CompilerMention[] = [];
++  let usedTokens = 0;
++  const seen = new Set<string>();
++  for (const ref of refs) {
++    const key = `${ref.type}:${ref.id ?? ref.query ?? ""}`;
++    if (seen.has(key)) {
++      continue;
++    }
++    seen.add(key);
++    if (isMentionStubType(ref.type)) {
++      throw new Error("mentions:unavailable");
++    }
++    if (ref.type === "file") {
++      const file = resolveProjectFile(repos, projectId, ref);
++      fileIds.push(file.id);
++      continue;
++    }
++    if (usedTokens >= MAX_MENTION_TOKENS) {
++      continue;
++    }
++    const remaining = MAX_MENTION_TOKENS - usedTokens;
++    if (ref.type === "conversation") {
++      const mention = resolveConversationMention(repos, projectId, currentConversationId, ref, remaining);
++      if (mention) {
++        usedTokens += mentionTokenEstimate(mention.text.length);
++        mentions.push(mention);
++      }
++      continue;
++    }
++    const packet = resolvePacketMention(repos, projectId, ref, remaining);
++    usedTokens += mentionTokenEstimate(packet.text.length);
++    mentions.push(packet);
++  }
++  return { fileIds, mentions };
++}
++
++function resolveProjectFile(
++  repos: HubRepos,
++  projectId: string | null,
++  ref: MentionRef,
++): { id: string } {
++  if (ref.id) {
++    const row = repos.getProjectFile(ref.id);
++    if (!row || row.projectId !== projectId) {
++      throw new Error("mentions:not_found");
++    }
++    return row;
++  }
++  const query = (ref.query ?? "").toLowerCase();
++  const match = repos
++    .listProjectFiles(projectId)
++    .find(
++      (item) => item.name.toLowerCase() === query || item.name.toLowerCase().endsWith(`/${query}`),
++    );
++  if (!match) {
++    throw new Error("mentions:not_found");
++  }
++  return match;
++}
++
++function resolveConversationMention(
++  repos: HubRepos,
++  projectId: string | null,
++  currentConversationId: string,
++  ref: MentionRef,
++  remainingTokens: number,
++): CompilerMention | null {
++  const conversation = ref.id
++    ? repos.getConversation(ref.id)
++    : repos
++        .listConversations(projectId)
++        .find((item) => item.title.toLowerCase() === (ref.query ?? "").toLowerCase());
++  if (!conversation || conversation.projectId !== projectId) {
++    throw new Error("mentions:not_found");
++  }
++  if (conversation.id === currentConversationId) {
++    return null;
++  }
++  const path = repos.listActivePath(conversation.id);
++  const lines: string[] = [];
++  for (const message of path) {
++    if (message.role === "system") {
++      continue;
++    }
++    const next = `${message.role}: ${redactSecrets(message.content)}`;
++    const candidate = [...lines, next].join("\n");
++    if (mentionTokenEstimate(candidate.length) > remainingTokens) {
++      break;
++    }
++    lines.push(next);
++  }
++  return {
++    kind: "conversation",
++    id: conversation.id,
++    name: conversation.title,
++    text: lines.join("\n") || "(empty)",
++  };
++}
++
++function resolvePacketMention(
++  repos: HubRepos,
++  projectId: string | null,
++  ref: MentionRef,
++  remainingTokens: number,
++): CompilerMention {
++  const packets = repos.listContextPackets(projectId);
++  const meta = ref.id
++    ? packets.find((item) => item.id === ref.id)
++    : packets.find((item) => {
++        const query = (ref.query ?? "").toLowerCase();
++        return (
++          item.origin.conversationLabel.toLowerCase() === query ||
++          item.origin.projectLabel.toLowerCase() === query
++        );
++      });
++  if (!meta || meta.projectId !== projectId) {
++    throw new Error("mentions:not_found");
++  }
++  const stored = repos.getContextPacket(meta.id);
++  if (!stored) {
++    throw new Error("mentions:not_found");
++  }
++  const envelope = portablePacketV1Schema.parse(JSON.parse(stored.payloadJson) as unknown);
++  const raw = redactSecrets(
++    [envelope.payload.system, ...envelope.payload.messages.map((item) => `${item.role}: ${item.content}`)].join(
++      "\n",
++    ),
++  );
++  const maxChars = Math.max(4, remainingTokens * 4);
++  return {
++    kind: "packet",
++    id: stored.id,
++    name: `${stored.origin.projectLabel} / ${stored.origin.conversationLabel}`,
++    text: raw.length > maxChars ? `${raw.slice(0, maxChars - 1)}ÔÇª` : raw,
++  };
++}
+
+diff --git a/docs/ADR/ADR-W13-001-mentions-structured-not-in-user-text.md b/docs/ADR/ADR-W13-001-mentions-structured-not-in-user-text.md
+new file mode 100644
+index 0000000..b713234
+--- /dev/null
++++ b/docs/ADR/ADR-W13-001-mentions-structured-not-in-user-text.md
+@@ -0,0 +1,33 @@
++# ADR-W13-001-mentions-structured-not-in-user-text
++
++- **Status:** accepted
++- **Onda:** W13
++- **Data:** 2026-09-18
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++D6 exige que `@file:README.md o que este repo faz?` injete s├│ aquele arquivo e que o texto vis├¡vel n├úo vire um dump. Anexos W12 j├í entram via `fileIds` e fatias `file`.
++
++## Decis├úo
++
++O send/preview leva `mentions[]` (`type` + `id` e/ou `query`). O main resolve e o compiler injeta no `system` (n├úo no `content` do user). Tokens `@type:query` s├úo removidos do texto persistido. `@file` resolve para `project_files` e reusa `fileIds` + `appendFilesToPacket`. `@conversation` e `@packet` viram fatias pr├│prias ap├│s o compile do path ativo.
++
++## Alternativas consideradas
++
++- **Concatenar o extract no texto do user:** viola o DoD e o preview.
++- **`mentionIds` s├│ para ficheiros:** duplicaria ADR-W12-002.
++
++## Consequ├¬ncias
++
++- Positivas: chip/token curto na UI; W14ÔÇôW17 podem ligar stubs no mesmo contrato.
++- Negativas: syntax `@type:query` sem espa├ºo no query.
++- Riscos aceitos: men├º├úo expl├¡cita entra mesmo em `privacyMode: strict`.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 13 / D6
++- `docs/ADR/ADR-W12-002-files-inject-as-compiler-slices.md`
++- `docs/reviews/W13/REVIEW.md`
+
+diff --git a/docs/ADR/ADR-W13-002-mention-stubs-until-later-waves.md b/docs/ADR/ADR-W13-002-mention-stubs-until-later-waves.md
+new file mode 100644
+index 0000000..d2e5b69
+--- /dev/null
++++ b/docs/ADR/ADR-W13-002-mention-stubs-until-later-waves.md
+@@ -0,0 +1,32 @@
++# ADR-W13-002-mention-stubs-until-later-waves
++
++- **Status:** accepted
++- **Onda:** W13
++- **Data:** 2026-09-18
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++O plano pede os tipos `@memory`, `@prompt` e `@skill` no autocomplete agora, mas as ondas donas ainda n├úo existem (W14, W15, W17).
++
++## Decis├úo
++
++Os tr├¬s tipos aparecem no trigger `@`. Escolher ou enviar um deles falha de forma expl├¡cita (`mentions:unavailable`) e **n├úo** injeta contexto. N├úo h├í tabela nem IPC de mem├│ria/prompt/skill nesta onda.
++
++## Alternativas consideradas
++
++- **Omitir do autocomplete:** o aceite D6 lista os seis tipos.
++- **Half-build com store vazio:** viola ÔÇ£hooks sem featureÔÇØ.
++
++## Consequ├¬ncias
++
++- Positivas: contrato est├ível para W14+.
++- Negativas: o utilizador v├¬ tipos que ainda n├úo resolvem.
++- Riscos aceitos: copy de stub em pt-BR e en.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 13
++- `docs/reviews/W13/REVIEW.md`
+
+diff --git a/packages/shared/src/mentions.ts b/packages/shared/src/mentions.ts
+new file mode 100644
+index 0000000..fc2266f
+--- /dev/null
++++ b/packages/shared/src/mentions.ts
+@@ -0,0 +1,92 @@
++export const MENTION_TYPES = ["file", "conversation", "memory", "prompt", "skill", "packet"] as const;
++
++export type MentionType = (typeof MENTION_TYPES)[number];
++
++export const MENTION_STUB_TYPES = ["memory", "prompt", "skill"] as const;
++
++export type MentionStubType = (typeof MENTION_STUB_TYPES)[number];
++
++export const MAX_MENTIONS_PER_SEND = 8;
++export const MAX_MENTION_TOKENS = 8_000;
++
++const MENTION_TOKEN = /@([a-z]+):([^\s@]+)/gi;
++
++export interface ParsedMention {
++  type: MentionType;
++  query: string;
++  raw: string;
++}
++
++export interface MentionParseResult {
++  mentions: ParsedMention[];
++  body: string;
++}
++
++export function isMentionType(value: string): value is MentionType {
++  return (MENTION_TYPES as readonly string[]).includes(value);
++}
++
++export function isMentionStubType(value: string): value is MentionStubType {
++  return (MENTION_STUB_TYPES as readonly string[]).includes(value);
++}
++
++export function parseMentionTokens(text: string): MentionParseResult {
++  const mentions: ParsedMention[] = [];
++  const body = text.replace(MENTION_TOKEN, (raw, typeRaw: string, query: string) => {
++    const type = typeRaw.toLowerCase();
++    if (!isMentionType(type) || query.trim().length === 0) {
++      return raw;
++    }
++    mentions.push({ type, query, raw });
++    return " ";
++  });
++  return { mentions, body: body.replace(/\s+/g, " ").trim() };
++}
++
++export function mentionVisibleContent(text: string): string {
++  const parsed = parseMentionTokens(text);
++  if (parsed.body.length > 0) {
++    return parsed.body;
++  }
++  return parsed.mentions.map((item) => item.raw).join(" ");
++}
++
++export function mentionTriggerIn(
++  text: string,
++  caret: number,
++): { start: number; typed: string } | null {
++  const clamped = Math.max(0, Math.min(caret, text.length));
++  const before = text.slice(0, clamped);
++  const at = before.lastIndexOf("@");
++  if (at < 0) {
++    return null;
++  }
++  const previous = at === 0 ? " " : before[at - 1];
++  if (previous && !/\s/.test(previous)) {
++    return null;
++  }
++  const typed = before.slice(at);
++  if (typed.length === 0 || /\s/.test(typed)) {
++    return null;
++  }
++  return { start: at, typed };
++}
++
++export function mentionTokenEstimate(chars: number): number {
++  return Math.ceil(chars / 4);
++}
++
++export function mentionQueryParts(typed: string):
++  | { kind: "types"; prefix: string }
++  | { kind: "items"; type: MentionType; query: string } {
++  const raw = typed.startsWith("@") ? typed.slice(1) : typed;
++  const colon = raw.indexOf(":");
++  if (colon < 0) {
++    return { kind: "types", prefix: raw.toLowerCase() };
++  }
++  const type = raw.slice(0, colon).toLowerCase();
++  if (!isMentionType(type)) {
++    return { kind: "types", prefix: raw.toLowerCase() };
++  }
++  return { kind: "items", type, query: raw.slice(colon + 1) };
++}
+
+diff --git a/packages/shared/src/mentions.test.ts b/packages/shared/src/mentions.test.ts
+new file mode 100644
+index 0000000..4102112
+--- /dev/null
++++ b/packages/shared/src/mentions.test.ts
+@@ -0,0 +1,40 @@
++import { describe, expect, it } from "vitest";
++import {
++  mentionTriggerIn,
++  mentionVisibleContent,
++  parseMentionTokens,
++} from "./mentions";
++
++describe("parseMentionTokens", () => {
++  it("strips @file:README.md and keeps the question", () => {
++    const parsed = parseMentionTokens("@file:README.md o que este repo faz?");
++    expect(parsed.body).toBe("o que este repo faz?");
++    expect(parsed.mentions).toEqual([
++      { type: "file", query: "README.md", raw: "@file:README.md" },
++    ]);
++    expect(mentionVisibleContent("@file:README.md o que este repo faz?")).toBe(
++      "o que este repo faz?",
++    );
++  });
++
++  it("keeps the short token when the body is only a mention", () => {
++    expect(mentionVisibleContent("@file:README.md")).toBe("@file:README.md");
++  });
++
++  it("leaves unknown @tokens in the body", () => {
++    const parsed = parseMentionTokens("see @unknown:thing please");
++    expect(parsed.mentions).toEqual([]);
++    expect(parsed.body).toContain("@unknown:thing");
++  });
++});
++
++describe("mentionTriggerIn", () => {
++  it("detects an @ trigger at the caret", () => {
++    const text = "hello @fi";
++    expect(mentionTriggerIn(text, text.length)).toEqual({ start: 6, typed: "@fi" });
++  });
++
++  it("ignores email-like mid-word at-signs", () => {
++    expect(mentionTriggerIn("a@b", 3)).toBeNull();
++  });
++});
