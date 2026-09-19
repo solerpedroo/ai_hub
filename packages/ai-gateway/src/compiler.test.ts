@@ -99,6 +99,40 @@ describe("compilePacket", () => {
     expect(withMentions.included[0]?.label).not.toContain("PostgreSQL");
   });
 
+  it("appends project memory and rag slices with filename-only labels", () => {
+    const compiled = compilePacket({
+      projectInstructions: null,
+      extraSystem: null,
+      messages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          role: "user",
+          content: "qual banco?",
+          status: "complete",
+        },
+      ],
+    });
+    const withContext = appendMentionsToPacket(compiled, [
+      {
+        kind: "memory",
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        name: "DB",
+        text: "usamos PostgreSQL",
+      },
+      {
+        kind: "rag",
+        id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        name: "payments.pdf#c0",
+        text: "Section 3 payments use PostgreSQL",
+      },
+    ]);
+    expect(withContext.packet.system).toContain("Project memory: DB");
+    expect(withContext.packet.system).toContain("Retrieved chunk: payments.pdf#c0");
+    expect(withContext.included[0]?.label).toBe("Project memory: DB");
+    expect(withContext.included[0]?.label).not.toContain("usamos");
+    expect(withContext.included[1]?.label).not.toContain("Section 3");
+  });
+
   it("never puts an apiKey field on the packet", () => {
     const packet = compilePacket({
       projectInstructions: null,
