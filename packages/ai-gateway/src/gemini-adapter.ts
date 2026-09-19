@@ -80,16 +80,28 @@ function classifyTransport(error: unknown, userSignal: AbortSignal, timeout: Abo
   throw new GatewayError("network", message);
 }
 
-function packetToGemini(packet: ProviderAgnosticPacket): {
+function packetToGemini(
+  packet: ProviderAgnosticPacket,
+  images?: ChatStreamRequest["images"],
+): {
   systemInstruction: { parts: Array<{ text: string }> } | undefined;
-  contents: Array<{ role: "user" | "model"; parts: Array<{ text: string }> }>;
+  contents: Array<{ role: "user" | "model"; parts: Array<Record<string, unknown>> }>;
 } {
+  const lastUser = [...packet.messages].reverse().find((item) => item.role === "user");
   return {
     systemInstruction: packet.system.length > 0 ? { parts: [{ text: packet.system }] } : undefined,
-    contents: packet.messages.map((message) => ({
-      role: message.role === "assistant" ? "model" : "user",
-      parts: [{ text: message.content }],
-    })),
+    contents: packet.messages.map((message) => {
+      const parts: Array<Record<string, unknown>> = [{ text: message.content }];
+      if (images && images.length > 0 && lastUser && message === lastUser) {
+        for (const image of images) {
+          parts.push({ inline_data: { mime_type: image.mime, data: image.data } });
+        }
+      }
+      return {
+        role: message.role === "assistant" ? "model" : "user",
+        parts,
+      };
+    }),
   };
 }
 
@@ -153,7 +165,7 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): Provide
       }
     },
     async *chatStream(input: ChatStreamRequest): AsyncIterable<ChatStreamEvent> {
-      const converted = packetToGemini(input.packet);
+      const converted = packetToGemini(input.packet, input.images);
       const generationConfig: Record<string, unknown> = {
         temperature: input.temperature ?? 1,
       };
