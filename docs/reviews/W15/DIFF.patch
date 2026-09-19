@@ -1,0 +1,2339 @@
+﻿diff --git a/apps/desktop/e2e/prompts.spec.ts b/apps/desktop/e2e/prompts.spec.ts
+new file mode 100644
+index 0000000..e2e95c6
+--- /dev/null
++++ b/apps/desktop/e2e/prompts.spec.ts
+@@ -0,0 +1,61 @@
++import { createRequire } from "node:module";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { _electron as electron, expect, test, type ElectronApplication } from "@playwright/test";
++
++const require = createRequire(import.meta.url);
++const electronBinary = require("electron") as string;
++const appRoot = path.join(fileURLToPath(new URL("..", import.meta.url)));
++
++async function launchHub(): Promise<ElectronApplication> {
++  return electron.launch({
++    executablePath: electronBinary,
++    args: [path.join(appRoot, "out/main/index.js")],
++    cwd: appRoot,
++    env: {
++      ...process.env,
++      AI_HUB_E2E: "1",
++      NODE_ENV: "production",
++    },
++  });
++}
++
++test("resolves prompt variables, runs two models, and saves the winner", async () => {
++  const app = await launchHub();
++  try {
++    const window = await app.firstWindow();
++    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
++    await window.getByTestId("nav-prompts").click();
++    await expect(window.getByTestId("prompts-view")).toBeVisible();
++    await window.getByTestId("prompt-folder-development").click();
++    await window.getByTestId("prompt-item").filter({ hasText: "Code review" }).click();
++    await expect(window.getByTestId("prompt-body")).toContainText("{{project}}");
++    await window.getByTestId("prompt-insert").click();
++    await expect(window.getByTestId("chat-composer")).toContainText("E2E");
++
++    await window.getByTestId("nav-prompts").click();
++    await window.getByTestId("prompt-item").filter({ hasText: "Code review" }).click();
++    const modelA = window.getByTestId("playground-model-0");
++    const modelB = window.getByTestId("playground-model-1");
++    await expect(modelA.locator("option")).not.toHaveCount(0);
++    const options = await modelA.locator("option").evaluateAll((nodes) =>
++      nodes.map((node) => (node as HTMLOptionElement).value),
++    );
++    expect(options.length).toBeGreaterThanOrEqual(2);
++    await modelA.selectOption(options[0] ?? "");
++    await modelB.selectOption(options[1] ?? options[0] ?? "");
++    await window.getByTestId("playground-run").click();
++    await expect(window.getByTestId("playground-assistant-0")).toHaveAttribute("data-status", "complete", {
++      timeout: 30_000,
++    });
++    await expect(window.getByTestId("playground-assistant-1")).toHaveAttribute("data-status", "complete", {
++      timeout: 30_000,
++    });
++    await window.getByTestId("playground-winner-title").fill("Winner");
++    await window.getByTestId("playground-save-0").click();
++    await window.getByTestId("prompt-folder-development").click();
++    await expect(window.getByTestId("prompt-item").filter({ hasText: "Winner" })).toBeVisible();
++  } finally {
++    await app.close();
++  }
++});
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index 23f4b6b..c2d3e61 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -67,6 +67,14 @@ import {
+   workspaceAddTaskInputSchema,
+   workspaceSetTaskDoneInputSchema,
+   conversationTaskDtoSchema,
++  promptDtoSchema,
++  promptListResultSchema,
++  promptCreateInputSchema,
++  promptUpdateInputSchema,
++  promptResolveInputSchema,
++  promptResolveResultSchema,
++  playgroundRunInputSchema,
++  playgroundRunResultSchema,
+   contextPacketDtoSchema,
+   contextPacketListResultSchema,
+   projectCreateInputSchema,
+@@ -107,6 +115,7 @@ import { suggestMemories } from "@ai-hub/memory";
+ import { previewPacket } from "./packet-preview";
+ import { getConversationWorkspaceDto, refreshConversationWorkspace } from "./workspace";
+ import { getHubDatabase } from "./persistence";
++import { listPromptDtos, resolvePromptDto, runPlayground } from "./playground";
+ import { testProviderKey } from "./provider-health";
+ import { localDayStartMs } from "./spend-guard";
+ import { checkForAppUpdates } from "./updater";
+@@ -509,6 +518,45 @@ export function registerWorkspaceIpc(): void {
+     getHubDatabase().repos.removeConversationTask(input.id);
+   });
+ 
++  registerHandler(IpcChannel.promptsList, emptyIpcPayloadSchema, promptListResultSchema, () =>
++    listPromptDtos().map((row) => promptDtoSchema.parse(row)),
++  );
++
++  registerHandler(IpcChannel.promptsCreate, promptCreateInputSchema, promptDtoSchema, (input) =>
++    promptDtoSchema.parse(
++      getHubDatabase().repos.createPrompt({
++        folder: input.folder,
++        title: input.title,
++        body: input.body,
++      }),
++    ),
++  );
++
++  registerHandler(IpcChannel.promptsUpdate, promptUpdateInputSchema, promptDtoSchema, (input) =>
++    promptDtoSchema.parse(
++      getHubDatabase().repos.updatePrompt(input.id, {
++        ...(input.folder !== undefined ? { folder: input.folder } : {}),
++        ...(input.title !== undefined ? { title: input.title } : {}),
++        ...(input.body !== undefined ? { body: input.body } : {}),
++      }),
++    ),
++  );
++
++  registerHandler(IpcChannel.promptsRemove, idInputSchema, ipcAckResultSchema, (input) => {
++    getHubDatabase().repos.removePrompt(input.id);
++  });
++
++  registerHandler(IpcChannel.promptsResolve, promptResolveInputSchema, promptResolveResultSchema, (input) =>
++    promptResolveResultSchema.parse(resolvePromptDto(input.promptId, input.projectId)),
++  );
++
++  registerHandler(
++    IpcChannel.playgroundRun,
++    playgroundRunInputSchema,
++    playgroundRunResultSchema,
++    (input, event) => runPlayground(input, event.sender),
++  );
++
+   registerHandler(IpcChannel.spendCapsGet, emptyIpcPayloadSchema, spendCapListResultSchema, () => {
+     const rows = getHubDatabase().repos.listSpendCaps();
+     return SPEND_CAP_SCOPES.map((scope) => ({
+diff --git a/apps/desktop/src/main/mentions.ts b/apps/desktop/src/main/mentions.ts
+index 3335123..23fa129 100644
+--- a/apps/desktop/src/main/mentions.ts
++++ b/apps/desktop/src/main/mentions.ts
+@@ -11,6 +11,7 @@ import {
+   type MentionRef,
+   type PacketPrivacyMode,
+ } from "@ai-hub/shared";
++import { interpolateStoredPrompt } from "./prompt-vars";
+ 
+ export function resolveSendMentions(
+   repos: HubRepos,
+@@ -72,6 +73,16 @@ export function resolveSendMentions(
+         mentions.push(mention);
+         continue;
+       }
++      if (ref.type === "prompt") {
++        const mention = resolvePromptMention(repos, projectId, ref, remaining);
++        if (seen.has(`prompt:${mention.id}`)) {
++          continue;
++        }
++        seen.add(`prompt:${mention.id}`);
++        usedTokens += mentionTokenEstimate(mention.text.length);
++        mentions.push(mention);
++        continue;
++      }
+       if (ref.type === "conversation") {
+         const mention = resolveConversationMention(repos, projectId, currentConversationId, ref, remaining);
+         if (mention) {
+@@ -130,6 +141,32 @@ function resolveMemoryMention(
+   };
+ }
+ 
++function resolvePromptMention(
++  repos: HubRepos,
++  projectId: string | null,
++  ref: MentionRef,
++  remainingTokens: number,
++): CompilerMention {
++  const prompts = repos.listPrompts();
++  const match = ref.id
++    ? prompts.find((item) => item.id === ref.id)
++    : prompts.find((item) => {
++        const query = (ref.query ?? "").toLowerCase();
++        return item.title.toLowerCase().includes(query);
++      });
++  if (!match) {
++    throw new Error("mentions:not_found");
++  }
++  const text = redactSecrets(interpolateStoredPrompt(repos, match.body, projectId));
++  const maxChars = Math.max(4, remainingTokens * 4);
++  return {
++    kind: "prompt",
++    id: match.id,
++    name: match.title,
++    text: text.length > maxChars ? `${text.slice(0, maxChars - 1)}ÔÇª` : text,
++  };
++}
++
+ function resolveProjectFile(
+   repos: HubRepos,
+   projectId: string | null,
+diff --git a/apps/desktop/src/main/persistence.ts b/apps/desktop/src/main/persistence.ts
+index 62e6dd1..ce58a1a 100644
+--- a/apps/desktop/src/main/persistence.ts
++++ b/apps/desktop/src/main/persistence.ts
+@@ -1,6 +1,7 @@
+ import { join } from "node:path";
+ import { app } from "electron";
+ import { openHubDatabase, type HubDatabase } from "@ai-hub/db";
++import { FACTORY_PROMPTS } from "@ai-hub/shared";
+ import { loadOrCreateMasterKey, MemorySecretStore } from "@ai-hub/security";
+ import { KeytarSecretStore } from "@ai-hub/security/keytar";
+ import { isE2eMode } from "./e2e-mode";
+@@ -39,6 +40,7 @@ export async function bootPersistence(): Promise<HubDatabase> {
+   const masterKey = await loadOrCreateMasterKey(store);
+   const dbPath = join(app.getPath("userData"), "ai-hub.sqlite");
+   hub = openHubDatabase({ path: dbPath, masterKey, secretStore: store });
++  hub.repos.ensureFactoryPrompts(FACTORY_PROMPTS);
+   if (isE2eMode() && process.env.AI_HUB_E2E_EMPTY !== "1") {
+     await seedE2eWorkspace(hub);
+   }
+diff --git a/apps/desktop/src/main/playground.ts b/apps/desktop/src/main/playground.ts
+new file mode 100644
+index 0000000..33320a8
+--- /dev/null
++++ b/apps/desktop/src/main/playground.ts
+@@ -0,0 +1,122 @@
++import { SpendCapError, addUsd, FACTORY_PROMPTS } from "@ai-hub/shared";
++import type { PlaygroundRunInput, PlaygroundRunResult } from "@ai-hub/shared";
++import type { WebContents } from "electron";
++import { sendChat } from "./chat-session";
++import { previewPacket } from "./packet-preview";
++import { getHubDatabase } from "./persistence";
++import { interpolateStoredPrompt } from "./prompt-vars";
++import { evaluateOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
++
++export function seedFactoryPrompts(): void {
++  getHubDatabase().repos.ensureFactoryPrompts(FACTORY_PROMPTS);
++}
++
++export function listPromptDtos() {
++  seedFactoryPrompts();
++  return getHubDatabase().repos.listPrompts();
++}
++
++export function resolvePromptDto(
++  promptId: string,
++  projectId: string | null,
++): { id: string; title: string; text: string } {
++  seedFactoryPrompts();
++  const prompt = getHubDatabase().repos.getPrompt(promptId);
++  if (!prompt) {
++    throw new Error("mentions:not_found");
++  }
++  const text = interpolateStoredPrompt(getHubDatabase().repos, prompt.body, projectId);
++  return { id: prompt.id, title: prompt.title, text };
++}
++
++export async function runPlayground(
++  input: PlaygroundRunInput,
++  sender: WebContents,
++): Promise<PlaygroundRunResult> {
++  const repos = getHubDatabase().repos;
++  seedFactoryPrompts();
++  let content = input.content;
++  if (input.promptId !== undefined) {
++    const resolved = resolvePromptDto(input.promptId, input.projectId);
++    content = `${resolved.text}\n\n${input.content}`.trim();
++  }
++  const uniqueKeys = new Set(input.slots.map((slot) => `${slot.providerKeyId}:${slot.model}`));
++  if (uniqueKeys.size !== input.slots.length) {
++    throw new Error("playground:duplicate_slot");
++  }
++
++  const conversations = [];
++  for (const slot of input.slots) {
++    const key = await repos.getProviderSecret(slot.providerKeyId);
++    if (!key) {
++      throw new Error("gateway:auth");
++    }
++    const conversation = repos.createConversation(
++      input.projectId,
++      `Playground ┬À ${slot.model}`,
++      "playground",
++    );
++    conversations.push({ slot, key, conversation });
++  }
++
++  let combinedEstimate: string | null = "0";
++  for (const item of conversations) {
++    const preview = previewPacket({
++      conversationId: item.conversation.id,
++      pendingContent: content,
++      model: item.slot.model,
++      providerSlug: item.key.providerSlug,
++      ...(input.privacyMode !== undefined ? { privacyMode: input.privacyMode } : {}),
++      ...(input.extraSystem !== undefined ? { extraSystem: input.extraSystem } : {}),
++      ...(input.maxTokens !== undefined ? { maxTokens: input.maxTokens } : {}),
++    });
++    if (preview.overflow) {
++      throw new Error("gateway:context_overflow");
++    }
++    if (preview.estimatedCostUsd && combinedEstimate) {
++      combinedEstimate = addUsd(combinedEstimate, preview.estimatedCostUsd);
++    } else {
++      combinedEstimate = null;
++    }
++  }
++
++  if (combinedEstimate) {
++    const cap = evaluateOutgoingCaps({
++      estimatedRequestUsd: combinedEstimate,
++      daySpentUsd: repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() }),
++      globalSpentUsd: repos.sumReceiptCostUsd({}),
++      limits: spendCapLimitsFromRows(repos.listSpendCaps()),
++    });
++    if (cap.blocked) {
++      for (const item of conversations) {
++        repos.removeConversation(item.conversation.id);
++      }
++      throw new SpendCapError(cap.blocked);
++    }
++  }
++
++  const slots = [];
++  for (const item of conversations) {
++    const send = await sendChat(
++      {
++        mode: "send",
++        conversationId: item.conversation.id,
++        providerKeyId: item.slot.providerKeyId,
++        model: item.slot.model,
++        content,
++        ...(input.privacyMode !== undefined ? { privacyMode: input.privacyMode } : {}),
++        ...(input.extraSystem !== undefined ? { extraSystem: input.extraSystem } : {}),
++        ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
++        ...(input.maxTokens !== undefined ? { maxTokens: input.maxTokens } : {}),
++      },
++      sender,
++    );
++    slots.push({
++      providerKeyId: item.slot.providerKeyId,
++      model: item.slot.model,
++      send,
++    });
++  }
++
++  return { content, slots };
++}
+diff --git a/apps/desktop/src/main/prompt-vars.ts b/apps/desktop/src/main/prompt-vars.ts
+new file mode 100644
+index 0000000..645516a
+--- /dev/null
++++ b/apps/desktop/src/main/prompt-vars.ts
+@@ -0,0 +1,22 @@
++import type { HubRepos } from "@ai-hub/db";
++import { interpolatePrompt } from "@ai-hub/shared";
++
++export function promptVarsForProject(
++  repos: HubRepos,
++  projectId: string | null,
++): { project: string; language: string; goal: string } {
++  const project = projectId ? repos.getProject(projectId) : null;
++  return {
++    project: project?.name ?? "",
++    language: repos.getAppearance().locale,
++    goal: project?.instructions ?? "",
++  };
++}
++
++export function interpolateStoredPrompt(
++  repos: HubRepos,
++  body: string,
++  projectId: string | null,
++): string {
++  return interpolatePrompt(body, promptVarsForProject(repos, projectId));
++}
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index 02e18af..899bcde 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -70,6 +70,14 @@ import {
+   workspaceAddTaskInputSchema,
+   workspaceSetTaskDoneInputSchema,
+   conversationTaskDtoSchema,
++  promptCreateInputSchema,
++  promptDtoSchema,
++  promptListResultSchema,
++  promptResolveInputSchema,
++  promptResolveResultSchema,
++  promptUpdateInputSchema,
++  playgroundRunInputSchema,
++  playgroundRunResultSchema,
+   contextPacketDtoSchema,
+   contextPacketListResultSchema,
+   projectCreateInputSchema,
+@@ -397,6 +405,20 @@ const hub: HubApi = {
+       ),
+     removeTask: (input) => invokeAckWith(IpcChannel.workspaceRemoveTask, input, idInputSchema),
+   },
++  prompts: {
++    list: () => invokeParsed(IpcChannel.promptsList, empty, emptyIpcPayloadSchema, promptListResultSchema),
++    create: (input) =>
++      invokeParsed(IpcChannel.promptsCreate, input, promptCreateInputSchema, promptDtoSchema),
++    update: (input) =>
++      invokeParsed(IpcChannel.promptsUpdate, input, promptUpdateInputSchema, promptDtoSchema),
++    remove: (input) => invokeAckWith(IpcChannel.promptsRemove, input, idInputSchema),
++    resolve: (input) =>
++      invokeParsed(IpcChannel.promptsResolve, input, promptResolveInputSchema, promptResolveResultSchema),
++  },
++  playground: {
++    run: (input) =>
++      invokeParsed(IpcChannel.playgroundRun, input, playgroundRunInputSchema, playgroundRunResultSchema),
++  },
+ };
+ 
+ contextBridge.exposeInMainWorld("hub", hub);
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index f2be8bc..90fe933 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -35,6 +35,7 @@ import { HomeView } from "@/components/layout/home-view";
+ import { SettingsView } from "@/components/layout/settings-view";
+ import { DebugView } from "@/components/layout/debug-view";
+ import { ImportView } from "@/components/layout/import-view";
++import { PromptsView } from "@/components/layout/prompts-view";
+ import { OnboardingView } from "@/components/layout/onboarding-view";
+ import {
+   ChromeCommandPalette,
+@@ -165,6 +166,7 @@ export function App(): JSX.Element {
+   const [costs, setCosts] = useState<CostsAggregateResult | null>(null);
+   const [showAllowOnce, setShowAllowOnce] = useState(false);
+   const [composerDraft, setComposerDraft] = useState("");
++  const [composerInsert, setComposerInsert] = useState<string | null>(null);
+   const [attachedFiles, setAttachedFiles] = useState<ProjectFileDto[]>([]);
+   const [mentionRefs, setMentionRefs] = useState<MentionRef[]>([]);
+   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+@@ -399,7 +401,7 @@ export function App(): JSX.Element {
+   ]);
+ 
+   useEffect(() => {
+-    if (view !== "home") {
++    if (view !== "home" && view !== "prompts") {
+       return;
+     }
+     void loadKeys()
+@@ -1190,6 +1192,8 @@ export function App(): JSX.Element {
+                 void sendToModel({ ...pending, allowOnce: true });
+               }}
+               onComposerDraft={reportComposerDraft}
++              composerInsert={composerInsert}
++              onComposerInsertConsumed={() => setComposerInsert(null)}
+               onPin={async (id, pinned) => {
+                 try {
+                   const updated = await window.hub.messages.pin({ id, pinned });
+@@ -1352,6 +1356,15 @@ export function App(): JSX.Element {
+             />
+           ) : view === "debug" ? (
+             <DebugView />
++          ) : view === "prompts" ? (
++            <PromptsView
++              project={selectedProject}
++              providerKeys={providerKeys}
++              onInsertIntoComposer={(text) => {
++                setComposerInsert(text);
++                setView("home");
++              }}
++            />
+           ) : view === "import" ? (
+             <ImportView
+               projects={projects}
+@@ -1487,6 +1500,7 @@ export function App(): JSX.Element {
+         onSettings={() => openSettings("general")}
+         onDebug={() => navigateToView("debug")}
+         onImport={() => navigateToView("import")}
++        onPrompts={() => navigateToView("prompts")}
+         onShortcuts={() => setShortcutsOpen(true)}
+       />
+     </div>
+diff --git a/apps/desktop/src/renderer/src/components/layout/command-palette.tsx b/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
+index 4fcbffd..aaac8d6 100644
+--- a/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
+@@ -56,6 +56,7 @@ export function ChromeCommandPalette({
+   onSettings,
+   onDebug,
+   onImport,
++  onPrompts,
+   onShortcuts,
+ }: {
+   projects: ProjectDto[];
+@@ -76,6 +77,7 @@ export function ChromeCommandPalette({
+   onSettings: () => void;
+   onDebug: () => void;
+   onImport: () => void;
++  onPrompts: () => void;
+   onShortcuts: () => void;
+ }): JSX.Element {
+   const { t } = useTranslation();
+@@ -161,6 +163,12 @@ export function ChromeCommandPalette({
+       keywords: "import chatgpt claude gemini importar",
+       run: onImport,
+     },
++    {
++      id: "prompts",
++      label: t("command.prompts"),
++      keywords: "prompt library playground prompts biblioteca",
++      run: onPrompts,
++    },
+     {
+       id: "imported",
+       label: t("command.importedInbox"),
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index ac4713a..5528cdc 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -23,6 +23,7 @@ import {
+   type ProjectDto,
+   type ProjectUpdateInput,
+   type ProjectFileDto,
++  type PromptDto,
+   type ProviderKeyDto,
+ } from "@ai-hub/shared";
+ import {
+@@ -127,6 +128,8 @@ export function HomeView({
+   onMentionsChange,
+   onDuplicateConversation,
+   onPromoteConversation,
++  composerInsert,
++  onComposerInsertConsumed,
+ }: {
+   project: ProjectDto | null;
+   importedInbox: boolean;
+@@ -191,6 +194,8 @@ export function HomeView({
+   onAttachFolder: () => Promise<void>;
+   onRemoveFile: (id: string) => Promise<void>;
+   onDropFiles: (files: File[]) => Promise<void>;
++  composerInsert: string | null;
++  onComposerInsertConsumed: () => void;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const modifier = window.hub.platform === "darwin" ? "Ôîÿ" : "Ctrl";
+@@ -206,6 +211,7 @@ export function HomeView({
+   const [memoryOpen, setMemoryOpen] = useState(false);
+   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+   const [projectMemories, setProjectMemories] = useState<ProjectMemoryDto[]>([]);
++  const [libraryPrompts, setLibraryPrompts] = useState<PromptDto[]>([]);
+   const [memoryOptedOut, setMemoryOptedOut] = useState(false);
+   const [memorySuggestions, setMemorySuggestions] = useState<string[]>([]);
+   const [conversationWorkspace, setConversationWorkspace] = useState<ConversationWorkspaceDto | null>(
+@@ -274,6 +280,34 @@ export function HomeView({
+             available: conversation !== undefined && conversation.id !== selectedConversationId,
+           };
+         }
++        if (item.type === "memory") {
++          const memory = projectMemories.find(
++            (row) =>
++              row.title.toLowerCase() === item.query.toLowerCase() ||
++              row.body.toLowerCase().includes(item.query.toLowerCase()),
++          );
++          return {
++            type: item.type,
++            id: memory?.id ?? null,
++            query: item.query,
++            label: memory?.title ?? item.query,
++            excerpt: memory?.body.slice(0, 120) ?? item.query,
++            tokens: memory ? Math.ceil(memory.body.length / 4) : 0,
++            available: memory !== undefined,
++          };
++        }
++        if (item.type === "prompt") {
++          const prompt = libraryPrompts.find((row) => row.title.toLowerCase() === item.query.toLowerCase());
++          return {
++            type: item.type,
++            id: prompt?.id ?? null,
++            query: item.query,
++            label: prompt?.title ?? item.query,
++            excerpt: prompt?.body.slice(0, 120) ?? item.query,
++            tokens: prompt ? Math.ceil(prompt.body.length / 4) : 0,
++            available: prompt !== undefined,
++          };
++        }
+         if (item.type === "packet") {
+           const packet = packets.find(
+             (row) =>
+@@ -315,6 +349,15 @@ export function HomeView({
+     onMentionsChange([]);
+   }, [onComposerDraft, onMentionsChange, selectedConversationId]);
+ 
++  useEffect(() => {
++    if (!composerInsert) {
++      return;
++    }
++    setDraft(composerInsert);
++    onComposerDraft(composerInsert);
++    onComposerInsertConsumed();
++  }, [composerInsert, onComposerDraft, onComposerInsertConsumed]);
++
+   useEffect(() => {
+     void window.hub.files
+       .list({ projectId: project?.id ?? null })
+@@ -322,6 +365,13 @@ export function HomeView({
+       .catch(() => setProjectFiles([]));
+   }, [attachedFiles, project?.id]);
+ 
++  useEffect(() => {
++    void window.hub.prompts
++      .list()
++      .then(setLibraryPrompts)
++      .catch(() => setLibraryPrompts([]));
++  }, []);
++
+   useEffect(() => {
+     if (!project) {
+       setProjectMemories([]);
+@@ -1278,6 +1328,27 @@ export function HomeView({
+                       );
+                       return;
+                     }
++                    if (parts.type === "prompt") {
++                      setMentionSuggestions(
++                        libraryPrompts
++                          .filter(
++                            (item) =>
++                              item.title.toLowerCase().includes(query) ||
++                              item.body.toLowerCase().includes(query),
++                          )
++                          .slice(0, 8)
++                          .map((item) => ({
++                            type: "prompt" as const,
++                            id: item.id,
++                            query: item.title,
++                            label: item.title,
++                            excerpt: item.body.slice(0, 120),
++                            tokens: Math.ceil(item.body.length / 4),
++                            available: true,
++                          })),
++                      );
++                      return;
++                    }
+                     if (parts.type === "conversation") {
+                       setMentionSuggestions(
+                         conversations
+diff --git a/apps/desktop/src/renderer/src/components/layout/prompts-view.tsx b/apps/desktop/src/renderer/src/components/layout/prompts-view.tsx
+new file mode 100644
+index 0000000..91bef05
+--- /dev/null
++++ b/apps/desktop/src/renderer/src/components/layout/prompts-view.tsx
+@@ -0,0 +1,445 @@
++import { type JSX, useEffect, useMemo, useState } from "react";
++import { useTranslation } from "react-i18next";
++import {
++  catalogModelsForProvider,
++  PROMPT_FOLDERS,
++  type MessageDto,
++  type PlaygroundRunResult,
++  type ProjectDto,
++  type PromptDto,
++  type PromptFolder,
++  type ProviderKeyDto,
++} from "@ai-hub/shared";
++import { Button } from "@/components/ui/button";
++import { Input } from "@/components/ui/input";
++import { ScrollArea } from "@/components/ui/scroll-area";
++
++type PlaygroundColumn = {
++  providerKeyId: string;
++  model: string;
++  messages: MessageDto[];
++  runId: string | null;
++};
++
++function defaultSlots(keys: ProviderKeyDto[]): PlaygroundColumn[] {
++  const active = keys.filter((key) => key.status === "active");
++  const first = active[0] ?? keys[0];
++  const second = active[1] ?? active[0] ?? keys[0];
++  const modelFor = (key: ProviderKeyDto | undefined): string => {
++    if (!key) {
++      return "gpt-4o-mini";
++    }
++    return catalogModelsForProvider(key.providerSlug)[0]?.id ?? "gpt-4o-mini";
++  };
++  return [
++    {
++      providerKeyId: first?.id ?? "",
++      model: modelFor(first),
++      messages: [],
++      runId: null,
++    },
++    {
++      providerKeyId: second?.id ?? "",
++      model: modelFor(second),
++      messages: [],
++      runId: null,
++    },
++  ];
++}
++
++export function PromptsView({
++  project,
++  providerKeys,
++  onInsertIntoComposer,
++}: {
++  project: ProjectDto | null;
++  providerKeys: ProviderKeyDto[];
++  onInsertIntoComposer: (text: string) => void;
++}): JSX.Element {
++  const { t } = useTranslation();
++  const [prompts, setPrompts] = useState<PromptDto[]>([]);
++  const [folder, setFolder] = useState<PromptFolder>("development");
++  const [selectedId, setSelectedId] = useState<string | null>(null);
++  const [title, setTitle] = useState("");
++  const [body, setBody] = useState("");
++  const [error, setError] = useState<string | null>(null);
++  const [playgroundDraft, setPlaygroundDraft] = useState("");
++  const [slots, setSlots] = useState<PlaygroundColumn[]>(() => defaultSlots(providerKeys));
++  const [running, setRunning] = useState(false);
++  const [winnerTitle, setWinnerTitle] = useState("");
++
++  const selected = prompts.find((item) => item.id === selectedId) ?? null;
++  const folderPrompts = prompts.filter((item) => item.folder === folder);
++
++  const keyOptions = useMemo(
++    () =>
++      providerKeys.flatMap((key) =>
++        catalogModelsForProvider(key.providerSlug).map((model) => ({
++          value: `${key.id}::${model.id}`,
++          label: `${key.label} ┬À ${model.label}`,
++          providerKeyId: key.id,
++          model: model.id,
++        })),
++      ),
++    [providerKeys],
++  );
++
++  const reload = async (): Promise<void> => {
++    const list = await window.hub.prompts.list();
++    setPrompts(list);
++  };
++
++  useEffect(() => {
++    void reload().catch(() => setError(t("prompts.error.generic")));
++  }, [t]);
++
++  useEffect(() => {
++    setSlots((current) => {
++      if (current.some((slot) => slot.providerKeyId.length > 0)) {
++        return current;
++      }
++      return defaultSlots(providerKeys);
++    });
++  }, [providerKeys]);
++
++  useEffect(() => {
++    const off = window.hub.chat.onEvent((event) => {
++      setSlots((current) =>
++        current.map((slot) => {
++          if (event.type === "chunk") {
++            return {
++              ...slot,
++              messages: slot.messages.map((message) =>
++                message.id === event.messageId
++                  ? { ...message, content: message.content + event.text, status: "streaming" as const }
++                  : message,
++              ),
++            };
++          }
++          if (event.type === "done") {
++            return {
++              ...slot,
++              runId: slot.runId === event.runId ? null : slot.runId,
++              messages: slot.messages.map((message) => (message.id === event.message.id ? event.message : message)),
++            };
++          }
++          return {
++            ...slot,
++            runId: slot.runId === event.runId ? null : slot.runId,
++          };
++        }),
++      );
++      if (event.type === "error" && event.code !== "aborted") {
++        setError(t("prompts.error.run"));
++      }
++    });
++    return off;
++  }, [t]);
++
++  const selectPrompt = (item: PromptDto): void => {
++    setSelectedId(item.id);
++    setTitle(item.title);
++    setBody(item.body);
++    setFolder(item.folder);
++  };
++
++  const startNew = (): void => {
++    setSelectedId(null);
++    setTitle("");
++    setBody("");
++  };
++
++  const savePrompt = async (): Promise<void> => {
++    try {
++      if (selectedId) {
++        const updated = await window.hub.prompts.update({ id: selectedId, folder, title, body });
++        setPrompts((current) => current.map((item) => (item.id === updated.id ? updated : item)));
++        setSelectedId(updated.id);
++      } else {
++        const created = await window.hub.prompts.create({ folder, title, body });
++        setPrompts((current) => [...current, created]);
++        setSelectedId(created.id);
++      }
++      setError(null);
++    } catch {
++      setError(t("prompts.error.save"));
++    }
++  };
++
++  const insertPrompt = async (): Promise<void> => {
++    const id = selectedId;
++    if (!id) {
++      return;
++    }
++    try {
++      const resolved = await window.hub.prompts.resolve({ promptId: id, projectId: project?.id ?? null });
++      onInsertIntoComposer(resolved.text);
++    } catch {
++      setError(t("prompts.error.resolve"));
++    }
++  };
++
++  const runPlayground = async (): Promise<void> => {
++    const ready = slots.filter((slot) => slot.providerKeyId.length > 0 && slot.model.length > 0);
++    if (ready.length < 2) {
++      setError(t("prompts.error.slots"));
++      return;
++    }
++    let content = playgroundDraft.trim();
++    if (selectedId) {
++      try {
++        const resolved = await window.hub.prompts.resolve({
++          promptId: selectedId,
++          projectId: project?.id ?? null,
++        });
++        content = content.length > 0 ? `${resolved.text}\n\n${content}` : resolved.text;
++      } catch {
++        setError(t("prompts.error.resolve"));
++        return;
++      }
++    }
++    if (content.length === 0) {
++      setError(t("prompts.error.content"));
++      return;
++    }
++    setRunning(true);
++    setError(null);
++    try {
++      const result: PlaygroundRunResult = await window.hub.playground.run({
++        projectId: project?.id ?? null,
++        content,
++        slots: ready.map((slot) => ({ providerKeyId: slot.providerKeyId, model: slot.model })),
++      });
++      setSlots(
++        result.slots.map((slot) => ({
++          providerKeyId: slot.providerKeyId,
++          model: slot.model,
++          runId: slot.send.runId,
++          messages: [slot.send.userMessage, slot.send.assistant].filter((item): item is MessageDto => item !== null),
++        })),
++      );
++    } catch {
++      setError(t("prompts.error.run"));
++    } finally {
++      setRunning(false);
++    }
++  };
++
++  const saveWinner = async (index: number): Promise<void> => {
++    const slot = slots[index];
++    const assistant = [...(slot?.messages ?? [])].reverse().find((item) => item.role === "assistant");
++    if (!assistant || assistant.content.trim().length === 0) {
++      return;
++    }
++    const name = winnerTitle.trim() || t("prompts.winnerDefault");
++    try {
++      const created = await window.hub.prompts.create({
++        folder,
++        title: name.slice(0, 120),
++        body: assistant.content.slice(0, 16_000),
++      });
++      setPrompts((current) => [...current, created]);
++      setSelectedId(created.id);
++      setTitle(created.title);
++      setBody(created.body);
++      setError(null);
++    } catch {
++      setError(t("prompts.error.save"));
++    }
++  };
++
++  return (
++    <div className="flex h-full min-h-0" data-testid="prompts-view">
++      <aside className="flex w-64 shrink-0 flex-col border-r">
++        <div className="flex items-center justify-between border-b px-2 py-1.5">
++          <p className="text-[12px] font-medium">{t("prompts.library")}</p>
++          <Button type="button" size="sm" data-testid="prompt-new" onClick={startNew}>
++            {t("prompts.new")}
++          </Button>
++        </div>
++        <div className="flex gap-1 border-b px-2 py-1">
++          {PROMPT_FOLDERS.map((item) => (
++            <Button
++              key={item}
++              type="button"
++              size="sm"
++              variant={folder === item ? "default" : "ghost"}
++              data-testid={`prompt-folder-${item}`}
++              onClick={() => setFolder(item)}
++            >
++              {t(`prompts.folder.${item}`)}
++            </Button>
++          ))}
++        </div>
++        <ScrollArea className="flex-1">
++          <ul className="p-1" data-testid="prompt-list">
++            {folderPrompts.map((item) => (
++              <li key={item.id}>
++                <button
++                  type="button"
++                  className={`w-full rounded px-2 py-1 text-left text-[12px] ${
++                    item.id === selectedId ? "bg-muted" : "hover:bg-muted/60"
++                  }`}
++                  data-testid="prompt-item"
++                  data-factory={item.factoryId ?? ""}
++                  onClick={() => selectPrompt(item)}
++                >
++                  {item.factoryId ? t(`prompts.factory.${item.factoryId}`) : item.title}
++                </button>
++              </li>
++            ))}
++          </ul>
++        </ScrollArea>
++      </aside>
++      <section className="flex min-w-0 flex-1 flex-col">
++        <div className="grid min-h-0 flex-1 grid-cols-2">
++          <div className="flex min-h-0 flex-col border-r p-2">
++            <p className="mb-1 text-[12px] font-medium">{t("prompts.editor")}</p>
++            <Input
++              className="mb-1"
++              data-testid="prompt-title"
++              value={title}
++              onChange={(event) => setTitle(event.target.value)}
++              placeholder={t("prompts.titlePlaceholder")}
++            />
++            <textarea
++              className="mb-2 min-h-[160px] flex-1 resize-none rounded border bg-background p-2 text-[12px]"
++              data-testid="prompt-body"
++              value={body}
++              onChange={(event) => setBody(event.target.value)}
++              placeholder={t("prompts.bodyPlaceholder")}
++            />
++            <div className="flex flex-wrap gap-1">
++              <Button type="button" size="sm" data-testid="prompt-save" onClick={() => void savePrompt()}>
++                {t("prompts.save")}
++              </Button>
++              <Button
++                type="button"
++                size="sm"
++                variant="secondary"
++                data-testid="prompt-insert"
++                disabled={!selectedId}
++                onClick={() => void insertPrompt()}
++              >
++                {t("prompts.insert")}
++              </Button>
++              {selectedId && !selected?.factoryId ? (
++                <Button
++                  type="button"
++                  size="sm"
++                  variant="ghost"
++                  data-testid="prompt-delete"
++                  onClick={() => {
++                    void window.hub.prompts.remove({ id: selectedId }).then(() => {
++                      setPrompts((current) => current.filter((item) => item.id !== selectedId));
++                      startNew();
++                    });
++                  }}
++                >
++                  {t("prompts.delete")}
++                </Button>
++              ) : null}
++            </div>
++          </div>
++          <div className="flex min-h-0 flex-col p-2">
++            <p className="mb-1 text-[12px] font-medium">{t("prompts.playground")}</p>
++            <textarea
++              className="mb-2 h-20 resize-none rounded border bg-background p-2 text-[12px]"
++              data-testid="playground-extra"
++              value={playgroundDraft}
++              onChange={(event) => setPlaygroundDraft(event.target.value)}
++              placeholder={t("prompts.playgroundPlaceholder")}
++            />
++            <div className="mb-2 flex flex-wrap items-center gap-1">
++              {slots.map((slot, index) => (
++                <label key={index} className="flex items-center gap-1 text-[11px]">
++                  <span className="text-muted-foreground">{t("prompts.slot", { n: index + 1 })}</span>
++                  <select
++                    className="h-8 rounded border bg-background px-1"
++                    data-testid={`playground-model-${index}`}
++                    value={slot.providerKeyId && slot.model ? `${slot.providerKeyId}::${slot.model}` : ""}
++                    onChange={(event) => {
++                      const option = keyOptions.find((item) => item.value === event.target.value);
++                      if (!option) {
++                        return;
++                      }
++                      setSlots((current) =>
++                        current.map((row, rowIndex) =>
++                          rowIndex === index
++                            ? { ...row, providerKeyId: option.providerKeyId, model: option.model }
++                            : row,
++                        ),
++                      );
++                    }}
++                  >
++                    {keyOptions.map((option) => (
++                      <option key={option.value} value={option.value}>
++                        {option.label}
++                      </option>
++                    ))}
++                  </select>
++                </label>
++              ))}
++              <Button
++                type="button"
++                size="sm"
++                data-testid="playground-run"
++                disabled={running}
++                onClick={() => void runPlayground()}
++              >
++                {running ? t("prompts.running") : t("prompts.run")}
++              </Button>
++            </div>
++            <Input
++              className="mb-2"
++              data-testid="playground-winner-title"
++              value={winnerTitle}
++              onChange={(event) => setWinnerTitle(event.target.value)}
++              placeholder={t("prompts.winnerPlaceholder")}
++            />
++            <div className="grid min-h-0 flex-1 grid-cols-2 gap-2">
++              {slots.map((slot, index) => {
++                const assistant = [...slot.messages].reverse().find((item) => item.role === "assistant");
++                return (
++                  <div
++                    key={index}
++                    className="flex min-h-0 flex-col rounded border"
++                    data-testid={`playground-slot-${index}`}
++                  >
++                    <div className="flex items-center justify-between border-b px-2 py-1 text-[11px]">
++                      <span className="truncate">{slot.model}</span>
++                      <Button
++                        type="button"
++                        size="sm"
++                        variant="ghost"
++                        data-testid={`playground-save-${index}`}
++                        disabled={!assistant || assistant.status !== "complete"}
++                        onClick={() => void saveWinner(index)}
++                      >
++                        {t("prompts.saveWinner")}
++                      </Button>
++                    </div>
++                    <ScrollArea className="flex-1 p-2">
++                      <p
++                        className="whitespace-pre-wrap text-[12px]"
++                        data-testid={`playground-assistant-${index}`}
++                        data-status={assistant?.status ?? "idle"}
++                      >
++                        {assistant?.content ?? t("prompts.playgroundEmpty")}
++                      </p>
++                    </ScrollArea>
++                  </div>
++                );
++              })}
++            </div>
++          </div>
++        </div>
++        {error ? (
++          <p className="border-t px-2 py-1 text-[12px] text-destructive" data-testid="prompts-error">
++            {error}
++          </p>
++        ) : null}
++      </section>
++    </div>
++  );
++}
+diff --git a/apps/desktop/src/renderer/src/components/layout/sidebar.tsx b/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
+index e10f73d..3314b5b 100644
+--- a/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
+@@ -1,5 +1,5 @@
+ import { type JSX, type ReactNode, useState, type RefObject } from "react";
+-import { Activity, Home, Inbox, Plus, Settings, Upload } from "lucide-react";
++import { Activity, Home, Inbox, Library, Plus, Settings, Upload } from "lucide-react";
+ import { useTranslation } from "react-i18next";
+ import type { ProjectDto, SearchHit } from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
+@@ -60,6 +60,13 @@ export function Sidebar({
+             onClick={() => onChange("home")}
+             testId="nav-home"
+           />
++          <NavButton
++            active={view === "prompts"}
++            icon={<Library className="h-3.5 w-3.5" />}
++            label={t("nav.prompts")}
++            onClick={() => onChange("prompts")}
++            testId="nav-prompts"
++          />
+           <NavButton
+             active={view === "settings"}
+             icon={<Settings className="h-3.5 w-3.5" />}
+diff --git a/apps/desktop/src/renderer/src/components/layout/types.ts b/apps/desktop/src/renderer/src/components/layout/types.ts
+index 892ea55..495a8f8 100644
+--- a/apps/desktop/src/renderer/src/components/layout/types.ts
++++ b/apps/desktop/src/renderer/src/components/layout/types.ts
+@@ -1,3 +1,3 @@
+-export type AppView = "home" | "settings" | "debug" | "import";
++export type AppView = "home" | "settings" | "debug" | "import" | "prompts";
+ 
+ export type SettingsSection = "general" | "providers" | "caps";
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 06017d4..4251053 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -1,6 +1,7 @@
+ {
+   "app.name": "AI Hub",
+   "nav.home": "Home",
++  "nav.prompts": "Prompts",
+   "nav.settings": "Settings",
+   "nav.debug": "Debug",
+   "nav.import": "Import",
+@@ -99,6 +100,7 @@
+   "workspace.packet.kind.packet": "Packet",
+   "workspace.packet.kind.memory": "Memory",
+   "workspace.packet.kind.rag": "Retrieved chunk",
++  "workspace.packet.kind.prompt": "Library prompt",
+   "memory.title": "Memory",
+   "memory.add": "Add memory",
+   "memory.update": "Update memory",
+@@ -249,6 +251,7 @@
+   "fallback.estimate": "Estimated ${{usd}} on {{suggested}}",
+   "command.debug": "Open debug",
+   "command.import": "Open Import Hub",
++  "command.prompts": "Open prompt library",
+   "command.exportActive": "Export active branch",
+   "command.exportTree": "Export tree JSON",
+   "command.providers": "Manage providers",
+@@ -361,5 +364,35 @@
+   "import.error.invalid_json": "That file is not valid JSON.",
+   "import.error.unrecognized": "No conversations were recognized in that file.",
+   "import.error.gemini_html": "HTML Takeout is not supported. Export Gemini Apps activity as JSON.",
+-  "import.error.empty": "No conversations were found in that export."
++  "import.error.empty": "No conversations were found in that export.",
++  "prompts.library": "Prompt library",
++  "prompts.editor": "Prompt",
++  "prompts.playground": "Playground",
++  "prompts.new": "New",
++  "prompts.save": "Save",
++  "prompts.insert": "Insert in composer",
++  "prompts.delete": "Delete",
++  "prompts.run": "Run",
++  "prompts.running": "RunningÔÇª",
++  "prompts.saveWinner": "Save winner",
++  "prompts.slot": "Model {{n}}",
++  "prompts.titlePlaceholder": "Title",
++  "prompts.bodyPlaceholder": "Template using project, language, and goal variables",
++  "prompts.playgroundPlaceholder": "Optional extra instructions for this run",
++  "prompts.winnerPlaceholder": "Winner title",
++  "prompts.winnerDefault": "Playground winner",
++  "prompts.playgroundEmpty": "Run two models to compare.",
++  "prompts.folder.development": "Development",
++  "prompts.folder.studies": "Studies",
++  "prompts.folder.work": "Work",
++  "prompts.factory.code-review": "Code review",
++  "prompts.factory.debug": "Debug",
++  "prompts.factory.summary": "Summary",
++  "prompts.factory.teacher": "Teacher",
++  "prompts.error.generic": "Could not load the prompt library.",
++  "prompts.error.save": "Could not save that prompt.",
++  "prompts.error.resolve": "Could not resolve variables for the active project.",
++  "prompts.error.run": "Playground run failed. Each model stays on the slot you picked.",
++  "prompts.error.slots": "Pick two different models to run the playground.",
++  "prompts.error.content": "Write a prompt or select one from the library."
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index dcd7506..488c926 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -1,6 +1,7 @@
+ {
+   "app.name": "AI Hub",
+   "nav.home": "In├¡cio",
++  "nav.prompts": "Prompts",
+   "nav.settings": "Configura├º├Áes",
+   "nav.debug": "Debug",
+   "nav.import": "Importar",
+@@ -99,6 +100,7 @@
+   "workspace.packet.kind.packet": "Pacote",
+   "workspace.packet.kind.memory": "Mem├│ria",
+   "workspace.packet.kind.rag": "Trecho recuperado",
++  "workspace.packet.kind.prompt": "Prompt da library",
+   "memory.title": "Mem├│ria",
+   "memory.add": "Adicionar mem├│ria",
+   "memory.update": "Atualizar mem├│ria",
+@@ -249,6 +251,7 @@
+   "fallback.estimate": "Estimado ${{usd}} em {{suggested}}",
+   "command.debug": "Abrir debug",
+   "command.import": "Abrir Import Hub",
++  "command.prompts": "Abrir biblioteca de prompts",
+   "command.exportActive": "Exportar ramo ativo",
+   "command.exportTree": "Exportar ├írvore JSON",
+   "command.providers": "Gerenciar providers",
+@@ -361,5 +364,35 @@
+   "import.error.invalid_json": "Esse ficheiro n├úo ├® JSON v├ílido.",
+   "import.error.unrecognized": "Nenhuma conversa foi reconhecida nesse ficheiro.",
+   "import.error.gemini_html": "Takeout em HTML n├úo ├® suportado. Exporte a atividade do Gemini Apps em JSON.",
+-  "import.error.empty": "Nenhuma conversa foi encontrada nesse export."
++  "import.error.empty": "Nenhuma conversa foi encontrada nesse export.",
++  "prompts.library": "Biblioteca de prompts",
++  "prompts.editor": "Prompt",
++  "prompts.playground": "Playground",
++  "prompts.new": "Novo",
++  "prompts.save": "Guardar",
++  "prompts.insert": "Inserir no composer",
++  "prompts.delete": "Apagar",
++  "prompts.run": "Correr",
++  "prompts.running": "A correrÔÇª",
++  "prompts.saveWinner": "Guardar vencedor",
++  "prompts.slot": "Modelo {{n}}",
++  "prompts.titlePlaceholder": "T├¡tulo",
++  "prompts.bodyPlaceholder": "Template com vari├íveis de projeto, idioma e objetivo",
++  "prompts.playgroundPlaceholder": "Instru├º├Áes extra opcionais para esta corrida",
++  "prompts.winnerPlaceholder": "T├¡tulo do vencedor",
++  "prompts.winnerDefault": "Vencedor do playground",
++  "prompts.playgroundEmpty": "Corra dois modelos para comparar.",
++  "prompts.folder.development": "Desenvolvimento",
++  "prompts.folder.studies": "Estudos",
++  "prompts.folder.work": "Trabalho",
++  "prompts.factory.code-review": "Code review",
++  "prompts.factory.debug": "Debug",
++  "prompts.factory.summary": "Resumo",
++  "prompts.factory.teacher": "Professor",
++  "prompts.error.generic": "N├úo foi poss├¡vel carregar a biblioteca de prompts.",
++  "prompts.error.save": "N├úo foi poss├¡vel guardar esse prompt.",
++  "prompts.error.resolve": "N├úo foi poss├¡vel resolver as vari├íveis no projeto ativo.",
++  "prompts.error.run": "A corrida do playground falhou. Cada modelo fica no slot que escolheu.",
++  "prompts.error.slots": "Escolha dois modelos para correr o playground.",
++  "prompts.error.content": "Escreva um prompt ou escolha um da library."
+ }
+diff --git a/docs/ADR/ADR-W13-002-mention-stubs-until-later-waves.md b/docs/ADR/ADR-W13-002-mention-stubs-until-later-waves.md
+index ecb0027..2b99b2b 100644
+--- a/docs/ADR/ADR-W13-002-mention-stubs-until-later-waves.md
++++ b/docs/ADR/ADR-W13-002-mention-stubs-until-later-waves.md
+@@ -1,11 +1,11 @@
+ # ADR-W13-002-mention-stubs-until-later-waves
+ 
+-- **Status:** accepted (`@prompt` / `@skill`); `@memory` superseded by ADR-W14-002
++- **Status:** accepted (`@skill`); `@memory` superseded by ADR-W14-002; `@prompt` superseded by ADR-W15-002
+ - **Onda:** W13
+ - **Data:** 2026-09-18
+ - **Deciders:** agent / Pedro
+ - **Supersedes:** ÔÇö
+-- **Superseded by:** ADR-W14-002 (apenas `@memory`)
++- **Superseded by:** ADR-W14-002 (`@memory`), ADR-W15-002 (`@prompt`)
+ 
+ ## Contexto
+ 
+diff --git a/docs/ADR/ADR-W14-002-memories-in-packet-strict-excludes.md b/docs/ADR/ADR-W14-002-memories-in-packet-strict-excludes.md
+index dc12c6c..b7ffb22 100644
+--- a/docs/ADR/ADR-W14-002-memories-in-packet-strict-excludes.md
++++ b/docs/ADR/ADR-W14-002-memories-in-packet-strict-excludes.md
+@@ -14,7 +14,7 @@ Mem├│rias de projeto devem reaparecer na conversa seguinte e entrar no packet. O
+ ## Decis├úo
+ 
+ - Tabela `project_memories` (t├¡tulo/corpo cifrados). CRUD + opt-out por projeto (`settings` `memory-opt-out:{projectId}`).
+-- `@memory` usa o mesmo `MentionRef` da W13; sai de `MENTION_STUB_TYPES`. `@prompt`/`@skill` continuam stub.
++- `@memory` usa o mesmo `MentionRef` da W13; sai de `MENTION_STUB_TYPES`. `@prompt` liga na W15 (ADR-W15-002); `@skill` continua stub at├® W17.
+ - Mem├│rias ativas entram no `system` como `Project memory:` via compiler. Opt-out desliga s├│ a inje├º├úo **autom├ítica** e o banner de sugerir; `@memory` expl├¡cito ainda resolve em `standard`.
+ - `privacyMode: strict` **exclui** mem├│rias autom├íticas, `@memory` e fatias RAG. W18 n├úo precisa de outro gancho para isto.
+ 
+diff --git a/docs/ADR/ADR-W15-001-prompt-library-encrypted.md b/docs/ADR/ADR-W15-001-prompt-library-encrypted.md
+new file mode 100644
+index 0000000..9d81a3a
+--- /dev/null
++++ b/docs/ADR/ADR-W15-001-prompt-library-encrypted.md
+@@ -0,0 +1,36 @@
++# ADR-W15-001-prompt-library-encrypted
++
++- **Status:** accepted
++- **Onda:** W15
++- **Data:** 2026-09-19
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++A Wave 15 pede uma Prompt Library com pastas (Desenvolvimento, Estudos, Trabalho) e prompts de f├íbrica (code review, debug, resumo, professor). O corpo do prompt pode incluir contexto de projeto; n├úo pode ir em plaintext no SQLite.
++
++## Decis├úo
++
++- Tabela global `prompts` (n├úo por projeto): `folder` plaintext (`development` | `studies` | `work`), `title_cipher` / `body_cipher`, `factory_id` opcional ├║nico.
++- Sem pacote novo: interpola├º├úo e f├íbrica em `packages/shared`; CRUD em `packages/db`.
++- Seed de f├íbrica **uma vez** (`settings` `prompt-factory-seeded`). Apagar um factory n├úo o recria.
++- Inserir no composer resolve vari├íveis no main e cola o texto no rascunho.
++
++## Alternativas consideradas
++
++- **Library por projeto:** o plano descreve pastas globais; vari├íveis ├® que ligam ao projeto ativo.
++- **Corpos em i18n s├│ no renderer:** o modelo recebe o template; ingl├¬s com `{{language}}` cobre os dois locales.
++
++## Consequ├¬ncias
++
++- Positivas: mesmo envelope de cifra das mem├│rias; factory determin├¡stico no e2e.
++- Negativas: t├¡tulos de f├íbrica ficam em ingl├¬s na DB; a UI pode mapear `factory_id` para i18n.
++- Riscos aceitos: pastas fixas nesta onda (sem CRUD de pasta).
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 15
++- `docs/reviews/W15/REVIEW.md`
++- ADR-W15-002, ADR-W15-003
+diff --git a/docs/ADR/ADR-W15-002-prompt-variables-and-mention.md b/docs/ADR/ADR-W15-002-prompt-variables-and-mention.md
+new file mode 100644
+index 0000000..3f17b1c
+--- /dev/null
++++ b/docs/ADR/ADR-W15-002-prompt-variables-and-mention.md
+@@ -0,0 +1,35 @@
++# ADR-W15-002-prompt-variables-and-mention
++
++- **Status:** accepted
++- **Onda:** W15
++- **Data:** 2026-09-19
++- **Deciders:** agent / Pedro
++- **Supersedes:** ADR-W13-002 (apenas `@prompt`)
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++O DoD exige que `{{project}}`, `{{language}}` e `{{goal}}` resolvam contra o projeto ativo. `@prompt` era stub (ADR-W13-002). Inserir no composer e mencionar `@prompt` s├úo os dois caminhos do plano.
++
++## Decis├úo
++
++- Interpola├º├úo no main (e testes em `shared`): `{{project}}` = nome do projeto (vazio na inbox); `{{language}}` = locale de appearance (`pt-BR` | `en`); `{{goal}}` = instru├º├Áes do projeto (vazio se null). Placeholders desconhecidos ficam no texto.
++- `@prompt` usa o mesmo `MentionRef` da W13; sai de `MENTION_STUB_TYPES`. O corpo **j├í interpolado** entra no `system` como fatia `Library prompt:` (compiler), n├úo no texto do user.
++- Inserir no composer cola o texto interpolado no rascunho (o user pode editar). N├úo ├® auto-inject.
++- `privacyMode: strict` **n├úo** bloqueia `@prompt` nem insert ÔÇö ├® conte├║do expl├¡cito do user, n├úo mem├│ria/RAG.
++
++## Alternativas consideradas
++
++- **S├│ insert, sem men├º├úo:** falha o aceite D6/`@prompt`.
++- **Resolver no renderer:** o renderer n├úo deve ler instru├º├Áes s├│ para template se o main j├í as tem; e o send precisa da mesma fun├º├úo.
++
++## Consequ├¬ncias
++
++- ADR-W13-002 permanece v├ílido s├│ para `@skill` (W17).
++- O corpo do prompt no packet debug ├® omitido no renderer (mesmo padr├úo de memory/file).
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 15
++- `docs/reviews/W15/REVIEW.md`
++- ADR-W13-001, ADR-W13-002, ADR-W15-001
+diff --git a/docs/ADR/ADR-W15-003-playground-n-sends-caps.md b/docs/ADR/ADR-W15-003-playground-n-sends-caps.md
+new file mode 100644
+index 0000000..dcc835b
+--- /dev/null
++++ b/docs/ADR/ADR-W15-003-playground-n-sends-caps.md
+@@ -0,0 +1,37 @@
++# ADR-W15-003-playground-n-sends-caps
++
++- **Status:** accepted
++- **Onda:** W15
++- **Data:** 2026-09-19
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++O playground corre o mesmo prompt em N modelos lado a lado. Caps s├úo hard-stop; fallback silencioso ├® proibido. `chat:send` s├│ admite um stream por conversa.
++
++## Decis├úo
++
++- IPC `playground:run`: 2ÔÇô4 slots (`providerKeyId` + `model`) expl├¡citos. Cria uma conversa `kind=playground` por slot e chama `sendChat` em cada uma.
++- Preflight: soma as estimativas e avalia caps **uma vez** contra N├ù custo. Se bloquear, nenhuma coluna dispara.
++- `listConversations` / busca da paleta **excluem** `kind=playground` para n├úo poluir a sidebar.
++- Falha de um modelo: evento de erro dessa coluna; **n├úo** troca o modelo. O user grava o vencedor na library (`prompts:create`).
++- Sem council, sem orquestra├º├úo, sem segundo LLM para ÔÇ£escolher o melhorÔÇØ.
++
++## Alternativas consideradas
++
++- **N├ù `chat:send` s├│ no renderer:** risco de duas avalia├º├Áes 1├ù passarem o teto di├írio em paralelo (receipts ainda sem `costUsd`).
++- **Persistir na conversa atual:** mistura playground com o chat do projeto e viola um-stream-por-conversa.
++
++## Consequ├¬ncias
++
++- Positivas: receipts e abort por coluna; mesmo caminho de caps do chat.
++- Negativas: conversas playground acumulam na DB at├® o user/app limpar (sem GC nesta onda).
++- Riscos aceitos: e2e usa mock; custo real N├ù n├úo ├® exercitado com chaves reais.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 15
++- `docs/reviews/W15/REVIEW.md`
++- ADR-W07-001, ADR-W07-003
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index 05d28f4..75c035b 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -87,8 +87,11 @@ N├úo escrever ADR de detalhe cosm├®tica. Se mexe em seguran├ºa, custo, provider
+ | [ADR-W12-003](./ADR-W12-003-vision-images-on-stream-not-packet.md) | W12 | Imagens no stream, n├úo no packet; gate `vision` | accepted |
+ | [ADR-W12-004](./ADR-W12-004-pdf-flatedecode-inflate.md) | W12 | PDF: inflate FlateDecode + literais Tj | accepted |
+ | [ADR-W13-001](./ADR-W13-001-mentions-structured-not-in-user-text.md) | W13 | Men├º├Áes estruturadas, n├úo no texto do user | accepted |
+-| [ADR-W13-002](./ADR-W13-002-mention-stubs-until-later-waves.md) | W13 | `@prompt`/`@skill` stub; `@memory` superseded by W14-002 | accepted |
++| [ADR-W13-002](./ADR-W13-002-mention-stubs-until-later-waves.md) | W13 | `@skill` stub; `@prompt` superseded by W15-002 | accepted |
+ | [ADR-W13-003](./ADR-W13-003-mention-token-cap-excludes-files.md) | W13 | Cap de men├º├úo n├úo inclui `@file` | accepted |
+ | [ADR-W14-001](./ADR-W14-001-local-hashed-embeddings.md) | W14 | Embeddings locais hashed; pacote `memory` | accepted |
+ | [ADR-W14-002](./ADR-W14-002-memories-in-packet-strict-excludes.md) | W14 | Mem├│rias no packet; `strict` exclui | accepted |
+ | [ADR-W14-003](./ADR-W14-003-workspace-local-no-llm.md) | W14 | Workspace por extra├º├úo local, sem LLM | accepted |
++| [ADR-W15-001](./ADR-W15-001-prompt-library-encrypted.md) | W15 | Library global cifrada + pastas + factory | accepted |
++| [ADR-W15-002](./ADR-W15-002-prompt-variables-and-mention.md) | W15 | Vari├íveis + `@prompt` no compiler | accepted |
++| [ADR-W15-003](./ADR-W15-003-playground-n-sends-caps.md) | W15 | Playground = N sends + preflight N├ù caps | accepted |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 527e8ea..382f1f2 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave
+ |---|---|
+ | Wave | **W15** |
+ | Marco | C ÔÇö V1 |
+-| State | `pending` |
++| State | `review` |
+ | Last completed | **W14** |
+-| Next action | Start Wave 15 (Prompt Library + Playground) |
++| Next action | Gate ┬º9 W15 (review + DIFF + ADRs) |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -41,13 +41,13 @@ None.
+ 
+ ## Notes for the next session
+ 
+-- W14 fechada. `@memory` no mesmo `MentionRef`. `@prompt` liga na W15; `@skill` na W17.
+-- W15: Prompt Library + Playground. N├úo implementar MCP, agentes, skills, Council.
+-- RAG/mem├│ria: hashed local; `strict` exclui no send/preview/compile (n├úo raspa envelope j├í aplicado).
++- W15: Prompt Library + Playground. N├úo implementar artifacts, skills, MCP, agentes, Council.
++- `@prompt` sai do stub (ADR-W15-002). `@skill` continua stub at├® W17.
++- Playground = N├ù `chat:send` com preflight N├ù caps; conversas `kind=playground` fora da sidebar.
+ 
+ ## Last review / ADR
+ 
+ | Kind | Path |
+ |---|---|
+ | Review | `docs/reviews/W14/REVIEW.md` |
+-| Latest ADR | `docs/ADR/ADR-W14-003-workspace-local-no-llm.md` |
++| Latest ADR | `docs/ADR/ADR-W15-003-playground-n-sends-caps.md` |
+diff --git a/packages/ai-gateway/src/compiler.test.ts b/packages/ai-gateway/src/compiler.test.ts
+index 73ab8ed..501120a 100644
+--- a/packages/ai-gateway/src/compiler.test.ts
++++ b/packages/ai-gateway/src/compiler.test.ts
+@@ -133,6 +133,32 @@ describe("compilePacket", () => {
+     expect(withContext.included[1]?.label).not.toContain("Section 3");
+   });
+ 
++  it("appends a library prompt slice without putting the body in the label", () => {
++    const compiled = compilePacket({
++      projectInstructions: null,
++      extraSystem: null,
++      messages: [
++        {
++          id: "11111111-1111-4111-8111-111111111111",
++          role: "user",
++          content: "review this",
++          status: "complete",
++        },
++      ],
++    });
++    const withPrompt = appendMentionsToPacket(compiled, [
++      {
++        kind: "prompt",
++        id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
++        name: "Code review",
++        text: "You are a senior code reviewer for E2E.",
++      },
++    ]);
++    expect(withPrompt.packet.system).toContain("Library prompt: Code review");
++    expect(withPrompt.included[0]?.label).toBe("Library prompt: Code review");
++    expect(withPrompt.included[0]?.label).not.toContain("senior");
++  });
++
+   it("never puts an apiKey field on the packet", () => {
+     const packet = compilePacket({
+       projectInstructions: null,
+diff --git a/packages/ai-gateway/src/compiler.ts b/packages/ai-gateway/src/compiler.ts
+index 4f3f64d..776a683 100644
+--- a/packages/ai-gateway/src/compiler.ts
++++ b/packages/ai-gateway/src/compiler.ts
+@@ -16,7 +16,7 @@ export interface CompilerFile {
+ }
+ 
+ export interface CompilerMention {
+-  kind: "conversation" | "packet" | "memory" | "rag";
++  kind: "conversation" | "packet" | "memory" | "rag" | "prompt";
+   id: string;
+   name: string;
+   text: string;
+@@ -256,6 +256,8 @@ function mentionHeading(mention: CompilerMention): string {
+       return `Project memory: ${mention.name}`;
+     case "rag":
+       return `Retrieved chunk: ${mention.name}`;
++    case "prompt":
++      return `Library prompt: ${mention.name}`;
+     default: {
+       const _never: never = mention.kind;
+       return String(_never);
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index 845c0b7..66bb063 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -1,5 +1,5 @@
+ export { applyMigrations } from "./migrate";
+-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL } from "./migrations";
++export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL } from "./migrations";
+ export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
+ export {
+   HubRepos,
+@@ -26,5 +26,7 @@ export {
+   type FileChunkRecord,
+   type ConversationWorkspaceRecord,
+   type ConversationTaskRecord,
++  type PromptRecord,
++  type PromptFolder,
+ } from "./repos";
+ export { schema } from "./schema";
+diff --git a/packages/db/src/migrations.ts b/packages/db/src/migrations.ts
+index 9a470d6..076aaaa 100644
+--- a/packages/db/src/migrations.ts
++++ b/packages/db/src/migrations.ts
+@@ -218,6 +218,20 @@ CREATE TABLE conversation_tasks (
+ CREATE INDEX conversation_tasks_conversation_idx ON conversation_tasks(conversation_id);
+ `;
+ 
++export const MIGRATION_0010_SQL = `
++ALTER TABLE conversations ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat';
++CREATE TABLE prompts (
++  id TEXT PRIMARY KEY,
++  folder TEXT NOT NULL,
++  title_cipher TEXT NOT NULL,
++  body_cipher TEXT NOT NULL,
++  factory_id TEXT UNIQUE,
++  created_at INTEGER NOT NULL,
++  updated_at INTEGER NOT NULL
++);
++CREATE INDEX prompts_folder_idx ON prompts(folder);
++`;
++
+ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 1, sql: MIGRATION_0001_SQL },
+   { version: 2, sql: MIGRATION_0002_SQL },
+@@ -228,4 +242,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 7, sql: MIGRATION_0007_SQL },
+   { version: 8, sql: MIGRATION_0008_SQL },
+   { version: 9, sql: MIGRATION_0009_SQL },
++  { version: 10, sql: MIGRATION_0010_SQL },
+ ];
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index 2a3984d..ad6bc88 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -125,7 +125,7 @@ describe("hub database", () => {
+       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
+       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
+       applyMigrations(second.sqlite);
+-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(9);
++      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(10);
+       second.close();
+     } finally {
+       rmSync(dir, { recursive: true, force: true });
+@@ -687,4 +687,37 @@ describe("hub database", () => {
+     expect(hub.repos.getProjectMemory(memory.id)).toBeNull();
+     hub.close();
+   });
++
++  it("stores prompts encrypted, seeds factory once, and hides playground chats", () => {
++    const { hub } = openTestDb();
++    hub.repos.ensureFactoryPrompts([
++      {
++        factoryId: "code-review",
++        folder: "development",
++        title: "Code review",
++        body: "Review {{project}}",
++      },
++    ]);
++    hub.repos.ensureFactoryPrompts([
++      {
++        factoryId: "code-review",
++        folder: "development",
++        title: "Code review",
++        body: "Review {{project}}",
++      },
++    ]);
++    expect(hub.repos.listPrompts()).toHaveLength(1);
++    const custom = hub.repos.createPrompt({
++      folder: "work",
++      title: "Winner",
++      body: "Best of two models for Alpha",
++    });
++    expect(dumpAllText(hub.sqlite)).not.toContain("Best of two models");
++    expect(hub.repos.getPrompt(custom.id)?.body).toBe("Best of two models for Alpha");
++    const project = hub.repos.createProject("Alpha");
++    hub.repos.createConversation(project.id, "Chat");
++    hub.repos.createConversation(project.id, "Playground ┬À gpt-4o-mini", "playground");
++    expect(hub.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Chat"]);
++    hub.close();
++  });
+ });
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 6d2802a..a84a66d 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -22,6 +22,7 @@ import {
+   importJobs,
+   projectFiles,
+   projectMemories,
++  prompts,
+   messageReceipts,
+   messages,
+   projects,
+@@ -63,6 +64,7 @@ export interface ConversationRecord {
+   importSource: "chatgpt" | "claude" | "gemini" | null;
+   activePacketId: string | null;
+   packetAppliedAt: string | null;
++  kind: "chat" | "playground";
+ }
+ 
+ export interface SearchHitRecord {
+@@ -204,6 +206,18 @@ export interface ConversationTaskRecord {
+   createdAt: string;
+ }
+ 
++export type PromptFolder = "development" | "studies" | "work";
++
++export interface PromptRecord {
++  id: string;
++  folder: PromptFolder;
++  title: string;
++  body: string;
++  factoryId: string | null;
++  createdAt: string;
++  updatedAt: string;
++}
++
+ export interface SpendCapOverrideRecord {
+   at: string;
+   scope: string;
+@@ -266,6 +280,7 @@ const BRANCH_LABELS_PREFIX = "branch-labels:";
+ const CUSTOM_BASE_URL_PREFIX = "custom-base-url:";
+ const SPEND_CAP_OVERRIDES_KEY = "spend-cap-overrides";
+ const MEMORY_OPT_OUT_PREFIX = "memory-opt-out:";
++const PROMPT_FACTORY_SEEDED_KEY = "prompt-factory-seeded";
+ const DEFAULT_SESSION: WorkspaceSessionRecord = {
+   projectId: null,
+   conversationId: null,
+@@ -467,6 +482,7 @@ export class HubRepos {
+           : null,
+       activePacketId: row.activePacketId ?? null,
+       packetAppliedAt: row.packetAppliedAt !== null && row.packetAppliedAt !== undefined ? iso(row.packetAppliedAt) : null,
++      kind: row.kind === "playground" ? "playground" : "chat",
+     };
+   }
+ 
+@@ -605,6 +621,7 @@ export class HubRepos {
+         : this.db.select().from(conversations).where(eq(conversations.projectId, projectId)).all();
+     return rows
+       .map((row) => this.toConversation(row))
++      .filter((item) => item.kind !== "playground")
+       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+   }
+ 
+@@ -613,7 +630,11 @@ export class HubRepos {
+     return row ? this.toConversation(row) : null;
+   }
+ 
+-  createConversation(projectId: string | null, title: string): ConversationRecord {
++  createConversation(
++    projectId: string | null,
++    title: string,
++    kind: "chat" | "playground" = "chat",
++  ): ConversationRecord {
+     const now = Date.now();
+     const id = randomUUID();
+     this.db
+@@ -626,6 +647,7 @@ export class HubRepos {
+         updatedAt: now,
+         importSource: null,
+         externalId: null,
++        kind,
+       })
+       .run();
+     return {
+@@ -638,6 +660,7 @@ export class HubRepos {
+       importSource: null,
+       activePacketId: null,
+       packetAppliedAt: null,
++      kind,
+     };
+   }
+ 
+@@ -837,6 +860,9 @@ export class HubRepos {
+       if (hits.length >= limit) {
+         break;
+       }
++      if (row.kind === "playground") {
++        continue;
++      }
+       const title = decryptUtf8(row.titleCipher, this.masterKey);
+       const titleMatched = matchesAllTokens(title, tokens);
+       let messageMatched = false;
+@@ -2024,6 +2050,106 @@ export class HubRepos {
+       .run();
+   }
+ 
++  ensureFactoryPrompts(
++    items: readonly { factoryId: string; folder: PromptFolder; title: string; body: string }[],
++  ): void {
++    const seeded = this.db.select().from(settings).where(eq(settings.key, PROMPT_FACTORY_SEEDED_KEY)).get();
++    if (seeded?.value === "1") {
++      return;
++    }
++    for (const item of items) {
++      const existing = this.db.select().from(prompts).where(eq(prompts.factoryId, item.factoryId)).get();
++      if (existing) {
++        continue;
++      }
++      this.createPrompt({
++        folder: item.folder,
++        title: item.title,
++        body: item.body,
++        factoryId: item.factoryId,
++      });
++    }
++    const now = Date.now();
++    this.db
++      .insert(settings)
++      .values({ key: PROMPT_FACTORY_SEEDED_KEY, value: "1", updatedAt: now })
++      .onConflictDoUpdate({
++        target: settings.key,
++        set: { value: "1", updatedAt: now },
++      })
++      .run();
++  }
++
++  createPrompt(input: {
++    folder: PromptFolder;
++    title: string;
++    body: string;
++    factoryId?: string | null;
++  }): PromptRecord {
++    const id = randomUUID();
++    const now = Date.now();
++    this.db
++      .insert(prompts)
++      .values({
++        id,
++        folder: input.folder,
++        titleCipher: encryptUtf8(input.title.slice(0, 120), this.masterKey),
++        bodyCipher: encryptUtf8(input.body.slice(0, 16_000), this.masterKey),
++        factoryId: input.factoryId ?? null,
++        createdAt: now,
++        updatedAt: now,
++      })
++      .run();
++    const created = this.getPrompt(id);
++    if (!created) {
++      throw new Error("Prompt not found");
++    }
++    return created;
++  }
++
++  getPrompt(id: string): PromptRecord | null {
++    const row = this.db.select().from(prompts).where(eq(prompts.id, id)).get();
++    return row ? this.toPrompt(row) : null;
++  }
++
++  listPrompts(): PromptRecord[] {
++    return this.db
++      .select()
++      .from(prompts)
++      .all()
++      .map((row) => this.toPrompt(row))
++      .sort((a, b) => a.folder.localeCompare(b.folder) || a.title.localeCompare(b.title));
++  }
++
++  updatePrompt(
++    id: string,
++    patch: { folder?: PromptFolder; title?: string; body?: string },
++  ): PromptRecord {
++    const existing = this.getPrompt(id);
++    if (!existing) {
++      throw new Error("Prompt not found");
++    }
++    this.db
++      .update(prompts)
++      .set({
++        folder: patch.folder ?? existing.folder,
++        titleCipher: encryptUtf8((patch.title ?? existing.title).slice(0, 120), this.masterKey),
++        bodyCipher: encryptUtf8((patch.body ?? existing.body).slice(0, 16_000), this.masterKey),
++        updatedAt: Date.now(),
++      })
++      .where(eq(prompts.id, id))
++      .run();
++    const updated = this.getPrompt(id);
++    if (!updated) {
++      throw new Error("Prompt not found");
++    }
++    return updated;
++  }
++
++  removePrompt(id: string): void {
++    this.db.delete(prompts).where(eq(prompts.id, id)).run();
++  }
++
+   replaceFileChunks(
+     fileId: string,
+     projectId: string | null,
+@@ -2272,6 +2398,22 @@ export class HubRepos {
+     };
+   }
+ 
++  private toPrompt(row: typeof prompts.$inferSelect): PromptRecord {
++    const folder =
++      row.folder === "development" || row.folder === "studies" || row.folder === "work"
++        ? row.folder
++        : "work";
++    return {
++      id: row.id,
++      folder,
++      title: decryptUtf8(row.titleCipher, this.masterKey),
++      body: decryptUtf8(row.bodyCipher, this.masterKey),
++      factoryId: row.factoryId ?? null,
++      createdAt: iso(row.createdAt),
++      updatedAt: iso(row.updatedAt),
++    };
++  }
++
+   async removeProviderKey(id: string): Promise<void> {
+     const row = this.db.select().from(providerKeys).where(eq(providerKeys.id, id)).get();
+     if (!row) {
+diff --git a/packages/db/src/schema.ts b/packages/db/src/schema.ts
+index 474b1ea..7d8cda0 100644
+--- a/packages/db/src/schema.ts
++++ b/packages/db/src/schema.ts
+@@ -21,6 +21,7 @@ export const conversations = sqliteTable("conversations", {
+   externalId: text("external_id"),
+   activePacketId: text("active_packet_id"),
+   packetAppliedAt: integer("packet_applied_at", { mode: "number" }),
++  kind: text("kind").notNull().default("chat"),
+ });
+ 
+ export const messages = sqliteTable("messages", {
+@@ -178,6 +179,16 @@ export const conversationTasks = sqliteTable("conversation_tasks", {
+   createdAt: integer("created_at", { mode: "number" }).notNull(),
+ });
+ 
++export const prompts = sqliteTable("prompts", {
++  id: text("id").primaryKey(),
++  folder: text("folder").notNull(),
++  titleCipher: text("title_cipher").notNull(),
++  bodyCipher: text("body_cipher").notNull(),
++  factoryId: text("factory_id"),
++  createdAt: integer("created_at", { mode: "number" }).notNull(),
++  updatedAt: integer("updated_at", { mode: "number" }).notNull(),
++});
++
+ export const schema = {
+   projects,
+   conversations,
+@@ -197,4 +208,5 @@ export const schema = {
+   fileChunks,
+   conversationWorkspace,
+   conversationTasks,
++  prompts,
+ };
+diff --git a/packages/files/src/packet-ui.test.ts b/packages/files/src/packet-ui.test.ts
+index 50c9d74..c77a8e1 100644
+--- a/packages/files/src/packet-ui.test.ts
++++ b/packages/files/src/packet-ui.test.ts
+@@ -29,4 +29,11 @@ describe("stripAttachedFileBodiesForRenderer", () => {
+     expect(stripped).not.toContain("PostgreSQL");
+     expect(stripped).not.toContain("secret-doc");
+   });
++
++  it("omits library prompt bodies", () => {
++    const system = "Be brief.\n\nLibrary prompt: Code review\nYou are a senior code reviewer for E2E.";
++    const stripped = stripAttachedFileBodiesForRenderer(system);
++    expect(stripped).toContain("Library prompt: Code review");
++    expect(stripped).not.toContain("senior");
++  });
+ });
+diff --git a/packages/files/src/packet-ui.ts b/packages/files/src/packet-ui.ts
+index de029f6..4c58483 100644
+--- a/packages/files/src/packet-ui.ts
++++ b/packages/files/src/packet-ui.ts
+@@ -1,6 +1,6 @@
+ export function stripAttachedFileBodiesForRenderer(system: string): string {
+   const heading =
+-    "(?:Attached file|Mentioned conversation|Mentioned packet|Project memory|Retrieved chunk)";
++    "(?:Attached file|Mentioned conversation|Mentioned packet|Project memory|Retrieved chunk|Library prompt)";
+   const omitted = system.replace(
+     new RegExp(
+       `((?:${heading}): [^\\n]+)(?:\\n(?!${heading}:)[\\s\\S]*?)?(?=(?:\\n\\n(?:${heading}): )|$)`,
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index 4c7fac3..2e40851 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -69,6 +69,13 @@ import type {
+   WorkspaceSetTaskDoneInput,
+   ConversationTaskDto,
+   ConversationToProjectResult,
++  PromptDto,
++  PromptCreateInput,
++  PromptUpdateInput,
++  PromptResolveInput,
++  PromptResolveResult,
++  PlaygroundRunInput,
++  PlaygroundRunResult,
+   ProviderKeyDto,
+   SecretsSaveInput,
+   SecretsTestInput,
+@@ -201,6 +208,18 @@ export interface HubWorkspaceApi {
+   removeTask: (input: IdInput) => Promise<void>;
+ }
+ 
++export interface HubPromptsApi {
++  list: () => Promise<PromptDto[]>;
++  create: (input: PromptCreateInput) => Promise<PromptDto>;
++  update: (input: PromptUpdateInput) => Promise<PromptDto>;
++  remove: (input: IdInput) => Promise<void>;
++  resolve: (input: PromptResolveInput) => Promise<PromptResolveResult>;
++}
++
++export interface HubPlaygroundApi {
++  run: (input: PlaygroundRunInput) => Promise<PlaygroundRunResult>;
++}
++
+ export interface HubChatApi {
+   send: (input: ChatSendInput) => Promise<ChatSendResult>;
+   abort: (input: ChatAbortInput) => Promise<void>;
+@@ -230,6 +249,8 @@ export interface HubApi {
+   files: HubFilesApi;
+   memory: HubMemoryApi;
+   workspace: HubWorkspaceApi;
++  prompts: HubPromptsApi;
++  playground: HubPlaygroundApi;
+ }
+ 
+ export type { AppLocale, ThemeMode };
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index e748016..8dab02d 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -19,6 +19,8 @@ export {
+   type HubPacketsApi,
+   type HubMemoryApi,
+   type HubWorkspaceApi,
++  type HubPromptsApi,
++  type HubPlaygroundApi,
+   type HubWindowApi,
+ } from "./hub-api";
+ export {
+@@ -57,6 +59,16 @@ export {
+   type MentionType,
+   type ParsedMention,
+ } from "./mentions";
++export {
++  FACTORY_PROMPTS,
++  interpolatePrompt,
++  isPromptFolder,
++  PROMPT_FOLDERS,
++  PROMPT_VARIABLE_NAMES,
++  type PromptFolder,
++  type PromptVariableName,
++  type PromptVariableValues,
++} from "./prompts";
+ export {
+   shouldShowOnboarding,
+   sortProvidersForWizard,
+@@ -93,6 +105,16 @@ export {
+   conversationListResultSchema,
+   conversationMoveInputSchema,
+   conversationToProjectResultSchema,
++  promptDtoSchema,
++  promptFolderSchema,
++  promptListResultSchema,
++  promptCreateInputSchema,
++  promptUpdateInputSchema,
++  promptResolveInputSchema,
++  promptResolveResultSchema,
++  playgroundRunInputSchema,
++  playgroundRunResultSchema,
++  playgroundSlotInputSchema,
+   emptyIpcPayloadSchema,
+   idInputSchema,
+   ipcAckResultSchema,
+@@ -192,6 +214,14 @@ export {
+   type ConversationListInput,
+   type ConversationMoveInput,
+   type ConversationToProjectResult,
++  type PromptDto,
++  type PromptFolderDto,
++  type PromptCreateInput,
++  type PromptUpdateInput,
++  type PromptResolveInput,
++  type PromptResolveResult,
++  type PlaygroundRunInput,
++  type PlaygroundRunResult,
+   type EmptyIpcPayload,
+   type IdInput,
+   type MessageCreateInput,
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index 767d645..4b6b3a7 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -71,6 +71,12 @@ export const IpcChannel = {
+   workspaceRemoveTask: "workspace:removeTask",
+   conversationsDuplicate: "conversations:duplicate",
+   conversationsToProject: "conversations:toProject",
++  promptsList: "prompts:list",
++  promptsCreate: "prompts:create",
++  promptsUpdate: "prompts:update",
++  promptsRemove: "prompts:remove",
++  promptsResolve: "prompts:resolve",
++  playgroundRun: "playground:run",
+ } as const;
+ 
+ export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index 8359e6f..618a039 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -25,6 +25,8 @@ import {
+   filesIngestPathsInputSchema,
+   filesRemoveInputSchema,
+   memoryCreateInputSchema,
++  promptCreateInputSchema,
++  playgroundRunInputSchema,
+   conversationWorkspaceDtoSchema,
+ } from "./ipc-schemas";
+ 
+@@ -429,3 +431,25 @@ describe("wave 14 memory and workspace contracts", () => {
+     expect(() => conversationWorkspaceDtoSchema.parse({ ...dto, extra: true })).toThrow();
+   });
+ });
++
++describe("wave 15 prompt and playground contracts", () => {
++  it("accepts a prompt create and a two-slot playground run", () => {
++    const created = promptCreateInputSchema.parse({
++      folder: "development",
++      title: "Code review",
++      body: "Review {{project}} in {{language}}. Goal: {{goal}}.",
++    });
++    expect(created.folder).toBe("development");
++    expect(() => promptCreateInputSchema.parse({ ...created, extra: true })).toThrow();
++    const run = playgroundRunInputSchema.parse({
++      projectId: "11111111-1111-4111-8111-111111111111",
++      content: "review this function",
++      slots: [
++        { providerKeyId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", model: "gpt-4o-mini" },
++        { providerKeyId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", model: "claude-sonnet-4-20250514" },
++      ],
++    });
++    expect(run.slots).toHaveLength(2);
++    expect(() => playgroundRunInputSchema.parse({ ...run, slots: run.slots.slice(0, 1) })).toThrow();
++  });
++});
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index ee553a1..eda5d20 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -980,3 +980,102 @@ export const conversationToProjectResultSchema = z
+ 
+ export type ConversationToProjectResult = z.infer<typeof conversationToProjectResultSchema>;
+ 
++export const promptFolderSchema = z.enum(["development", "studies", "work"]);
++
++export type PromptFolderDto = z.infer<typeof promptFolderSchema>;
++
++export const promptDtoSchema = z
++  .object({
++    id: z.string().uuid(),
++    folder: promptFolderSchema,
++    title: z.string().min(1).max(120),
++    body: z.string().min(1).max(16_000),
++    factoryId: z.string().min(1).max(40).nullable(),
++    createdAt: isoTimestampSchema,
++    updatedAt: isoTimestampSchema,
++  })
++  .strict();
++
++export type PromptDto = z.infer<typeof promptDtoSchema>;
++
++export const promptListResultSchema = z.array(promptDtoSchema).max(200);
++
++export const promptCreateInputSchema = z
++  .object({
++    folder: promptFolderSchema,
++    title: z.string().trim().min(1).max(120),
++    body: z.string().trim().min(1).max(16_000),
++  })
++  .strict();
++
++export type PromptCreateInput = z.infer<typeof promptCreateInputSchema>;
++
++export const promptUpdateInputSchema = z
++  .object({
++    id: z.string().uuid(),
++    folder: promptFolderSchema.optional(),
++    title: z.string().trim().min(1).max(120).optional(),
++    body: z.string().trim().min(1).max(16_000).optional(),
++  })
++  .strict();
++
++export type PromptUpdateInput = z.infer<typeof promptUpdateInputSchema>;
++
++export const promptResolveInputSchema = z
++  .object({
++    promptId: z.string().uuid(),
++    projectId: z.string().uuid().nullable(),
++  })
++  .strict();
++
++export type PromptResolveInput = z.infer<typeof promptResolveInputSchema>;
++
++export const promptResolveResultSchema = z
++  .object({
++    id: z.string().uuid(),
++    title: z.string().min(1).max(120),
++    text: z.string().min(1).max(16_000),
++  })
++  .strict();
++
++export type PromptResolveResult = z.infer<typeof promptResolveResultSchema>;
++
++export const playgroundSlotInputSchema = z
++  .object({
++    providerKeyId: z.string().uuid(),
++    model: z.string().min(1).max(128),
++  })
++  .strict();
++
++export const playgroundRunInputSchema = z
++  .object({
++    projectId: z.string().uuid().nullable(),
++    content: z.string().trim().min(1).max(100_000),
++    promptId: z.string().uuid().optional(),
++    slots: z.array(playgroundSlotInputSchema).min(2).max(4),
++    privacyMode: packetPrivacyModeSchema.optional(),
++    extraSystem: z.string().max(20_000).optional(),
++    temperature: z.number().min(0).max(2).optional(),
++    maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
++  })
++  .strict();
++
++export type PlaygroundRunInput = z.infer<typeof playgroundRunInputSchema>;
++
++export const playgroundRunSlotSchema = z
++  .object({
++    providerKeyId: z.string().uuid(),
++    model: z.string().min(1).max(128),
++    send: chatSendResultSchema,
++  })
++  .strict();
++
++export const playgroundRunResultSchema = z
++  .object({
++    content: z.string().min(1).max(100_000),
++    slots: z.array(playgroundRunSlotSchema).min(2).max(4),
++  })
++  .strict();
++
++export type PlaygroundRunResult = z.infer<typeof playgroundRunResultSchema>;
++
+diff --git a/packages/shared/src/mentions.ts b/packages/shared/src/mentions.ts
+index 7af4eb5..f72d4aa 100644
+--- a/packages/shared/src/mentions.ts
++++ b/packages/shared/src/mentions.ts
+@@ -2,7 +2,7 @@ export const MENTION_TYPES = ["file", "conversation", "memory", "prompt", "skill
+ 
+ export type MentionType = (typeof MENTION_TYPES)[number];
+ 
+-export const MENTION_STUB_TYPES = ["prompt", "skill"] as const;
++export const MENTION_STUB_TYPES = ["skill"] as const;
+ 
+ export type MentionStubType = (typeof MENTION_STUB_TYPES)[number];
+ 
+diff --git a/packages/shared/src/portable-packet.ts b/packages/shared/src/portable-packet.ts
+index 07e61c1..8cb3f67 100644
+--- a/packages/shared/src/portable-packet.ts
++++ b/packages/shared/src/portable-packet.ts
+@@ -17,6 +17,7 @@ export const packetSliceKindSchema = z.enum([
+   "packet",
+   "memory",
+   "rag",
++  "prompt",
+ ]);
+ 
+ export type PacketSliceKind = z.infer<typeof packetSliceKindSchema>;
+diff --git a/packages/shared/src/prompts.test.ts b/packages/shared/src/prompts.test.ts
+new file mode 100644
+index 0000000..2b74db0
+--- /dev/null
++++ b/packages/shared/src/prompts.test.ts
+@@ -0,0 +1,39 @@
++import { describe, expect, it } from "vitest";
++import { FACTORY_PROMPTS, interpolatePrompt, isPromptFolder } from "./prompts";
++
++describe("interpolatePrompt", () => {
++  it("resolves project, language, and goal against the active context", () => {
++    const text = interpolatePrompt(
++      "Review {{project}} in {{language}}. Goal: {{goal}}.",
++      { project: "E2E", language: "pt-BR", goal: "ship the compiler" },
++    );
++    expect(text).toBe("Review E2E in pt-BR. Goal: ship the compiler.");
++  });
++
++  it("leaves unknown placeholders and empty values as-is or blank", () => {
++    expect(interpolatePrompt("Keep {{unknown}} and {{project}}", { project: "", language: "en", goal: "" })).toBe(
++      "Keep {{unknown}} and ",
++    );
++  });
++});
++
++describe("factory prompts", () => {
++  it("covers the four factory ids in the three library folders", () => {
++    expect(FACTORY_PROMPTS.map((item) => item.factoryId)).toEqual([
++      "code-review",
++      "debug",
++      "summary",
++      "teacher",
++    ]);
++    expect(new Set(FACTORY_PROMPTS.map((item) => item.folder))).toEqual(
++      new Set(["development", "studies", "work"]),
++    );
++    expect(isPromptFolder("development")).toBe(true);
++    expect(isPromptFolder("inbox")).toBe(false);
++    for (const prompt of FACTORY_PROMPTS) {
++      expect(prompt.body).toContain("{{project}}");
++      expect(prompt.body).toContain("{{language}}");
++      expect(prompt.body).toContain("{{goal}}");
++    }
++  });
++});
+diff --git a/packages/shared/src/prompts.ts b/packages/shared/src/prompts.ts
+new file mode 100644
+index 0000000..b903cf3
+--- /dev/null
++++ b/packages/shared/src/prompts.ts
+@@ -0,0 +1,70 @@
++export const PROMPT_FOLDERS = ["development", "studies", "work"] as const;
++
++export type PromptFolder = (typeof PROMPT_FOLDERS)[number];
++
++export const PROMPT_VARIABLE_NAMES = ["project", "language", "goal"] as const;
++
++export type PromptVariableName = (typeof PROMPT_VARIABLE_NAMES)[number];
++
++export interface PromptVariableValues {
++  project: string;
++  language: string;
++  goal: string;
++}
++
++const VARIABLE_TOKEN = /\{\{\s*(project|language|goal)\s*\}\}/gi;
++
++export const FACTORY_PROMPTS: readonly {
++  factoryId: "code-review" | "debug" | "summary" | "teacher";
++  folder: PromptFolder;
++  title: string;
++  body: string;
++}[] = [
++  {
++    factoryId: "code-review",
++    folder: "development",
++    title: "Code review",
++    body: `You are a senior code reviewer for {{project}}.
++Project goal: {{goal}}
++Respond in {{language}}.
++Review the code for correctness, security, and maintainability. List findings by severity. Ask for the code if none was provided.`,
++  },
++  {
++    factoryId: "debug",
++    folder: "development",
++    title: "Debug",
++    body: `You are debugging an issue in {{project}}.
++Project goal: {{goal}}
++Respond in {{language}}.
++Ask for the error, stack, and what already failed. Propose the smallest next experiment.`,
++  },
++  {
++    factoryId: "summary",
++    folder: "work",
++    title: "Summary",
++    body: `Summarize the material for {{project}}.
++Goal: {{goal}}
++Write in {{language}}.
++Produce: 5 bullets, decisions, and open questions.`,
++  },
++  {
++    factoryId: "teacher",
++    folder: "studies",
++    title: "Teacher",
++    body: `You are a patient tutor for {{project}}.
++Learning goal: {{goal}}
++Teach in {{language}}.
++Explain simply, then quiz with 3 questions.`,
++  },
++];
++
++export function isPromptFolder(value: string): value is PromptFolder {
++  return (PROMPT_FOLDERS as readonly string[]).includes(value);
++}
++
++export function interpolatePrompt(template: string, vars: PromptVariableValues): string {
++  return template.replace(VARIABLE_TOKEN, (_raw, name: string) => {
++    const key = name.toLowerCase() as PromptVariableName;
++    return vars[key];
++  });
++}
