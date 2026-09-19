@@ -70,6 +70,14 @@ import {
   workspaceAddTaskInputSchema,
   workspaceSetTaskDoneInputSchema,
   conversationTaskDtoSchema,
+  promptCreateInputSchema,
+  promptDtoSchema,
+  promptListResultSchema,
+  promptResolveInputSchema,
+  promptResolveResultSchema,
+  promptUpdateInputSchema,
+  playgroundRunInputSchema,
+  playgroundRunResultSchema,
   contextPacketDtoSchema,
   contextPacketListResultSchema,
   projectCreateInputSchema,
@@ -396,6 +404,20 @@ const hub: HubApi = {
         conversationTaskDtoSchema,
       ),
     removeTask: (input) => invokeAckWith(IpcChannel.workspaceRemoveTask, input, idInputSchema),
+  },
+  prompts: {
+    list: () => invokeParsed(IpcChannel.promptsList, empty, emptyIpcPayloadSchema, promptListResultSchema),
+    create: (input) =>
+      invokeParsed(IpcChannel.promptsCreate, input, promptCreateInputSchema, promptDtoSchema),
+    update: (input) =>
+      invokeParsed(IpcChannel.promptsUpdate, input, promptUpdateInputSchema, promptDtoSchema),
+    remove: (input) => invokeAckWith(IpcChannel.promptsRemove, input, idInputSchema),
+    resolve: (input) =>
+      invokeParsed(IpcChannel.promptsResolve, input, promptResolveInputSchema, promptResolveResultSchema),
+  },
+  playground: {
+    run: (input) =>
+      invokeParsed(IpcChannel.playgroundRun, input, playgroundRunInputSchema, playgroundRunResultSchema),
   },
 };
 
