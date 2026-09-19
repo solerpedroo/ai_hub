@@ -47,6 +47,7 @@ import { toMessageDto } from "./message-dto";
 import { loadSendAttachments } from "./files";
 import { resolveSendMentions } from "./mentions";
 import { getHubDatabase } from "./persistence";
+import { loadAutoProjectContext } from "./project-context";
 import { estimateOutgoingCostUsd, evaluateOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
 
 interface ActiveRun {
@@ -345,12 +346,14 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
 
   const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
   const catalogForVision = findCatalogModel(input.model, key.providerSlug);
+  const privacyMode = input.privacyMode ?? "standard";
   const resolvedMentions = resolveSendMentions(
     repos,
     input.mentions,
     conversation.projectId,
     input.conversationId,
     "send",
+    privacyMode,
   );
   const fileIds = [...new Set([...(input.fileIds ?? []), ...resolvedMentions.fileIds])];
   const attachments = loadSendAttachments(
@@ -366,8 +369,25 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     key.providerSlug,
     conversation,
   );
+  const query =
+    input.mode === "send" || input.mode === "edit"
+      ? mentionVisibleContent(input.content) || input.content
+      : (compileRows.filter((item) => item.role === "user").at(-1)?.content ?? "");
+  const skipMemoryIds = new Set(
+    resolvedMentions.mentions.filter((item) => item.kind === "memory").map((item) => item.id),
+  );
+  const autoContext = loadAutoProjectContext(
+    repos,
+    conversation.projectId,
+    query,
+    privacyMode,
+    skipMemoryIds,
+  );
   const withFiles = appendFilesToPacket(compiled, attachments.files);
-  const packet = appendMentionsToPacket(withFiles.packet, resolvedMentions.mentions).packet;
+  const packet = appendMentionsToPacket(withFiles.packet, [
+    ...resolvedMentions.mentions,
+    ...autoContext,
+  ]).packet;
   if (packet.messages.length === 0) {
     throw new Error("Add a user message before sending");
   }
