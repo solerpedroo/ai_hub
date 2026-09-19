@@ -3,7 +3,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { basename } from "node:path";
 import { BrowserWindow, dialog, type OpenDialogOptions, type WebContents } from "electron";
 import { appendMentionsToPacket, compileActivePathDetailed } from "@ai-hub/ai-gateway";
-import { redactSecrets } from "@ai-hub/security";
+import { applyContextFirewall, redactSecrets, type FirewallPolicy } from "@ai-hub/security";
 import {
   contextPacketDtoSchema,
   findCatalogModel,
@@ -11,6 +11,7 @@ import {
   packetsExportResultSchema,
   portablePacketFromCompile,
   portablePacketV1Schema,
+  packetV0Schema,
   type ContextPacketDto,
   type ImportPickResult,
   type PacketsCompileInput,
@@ -25,11 +26,41 @@ import { loadAutoProjectContext } from "./project-context";
 const tickets = new Map<string, { path: string; fileName: string }>();
 const MAX_PACKET_BYTES = 2_000_000;
 
+function firewallPacketPayload(payload: Parameters<typeof packetV0Schema.parse>[0], policy: FirewallPolicy) {
+  const safe = (text: string): string => {
+    const result = applyContextFirewall(text, policy);
+    if (result.blocked.length > 0) throw new Error(`firewall:blocked:${result.blocked.join(",")}`);
+    return result.maskedText;
+  };
+  const parsed = packetV0Schema.parse(payload);
+  return packetV0Schema.parse({
+    ...parsed,
+    system: safe(parsed.system),
+    messages: parsed.messages.map((message) => ({ ...message, content: safe(message.content) })),
+  });
+}
+
+function firewallEnvelope(envelope: Parameters<typeof portablePacketV1Schema.parse>[0], policy: FirewallPolicy) {
+  const safe = (text: string): string => {
+    const result = applyContextFirewall(text, policy);
+    if (result.blocked.length > 0) throw new Error(`firewall:blocked:${result.blocked.join(",")}`);
+    return result.maskedText;
+  };
+  const parsed = portablePacketV1Schema.parse(envelope);
+  return portablePacketV1Schema.parse({
+    ...parsed,
+    origin: { ...parsed.origin, projectLabel: safe(parsed.origin.projectLabel), conversationLabel: safe(parsed.origin.conversationLabel) },
+    included: parsed.included.map((slice) => ({ ...slice, label: safe(slice.label) })),
+    omitted: parsed.omitted.map((slice) => ({ ...slice, label: safe(slice.label) })),
+    payload: firewallPacketPayload(parsed.payload, policy),
+  });
+}
+
 function toPacketDto(row: {
   id: string;
   projectId: string | null;
   tokenEstimate: number | null;
-  privacyMode: "standard" | "strict";
+  privacyMode: "private" | "normal" | "maximum" | "standard" | "strict";
   origin: { source: "compile" | "import"; projectLabel: string; conversationLabel: string };
   createdAt: string;
 }): ContextPacketDto {
@@ -70,7 +101,7 @@ export function compileAndSavePacket(input: PacketsCompileInput): ContextPacketD
   const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
   const extraSystem =
     input.extraSystem !== undefined && input.extraSystem.trim().length > 0 ? input.extraSystem.trim() : null;
-  const privacyMode = input.privacyMode ?? "standard";
+  const privacyMode = repos.getAppPrefs().privacyMode;
   const catalog =
     input.model && input.providerSlug ? findCatalogModel(input.model, input.providerSlug) : null;
   const compiled = {
@@ -101,7 +132,7 @@ export function compileAndSavePacket(input: PacketsCompileInput): ContextPacketD
     new Set(),
   );
   const withContext = appendMentionsToPacket(detailed.packet, autoContext);
-  const envelope = portablePacketFromCompile({
+  const envelope = firewallEnvelope(portablePacketFromCompile({
     privacyMode,
     origin: {
       source: "compile",
@@ -110,8 +141,8 @@ export function compileAndSavePacket(input: PacketsCompileInput): ContextPacketD
     },
     included: [...detailed.included, ...withContext.included],
     omitted: detailed.omitted,
-    payload: withContext.packet,
-  });
+    payload: firewallPacketPayload(withContext.packet, repos.getAppPrefs().firewallPolicy),
+  }), repos.getAppPrefs().firewallPolicy);
   const payloadJson = redactSecrets(JSON.stringify(envelope));
   const stored = repos.createContextPacket({
     projectId: conversation.projectId,
@@ -212,16 +243,17 @@ export async function importPacketFile(input: PacketsImportInput): Promise<Conte
   }
   const parsed = portablePacketV1Schema.parse(JSON.parse(bytes.toString("utf8")) as unknown);
   const redacted = portablePacketV1Schema.parse(JSON.parse(redactSecrets(JSON.stringify(parsed))) as unknown);
+  const safePacket = firewallEnvelope(redacted, repos.getAppPrefs().firewallPolicy);
   const stored = repos.createContextPacket({
     projectId: project.id,
-    privacyMode: redacted.privacyMode,
+    privacyMode: safePacket.privacyMode,
     origin: {
       source: "import",
-      projectLabel: redacted.origin.projectLabel,
-      conversationLabel: redacted.origin.conversationLabel,
+      projectLabel: safePacket.origin.projectLabel,
+      conversationLabel: safePacket.origin.conversationLabel,
     },
-    tokenEstimate: redacted.payload.tokenEstimate,
-    payloadJson: redactSecrets(JSON.stringify(redacted)),
+    tokenEstimate: safePacket.payload.tokenEstimate,
+    payloadJson: redactSecrets(JSON.stringify(safePacket)),
   });
   return toPacketDto(stored);
 }
