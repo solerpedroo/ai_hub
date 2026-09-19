@@ -1,9 +1,27 @@
 import { z } from "zod";
 import { packetV0Schema, type ProviderAgnosticPacket } from "./gateway";
 
-export const packetPrivacyModeSchema = z.enum(["standard", "strict"]);
+// `standard` and `strict` are retained only so existing local packets remain readable.
+// New UI and persisted preferences must use the three W18 modes.
+export const packetPrivacyModeSchema = z.enum(["private", "normal", "maximum", "standard", "strict"]);
 
 export type PacketPrivacyMode = z.infer<typeof packetPrivacyModeSchema>;
+
+export type EffectivePrivacyMode = "private" | "normal" | "maximum";
+
+export function effectivePrivacyMode(value: PacketPrivacyMode | undefined): EffectivePrivacyMode {
+  switch (value) {
+    case "strict":
+    case "private":
+      return "private";
+    case "maximum":
+      return "maximum";
+    case "standard":
+    case "normal":
+    case undefined:
+      return "normal";
+  }
+}
 
 export const packetSliceKindSchema = z.enum([
   "project-instructions",
