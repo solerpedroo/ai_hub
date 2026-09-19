@@ -39,12 +39,34 @@ function readNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function packetMessages(packet: ProviderAgnosticPacket): Array<{ role: string; content: string }> {
-  const messages: Array<{ role: string; content: string }> = [];
+function packetMessages(
+  packet: ProviderAgnosticPacket,
+  images: ChatStreamRequest["images"],
+): Array<{ role: string; content: unknown }> {
+  const messages: Array<{ role: string; content: unknown }> = [];
   if (packet.system.length > 0) {
     messages.push({ role: "system", content: packet.system });
   }
+  const lastUser = [...packet.messages].reverse().find((item) => item.role === "user");
   for (const message of packet.messages) {
+    if (
+      images &&
+      images.length > 0 &&
+      lastUser &&
+      message === lastUser
+    ) {
+      messages.push({
+        role: message.role,
+        content: [
+          { type: "text", text: message.content },
+          ...images.map((image) => ({
+            type: "image_url",
+            image_url: { url: `data:${image.mime};base64,${image.data}` },
+          })),
+        ],
+      });
+      continue;
+    }
     messages.push({ role: message.role, content: message.content });
   }
   return messages;
@@ -186,7 +208,7 @@ export function createOpenAICompatibleAdapter(
         model: input.model,
         stream: true,
         stream_options: { include_usage: true },
-        messages: packetMessages(input.packet),
+        messages: packetMessages(input.packet, input.images),
         temperature: input.temperature ?? 1,
       };
       if (input.maxTokens !== undefined && input.maxTokens !== null) {
