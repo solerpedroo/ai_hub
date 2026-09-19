@@ -24,6 +24,8 @@ import {
   workspaceSessionSchema,
   filesIngestPathsInputSchema,
   filesRemoveInputSchema,
+  memoryCreateInputSchema,
+  conversationWorkspaceDtoSchema,
 } from "./ipc-schemas";
 
 describe("emptyIpcPayloadSchema", () => {
@@ -400,5 +402,30 @@ describe("wave 12 file contracts", () => {
     const remove = { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", projectId: null };
     expect(filesRemoveInputSchema.parse(remove).projectId).toBeNull();
     expect(() => filesRemoveInputSchema.parse({ ...remove, extra: true })).toThrow();
+  });
+});
+
+describe("wave 14 memory and workspace contracts", () => {
+  it("accepts a memory create and rejects extra keys", () => {
+    const input = {
+      projectId: "11111111-1111-4111-8111-111111111111",
+      title: "DB",
+      body: "usamos PostgreSQL",
+      source: "manual" as const,
+    };
+    expect(memoryCreateInputSchema.parse(input).body).toBe("usamos PostgreSQL");
+    expect(() => memoryCreateInputSchema.parse({ ...input, extra: true })).toThrow();
+  });
+
+  it("accepts a workspace dto and rejects extra keys", () => {
+    const dto = {
+      conversationId: "11111111-1111-4111-8111-111111111111",
+      summary: "User: qual banco?",
+      decisions: ["usamos PostgreSQL"],
+      tasks: [],
+      pins: [],
+    };
+    expect(conversationWorkspaceDtoSchema.parse(dto).decisions).toHaveLength(1);
+    expect(() => conversationWorkspaceDtoSchema.parse({ ...dto, extra: true })).toThrow();
   });
 });
