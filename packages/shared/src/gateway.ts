@@ -91,7 +91,7 @@ const chatSendBaseSchema = z.object({
   extraSystem: z.string().max(20_000).optional(),
   compactHistory: z.boolean().optional(),
   allowOnce: z.boolean().optional(),
-  privacyMode: z.enum(["standard", "strict"]).optional(),
+  privacyMode: z.enum(["private", "normal", "maximum", "standard", "strict"]).optional(),
   fileIds: z.array(z.string().uuid()).max(8).optional(),
   mentions: mentionRefListSchema.optional(),
 });
