@@ -114,6 +114,7 @@ export function PacketPanel({
                         <li
                           key={`${slice.kind}-${slice.id ?? index}`}
                           className="rounded-md border px-2 py-1"
+                          data-testid={`packet-slice-${slice.kind}`}
                         >
                           {t(`workspace.packet.kind.${slice.kind}`)} · {slice.label} · ~
                           {slice.tokens}
