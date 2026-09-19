@@ -4,10 +4,17 @@ import {
   activePath,
   catalogModelsForProvider,
   findCatalogModel,
+  isMentionStubType,
+  MAX_MENTION_TOKENS,
+  mentionQueryParts,
+  mentionVisibleContent,
+  MENTION_TYPES,
+  parseMentionTokens,
   type BranchLabels,
   type CatalogModel,
   type ContextPacketDto,
   type ConversationDto,
+  type MentionRef,
   type MessageDto,
   type PacketPreviewResult,
   type PacketPrivacyMode,
@@ -16,7 +23,11 @@ import {
   type ProjectFileDto,
   type ProviderKeyDto,
 } from "@ai-hub/shared";
-import { ChatComposer, type SlashCommandId } from "@/components/chat/chat-composer";
+import {
+  ChatComposer,
+  type MentionSuggestion,
+  type SlashCommandId,
+} from "@/components/chat/chat-composer";
 import { ConversationTree } from "@/components/chat/conversation-tree";
 import { MessageBubble } from "@/components/chat/message-bubble";
 import { PacketPanel } from "@/components/chat/packet-panel";
@@ -34,6 +45,19 @@ const PROJECT_COLORS = [
   "#16a34a",
   "#0891b2",
 ] as const;
+
+function mentionRefsFrom(chips: MentionSuggestion[], draft: string): MentionRef[] {
+  const fromChips = chips.map((chip) =>
+    chip.id ? { type: chip.type, id: chip.id } : { type: chip.type, query: chip.query || chip.label },
+  );
+  const fromText = parseMentionTokens(draft).mentions.map((item) => ({
+    type: item.type,
+    query: item.query,
+  }));
+  return [...fromChips, ...fromText]
+    .filter((item) => ("id" in item && item.id.length > 0) || ("query" in item && item.query.length > 0))
+    .slice(0, 8);
+}
 
 export function HomeView({
   project,
@@ -96,6 +120,7 @@ export function HomeView({
   onAttachFolder,
   onRemoveFile,
   onDropFiles,
+  onMentionsChange,
 }: {
   project: ProjectDto | null;
   importedInbox: boolean;
@@ -121,7 +146,8 @@ export function HomeView({
   onSelectTemperature: (value: number) => void;
   onSelectMaxTokens: (value: number | null) => void;
   onSelectExtraSystem: (value: string) => void;
-  onSend: (content: string) => Promise<boolean>;
+  onSend: (content: string, mentions: MentionRef[]) => Promise<boolean>;
+  onMentionsChange: (mentions: MentionRef[]) => void;
   onAbort: () => Promise<void>;
   onRegenerate: (messageId: string) => Promise<void>;
   onContinue: () => Promise<void>;
@@ -162,6 +188,10 @@ export function HomeView({
   const modifier = window.hub.platform === "darwin" ? "⌘" : "Ctrl";
   const [title, setTitle] = useState("");
   const [draft, setDraft] = useState("");
+  const [mentionChips, setMentionChips] = useState<MentionSuggestion[]>([]);
+  const [mentionSuggestions, setMentionSuggestions] = useState<MentionSuggestion[]>([]);
+  const [projectFiles, setProjectFiles] = useState<ProjectFileDto[]>([]);
+  const mentionQueryRef = useRef<string | null>(null);
   const [editing, setEditing] = useState(false);
   const [treeOpen, setTreeOpen] = useState(false);
   const [packetOpen, setPacketOpen] = useState(false);
@@ -195,6 +225,68 @@ export function HomeView({
   const preferredModels = preferredProvider
     ? catalogModelsForProvider(preferredProvider)
     : [];
+  const mentionPreviewRows: MentionSuggestion[] = [
+    ...mentionChips,
+    ...parseMentionTokens(draft)
+      .mentions.filter(
+        (item) => !mentionChips.some((chip) => chip.type === item.type && chip.query === item.query),
+      )
+      .map((item) => {
+        if (item.type === "file") {
+          const file = projectFiles.find((row) => row.name.toLowerCase() === item.query.toLowerCase());
+          return {
+            type: item.type,
+            id: file?.id ?? null,
+            query: item.query,
+            label: file?.name ?? item.query,
+            excerpt: file?.excerpt ?? item.query,
+            tokens: file?.tokenEstimate ?? 0,
+            available: file !== undefined,
+          };
+        }
+        if (item.type === "conversation") {
+          const conversation = conversations.find(
+            (row) => row.title.toLowerCase() === item.query.toLowerCase(),
+          );
+          return {
+            type: item.type,
+            id: conversation?.id ?? null,
+            query: item.query,
+            label: conversation?.title ?? item.query,
+            excerpt: conversation?.title ?? item.query,
+            tokens: 0,
+            available: conversation !== undefined && conversation.id !== selectedConversationId,
+          };
+        }
+        if (item.type === "packet") {
+          const packet = packets.find(
+            (row) =>
+              row.origin.conversationLabel.toLowerCase() === item.query.toLowerCase() ||
+              row.origin.projectLabel.toLowerCase() === item.query.toLowerCase(),
+          );
+          return {
+            type: item.type,
+            id: packet?.id ?? null,
+            query: item.query,
+            label: packet
+              ? `${packet.origin.projectLabel} / ${packet.origin.conversationLabel}`
+              : item.query,
+            excerpt: packet?.origin.conversationLabel ?? item.query,
+            tokens: packet?.tokenEstimate ?? 0,
+            available: packet !== undefined,
+          };
+        }
+        return {
+          type: item.type,
+          id: null,
+          query: item.query,
+          label: item.query,
+          excerpt: "",
+          tokens: 0,
+          available: false,
+        };
+      }),
+  ];
 
   useEffect(() => {
     setEditing(false);
@@ -202,8 +294,21 @@ export function HomeView({
     setPacketOpen(false);
     setTagDraft("");
     setDraft("");
+    setMentionChips([]);
     onComposerDraft("");
-  }, [onComposerDraft, selectedConversationId]);
+    onMentionsChange([]);
+  }, [onComposerDraft, onMentionsChange, selectedConversationId]);
+
+  useEffect(() => {
+    void window.hub.files
+      .list({ projectId: project?.id ?? null })
+      .then(setProjectFiles)
+      .catch(() => setProjectFiles([]));
+  }, [attachedFiles, project?.id]);
+
+  useEffect(() => {
+    onMentionsChange(mentionRefsFrom(mentionChips, draft));
+  }, [draft, mentionChips, onMentionsChange]);
 
   useEffect(() => {
     setProjectName(project?.name ?? "");
@@ -890,6 +995,63 @@ export function HomeView({
                       })}
                     </p>
                   ) : null}
+                  {mentionChips.length > 0 ? (
+                    <ul className="flex flex-col gap-1" data-testid="mention-chips">
+                      {mentionChips.map((chip, index) => (
+                        <li
+                          key={`${chip.type}-${chip.id ?? chip.query}-${index}`}
+                          className="flex items-center justify-between gap-2 rounded-md border px-2 py-1 text-[12px]"
+                          data-testid="mention-chip"
+                        >
+                          <span className="min-w-0 truncate">
+                            @{chip.type}:{chip.query || chip.label}
+                            <span className="ml-2 text-muted-foreground">
+                              {t("mentions.tokens", { n: chip.tokens })}
+                            </span>
+                            {!chip.available ? (
+                              <span className="ml-2 text-muted-foreground">{t("mentions.stub")}</span>
+                            ) : null}
+                          </span>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            data-testid="mention-remove"
+                            onClick={() => {
+                              setMentionChips((current) => current.filter((_, item) => item !== index));
+                            }}
+                          >
+                            {t("mentions.remove")}
+                          </Button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                  {mentionPreviewRows.length > 0 ? (
+                    <div className="flex flex-col gap-1" data-testid="mention-preview">
+                      <p className="text-[11px] font-medium">{t("mentions.preview")}</p>
+                      {mentionPreviewRows.map((chip, index) => (
+                        <p key={`preview-${chip.type}-${chip.id ?? chip.query}-${index}`} className="text-[11px] text-muted-foreground">
+                          {chip.excerpt || chip.label} · {t("mentions.tokens", { n: chip.tokens })}
+                        </p>
+                      ))}
+                      {(() => {
+                        const n = mentionPreviewRows
+                          .filter((chip) => chip.type === "conversation" || chip.type === "packet")
+                          .reduce((sum, chip) => sum + chip.tokens, 0);
+                        return (
+                          <p
+                            className="text-[11px] text-muted-foreground"
+                            data-testid="mention-token-warning"
+                          >
+                            {n > MAX_MENTION_TOKENS
+                              ? t("mentions.tokenOver", { cap: MAX_MENTION_TOKENS })
+                              : t("mentions.tokenWarning", { n, cap: MAX_MENTION_TOKENS })}
+                          </p>
+                        );
+                      })()}
+                    </div>
+                  ) : null}
                 </div>
                 <ChatComposer
                   key={selectedConversationId}
@@ -901,17 +1063,137 @@ export function HomeView({
                   streaming={streaming}
                   sending={sending}
                   disabled={!hasKey || editing}
-                  onSend={() => {
-                    const next = draft.trim();
-                    if (!next) {
+                  hasMentions={mentionChips.length > 0}
+                  mentionSuggestions={mentionSuggestions}
+                  onMentionQuery={(typed) => {
+                    mentionQueryRef.current = typed;
+                    if (!typed) {
+                      setMentionSuggestions([]);
                       return;
                     }
-                    void onSend(next).then((ok) => {
-                      if (ok) {
-                        setDraft("");
-                        onComposerDraft("");
-                      }
-                    });
+                    const parts = mentionQueryParts(typed);
+                    if (parts.kind === "types") {
+                      setMentionSuggestions(
+                        MENTION_TYPES.filter((item) => item.startsWith(parts.prefix)).map((type) => ({
+                          type,
+                          id: null,
+                          query: "",
+                          label: t(`mentions.type.${type}`),
+                          excerpt: isMentionStubType(type) ? t("mentions.stub") : t(`mentions.type.${type}`),
+                          tokens: 0,
+                          available: !isMentionStubType(type),
+                        })),
+                      );
+                      return;
+                    }
+                    if (isMentionStubType(parts.type)) {
+                      setMentionSuggestions([
+                        {
+                          type: parts.type,
+                          id: null,
+                          query: parts.query,
+                          label: t(`mentions.type.${parts.type}`),
+                          excerpt: t("mentions.stub"),
+                          tokens: 0,
+                          available: false,
+                        },
+                      ]);
+                      return;
+                    }
+                    const query = parts.query.toLowerCase();
+                    if (parts.type === "file") {
+                      setMentionSuggestions(
+                        projectFiles
+                          .filter((file) => file.name.toLowerCase().includes(query))
+                          .slice(0, 8)
+                          .map((file) => ({
+                            type: "file" as const,
+                            id: file.id,
+                            query: file.name,
+                            label: file.name,
+                            excerpt: file.excerpt,
+                            tokens: file.tokenEstimate,
+                            available: true,
+                          })),
+                      );
+                      return;
+                    }
+                    if (parts.type === "conversation") {
+                      setMentionSuggestions(
+                        conversations
+                          .filter(
+                            (item) =>
+                              item.id !== selectedConversationId &&
+                              item.title.toLowerCase().includes(query),
+                          )
+                          .slice(0, 8)
+                          .map((item) => ({
+                            type: "conversation" as const,
+                            id: item.id,
+                            query: item.title,
+                            label: item.title,
+                            excerpt: item.title,
+                            tokens: 0,
+                            available: true,
+                          })),
+                      );
+                      return;
+                    }
+                    setMentionSuggestions(
+                      packets
+                        .filter((item) => {
+                          const hay = `${item.origin.conversationLabel} ${item.origin.projectLabel}`.toLowerCase();
+                          return hay.includes(query);
+                        })
+                        .slice(0, 8)
+                        .map((item) => ({
+                          type: "packet" as const,
+                          id: item.id,
+                          query: item.origin.conversationLabel,
+                          label: `${item.origin.projectLabel} / ${item.origin.conversationLabel}`,
+                          excerpt: item.origin.conversationLabel,
+                          tokens: item.tokenEstimate ?? 0,
+                          available: true,
+                        })),
+                    );
+                  }}
+                  onPickMention={(item, replace) => {
+                    const nextDraft = `${draft.slice(0, replace.start)}${draft.slice(replace.end)}`;
+                    if (!item.query && item.id === null) {
+                      const inserted = `${nextDraft.slice(0, replace.start)}@${item.type}:${nextDraft.slice(replace.start)}`;
+                      setDraft(inserted);
+                      onComposerDraft(inserted);
+                      return;
+                    }
+                    setDraft(nextDraft);
+                    onComposerDraft(nextDraft);
+                    setMentionChips((current) =>
+                      [...current, item].filter(
+                        (chip, index, all) =>
+                          all.findIndex((row) => row.type === chip.type && row.id === chip.id && row.query === chip.query) ===
+                          index,
+                      ),
+                    );
+                  }}
+                  onRemoveLastMention={() => {
+                    setMentionChips((current) => current.slice(0, -1));
+                  }}
+                  onSend={() => {
+                    const mentions = mentionRefsFrom(mentionChips, draft);
+                    const next = mentionVisibleContent(draft);
+                    if (!next && mentions.length === 0) {
+                      return;
+                    }
+                    void onSend(next || mentionChips.map((chip) => `@${chip.type}:${chip.query}`).join(" "), mentions).then(
+                      (ok) => {
+                        if (ok) {
+                          setDraft("");
+                          setMentionChips([]);
+                          onComposerDraft("");
+                          onMentionsChange([]);
+                        }
+                      },
+                    );
                   }}
                   onAbort={() => {
                     void onAbort();
