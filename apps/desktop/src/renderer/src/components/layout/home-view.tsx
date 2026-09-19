@@ -14,8 +14,10 @@ import {
   type CatalogModel,
   type ContextPacketDto,
   type ConversationDto,
+  type ConversationWorkspaceDto,
   type MentionRef,
   type MessageDto,
+  type ProjectMemoryDto,
   type PacketPreviewResult,
   type PacketPrivacyMode,
   type ProjectDto,
@@ -31,6 +33,8 @@ import {
 import { ConversationTree } from "@/components/chat/conversation-tree";
 import { MessageBubble } from "@/components/chat/message-bubble";
 import { PacketPanel } from "@/components/chat/packet-panel";
+import { ConversationWorkspacePanel } from "@/components/workspace/conversation-workspace-panel";
+import { MemoryPanel } from "@/components/workspace/memory-panel";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -121,6 +125,8 @@ export function HomeView({
   onRemoveFile,
   onDropFiles,
   onMentionsChange,
+  onDuplicateConversation,
+  onPromoteConversation,
 }: {
   project: ProjectDto | null;
   importedInbox: boolean;
@@ -156,6 +162,8 @@ export function HomeView({
   onRenameBranch: (branchId: string, label: string) => Promise<void>;
   onExport: (mode: "active" | "tree") => Promise<void>;
   onMoveConversation: (projectId: string | null) => Promise<void>;
+  onDuplicateConversation: () => Promise<void>;
+  onPromoteConversation: () => Promise<void>;
   onSaveProject: (input: Omit<ProjectUpdateInput, "id">) => Promise<void>;
   onRemoveProject: () => Promise<void>;
   onSetTags: (names: string[]) => Promise<void>;
@@ -195,6 +203,14 @@ export function HomeView({
   const [editing, setEditing] = useState(false);
   const [treeOpen, setTreeOpen] = useState(false);
   const [packetOpen, setPacketOpen] = useState(false);
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [projectMemories, setProjectMemories] = useState<ProjectMemoryDto[]>([]);
+  const [memoryOptedOut, setMemoryOptedOut] = useState(false);
+  const [memorySuggestions, setMemorySuggestions] = useState<string[]>([]);
+  const [conversationWorkspace, setConversationWorkspace] = useState<ConversationWorkspaceDto | null>(
+    null,
+  );
   const [tagDraft, setTagDraft] = useState("");
   const [projectName, setProjectName] = useState(project?.name ?? "");
   const [projectColor, setProjectColor] = useState<string | null>(project?.color ?? null);
@@ -305,6 +321,56 @@ export function HomeView({
       .then(setProjectFiles)
       .catch(() => setProjectFiles([]));
   }, [attachedFiles, project?.id]);
+
+  useEffect(() => {
+    if (!project) {
+      setProjectMemories([]);
+      setMemoryOptedOut(false);
+      return;
+    }
+    void window.hub.memory
+      .list({ projectId: project.id })
+      .then(setProjectMemories)
+      .catch(() => setProjectMemories([]));
+    void window.hub.memory
+      .getOptOut({ projectId: project.id })
+      .then((row) => setMemoryOptedOut(row.optedOut))
+      .catch(() => setMemoryOptedOut(false));
+  }, [project]);
+
+  useEffect(() => {
+    if (!selectedConversationId) {
+      setConversationWorkspace(null);
+      return;
+    }
+    const last = messages.at(-1);
+    const op =
+      last?.role === "assistant" && last.status === "complete"
+        ? window.hub.workspace.refresh({ conversationId: selectedConversationId })
+        : window.hub.workspace.get({ conversationId: selectedConversationId });
+    void op.then(setConversationWorkspace).catch(() => setConversationWorkspace(null));
+  }, [messages, selectedConversationId]);
+
+  useEffect(() => {
+    if (!project || memoryOptedOut || streaming || sending) {
+      return;
+    }
+    const last = messages.at(-1);
+    const prev = messages.at(-2);
+    if (!last || last.role !== "assistant" || last.status !== "complete" || !prev || prev.role !== "user") {
+      return;
+    }
+    void window.hub.memory
+      .suggest({ projectId: project.id, text: `${prev.content}\n${last.content}` })
+      .then((row) => {
+        setMemorySuggestions(row.suggestions);
+        setMemoryOptedOut(row.optedOut);
+        if (row.suggestions.length > 0) {
+          setMemoryOpen(true);
+        }
+      })
+      .catch(() => setMemorySuggestions([]));
+  }, [memoryOptedOut, messages, project, sending, streaming]);
 
   useEffect(() => {
     onMentionsChange(mentionRefsFrom(mentionChips, draft));
@@ -755,6 +821,51 @@ export function HomeView({
                   type="button"
                   size="sm"
                   variant="outline"
+                  data-testid="memory-open"
+                  aria-pressed={memoryOpen}
+                  disabled={!project}
+                  onClick={() => setMemoryOpen((open) => !open)}
+                >
+                  {t("memory.title")}
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  data-testid="workspace-open"
+                  aria-pressed={workspaceOpen}
+                  onClick={() => setWorkspaceOpen((open) => !open)}
+                >
+                  {t("workspace.panel.title")}
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  data-testid="conversation-duplicate"
+                  disabled={!selectedConversationId || busy}
+                  onClick={() => {
+                    void onDuplicateConversation();
+                  }}
+                >
+                  {t("workspace.duplicate")}
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  data-testid="conversation-to-project"
+                  disabled={!selectedConversationId || busy}
+                  onClick={() => {
+                    void onPromoteConversation();
+                  }}
+                >
+                  {t("workspace.toProject")}
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
                   data-testid="tree-toggle"
                   aria-pressed={treeOpen}
                   onClick={() => setTreeOpen((open) => !open)}
@@ -1052,6 +1163,34 @@ export function HomeView({
                       })()}
                     </div>
                   ) : null}
+                  {packetPreview?.included.some((item) => item.kind === "rag" || item.kind === "memory") ? (
+                    <ul className="flex flex-col gap-1" data-testid="citations">
+                      {packetPreview.included
+                        .filter((item) => item.kind === "rag" || item.kind === "memory")
+                        .map((item, index) => {
+                          const target = item.label.replace(/^(?:Project memory|Retrieved chunk): /, "");
+                          return (
+                            <li key={`${item.kind}-${item.id ?? index}`}>
+                              <button
+                                type="button"
+                                className="text-left text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+                                data-testid={`citation-${item.kind}`}
+                                data-citation-target={target}
+                                onClick={() => {
+                                  if (item.kind === "memory") {
+                                    setMemoryOpen(true);
+                                    return;
+                                  }
+                                  setWorkspaceOpen(false);
+                                }}
+                              >
+                                {t(`workspace.packet.kind.${item.kind}`)} · {item.label}
+                              </button>
+                            </li>
+                          );
+                        })}
+                    </ul>
+                  ) : null}
                 </div>
                 <ChatComposer
                   key={selectedConversationId}
@@ -1113,6 +1252,27 @@ export function HomeView({
                             label: file.name,
                             excerpt: file.excerpt,
                             tokens: file.tokenEstimate,
+                            available: true,
+                          })),
+                      );
+                      return;
+                    }
+                    if (parts.type === "memory") {
+                      setMentionSuggestions(
+                        projectMemories
+                          .filter(
+                            (item) =>
+                              item.title.toLowerCase().includes(query) ||
+                              item.body.toLowerCase().includes(query),
+                          )
+                          .slice(0, 8)
+                          .map((item) => ({
+                            type: "memory" as const,
+                            id: item.id,
+                            query: item.title,
+                            label: item.title,
+                            excerpt: item.body.slice(0, 120),
+                            tokens: Math.ceil(item.body.length / 4),
                             available: true,
                           })),
                       );
@@ -1204,6 +1364,104 @@ export function HomeView({
                   }}
                 />
               </div>
+              {memoryOpen && project ? (
+                <MemoryPanel
+                  memories={projectMemories}
+                  optedOut={memoryOptedOut}
+                  suggestions={memorySuggestions}
+                  canEdit
+                  onCreate={async (title, body) => {
+                    const created = await window.hub.memory.create({
+                      projectId: project.id,
+                      title,
+                      body,
+                      source: "manual",
+                    });
+                    setProjectMemories((current) => [created, ...current]);
+                  }}
+                  onUpdate={async (id, title, body) => {
+                    const updated = await window.hub.memory.update({ id, title, body });
+                    setProjectMemories((current) =>
+                      current.map((item) => (item.id === id ? updated : item)),
+                    );
+                  }}
+                  onRemove={async (id) => {
+                    await window.hub.memory.remove({ id });
+                    setProjectMemories((current) => current.filter((item) => item.id !== id));
+                  }}
+                  onSetOptOut={async (optedOut) => {
+                    const row = await window.hub.memory.setOptOut({ projectId: project.id, optedOut });
+                    setMemoryOptedOut(row.optedOut);
+                    if (row.optedOut) {
+                      setMemorySuggestions([]);
+                    }
+                  }}
+                  onSaveSuggestion={async (body) => {
+                    const created = await window.hub.memory.create({
+                      projectId: project.id,
+                      title: body.slice(0, 80),
+                      body,
+                      source: "suggested",
+                    });
+                    setProjectMemories((current) => [created, ...current]);
+                    setMemorySuggestions((current) => current.filter((item) => item !== body));
+                  }}
+                  onDismissSuggestions={() => setMemorySuggestions([])}
+                />
+              ) : null}
+              {workspaceOpen ? (
+                <ConversationWorkspacePanel
+                  workspace={conversationWorkspace}
+                  busy={busy}
+                  onRefresh={async () => {
+                    if (!selectedConversationId) {
+                      return;
+                    }
+                    setConversationWorkspace(
+                      await window.hub.workspace.refresh({ conversationId: selectedConversationId }),
+                    );
+                  }}
+                  onAddTask={async (title) => {
+                    if (!selectedConversationId) {
+                      return;
+                    }
+                    const task = await window.hub.workspace.addTask({
+                      conversationId: selectedConversationId,
+                      title,
+                    });
+                    setConversationWorkspace((current) =>
+                      current
+                        ? { ...current, tasks: [...current.tasks, task] }
+                        : {
+                            conversationId: selectedConversationId,
+                            summary: "",
+                            decisions: [],
+                            tasks: [task],
+                            pins: [],
+                          },
+                    );
+                  }}
+                  onSetTaskDone={async (id, done) => {
+                    const task = await window.hub.workspace.setTaskDone({ id, done });
+                    setConversationWorkspace((current) =>
+                      current
+                        ? {
+                            ...current,
+                            tasks: current.tasks.map((item) => (item.id === id ? task : item)),
+                          }
+                        : current,
+                    );
+                  }}
+                  onRemoveTask={async (id) => {
+                    await window.hub.workspace.removeTask({ id });
+                    setConversationWorkspace((current) =>
+                      current
+                        ? { ...current, tasks: current.tasks.filter((item) => item.id !== id) }
+                        : current,
+                    );
+                  }}
+                />
+              ) : null}
               {treeOpen ? (
                 <ConversationTree
                   messages={messages}
