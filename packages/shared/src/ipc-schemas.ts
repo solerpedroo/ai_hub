@@ -3,6 +3,7 @@ import { localeSchema, themeModeSchema } from "./appearance";
 import {
   gatewayErrorCodeSchema,
   mentionRefListSchema,
+  mentionTypeSchema,
   packetV0Schema,
   receiptDtoSchema,
 } from "./gateway";
@@ -1148,4 +1149,100 @@ export const artifactExportResultSchema = z.discriminatedUnion("status", [
 ]);
 
 export type ArtifactExportResult = z.infer<typeof artifactExportResultSchema>;
+
+export const skillFolderSchema = promptFolderSchema;
+
+export type SkillFolderDto = z.infer<typeof skillFolderSchema>;
+
+export const skillStepDtoSchema = z
+  .object({
+    id: z.string().min(1).max(40),
+    title: z.string().min(1).max(80),
+    section: z.string().min(1).max(4_000),
+  })
+  .strict();
+
+export const skillDefaultMentionDtoSchema = z
+  .object({
+    type: mentionTypeSchema,
+    query: z.string().min(1).max(260),
+  })
+  .strict();
+
+export const skillDtoSchema = z
+  .object({
+    id: z.string().uuid(),
+    folder: skillFolderSchema,
+    title: z.string().min(1).max(120),
+    description: z.string().min(1).max(400),
+    prompt: z.string().min(1).max(16_000),
+    preferredModel: z.string().min(1).max(128).nullable(),
+    defaultMentions: z.array(skillDefaultMentionDtoSchema).max(8),
+    steps: z.array(skillStepDtoSchema).max(12),
+    factoryId: z.string().min(1).max(40).nullable(),
+    contractVersion: z.literal(1),
+    createdAt: isoTimestampSchema,
+    updatedAt: isoTimestampSchema,
+  })
+  .strict();
+
+export type SkillDto = z.infer<typeof skillDtoSchema>;
+
+export const skillListResultSchema = z.array(skillDtoSchema).max(200);
+
+export const skillCreateInputSchema = z
+  .object({
+    folder: skillFolderSchema,
+    title: z.string().trim().min(1).max(120),
+    description: z.string().trim().min(1).max(400),
+    prompt: z.string().trim().min(1).max(16_000),
+    preferredModel: z.string().trim().min(1).max(128).nullable(),
+    defaultMentions: z.array(skillDefaultMentionDtoSchema).max(8),
+    steps: z.array(skillStepDtoSchema).max(12),
+  })
+  .strict();
+
+export type SkillCreateInput = z.infer<typeof skillCreateInputSchema>;
+
+export const skillUpdateInputSchema = z
+  .object({
+    id: z.string().uuid(),
+    folder: skillFolderSchema.optional(),
+    title: z.string().trim().min(1).max(120).optional(),
+    description: z.string().trim().min(1).max(400).optional(),
+    prompt: z.string().trim().min(1).max(16_000).optional(),
+    preferredModel: z.string().trim().min(1).max(128).nullable().optional(),
+    defaultMentions: z.array(skillDefaultMentionDtoSchema).max(8).optional(),
+    steps: z.array(skillStepDtoSchema).max(12).optional(),
+  })
+  .strict();
+
+export type SkillUpdateInput = z.infer<typeof skillUpdateInputSchema>;
+
+export const skillResolveInputSchema = z
+  .object({
+    skillId: z.string().uuid().optional(),
+    query: z.string().trim().min(1).max(260).optional(),
+    projectId: z.string().uuid().nullable(),
+    privacyMode: packetPrivacyModeSchema.optional(),
+  })
+  .strict()
+  .refine((value) => value.skillId !== undefined || value.query !== undefined, {
+    message: "skill resolve needs id or query",
+  });
+
+export type SkillResolveInput = z.infer<typeof skillResolveInputSchema>;
+
+export const skillResolveResultSchema = z
+  .object({
+    id: z.string().uuid(),
+    title: z.string().min(1).max(120),
+    text: z.string().min(1).max(32_000),
+    preferredModel: z.string().min(1).max(128).nullable(),
+    defaultMentions: z.array(skillDefaultMentionDtoSchema).max(8),
+    steps: z.array(skillStepDtoSchema).max(12),
+  })
+  .strict();
+
+export type SkillResolveResult = z.infer<typeof skillResolveResultSchema>;
 
