@@ -633,12 +633,12 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 
 **Sub-tasks:**
 
-- [ ] Drag/drop: PDF, DOCX, TXT, MD, CSV, imagens, código
-- [ ] Extração de texto; preview; armazenamento no projeto
-- [ ] Imagem para modelos com vision (capability gate da W5)
-- [ ] Pasta → resumo do projeto v1 (arquitetura, stack, deps, README)
-- [ ] Limite de tamanho + aviso de tokens antes de injetar
-- [ ] Arquivos passam pelo redactor antes de ir ao provider
+- [x] Drag/drop: PDF, DOCX, TXT, MD, CSV, imagens, código
+- [x] Extração de texto; preview; armazenamento no projeto
+- [x] Imagem para modelos com vision (capability gate da W5)
+- [x] Pasta → resumo do projeto v1 (arquitetura, stack, deps, README)
+- [x] Limite de tamanho + aviso de tokens antes de injetar
+- [x] Arquivos passam pelo redactor antes de ir ao provider
 
 **DoD:** arrastar um PDF e perguntar “resuma a seção 3”; arrastar pasta Node e obter stack detectada.
 
