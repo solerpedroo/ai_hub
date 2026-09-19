@@ -22,6 +22,7 @@ import {
   type FilesIngestPathsInput,
   type ProjectFileDto,
 } from "@ai-hub/shared";
+import { chunkText, embedText } from "@ai-hub/memory";
 import { isE2eMode } from "./e2e-mode";
 import { getHubDatabase } from "./persistence";
 
@@ -76,7 +77,7 @@ async function persistExtract(input: {
   const extracted = await extractFile(input.bytes, input.name);
   const text = redactSecrets(extracted.text);
   const imageJson = extracted.image ? JSON.stringify(extracted.image) : null;
-  return getHubDatabase().repos.createProjectFile({
+  const created = getHubDatabase().repos.createProjectFile({
     projectId: input.projectId,
     name: input.name,
     kind: extracted.kind,
@@ -87,6 +88,23 @@ async function persistExtract(input: {
     imageJson,
     truncated: extracted.truncated,
   });
+  indexProjectFile(created);
+  return created;
+}
+
+function indexProjectFile(file: ProjectFileRecord): void {
+  if (!file.projectId || file.extract.trim().length === 0) {
+    return;
+  }
+  getHubDatabase().repos.replaceFileChunks(
+    file.id,
+    file.projectId,
+    chunkText(file.extract).map((chunk) => ({
+      text: chunk.text,
+      embedding: embedText(chunk.text),
+      tokenEstimate: chunk.tokenEstimate,
+    })),
+  );
 }
 
 async function persistFolder(projectId: string | null, root: string): Promise<ProjectFileRecord> {
@@ -136,7 +154,7 @@ async function persistFolder(projectId: string | null, root: string): Promise<Pr
   await visit(rootReal, 0);
   const summary = summarizeFolder({ rootName: basename(root), files: entries });
   const text = redactSecrets(summary.text);
-  return getHubDatabase().repos.createProjectFile({
+  const created = getHubDatabase().repos.createProjectFile({
     projectId,
     name: basename(root),
     kind: "folder-summary",
@@ -146,6 +164,8 @@ async function persistFolder(projectId: string | null, root: string): Promise<Pr
     extract: text,
     truncated: false,
   });
+  indexProjectFile(created);
+  return created;
 }
 
 async function ingestResolved(projectId: string | null, target: string): Promise<ProjectFileRecord> {
@@ -185,6 +205,22 @@ export async function attachFromDialog(
 ): Promise<ProjectFileDto[]> {
   const fileFixture = process.env.AI_HUB_E2E_ATTACH_FILE;
   const folderFixture = process.env.AI_HUB_E2E_ATTACH_FOLDER;
+  const dirFixture = process.env.AI_HUB_E2E_ATTACH_DIR;
+  if (isE2eMode() && input.kind === "file" && dirFixture && dirFixture.trim().length > 0) {
+    const names = await readdir(resolve(dirFixture));
+    const created: ProjectFileDto[] = [];
+    for (const name of names) {
+      if (created.length >= 20) {
+        break;
+      }
+      const full = resolve(dirFixture, name);
+      const info = await stat(full);
+      if (info.isFile()) {
+        created.push(toProjectFileDto(await ingestResolved(input.projectId, full)));
+      }
+    }
+    return created;
+  }
   if (isE2eMode() && input.kind === "file" && fileFixture && fileFixture.trim().length > 0) {
     return [toProjectFileDto(await ingestResolved(input.projectId, resolve(fileFixture)))];
   }
