@@ -189,6 +189,20 @@ export const prompts = sqliteTable("prompts", {
   updatedAt: integer("updated_at", { mode: "number" }).notNull(),
 });
 
+export const artifacts = sqliteTable("artifacts", {
+  id: text("id").primaryKey(),
+  conversationId: text("conversation_id").notNull(),
+  familyId: text("family_id").notNull(),
+  sourceMessageId: text("source_message_id"),
+  kind: text("kind").notNull(),
+  titleCipher: text("title_cipher").notNull(),
+  bodyCipher: text("body_cipher").notNull(),
+  language: text("language"),
+  version: integer("version", { mode: "number" }).notNull(),
+  pinned: integer("pinned", { mode: "number" }).notNull().default(0),
+  createdAt: integer("created_at", { mode: "number" }).notNull(),
+});
+
 export const schema = {
   projects,
   conversations,
@@ -209,4 +223,5 @@ export const schema = {
   conversationWorkspace,
   conversationTasks,
   prompts,
+  artifacts,
 };
