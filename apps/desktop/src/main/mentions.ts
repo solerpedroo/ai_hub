@@ -3,15 +3,18 @@ import type { HubRepos } from "@ai-hub/db";
 import { allowsProjectContext } from "@ai-hub/memory";
 import { redactSecrets } from "@ai-hub/security";
 import {
+  composeSkillPrompt,
   MAX_MENTION_TOKENS,
   MAX_MENTIONS_PER_SEND,
   isMentionStubType,
   mentionTokenEstimate,
+  projectFileNameMatches,
   portablePacketV1Schema,
   type MentionRef,
   type PacketPrivacyMode,
 } from "@ai-hub/shared";
 import { interpolateStoredPrompt } from "./prompt-vars";
+import { matchSkill } from "./skills";
 
 export function resolveSendMentions(
   repos: HubRepos,
@@ -79,6 +82,16 @@ export function resolveSendMentions(
           continue;
         }
         seen.add(`prompt:${mention.id}`);
+        usedTokens += mentionTokenEstimate(mention.text.length);
+        mentions.push(mention);
+        continue;
+      }
+      if (ref.type === "skill") {
+        const mention = resolveSkillMention(repos, projectId, ref, remaining, privacyMode);
+        if (seen.has(`skill:${mention.id}`)) {
+          continue;
+        }
+        seen.add(`skill:${mention.id}`);
         usedTokens += mentionTokenEstimate(mention.text.length);
         mentions.push(mention);
         continue;
@@ -172,6 +185,28 @@ function resolvePromptMention(
   };
 }
 
+function resolveSkillMention(
+  repos: HubRepos,
+  projectId: string | null,
+  ref: MentionRef,
+  remainingTokens: number,
+  privacyMode: PacketPrivacyMode,
+): CompilerMention {
+  const match = matchSkill(ref.query, ref.id);
+  if (!match) {
+    throw new Error("mentions:not_found");
+  }
+  const composed = composeSkillPrompt(match.prompt, match.steps);
+  const text = redactSecrets(interpolateStoredPrompt(repos, composed, projectId, privacyMode));
+  const maxChars = Math.max(4, remainingTokens * 4);
+  return {
+    kind: "skill",
+    id: match.id,
+    name: match.title,
+    text: text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text,
+  };
+}
+
 function resolveProjectFile(
   repos: HubRepos,
   projectId: string | null,
@@ -187,9 +222,7 @@ function resolveProjectFile(
   const query = (ref.query ?? "").toLowerCase();
   const match = repos
     .listProjectFiles(projectId)
-    .find(
-      (item) => item.name.toLowerCase() === query || item.name.toLowerCase().endsWith(`/${query}`),
-    );
+    .find((item) => projectFileNameMatches(item.name, query));
   if (!match) {
     throw new Error("mentions:not_found");
   }
