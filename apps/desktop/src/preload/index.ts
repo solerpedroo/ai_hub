@@ -78,6 +78,13 @@ import {
   promptUpdateInputSchema,
   playgroundRunInputSchema,
   playgroundRunResultSchema,
+  artifactDtoSchema,
+  artifactListResultSchema,
+  artifactsListInputSchema,
+  artifactSaveVersionInputSchema,
+  artifactPinInputSchema,
+  artifactExportInputSchema,
+  artifactExportResultSchema,
   contextPacketDtoSchema,
   contextPacketListResultSchema,
   projectCreateInputSchema,
@@ -418,6 +425,17 @@ const hub: HubApi = {
   playground: {
     run: (input) =>
       invokeParsed(IpcChannel.playgroundRun, input, playgroundRunInputSchema, playgroundRunResultSchema),
+  },
+  artifacts: {
+    list: (input) =>
+      invokeParsed(IpcChannel.artifactsList, input, artifactsListInputSchema, artifactListResultSchema),
+    get: (input) => invokeParsed(IpcChannel.artifactsGet, input, idInputSchema, artifactDtoSchema),
+    saveVersion: (input) =>
+      invokeParsed(IpcChannel.artifactsSaveVersion, input, artifactSaveVersionInputSchema, artifactDtoSchema),
+    setPinned: (input) =>
+      invokeParsed(IpcChannel.artifactsSetPinned, input, artifactPinInputSchema, artifactDtoSchema),
+    exportFile: (input) =>
+      invokeParsed(IpcChannel.artifactsExport, input, artifactExportInputSchema, artifactExportResultSchema),
   },
 };
 
