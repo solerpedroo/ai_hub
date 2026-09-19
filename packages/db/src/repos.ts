@@ -23,6 +23,7 @@ import {
   projectFiles,
   projectMemories,
   prompts,
+  artifacts,
   messageReceipts,
   messages,
   projects,
@@ -216,6 +217,22 @@ export interface PromptRecord {
   factoryId: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export type ArtifactKind = "mermaid" | "html" | "markdown" | "code";
+
+export interface ArtifactRecord {
+  id: string;
+  conversationId: string;
+  familyId: string;
+  sourceMessageId: string | null;
+  kind: ArtifactKind;
+  title: string;
+  body: string;
+  language: string | null;
+  version: number;
+  pinned: boolean;
+  createdAt: string;
 }
 
 export interface SpendCapOverrideRecord {
@@ -665,6 +682,7 @@ export class HubRepos {
   }
 
   removeConversation(id: string): void {
+    this.db.delete(artifacts).where(eq(artifacts.conversationId, id)).run();
     this.db.delete(conversationTags).where(eq(conversationTags.conversationId, id)).run();
     this.db.delete(conversations).where(eq(conversations.id, id)).run();
   }
@@ -2150,6 +2168,92 @@ export class HubRepos {
     this.db.delete(prompts).where(eq(prompts.id, id)).run();
   }
 
+  createArtifact(input: {
+    conversationId: string;
+    familyId?: string;
+    sourceMessageId?: string | null;
+    kind: ArtifactKind;
+    title: string;
+    body: string;
+    language?: string | null;
+    pinned?: boolean;
+    version?: number;
+  }): ArtifactRecord {
+    const familyId = input.familyId ?? randomUUID();
+    const existing = this.listArtifactsByFamily(familyId);
+    const version =
+      input.version ??
+      (existing.length === 0 ? 1 : Math.max(...existing.map((item) => item.version)) + 1);
+    const pinned = input.pinned ?? existing[0]?.pinned ?? false;
+    const id = randomUUID();
+    const now = Date.now();
+    this.db
+      .insert(artifacts)
+      .values({
+        id,
+        conversationId: input.conversationId,
+        familyId,
+        sourceMessageId: input.sourceMessageId ?? null,
+        kind: input.kind,
+        titleCipher: encryptUtf8(input.title.slice(0, 120), this.masterKey),
+        bodyCipher: encryptUtf8(input.body.slice(0, 100_000), this.masterKey),
+        language: input.language ?? null,
+        version,
+        pinned: pinned ? 1 : 0,
+        createdAt: now,
+      })
+      .run();
+    const created = this.getArtifact(id);
+    if (!created) {
+      throw new Error("Artifact not found");
+    }
+    return created;
+  }
+
+  getArtifact(id: string): ArtifactRecord | null {
+    const row = this.db.select().from(artifacts).where(eq(artifacts.id, id)).get();
+    return row ? this.toArtifact(row) : null;
+  }
+
+  listArtifacts(conversationId: string): ArtifactRecord[] {
+    return this.db
+      .select()
+      .from(artifacts)
+      .where(eq(artifacts.conversationId, conversationId))
+      .all()
+      .map((row) => this.toArtifact(row))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.version - a.version);
+  }
+
+  listArtifactsByFamily(familyId: string): ArtifactRecord[] {
+    return this.db
+      .select()
+      .from(artifacts)
+      .where(eq(artifacts.familyId, familyId))
+      .all()
+      .map((row) => this.toArtifact(row))
+      .sort((a, b) => a.version - b.version);
+  }
+
+  listArtifactsByMessage(messageId: string): ArtifactRecord[] {
+    return this.db
+      .select()
+      .from(artifacts)
+      .where(eq(artifacts.sourceMessageId, messageId))
+      .all()
+      .map((row) => this.toArtifact(row))
+      .sort((a, b) => a.kind.localeCompare(b.kind) || a.version - b.version);
+  }
+
+  setArtifactFamilyPinned(familyId: string, pinned: boolean): ArtifactRecord[] {
+    this.db
+      .update(artifacts)
+      .set({ pinned: pinned ? 1 : 0 })
+      .where(eq(artifacts.familyId, familyId))
+      .run();
+    return this.listArtifactsByFamily(familyId);
+  }
+
   replaceFileChunks(
     fileId: string,
     projectId: string | null,
@@ -2337,6 +2441,25 @@ export class HubRepos {
         this.setConversationTaskDone(cloned.id, true);
       }
     }
+    const familyMap = new Map<string, string>();
+    for (const artifact of this.listArtifacts(id)) {
+      let nextFamily = familyMap.get(artifact.familyId);
+      if (!nextFamily) {
+        nextFamily = randomUUID();
+        familyMap.set(artifact.familyId, nextFamily);
+      }
+      this.createArtifact({
+        conversationId: copy.id,
+        familyId: nextFamily,
+        sourceMessageId: artifact.sourceMessageId ? (idMap.get(artifact.sourceMessageId) ?? null) : null,
+        kind: artifact.kind,
+        title: artifact.title,
+        body: artifact.body,
+        language: artifact.language,
+        pinned: artifact.pinned,
+        version: artifact.version,
+      });
+    }
     const created = this.getConversation(copy.id);
     if (!created) {
       throw new Error("Conversation not found");
@@ -2411,6 +2534,26 @@ export class HubRepos {
       factoryId: row.factoryId ?? null,
       createdAt: iso(row.createdAt),
       updatedAt: iso(row.updatedAt),
+    };
+  }
+
+  private toArtifact(row: typeof artifacts.$inferSelect): ArtifactRecord {
+    const kind: ArtifactKind =
+      row.kind === "mermaid" || row.kind === "html" || row.kind === "markdown" || row.kind === "code"
+        ? row.kind
+        : "markdown";
+    return {
+      id: row.id,
+      conversationId: row.conversationId,
+      familyId: row.familyId,
+      sourceMessageId: row.sourceMessageId ?? null,
+      kind,
+      title: decryptUtf8(row.titleCipher, this.masterKey),
+      body: decryptUtf8(row.bodyCipher, this.masterKey),
+      language: row.language ?? null,
+      version: row.version,
+      pinned: row.pinned === 1,
+      createdAt: iso(row.createdAt),
     };
   }
 
