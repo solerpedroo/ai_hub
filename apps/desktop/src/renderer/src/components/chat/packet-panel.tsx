@@ -88,16 +88,11 @@ export function PacketPanel({
                     disabled={Boolean(appliedPacketId) || busy}
                     data-testid="packet-privacy"
                     aria-label={t("workspace.packet.privacy")}
-                    onChange={(event) =>
-                      onPrivacyMode(
-                        event.target.value === "strict" ? "strict" : "standard",
-                      )
-                    }
+                    onChange={(event) => onPrivacyMode(event.target.value as PacketPrivacyMode)}
                   >
-                    <option value="standard">
-                      {t("workspace.packet.privacy.standard")}
-                    </option>
-                    <option value="strict">{t("workspace.packet.privacy.strict")}</option>
+                    {(["private", "normal", "maximum"] as const).map((mode) => (
+                      <option key={mode} value={mode}>{t(`privacy.mode.${mode}`)}</option>
+                    ))}
                   </select>
                 </label>
                 <section>
