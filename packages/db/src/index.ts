@@ -1,5 +1,5 @@
 export { applyMigrations } from "./migrate";
-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL } from "./migrations";
+export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL } from "./migrations";
 export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
 export {
   HubRepos,
@@ -21,5 +21,6 @@ export {
   type AppPrefsRecord,
   type ContextPacketRecord,
   type ContextPacketStored,
+  type ProjectFileRecord,
 } from "./repos";
 export { schema } from "./schema";
