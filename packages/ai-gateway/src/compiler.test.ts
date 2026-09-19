@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compileActivePath, compilePacket, mergePacketWithTail } from "./compiler";
+import { compileActivePath, compilePacket, compilePacketDetailed, mergePacketWithTail } from "./compiler";
 
 describe("compilePacket", () => {
   it("joins project instructions and skips streaming messages", () => {
@@ -37,6 +37,33 @@ describe("compilePacket", () => {
     expect(packet.tokenEstimate).toBe(
       Math.ceil((packet.system.length + "hello".length + "hi".length) / 4),
     );
+  });
+
+  it("injects attached files into the system packet and preview slices", () => {
+    const detailed = compilePacketDetailed({
+      projectInstructions: null,
+      extraSystem: null,
+      files: [
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          name: "spec.pdf",
+          text: "Section 3: payments",
+        },
+      ],
+      messages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          role: "user",
+          content: "resuma a seção 3",
+          status: "complete",
+        },
+      ],
+    });
+    expect(detailed.packet.system).toContain("Attached file: spec.pdf");
+    expect(detailed.packet.system).toContain("Section 3: payments");
+    const fileSlice = detailed.included.find((item) => item.kind === "file");
+    expect(fileSlice?.label).toBe("Attached file: spec.pdf");
+    expect(fileSlice?.label).not.toContain("payments");
   });
 
   it("never puts an apiKey field on the packet", () => {
