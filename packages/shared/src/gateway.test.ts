@@ -69,6 +69,34 @@ describe("chat contracts", () => {
     ).toThrow();
   });
 
+  it("rejects a mention ref without id or query", () => {
+    expect(() =>
+      chatSendInputSchema.parse({
+        mode: "send",
+        conversationId: "11111111-1111-4111-8111-111111111111",
+        providerKeyId: "22222222-2222-4222-8222-222222222222",
+        model: "gpt-4o-mini",
+        content: "hello",
+        mentions: [{ type: "file" }],
+      }),
+    ).toThrow();
+  });
+
+  it("accepts mentions on send without extra keys", () => {
+    const parsed = chatSendInputSchema.parse({
+      mode: "send",
+      conversationId: "11111111-1111-4111-8111-111111111111",
+      providerKeyId: "22222222-2222-4222-8222-222222222222",
+      model: "gpt-4o-mini",
+      content: "o que este repo faz?",
+      mentions: [{ type: "file", query: "README.md" }],
+    });
+    expect(parsed.mode).toBe("send");
+    if (parsed.mode === "send") {
+      expect(parsed.mentions).toEqual([{ type: "file", query: "README.md" }]);
+    }
+  });
+
   it("accepts fileIds on send without extra keys", () => {
     const parsed = chatSendInputSchema.parse({
       mode: "send",
