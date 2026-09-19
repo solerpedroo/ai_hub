@@ -129,6 +129,12 @@ export function abortChat(runId: string): void {
   runs.get(runId)?.abort.abort();
 }
 
+export async function waitForChatRun(runId: string): Promise<void> {
+  while (runs.has(runId)) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 function compilerMessages(rows: MessageRecord[]): CompilerMessage[] {
   return rows.map((item) => ({
     id: item.id,
