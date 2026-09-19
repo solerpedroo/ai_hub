@@ -43,6 +43,7 @@ import {
 } from "@ai-hub/shared";
 import { recordDebugSnapshot } from "./debug-snapshot";
 import { isE2eMode } from "./e2e-mode";
+import { captureMessageArtifacts } from "./artifacts";
 import { toMessageDto } from "./message-dto";
 import { loadSendAttachments } from "./files";
 import { resolveSendMentions } from "./mentions";
@@ -551,6 +552,11 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
         },
       });
       repos.updateMessage(assistant.id, result.content, "complete");
+      try {
+        captureMessageArtifacts(repos, assistant.id);
+      } catch {
+        // Artifact capture must not flip a completed stream to interrupted.
+      }
       writeReceipt(assistant.id, run, result.tokensIn, result.tokensOut, result.content.length, null, result.costUsd);
       repos.recordHealthSample({
         providerSlug: run.provider,
