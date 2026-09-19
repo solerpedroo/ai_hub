@@ -24,6 +24,7 @@ import {
   type ProjectUpdateInput,
   type ProjectFileDto,
   type PromptDto,
+  type SkillDto,
   type ArtifactDto,
   type ProviderKeyDto,
 } from "@ai-hub/shared";
@@ -132,6 +133,9 @@ export function HomeView({
   onPromoteConversation,
   composerInsert,
   onComposerInsertConsumed,
+  pendingSkill,
+  onPendingSkillConsumed,
+  onOpenSkills,
 }: {
   project: ProjectDto | null;
   importedInbox: boolean;
@@ -198,6 +202,9 @@ export function HomeView({
   onDropFiles: (files: File[]) => Promise<void>;
   composerInsert: string | null;
   onComposerInsertConsumed: () => void;
+  pendingSkill: { id?: string; query: string } | null;
+  onPendingSkillConsumed: () => void;
+  onOpenSkills: () => void;
 }): JSX.Element {
   const { t } = useTranslation();
   const modifier = window.hub.platform === "darwin" ? "⌘" : "Ctrl";
@@ -218,6 +225,12 @@ export function HomeView({
   const autoOpenedArtifactRef = useRef<string | null>(null);
   const [projectMemories, setProjectMemories] = useState<ProjectMemoryDto[]>([]);
   const [libraryPrompts, setLibraryPrompts] = useState<PromptDto[]>([]);
+  const [librarySkills, setLibrarySkills] = useState<SkillDto[]>([]);
+  const [skillRun, setSkillRun] = useState<{
+    title: string;
+    steps: Array<{ id: string; title: string }>;
+    status: "running" | "complete";
+  } | null>(null);
   const [memoryOptedOut, setMemoryOptedOut] = useState(false);
   const [memorySuggestions, setMemorySuggestions] = useState<string[]>([]);
   const [conversationWorkspace, setConversationWorkspace] = useState<ConversationWorkspaceDto | null>(
@@ -303,6 +316,25 @@ export function HomeView({
             available: memory !== undefined,
           };
         }
+        if (item.type === "skill") {
+          const skill = librarySkills.find((row) => {
+            const label = row.factoryId ? t(`skills.factory.${row.factoryId}`) : row.title;
+            return (
+              row.title.toLowerCase() === item.query.toLowerCase() ||
+              label.toLowerCase() === item.query.toLowerCase() ||
+              (row.factoryId ?? "").toLowerCase() === item.query.toLowerCase()
+            );
+          });
+          return {
+            type: item.type,
+            id: skill?.id ?? null,
+            query: item.query,
+            label: skill?.title ?? item.query,
+            excerpt: skill?.description.slice(0, 120) ?? item.query,
+            tokens: skill ? Math.ceil(skill.prompt.length / 4) : 0,
+            available: skill !== undefined,
+          };
+        }
         if (item.type === "prompt") {
           const prompt = libraryPrompts.find((row) => {
             const label = row.factoryId ? t(`prompts.factory.${row.factoryId}`) : row.title;
@@ -372,6 +404,32 @@ export function HomeView({
   }, [composerInsert, onComposerDraft, onComposerInsertConsumed]);
 
   useEffect(() => {
+    if (!pendingSkill) {
+      return;
+    }
+    const remainder = draft;
+    const mentions: MentionRef[] = [
+      pendingSkill.id
+        ? { type: "skill", id: pendingSkill.id }
+        : { type: "skill", query: pendingSkill.query },
+      ...mentionRefsFrom(mentionChips, remainder),
+    ];
+    const next = mentionVisibleContent(remainder);
+    onPendingSkillConsumed();
+    sendDraft(next || `@skill:${pendingSkill.query}`, mentions);
+  }, [pendingSkill]);
+
+  useEffect(() => {
+    if (!skillRun || skillRun.status !== "running") {
+      return;
+    }
+    const last = messages.at(-1);
+    if (last?.role === "assistant" && last.status === "complete") {
+      setSkillRun({ ...skillRun, status: "complete" });
+    }
+  }, [messages, skillRun]);
+
+  useEffect(() => {
     void window.hub.files
       .list({ projectId: project?.id ?? null })
       .then(setProjectFiles)
@@ -383,6 +441,10 @@ export function HomeView({
       .list()
       .then(setLibraryPrompts)
       .catch(() => setLibraryPrompts([]));
+    void window.hub.skills
+      .list()
+      .then(setLibrarySkills)
+      .catch(() => setLibrarySkills([]));
   }, []);
 
   useEffect(() => {
@@ -480,7 +542,43 @@ export function HomeView({
       case "cap":
         onOpenCaps();
         return;
+      case "skill":
+        onOpenSkills();
+        return;
     }
+  };
+
+  const sendDraft = (content: string, mentions: MentionRef[]): void => {
+    const skillMention = mentions.find((item) => item.type === "skill");
+    if (skillMention) {
+      const skill = librarySkills.find((row) => {
+        const label = row.factoryId ? t(`skills.factory.${row.factoryId}`) : row.title;
+        const query = (skillMention.query ?? "").toLowerCase();
+        return (
+          row.id === skillMention.id ||
+          row.title.toLowerCase() === query ||
+          label.toLowerCase() === query ||
+          (row.factoryId ?? "").toLowerCase() === query
+        );
+      });
+      if (skill) {
+        setSkillRun({
+          title: skill.factoryId ? t(`skills.factory.${skill.factoryId}`) : skill.title,
+          steps: skill.steps.map((step) => ({ id: step.id, title: step.title })),
+          status: "running",
+        });
+      }
+    }
+    void onSend(content, mentions).then((ok) => {
+      if (ok) {
+        setDraft("");
+        setMentionChips([]);
+        onComposerDraft("");
+        onMentionsChange([]);
+      } else if (skillMention) {
+        setSkillRun(null);
+      }
+    });
   };
 
   return (
@@ -1300,6 +1398,34 @@ export function HomeView({
                     </ul>
                   ) : null}
                 </div>
+                {skillRun ? (
+                  <div
+                    className="border-t px-2 py-1.5"
+                    data-testid="skill-run"
+                    data-status={skillRun.status}
+                  >
+                    <p className="text-[12px] font-medium">
+                      {t("skills.run.title", { name: skillRun.title })}
+                    </p>
+                    <ol className="mt-1 flex flex-wrap gap-1">
+                      {skillRun.steps.map((step, index) => {
+                        const current = skillRun.status === "running";
+                        return (
+                          <li
+                            key={step.id}
+                            data-testid="skill-step"
+                            data-current={current ? "true" : "false"}
+                            className={`rounded border px-1.5 py-0.5 text-[11px] ${
+                              current ? "border-foreground" : "border-border text-muted-foreground"
+                            }`}
+                          >
+                            {index + 1}. {step.title}
+                          </li>
+                        );
+                      })}
+                    </ol>
+                  </div>
+                ) : null}
                 <ChatComposer
                   key={selectedConversationId}
                   value={draft}
@@ -1331,20 +1457,6 @@ export function HomeView({
                           available: !isMentionStubType(type),
                         })),
                       );
-                      return;
-                    }
-                    if (isMentionStubType(parts.type)) {
-                      setMentionSuggestions([
-                        {
-                          type: parts.type,
-                          id: null,
-                          query: parts.query,
-                          label: t(`mentions.type.${parts.type}`),
-                          excerpt: t("mentions.stub"),
-                          tokens: 0,
-                          available: false,
-                        },
-                      ]);
                       return;
                     }
                     const query = parts.query.toLowerCase();
@@ -1381,6 +1493,32 @@ export function HomeView({
                             label: item.title,
                             excerpt: item.body.slice(0, 120),
                             tokens: Math.ceil(item.body.length / 4),
+                            available: true,
+                          })),
+                      );
+                      return;
+                    }
+                    if (parts.type === "skill") {
+                      setMentionSuggestions(
+                        librarySkills
+                          .filter((item) => {
+                            const label = item.factoryId
+                              ? t(`skills.factory.${item.factoryId}`)
+                              : item.title;
+                            return (
+                              label.toLowerCase().includes(query) ||
+                              item.title.toLowerCase().includes(query) ||
+                              item.description.toLowerCase().includes(query)
+                            );
+                          })
+                          .slice(0, 8)
+                          .map((item) => ({
+                            type: "skill" as const,
+                            id: item.id,
+                            query: item.title,
+                            label: item.factoryId ? t(`skills.factory.${item.factoryId}`) : item.title,
+                            excerpt: item.description.slice(0, 120),
+                            tokens: Math.ceil(item.prompt.length / 4),
                             available: true,
                           })),
                       );
@@ -1478,21 +1616,27 @@ export function HomeView({
                     if (!next && mentions.length === 0) {
                       return;
                     }
-                    void onSend(next || mentionChips.map((chip) => `@${chip.type}:${chip.query}`).join(" "), mentions).then(
-                      (ok) => {
-                        if (ok) {
-                          setDraft("");
-                          setMentionChips([]);
-                          onComposerDraft("");
-                          onMentionsChange([]);
-                        }
-                      },
+                    sendDraft(
+                      next || mentionChips.map((chip) => `@${chip.type}:${chip.query}`).join(" "),
+                      mentions,
                     );
                   }}
                   onAbort={() => {
                     void onAbort();
                   }}
                   onSlashCommand={runSlashCommand}
+                  onSkillSlash={(query, remainder) => {
+                    if (!query) {
+                      onOpenSkills();
+                      return;
+                    }
+                    const mentions: MentionRef[] = [
+                      { type: "skill", query },
+                      ...mentionRefsFrom(mentionChips, remainder),
+                    ];
+                    const next = mentionVisibleContent(remainder);
+                    sendDraft(next || `@skill:${query}`, mentions);
+                  }}
                   onFilesDrop={(files) => {
                     void onDropFiles(files);
                   }}
