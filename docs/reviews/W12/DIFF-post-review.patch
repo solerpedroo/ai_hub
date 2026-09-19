@@ -1,0 +1,366 @@
+diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts index 9c711fe..31953dd 100644 --- a/apps/desktop/src/main/chat-session.ts +++ b/apps/desktop/src/main/chat-session.ts @@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";  import type { WebContents } from "electron";  import {    composeReceipt, +  appendFilesToPacket,    compileActivePath,    compilePacket,    consumeCrashSafeStream, @@ -18,6 +19,7 @@ import {    type ProviderAdapter,  } from "@ai-hub/ai-gateway";  import type { ConversationRecord, MessageRecord } from "@ai-hub/db"; +import { stripAttachedFileBodiesForRenderer } from "@ai-hub/files";  import { redactSecrets } from "@ai-hub/security";  import {    activePath, @@ -40,6 +42,7 @@ import {  import { recordDebugSnapshot } from "./debug-snapshot";  import { isE2eMode } from "./e2e-mode";  import { toMessageDto } from "./message-dto"; +import { loadSendAttachments } from "./files";  import { getHubDatabase } from "./persistence";  import { estimateOutgoingCostUsd, evaluateOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";   @@ -72,7 +75,11 @@ function adapterFor(slug: string, baseUrl: string | null): ProviderAdapter {  }    function inspectablePacket(packet: ProviderAgnosticPacket): ProviderAgnosticPacket { -  return packetV0Schema.parse(JSON.parse(redactSecrets(JSON.stringify(packet))) as unknown); +  const stripped = { +    ...packet, +    system: stripAttachedFileBodiesForRenderer(packet.system), +  }; +  return packetV0Schema.parse(JSON.parse(redactSecrets(JSON.stringify(stripped))) as unknown);  }    function emit(sender: WebContents, event: ChatEvent): void { @@ -332,7 +339,21 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi    }      const project = conversation.projectId ? repos.getProject(conversation.projectId) : null; -  const packet = compileOutgoing(input, project?.instructions ?? null, compileRows, key.providerSlug, conversation); +  const catalogForVision = findCatalogModel(input.model, key.providerSlug); +  const attachments = loadSendAttachments( +    input.fileIds, +    conversation.projectId, +    catalogForVision?.vision === true, +    "send", +  ); +  const compiled = compileOutgoing( +    input, +    project?.instructions ?? null, +    compileRows, +    key.providerSlug, +    conversation, +  ); +  const packet = appendFilesToPacket(compiled, attachments.files).packet;    if (packet.messages.length === 0) {      throw new Error("Add a user message before sending");    } @@ -387,7 +408,11 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi      });    }   -  console.info("[hub:packet]", redactSecrets(JSON.stringify(packet))); +  console.info("[hub:packet]", { +    tokens: packet.tokenEstimate, +    messages: packet.messages.length, +    systemChars: packet.system.length, +  });    const publicPacket = inspectablePacket(packet);      const userMessage = persistUser ? persistUser() : null; @@ -468,6 +493,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi                signal: run.abort.signal,                temperature: input.temperature ?? 1,                maxTokens: input.maxTokens ?? null, +              ...(attachments.images.length > 0 ? { images: attachments.images } : {}),              }),              onDelta: (text) => {                streamed = true; diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts index 68da176..1fb2965 100644 --- a/apps/desktop/src/main/ipc.ts +++ b/apps/desktop/src/main/ipc.ts @@ -46,6 +46,11 @@ import {    packetsExportResultSchema,    packetsImportInputSchema,    packetsListInputSchema, +  projectFileListInputSchema, +  projectFileListResultSchema, +  filesAttachInputSchema, +  filesIngestPathsInputSchema, +  filesRemoveInputSchema,    contextPacketDtoSchema,    contextPacketListResultSchema,    projectCreateInputSchema, @@ -81,6 +86,7 @@ import {    listProjectPackets,    pickPacketFile,  } from "./packet-file"; +import { attachFromDialog, ingestDroppedPaths, listProjectFileDtos, removeProjectFile } from "./files";  import { previewPacket } from "./packet-preview";  import { getHubDatabase } from "./persistence";  import { testProviderKey } from "./provider-health"; @@ -368,6 +374,31 @@ export function registerWorkspaceIpc(): void {      (input) => previewPacket(input),    );   +  registerHandler( +    IpcChannel.filesList, +    projectFileListInputSchema, +    projectFileListResultSchema, +    (input) => listProjectFileDtos(input.projectId), +  ); + +  registerHandler( +    IpcChannel.filesAttach, +    filesAttachInputSchema, +    projectFileListResultSchema, +    (input, event) => attachFromDialog(input, event.sender), +  ); + +  registerHandler( +    IpcChannel.filesIngestPaths, +    filesIngestPathsInputSchema, +    projectFileListResultSchema, +    (input) => ingestDroppedPaths(input), +  ); + +  registerHandler(IpcChannel.filesRemove, filesRemoveInputSchema, ipcAckResultSchema, (input) => { +    removeProjectFile(input.id, input.projectId); +  }); +    registerHandler(IpcChannel.spendCapsGet, emptyIpcPayloadSchema, spendCapListResultSchema, () => {      const rows = getHubDatabase().repos.listSpendCaps();      return SPEND_CAP_SCOPES.map((scope) => ({ diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts index cb58cd3..3ea5713 100644 --- a/apps/desktop/src/preload/index.ts +++ b/apps/desktop/src/preload/index.ts @@ -1,4 +1,4 @@ -import { contextBridge, ipcRenderer } from "electron"; +import { contextBridge, ipcRenderer, webUtils } from "electron";  import { ZodError, type ZodType } from "zod";  import {    IpcChannel, @@ -49,6 +49,11 @@ import {    packetsExportResultSchema,    packetsImportInputSchema,    packetsListInputSchema, +  projectFileListInputSchema, +  projectFileListResultSchema, +  filesAttachInputSchema, +  filesIngestPathsInputSchema, +  filesRemoveInputSchema,    contextPacketDtoSchema,    contextPacketListResultSchema,    projectCreateInputSchema, @@ -304,6 +309,33 @@ const hub: HubApi = {      clear: (input) =>        invokeParsed(IpcChannel.packetsClear, input, packetsClearInputSchema, conversationDtoSchema),    }, +  files: { +    list: (input) => +      invokeParsed( +        IpcChannel.filesList, +        input, +        projectFileListInputSchema, +        projectFileListResultSchema, +      ), +    attach: (input) => +      invokeParsed(IpcChannel.filesAttach, input, filesAttachInputSchema, projectFileListResultSchema), +    fromDrop: (input) => { +      const list = Array.isArray(input.files) ? input.files : []; +      const items = list.flatMap((item) => { +        if (typeof File !== "undefined" && item instanceof File) { +          return [{ path: webUtils.getPathForFile(item), name: item.name }]; +        } +        return []; +      }); +      return invokeParsed( +        IpcChannel.filesIngestPaths, +        { projectId: input.projectId, items }, +        filesIngestPathsInputSchema, +        projectFileListResultSchema, +      ); +    }, +    remove: (input) => invokeAckWith(IpcChannel.filesRemove, input, filesRemoveInputSchema), +  },  };    contextBridge.exposeInMainWorld("hub", hub); diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx index 4a29267..e548301 100644 --- a/apps/desktop/src/renderer/src/App.tsx +++ b/apps/desktop/src/renderer/src/App.tsx @@ -15,6 +15,7 @@ import type {    PacketPrivacyMode,    ProjectDto,    ProjectUpdateInput, +  ProjectFileDto,    ProviderKeyDto,    SearchHit,  } from "@ai-hub/shared"; @@ -76,6 +77,21 @@ function workspaceErrorText(    if (classified.kind === "unknown_model") {      return { text: t("workspace.error.unknownModel"), cap: false };    } +  if (message.includes("files:vision_required")) { +    return { text: t("files.error.vision"), cap: false }; +  } +  if (message.includes("files:too_large")) { +    return { text: t("files.error.tooLarge"), cap: false }; +  } +  if (message.includes("files:unsupported")) { +    return { text: t("files.error.unsupported"), cap: false }; +  } +  if (message.includes("files:project_mismatch")) { +    return { text: t("files.error.projectMismatch"), cap: false }; +  } +  if (message.includes("files:limit")) { +    return { text: t("files.error.limit"), cap: false }; +  }    if (      classified.kind === "gateway" &&      classified.code && @@ -86,6 +102,10 @@ function workspaceErrorText(    return { text: t("workspace.error.generic"), cap: false };  }   +function fileIdsPayload(files: ProjectFileDto[]): { fileIds: string[] } | Record<string, never> { +  return files.length > 0 ? { fileIds: files.map((file) => file.id) } : {}; +} +  function chatEventErrorText(t: TFunction, code: GatewayErrorCode): string {    if (GATEWAY_ERROR_KEYS.has(code)) {      return t(`workspace.error.${code}`); @@ -129,6 +149,7 @@ export function App(): JSX.Element {    const [costs, setCosts] = useState<CostsAggregateResult | null>(null);    const [showAllowOnce, setShowAllowOnce] = useState(false);    const [composerDraft, setComposerDraft] = useState(""); +  const [attachedFiles, setAttachedFiles] = useState<ProjectFileDto[]>([]);    const [shortcutsOpen, setShortcutsOpen] = useState(false);    const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");    const [fallback, setFallback] = useState<{ @@ -446,6 +467,7 @@ export function App(): JSX.Element {            ...(extra !== undefined ? { extraSystem: extra } : {}),            ...(pending !== undefined ? { pendingContent: pending } : {}),            ...(maxTokens !== null ? { maxTokens } : {}), +          ...fileIdsPayload(attachedFiles),          })          .then(setPacketPreview)          .catch(fail); @@ -464,6 +486,7 @@ export function App(): JSX.Element {      selectedModel,      privacyMode,      activePacketId, +    attachedFiles,    ]);      useEffect(() => { @@ -544,10 +567,12 @@ export function App(): JSX.Element {          privacyMode,          ...(extra !== undefined ? { extraSystem: extra } : {}),          ...(maxTokens !== null ? { maxTokens } : {}), +        ...fileIdsPayload(attachedFiles),        })        .then(setFallbackPreview)        .catch(() => setFallbackPreview(null));    }, [ +    attachedFiles,      compactHistory,      extraSystem,      fallback, @@ -660,6 +685,7 @@ export function App(): JSX.Element {        abortIfLeaving(null);        setSelectedProjectId(id);        setImportedInbox(false); +      setAttachedFiles([]);        setSelectedConversationId(null);        setMessages([]);        setBranchLabels({}); @@ -818,6 +844,7 @@ export function App(): JSX.Element {            onSelectImportedInbox={() => {              abortIfLeaving(null);              setSelectedProjectId(null); +            setAttachedFiles([]);              setImportedInbox(true);              setSelectedConversationId(null);              setMessages([]); @@ -909,6 +936,7 @@ export function App(): JSX.Element {                    maxTokens,                    extraSystem,                    compactHistory, +                  ...fileIdsPayload(attachedFiles),                  });                }}                onAbort={async () => { @@ -934,6 +962,7 @@ export function App(): JSX.Element {                    temperature,                    maxTokens,                    extraSystem, +                  ...fileIdsPayload(attachedFiles),                  });                }}                onContinue={async () => { @@ -948,6 +977,7 @@ export function App(): JSX.Element {                    temperature,                    maxTokens,                    extraSystem, +                  ...fileIdsPayload(attachedFiles),                  });                }}                onEditUser={async (id, content) => { @@ -964,6 +994,7 @@ export function App(): JSX.Element {                    temperature,                    maxTokens,                    extraSystem, +                  ...fileIdsPayload(attachedFiles),                  });                }}                onActivate={async (id) => { @@ -1203,6 +1234,71 @@ export function App(): JSX.Element {                  }                }}                onOpenCaps={() => openSettings("caps")} +              attachedFiles={attachedFiles} +              onAttachFile={async () => { +                try { +                  const created = await window.hub.files.attach({ +                    projectId: selectedProjectId, +                    kind: "file", +                  }); +                  setAttachedFiles((current) => +                    [...current, ...created.filter((item) => !current.some((row) => row.id === item.id))].slice( +                      0, +                      8, +                    ), +                  ); +                  setError(null); +                } catch (error) { +                  const mapped = workspaceErrorText(t, error); +                  setError(mapped.text); +                } +              }} +              onAttachFolder={async () => { +                try { +                  const created = await window.hub.files.attach({ +                    projectId: selectedProjectId, +                    kind: "folder", +                  }); +                  setAttachedFiles((current) => +                    [...current, ...created.filter((item) => !current.some((row) => row.id === item.id))].slice( +                      0, +                      8, +                    ), +                  ); +                  setError(null); +                } catch (error) { +                  const mapped = workspaceErrorText(t, error); +                  setError(mapped.text); +                } +              }} +              onRemoveFile={async (id) => { +                try { +                  await window.hub.files.remove({ id, projectId: selectedProjectId }); +                  setAttachedFiles((current) => current.filter((item) => item.id !== id)); +                  setError(null); +                } catch (error) { +                  const mapped = workspaceErrorText(t, error); +                  setError(mapped.text); +                } +              }} +              onDropFiles={async (files) => { +                try { +                  const created = await window.hub.files.fromDrop({ +                    projectId: selectedProjectId, +                    files, +                  }); +                  setAttachedFiles((current) => +                    [...current, ...created.filter((item) => !current.some((row) => row.id === item.id))].slice( +                      0, +                      8, +                    ), +                  ); +                  setError(null); +                } catch (error) { +                  const mapped = workspaceErrorText(t, error); +                  setError(mapped.text); +                } +              }}              />            ) : view === "debug" ? (              <DebugView /> @@ -1287,6 +1383,7 @@ export function App(): JSX.Element {                        temperature,                        maxTokens,                        extraSystem, +                      ...fileIdsPayload(attachedFiles),                      });                    }}                  > diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx index 9137c7a..bc015f4 100644 --- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx +++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx @@ -13,6 +13,7 @@ import {    type PacketPrivacyMode,    type ProjectDto,    type ProjectUpdateInput, +  type ProjectFileDto,    type ProviderKeyDto,  } from "@ai-hub/shared";  import { ChatComposer, type SlashCommandId } from "@/components/chat/chat-composer"; @@ -90,6 +91,11 @@ export function HomeView({    onApplyPacket,    onClearPacket,    onOpenCaps, +  attachedFiles, +  onAttachFile, +  onAttachFolder, +  onRemoveFile, +  onDropFiles,  }: {    project: ProjectDto | null;    importedInbox: boolean; @@ -146,6 +152,11 @@ export function HomeView({    onApplyPacket: (packetId: string) => Promise<void>;    onClearPacket: () => Promise<void>;    onOpenCaps: () => void; +  attachedFiles: ProjectFileDto[]; +  onAttachFile: () => Promise<void>; +  onAttachFolder: () => Promise<void>; +  onRemoveFile: (id: string) => Promise<void>; +  onDropFiles: (files: File[]) => Promise<void>;  }): JSX.Element {    const { t } = useTranslation();    const modifier = window.hub.platform === "darwin" ? "Ôîÿ" : "Ctrl"; @@ -805,6 +816,81 @@ export function HomeView({                      aria-label={t("workspace.extraSystem")}                    />                  </label> +                <div className="flex flex-col gap-1.5"> +                  <div className="flex flex-wrap items-center gap-1.5"> +                    <Button +                      type="button" +                      size="sm" +                      variant="outline" +                      data-testid="files-attach" +                      disabled={busy || editing} +                      onClick={() => { +                        void onAttachFile(); +                      }} +                    > +                      {t("files.attach")} +                    </Button> +                    <Button +                      type="button" +                      size="sm" +                      variant="outline" +                      data-testid="files-attach-folder" +                      disabled={busy || editing} +                      onClick={() => { +                        void onAttachFolder(); +                      }} +                    > +                      {t("files.attachFolder")} +                    </Button> +                  </div> +                  {attachedFiles.length > 0 ? ( +                    <ul className="flex flex-col gap-1" data-testid="files-attached"> +                      {attachedFiles.map((file) => ( +                        <li +                          key={file.id} +                          className="flex items-center justify-between gap-2 rounded-md border px-2 py-1 text-[12px]" +                          data-testid="files-chip" +                        > +                          <span className="min-w-0 truncate"> +                            {file.name} +                            <span className="ml-2 text-muted-foreground"> +                              {t("files.tokens", { n: file.tokenEstimate })} +                            </span> +                            {file.truncated ? ( +                              <span className="ml-2 text-muted-foreground">{t("files.truncated")}</span> +                            ) : null} +                            {file.visionRequired ? ( +                              <span className="ml-2 text-muted-foreground"> +                                {t("files.visionHint")} +                              </span> +                            ) : null} +                            {file.excerpt ? ( +                              <span className="ml-2 text-muted-foreground">{file.excerpt}</span> +                            ) : null} +                          </span> +                          <Button +                            type="button" +                            size="sm" +                            variant="ghost" +                            data-testid="files-remove" +                            onClick={() => { +                              void onRemoveFile(file.id); +                            }} +                          > +                            {t("files.remove")} +                          </Button> +                        </li> +                      ))} +                    </ul> +                  ) : null} +                  {attachedFiles.length > 0 ? ( +                    <p className="text-[11px] text-muted-foreground" data-testid="files-token-warning"> +                      {t("files.tokenWarning", { +                        n: attachedFiles.reduce((sum, file) => sum + file.tokenEstimate, 0), +                      })} +                    </p> +                  ) : null} +                </div>                  <ChatComposer                    key={selectedConversationId}                    value={draft} @@ -831,6 +917,9 @@ export function HomeView({                      void onAbort();                    }}                    onSlashCommand={runSlashCommand} +                  onFilesDrop={(files) => { +                    void onDropFiles(files); +                  }}                  />                </div>                {treeOpen ? ( diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json index bbbc1ba..5030585 100644 --- a/apps/desktop/src/renderer/src/locales/en.json +++ b/apps/desktop/src/renderer/src/locales/en.json @@ -105,6 +105,18 @@    "workspace.error.chat": "The model request failed ({{code}}).",    "workspace.error.cap": "Spend cap reached ({{scope}}). This send was not started.",    "workspace.error.unknownModel": "That model is not in the local catalog for this provider.", +  "files.attach": "Attach file", +  "files.attachFolder": "Attach folder", +  "files.remove": "Remove", +  "files.tokens": "~{{n}} tokens", +  "files.visionHint": "Needs a vision model", +  "files.tokenWarning": "These files add ~{{n}} tokens before the message is sent.", +  "files.truncated": "Preview is truncated", +  "files.error.vision": "This model cannot read images. Pick one marked Vision or remove the image.", +  "files.error.tooLarge": "That file is over the 8 MB limit.", +  "files.error.unsupported": "That file type is not supported.", +  "files.error.projectMismatch": "That file belongs to another project.", +  "files.error.limit": "You can attach up to 8 files per send.",    "workspace.error.timeout": "The provider timed out. Retry or try another model.",    "workspace.error.rate_limit": "The provider is rate-limiting this key. Wait and retry.",    "workspace.error.auth": "The provider rejected this key. Check it in Settings.", diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json index 7e4b5ac..4043822 100644 --- a/apps/desktop/src/renderer/src/locales/pt-BR.json +++ b/apps/desktop/src/renderer/src/locales/pt-BR.json @@ -105,6 +105,18 @@    "workspace.error.chat": "A chamada ao modelo falhou ({{code}}).",    "workspace.error.cap": "Teto de gasto atingido ({{scope}}). Este envio n├úo come├ºou.",    "workspace.error.unknownModel": "Este modelo n├úo est├í no cat├ílogo local deste provedor.", +  "files.attach": "Anexar arquivo", +  "files.attachFolder": "Anexar pasta", +  "files.remove": "Remover", +  "files.tokens": "~{{n}} tokens", +  "files.visionHint": "Precisa de modelo com vision", +  "files.tokenWarning": "Estes arquivos somam ~{{n}} tokens antes do envio.", +  "files.truncated": "Pr├®via truncada", +  "files.error.vision": "Este modelo n├úo l├¬ imagens. Escolha um marcado Vision ou remova a imagem.", +  "files.error.tooLarge": "Esse arquivo passa do limite de 8 MB.", +  "files.error.unsupported": "Esse tipo de arquivo n├úo ├® suportado.", +  "files.error.projectMismatch": "Esse arquivo pertence a outro projeto.", +  "files.error.limit": "D├í para anexar no m├íximo 8 arquivos por envio.",    "workspace.error.timeout": "O provedor estourou o tempo. Tente de novo ou troque o modelo.",    "workspace.error.rate_limit": "O provedor est├í limitando esta chave. Espere e tente de novo.",    "workspace.error.auth": "O provedor recusou esta chave. Verifique em Configura├º├Áes.", diff --git a/docs/ADR/README.md b/docs/ADR/README.md index 93dfbe9..53cb1af 100644 --- a/docs/ADR/README.md +++ b/docs/ADR/README.md @@ -82,3 +82,7 @@ N├úo escrever ADR de detalhe cosm├®tica. Se mexe em seguran├ºa, custo, provider  | [ADR-W10-003](./ADR-W10-003-deterministic-inactive-summary-and-pins.md) | W10 | Resumo de ramos inativos sem LLM; pins no compact | accepted |  | [ADR-W11-001](./ADR-W11-001-slash-commands-local-ui.md) | W11 | Slash commands s├úo a├º├Áes locais, n├úo send | accepted |  | [ADR-W11-002](./ADR-W11-002-palette-reuses-w6-search.md) | W11 | Paleta reusa busca W6; FTS5 continua vazio | accepted | +| [ADR-W12-001](./ADR-W12-001-files-package-and-encrypted-extract.md) | W12 | Pacote `files` + extract cifrado | accepted | +| [ADR-W12-002](./ADR-W12-002-files-inject-as-compiler-slices.md) | W12 | Anexos entram como fatias do compiler, n├úo no packet v1 | accepted | +| [ADR-W12-003](./ADR-W12-003-vision-images-on-stream-not-packet.md) | W12 | Imagens no stream, n├úo no packet; gate `vision` | accepted | +| [ADR-W12-004](./ADR-W12-004-pdf-flatedecode-inflate.md) | W12 | PDF: inflate FlateDecode + literais Tj | accepted | diff --git a/docs/IMPLEMENTATION_PLAN.md b/docs/IMPLEMENTATION_PLAN.md index b1a102d..3bbcc44 100644 --- a/docs/IMPLEMENTATION_PLAN.md +++ b/docs/IMPLEMENTATION_PLAN.md @@ -633,12 +633,12 @@ O que **n├úo** entra no MVP (W0ÔÇôW8), mesmo sendo tentador: RAG, Council, MCP,    **Sub-tasks:**   -- [ ] Drag/drop: PDF, DOCX, TXT, MD, CSV, imagens, c├│digo -- [ ] Extra├º├úo de texto; preview; armazenamento no projeto -- [ ] Imagem para modelos com vision (capability gate da W5) -- [ ] Pasta ÔåÆ resumo do projeto v1 (arquitetura, stack, deps, README) -- [ ] Limite de tamanho + aviso de tokens antes de injetar -- [ ] Arquivos passam pelo redactor antes de ir ao provider +- [x] Drag/drop: PDF, DOCX, TXT, MD, CSV, imagens, c├│digo +- [x] Extra├º├úo de texto; preview; armazenamento no projeto +- [x] Imagem para modelos com vision (capability gate da W5) +- [x] Pasta ÔåÆ resumo do projeto v1 (arquitetura, stack, deps, README) +- [x] Limite de tamanho + aviso de tokens antes de injetar +- [x] Arquivos passam pelo redactor antes de ir ao provider    **DoD:** arrastar um PDF e perguntar ÔÇ£resuma a se├º├úo 3ÔÇØ; arrastar pasta Node e obter stack detectada.   diff --git a/docs/STATUS.md b/docs/STATUS.md index 77dd5a1..40bb374 100644 --- a/docs/STATUS.md +++ b/docs/STATUS.md @@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave    | Field | Value |  |---|---| -| Wave | **W12** | +| Wave | **W13** |  | Marco | C ÔÇö V1 |  | State | `pending` | -| Last completed | **W11** | -| Next action | W12.1: drag/drop + extra├º├úo de texto (PDF, DOCX, TXT, MD, CSV, imagens, c├│digo) | +| Last completed | **W12** | +| Next action | Start Wave 13 (@-mentions) |    `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.   @@ -20,14 +20,14 @@ None.    ## Open residual risks   -- W00ÔÇôW11 n├úo revalidaram a janela Electron com chaves reais ap├│s o ├║ltimo gate (e2e usa mock). +- W00ÔÇôW12 n├úo revalidaram a janela Electron com chaves reais ap├│s o ├║ltimo gate (e2e usa mock).  - Instalador NSIS gerado no gate W08; install em m├íquina limpa n├úo corrido.  - macOS n├úo exercitado / n├úo assinado.  - Dev CSP com `unsafe-eval` para HMR (ADR-W00-003).  - `better-sqlite3` tem um bin├írio s├│: `pnpm dev` recompila para Electron; `pnpm test` no `db` restaura o ABI do Node. e2e precisa de `rebuild:native`.  - Busca W6/W11 decripta no main e **n├úo** popula `messages_fts` (ADR-W06-001, ADR-W11-002). ├ìndice FTS5 continua vazio; O(n) local. Paleta reusa o mesmo `search:query`.  - Tags e `preferred_*` em plaintext (ADR-W06-004). -- Zustand ainda n├úo foi introduzido; W0ÔÇôW11 usam `useState` (barulho vs stack travada). +- Zustand ainda n├úo foi introduzido; W0ÔÇôW12 usam `useState` (barulho vs stack travada).  - `AI_HUB_E2E=1` s├│ liga mock se o app **n├úo** est├í empacotado; unpackaged + env ainda ├® o caminho CI.  - Caps projeto/provider ficam para W18; request/day/global j├í hard-stopam `chat:send`.  - Feed de auto-update (GitHub Releases) pode estar vazio; o check n├úo derruba o app (`unavailable`/`skipped`). @@ -35,17 +35,18 @@ None.  - Import Hub: e2e com fixture ChatGPT, n├úo ZIP real da OpenAI; cancel durante inflate/parse ainda s├¡ncrono no main; Gemini ├® activity log; ZIP Zip64/data descriptor ÔåÆ extrair JSON.  - Packet importado grande + modelo com janela menor ÔåÆ `context_overflow` (compact n├úo corta o envelope). Labels `origin` em plaintext.  - Paleta: falha de `search:query` parece lista vazia; key `command.search` ├│rf├ú; colar secret na paleta herda o contrato W6. +- PDF W12: extra├º├úo v1 (Tj + FlateDecode). CID/ToUnicode pode sair vazio. Nome do ficheiro em plaintext. Canal `files:ingestPaths` existe s├│ para o preload.    ## Notes for the next session   -- W11 fechada. Pr├│xima: **W12 Arquivos e multimodal b├ísico** (drag/drop, extra├º├úo, vision gate W5, pasta ÔåÆ resumo v1, limite + redactor). -- N├úo implementar @-mentions (W13), RAG, MCP, agentes, run modes. -- Slash `/` ├® UI local (ADR-W11-001). N├úo mandar comandos conhecidos a `chat:send`. -- Composer j├í tem listbox de slash; W12 n├úo pode tapar o teclado no drop. +- W12 fechada. N├úo implementar @-mentions at├® arrancar W13. +- W13 `@file` deve reusar `project_files` + `fileIds` + `assertFileAttachmentAccess` (n├úo novo store). +- Slash `/` ├® UI local (ADR-W11-001). Composer j├í tem listbox; `@` ├® outro trigger. +- Packet v1 **n├úo** leva extract de ficheiros (ADR-W12-002). Imagens s├│ no stream (ADR-W12-003).    ## Last review / ADR    | Kind | Path |  |---|---| -| Review | `docs/reviews/W11/REVIEW.md` | -| Latest ADR | `docs/ADR/ADR-W11-002-palette-reuses-w6-search.md` +| Review | `docs/reviews/W12/REVIEW.md` | +| Latest ADR | `docs/ADR/ADR-W12-004-pdf-flatedecode-inflate.md` diff --git a/packages/ai-gateway/src/compiler.test.ts b/packages/ai-gateway/src/compiler.test.ts index b8d2448..302508a 100644 --- a/packages/ai-gateway/src/compiler.test.ts +++ b/packages/ai-gateway/src/compiler.test.ts @@ -1,5 +1,5 @@  import { describe, expect, it } from "vitest"; -import { compileActivePath, compilePacket, mergePacketWithTail } from "./compiler"; +import { compileActivePath, compilePacket, compilePacketDetailed, mergePacketWithTail } from "./compiler";    describe("compilePacket", () => {    it("joins project instructions and skips streaming messages", () => { @@ -39,6 +39,33 @@ describe("compilePacket", () => {      );    });   +  it("injects attached files into the system packet and preview slices", () => { +    const detailed = compilePacketDetailed({ +      projectInstructions: null, +      extraSystem: null, +      files: [ +        { +          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", +          name: "spec.pdf", +          text: "Section 3: payments", +        }, +      ], +      messages: [ +        { +          id: "11111111-1111-4111-8111-111111111111", +          role: "user", +          content: "resuma a se├º├úo 3", +          status: "complete", +        }, +      ], +    }); +    expect(detailed.packet.system).toContain("Attached file: spec.pdf"); +    expect(detailed.packet.system).toContain("Section 3: payments"); +    const fileSlice = detailed.included.find((item) => item.kind === "file"); +    expect(fileSlice?.label).toBe("Attached file: spec.pdf"); +    expect(fileSlice?.label).not.toContain("payments"); +  }); +    it("never puts an apiKey field on the packet", () => {      const packet = compilePacket({        projectInstructions: null, diff --git a/packages/ai-gateway/src/compiler.ts b/packages/ai-gateway/src/compiler.ts index e00eed6..a59b1e9 100644 --- a/packages/ai-gateway/src/compiler.ts +++ b/packages/ai-gateway/src/compiler.ts @@ -9,6 +9,12 @@ export interface CompilerMessage {    pinned?: boolean;  }   +export interface CompilerFile { +  id: string; +  name: string; +  text: string; +} +  export interface CompileInput {    projectInstructions: string | null;    extraSystem: string | null; @@ -16,6 +22,7 @@ export interface CompileInput {    maxTokenBudget?: number;    privacyMode?: PacketPrivacyMode;    inactiveSummaries?: InactiveBranchSummaries | null; +  files?: CompilerFile[];  }    type PacketRow = { @@ -125,6 +132,17 @@ export function compilePacketDetailed(input: CompileInput): CompileDetailedResul      included.push(sliceFor("extra-system", null, extra));    }   +  for (const file of input.files ?? []) { +    const block = `Attached file: ${file.name}\n${file.text}`; +    systemParts.push(block); +    included.push({ +      kind: "file", +      id: file.id, +      label: clipPacketLabel(`Attached file: ${file.name}`, 200), +      tokens: tokenEstimateFromChars(block.length), +    }); +  } +    const inactive = input.inactiveSummaries ?? null;    if (inactive && inactive.block.trim().length > 0) {      if (privacyMode === "strict") { @@ -196,12 +214,38 @@ export function compilePacket(input: CompileInput): ProviderAgnosticPacket {    return compilePacketDetailed(input).packet;  }   +export function appendFilesToPacket( +  packet: ProviderAgnosticPacket, +  files: CompilerFile[], +): { packet: ProviderAgnosticPacket; included: PacketSlice[] } { +  if (files.length === 0) { +    return { packet, included: [] }; +  } +  const blocks = files.map((file) => `Attached file: ${file.name}\n${file.text}`); +  const extra = blocks.join("\n\n"); +  const system = packet.system.length > 0 ? `${packet.system}\n\n${extra}` : extra; +  return { +    packet: packetV0Schema.parse({ +      ...packet, +      system, +      tokenEstimate: packet.tokenEstimate + tokenEstimateFromChars(extra.length), +    }), +    included: files.map((file) => ({ +      kind: "file" as const, +      id: file.id, +      label: clipPacketLabel(`Attached file: ${file.name}`, 200), +      tokens: tokenEstimateFromChars(`Attached file: ${file.name}\n${file.text}`.length), +    })), +  }; +} +  export function compileActivePathDetailed(input: {    projectInstructions: string | null;    extraSystem: string | null;    messages: CompilerGraphMessage[];    maxTokenBudget?: number;    privacyMode?: PacketPrivacyMode; +  files?: CompilerFile[];  }): CompileDetailedResult {    const compiled: CompileInput = {      projectInstructions: input.projectInstructions, @@ -215,6 +259,9 @@ export function compileActivePathDetailed(input: {    if (input.privacyMode !== undefined) {      compiled.privacyMode = input.privacyMode;    } +  if (input.files !== undefined) { +    compiled.files = input.files; +  }    return compilePacketDetailed(compiled);  }   diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts index 713d63d..f792d83 100644 --- a/packages/shared/src/hub-api.ts +++ b/packages/shared/src/hub-api.ts @@ -50,6 +50,10 @@ import type {    PacketsImportInput,    PacketsListInput,    MessagePinInput, +  ProjectFileDto, +  ProjectFileListInput, +  FilesAttachInput, +  FilesRemoveInput,    ProviderKeyDto,    SecretsSaveInput,    SecretsTestInput, @@ -155,6 +159,13 @@ export interface HubPacketsApi {    clear: (input: PacketsClearInput) => Promise<ConversationDto>;  }   +export interface HubFilesApi { +  list: (input: ProjectFileListInput) => Promise<ProjectFileDto[]>; +  attach: (input: FilesAttachInput) => Promise<ProjectFileDto[]>; +  fromDrop: (input: { projectId: string | null; files: unknown }) => Promise<ProjectFileDto[]>; +  remove: (input: FilesRemoveInput) => Promise<void>; +} +  export interface HubChatApi {    send: (input: ChatSendInput) => Promise<ChatSendResult>;    abort: (input: ChatAbortInput) => Promise<void>; @@ -181,6 +192,7 @@ export interface HubApi {    chat: HubChatApi;    import: HubImportApi;    packets: HubPacketsApi; +  files: HubFilesApi;  }    export type { AppLocale, ThemeMode }; diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts index c0ab0f1..8be1e0f 100644 --- a/packages/shared/src/index.ts +++ b/packages/shared/src/index.ts @@ -86,6 +86,13 @@ export {    messageUpdateInputSchema,    packetPreviewInputSchema,    packetPreviewResultSchema, +  projectFileDtoSchema, +  projectFileKindSchema, +  projectFileListInputSchema, +  projectFileListResultSchema, +  filesAttachInputSchema, +  filesIngestPathsInputSchema, +  filesRemoveInputSchema,    projectCreateInputSchema,    projectDtoSchema,    projectListResultSchema, @@ -193,6 +200,12 @@ export {    type PacketsApplyInput,    type PacketsClearInput,    type MessagePinInput, +  type ProjectFileDto, +  type ProjectFileKind, +  type ProjectFileListInput, +  type FilesAttachInput, +  type FilesIngestPathsInput, +  type FilesRemoveInput,    type ProviderKeyDto,    type SecretsSaveInput,    type SecretsTestInput, diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts index 0ef4ccd..41f0138 100644 --- a/packages/shared/src/ipc-schemas.test.ts +++ b/packages/shared/src/ipc-schemas.test.ts @@ -22,6 +22,8 @@ import {    secretsTestResultSchema,    windowIsMaximizedResultSchema,    workspaceSessionSchema, +  filesIngestPathsInputSchema, +  filesRemoveInputSchema,  } from "./ipc-schemas";    describe("emptyIpcPayloadSchema", () => { @@ -386,3 +388,17 @@ describe("wave 8 contracts", () => {      expect(() => appPrefsSchema.parse({ ...prefs, apiKey: "sk-test" })).toThrow();    });  }); + +describe("wave 12 file contracts", () => { +  it("rejects extra keys on ingest paths and remove", () => { +    const ingest = { +      projectId: null, +      items: [{ path: "C:\\\\docs\\\\spec.pdf", name: "spec.pdf" }], +    }; +    expect(filesIngestPathsInputSchema.parse(ingest).items).toHaveLength(1); +    expect(() => filesIngestPathsInputSchema.parse({ ...ingest, extra: true })).toThrow(); +    const remove = { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", projectId: null }; +    expect(filesRemoveInputSchema.parse(remove).projectId).toBeNull(); +    expect(() => filesRemoveInputSchema.parse({ ...remove, extra: true })).toThrow(); +  }); +}); diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts index 25c58ed..ac42e7b 100644 --- a/packages/shared/src/ipc-schemas.ts +++ b/packages/shared/src/ipc-schemas.ts @@ -180,6 +180,7 @@ export const packetPreviewInputSchema = z      pendingContent: z.string().max(100_000).optional(),      maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),      privacyMode: packetPrivacyModeSchema.optional(), +    fileIds: z.array(z.string().uuid()).max(8).optional(),    })    .strict();   @@ -745,3 +746,82 @@ export const messagePinInputSchema = z    export type MessagePinInput = z.infer<typeof messagePinInputSchema>;   +export const projectFileKindSchema = z.enum([ +  "pdf", +  "docx", +  "text", +  "code", +  "csv", +  "image", +  "folder-summary", +]); + +export type ProjectFileKind = z.infer<typeof projectFileKindSchema>; + +export const projectFileDtoSchema = z +  .object({ +    id: z.string().uuid(), +    projectId: z.string().uuid().nullable(), +    name: z.string().min(1).max(260), +    kind: projectFileKindSchema, +    mime: z.string().min(1).max(128), +    byteSize: z.number().int().nonnegative(), +    tokenEstimate: z.number().int().nonnegative(), +    excerpt: z.string().max(400), +    truncated: z.boolean(), +    visionRequired: z.boolean(), +    createdAt: isoTimestampSchema, +  }) +  .strict(); + +export type ProjectFileDto = z.infer<typeof projectFileDtoSchema>; + +export const projectFileListInputSchema = z +  .object({ +    projectId: z.string().uuid().nullable(), +  }) +  .strict(); + +export type ProjectFileListInput = z.infer<typeof projectFileListInputSchema>; + +export const projectFileListResultSchema = z.array(projectFileDtoSchema).max(100); + +export const filesIngestPathsInputSchema = z +  .object({ +    projectId: z.string().uuid().nullable(), +    items: z +      .array( +        z +          .object({ +            path: z.string().min(1).max(1024), +            name: z.string().min(1).max(260), +          }) +          .strict(), +      ) +      .min(1) +      .max(8), +  }) +  .strict(); + +export type FilesIngestPathsInput = z.infer<typeof filesIngestPathsInputSchema>; + +export const filesAttachKindSchema = z.enum(["file", "folder"]); + +export const filesAttachInputSchema = z +  .object({ +    projectId: z.string().uuid().nullable(), +    kind: filesAttachKindSchema, +  }) +  .strict(); + +export type FilesAttachInput = z.infer<typeof filesAttachInputSchema>; + +export const filesRemoveInputSchema = z +  .object({ +    id: z.string().uuid(), +    projectId: z.string().uuid().nullable(), +  }) +  .strict(); + +export type FilesRemoveInput = z.infer<typeof filesRemoveInputSchema>; + diff --git a/packages/shared/src/secret-paste.test.ts b/packages/shared/src/secret-paste.test.ts index 5f43f39..3b4a0bc 100644 --- a/packages/shared/src/secret-paste.test.ts +++ b/packages/shared/src/secret-paste.test.ts @@ -13,4 +13,12 @@ describe("secret paste hints", () => {      expect(redacted).not.toContain("sk-testfixture");      expect(redacted).toContain("[REDACTED]");    }); + +  it("redacts PEM blocks, AWS access keys, and GitHub PATs", () => { +    const pem = "-----BEGIN PRIVATE KEY-----\nMIIBfixtureKEY\n-----END PRIVATE KEY-----"; +    expect(looksLikePastedSecret(pem)).toBe(true); +    expect(redactPastedSecrets(pem)).not.toContain("MIIBfixtureKEY"); +    expect(redactPastedSecrets("id AKIATESTFIXTUREKEY12 leftover")).not.toContain("AKIATESTFIXTUREKEY12"); +    expect(redactPastedSecrets("token ghp_abcdefghijklmnopqrstuvwxyz")).not.toContain("ghp_abcdefghijklmnop"); +  });  }); diff --git a/packages/shared/src/secret-paste.ts b/packages/shared/src/secret-paste.ts index cc27c35..bb5be35 100644 --- a/packages/shared/src/secret-paste.ts +++ b/packages/shared/src/secret-paste.ts @@ -4,6 +4,9 @@ const SECRET_HINT_PATTERNS: readonly RegExp[] = [    /AIza[A-Za-z0-9_-]{10,}/g,    /Bearer\s+[A-Za-z0-9._\-+=/]+/gi,    /(?:api[_-]?key|access[_-]?token|secret|x-api-key|x-goog-api-key)[=:\s]+['"]?[^\s'"]+/gi, +  /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]+?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g, +  /AKIA[0-9A-Z]{16}/g, +  /ghp_[A-Za-z0-9]{20,}/g,  ];    export function looksLikePastedSecret(text: string): boolean {
+diff --git a/packages/files/src/send-gate.ts b/packages/files/src/send-gate.ts
+new file mode 100644
+index 0000000..12c5ba8
+--- /dev/null
++++ b/packages/files/src/send-gate.ts
+@@ -0,0 +1,20 @@
++export type SendAttachmentMode = "preview" | "send";
++
++export function assertFileAttachmentAccess(input: {
++  exists: boolean;
++  rowProjectId: string | null;
++  conversationProjectId: string | null;
++  kind: string;
++  vision: boolean;
++  mode: SendAttachmentMode;
++}): void {
++  if (!input.exists) {
++    throw new Error("files:unsupported");
++  }
++  if (input.rowProjectId !== input.conversationProjectId) {
++    throw new Error("files:project_mismatch");
++  }
++  if (input.kind === "image" && !input.vision && input.mode === "send") {
++    throw new Error("files:vision_required");
++  }
++}
+
+diff --git a/packages/files/src/send-gate.test.ts b/packages/files/src/send-gate.test.ts
+new file mode 100644
+index 0000000..b754e23
+--- /dev/null
++++ b/packages/files/src/send-gate.test.ts
+@@ -0,0 +1,66 @@
++import { describe, expect, it } from "vitest";
++import { assertFileAttachmentAccess } from "./send-gate";
++
++describe("assertFileAttachmentAccess", () => {
++  it("rejects a missing file", () => {
++    expect(() =>
++      assertFileAttachmentAccess({
++        exists: false,
++        rowProjectId: null,
++        conversationProjectId: null,
++        kind: "text",
++        vision: false,
++        mode: "send",
++      }),
++    ).toThrow("files:unsupported");
++  });
++
++  it("rejects a file from another project", () => {
++    expect(() =>
++      assertFileAttachmentAccess({
++        exists: true,
++        rowProjectId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
++        conversationProjectId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
++        kind: "text",
++        vision: false,
++        mode: "send",
++      }),
++    ).toThrow("files:project_mismatch");
++  });
++
++  it("rejects an image send when the catalog has no vision", () => {
++    expect(() =>
++      assertFileAttachmentAccess({
++        exists: true,
++        rowProjectId: null,
++        conversationProjectId: null,
++        kind: "image",
++        vision: false,
++        mode: "send",
++      }),
++    ).toThrow("files:vision_required");
++  });
++
++  it("allows image preview without vision and send with vision", () => {
++    expect(() =>
++      assertFileAttachmentAccess({
++        exists: true,
++        rowProjectId: null,
++        conversationProjectId: null,
++        kind: "image",
++        vision: false,
++        mode: "preview",
++      }),
++    ).not.toThrow();
++    expect(() =>
++      assertFileAttachmentAccess({
++        exists: true,
++        rowProjectId: null,
++        conversationProjectId: null,
++        kind: "image",
++        vision: true,
++        mode: "send",
++      }),
++    ).not.toThrow();
++  });
++});
+
+diff --git a/packages/files/src/path-guard.ts b/packages/files/src/path-guard.ts
+new file mode 100644
+index 0000000..903be61
+--- /dev/null
++++ b/packages/files/src/path-guard.ts
+@@ -0,0 +1,7 @@
++export function isPathInsideRoot(rootReal: string, candidateReal: string, sep: string): boolean {
++  if (candidateReal === rootReal) {
++    return true;
++  }
++  const prefix = rootReal.endsWith(sep) ? rootReal : `${rootReal}${sep}`;
++  return candidateReal.startsWith(prefix);
++}
+
+diff --git a/packages/files/src/path-guard.test.ts b/packages/files/src/path-guard.test.ts
+new file mode 100644
+index 0000000..0fc16f8
+--- /dev/null
++++ b/packages/files/src/path-guard.test.ts
+@@ -0,0 +1,15 @@
++import { describe, expect, it } from "vitest";
++import { isPathInsideRoot } from "./path-guard";
++
++describe("isPathInsideRoot", () => {
++  it("accepts the root and children", () => {
++    expect(isPathInsideRoot("C:\\proj", "C:\\proj", "\\")).toBe(true);
++    expect(isPathInsideRoot("C:\\proj", "C:\\proj\\src\\index.ts", "\\")).toBe(true);
++  });
++
++  it("rejects a sibling or parent escape", () => {
++    expect(isPathInsideRoot("C:\\proj", "C:\\other\\secret.md", "\\")).toBe(false);
++    expect(isPathInsideRoot("C:\\proj", "C:\\proj-evil\\x", "\\")).toBe(false);
++    expect(isPathInsideRoot("/tmp/proj", "/etc/passwd", "/")).toBe(false);
++  });
++});
+
+diff --git a/packages/files/src/packet-ui.ts b/packages/files/src/packet-ui.ts
+new file mode 100644
+index 0000000..b7ac62f
+--- /dev/null
++++ b/packages/files/src/packet-ui.ts
+@@ -0,0 +1,6 @@
++export function stripAttachedFileBodiesForRenderer(system: string): string {
++  return system.replace(
++    /(Attached file: [^\n]+)(?:\n(?!Attached file:)[\s\S]*?)?(?=(?:\n\nAttached file: )|$)/g,
++    "$1\n[file extract omitted from renderer]",
++  );
++}
+
+diff --git a/packages/files/src/packet-ui.test.ts b/packages/files/src/packet-ui.test.ts
+new file mode 100644
+index 0000000..5ca572d
+--- /dev/null
++++ b/packages/files/src/packet-ui.test.ts
+@@ -0,0 +1,12 @@
++import { describe, expect, it } from "vitest";
++import { stripAttachedFileBodiesForRenderer } from "./packet-ui";
++
++describe("stripAttachedFileBodiesForRenderer", () => {
++  it("keeps the filename and drops the extract", () => {
++    const system = "Be brief.\n\nAttached file: spec.pdf\nSection 3 secret-doc\nmore";
++    const stripped = stripAttachedFileBodiesForRenderer(system);
++    expect(stripped).toContain("Attached file: spec.pdf");
++    expect(stripped).toContain("[file extract omitted from renderer]");
++    expect(stripped).not.toContain("secret-doc");
++  });
++});
+
+diff --git a/docs/ADR/ADR-W12-004-pdf-flatedecode-inflate.md b/docs/ADR/ADR-W12-004-pdf-flatedecode-inflate.md
+new file mode 100644
+index 0000000..52b6050
+--- /dev/null
++++ b/docs/ADR/ADR-W12-004-pdf-flatedecode-inflate.md
+@@ -0,0 +1,33 @@
++# ADR-W12-004-pdf-flatedecode-inflate
++
++- **Status:** accepted
++- **Onda:** W12
++- **Data:** 2026-09-18
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++O extrator PDF da W12 lia s├│ literais `(ÔÇª) Tj` / `TJ` no bytes crus. PDFs reais comprimem o content stream com `/FlateDecode`; nesse caso o DoD (ÔÇ£resuma a se├º├úo 3ÔÇØ) s├│ passava no fixture uncompressed.
++
++## Decis├úo
++
++Inflacionar streams `/FlateDecode` com `zlib.inflateSync` e voltar a correr o extrator de literais. Sem `pdfjs`/`unpdf` nesta onda.
++
++## Alternativas consideradas
++
++- **pdfjs-dist / unpdf:** extra├º├úo mais completa (CID, ToUnicode), mas depend├¬ncia pesada e worker no main.
++- **Aceitar s├│ fixture literal:** mentiria o DoD em PDFs do dia a dia.
++
++## Consequ├¬ncias
++
++- Positivas: PDFs Flate t├¡picos passam no teste sem novo pacote.
++- Negativas: sem cmap/ToUnicode, PDFs CID/subset ainda podem sair vazios.
++- Riscos aceitos: extra├º├úo v1 ├® best-effort; OCR e layout ficam fora da onda.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 12
++- `docs/reviews/W12/REVIEW.md`
++- `packages/files/src/extract-pdf.ts`
+
+diff --git a/docs/reviews/W12/REVIEW.md b/docs/reviews/W12/REVIEW.md
+new file mode 100644
+index 0000000..97679a0
+--- /dev/null
++++ b/docs/reviews/W12/REVIEW.md
+@@ -0,0 +1,119 @@
++# REVIEW ÔÇö Wave 12 (W12)
++
++- **Wave:** W12 ÔÇö Arquivos e multimodal b├ísico
++- **Data:** 2026-09-18
++- **Reviewer:** agent (s├¡ntese). Independentes: [wave-reviewer](5d59b1cb-7fc8-4312-b993-6e271b9e602f), [trust-auditor](27215d66-2c6f-487e-bcc8-85331a0890eb); delta [wave-reviewer](4cd0678c-2ad6-49c1-9a20-a49bda0ff89e)
++- **Branch / HEAD (freeze):** `main` / `3cc8327d314a4f8240f4bb30b335643ab15a30bf` (working tree uncommitted)
++- **`security-review` / Bugbot Cursor:** n├úo disparados (utilizador n├úo pediu pelo nome). Superf├¡cie coberta pelo `trust-auditor`.
++
++## DoD (plano)
++
++| Crit├®rio | Resultado | Como verificou |
++|---|---|---|
++| Drag/drop PDF, DOCX, TXT, MD, CSV, imagens, c├│digo | pass | `packages/files` classify + composer drop + `fromDrop` |
++| Extra├º├úo + preview + store no projeto | pass | `project_files` migration 8; DTO excerpt; extract cifrado |
++| Imagem s├│ se catalog `vision` (W5) | pass | `assertFileAttachmentAccess` + `files:vision_required` no send |
++| Pasta ÔåÆ resumo v1 (stack, deps, README) | pass | `summarizeFolder`; e2e pasta Node cont├®m `Node.js` |
++| Limite de tamanho + aviso de tokens | pass | 8 MB / 8 ficheiros; chip + `files.tokenWarning` |
++| Redactor antes do provider | pass | `redactSecrets` no persist e no `loadSendAttachments` |
++| **DoD:** arrastar PDF e ÔÇ£resuma a se├º├úo 3ÔÇØ | pass | e2e `files.spec.ts` (2.4s); extract Flate no unit |
++| **DoD:** pasta Node com stack detectada | pass | e2e `files.spec.ts` (2.2s); chip `Node.js` |
++
++## Checklist ┬º9.4
++
++**DoD e escopo**
++
++- [x] Sub-tasks existem em c├│digo
++- [x] DoD demonstr├ível: typecheck desktop + e2e files 2/2
++- [x] Sem feature de onda posterior (sem @-mentions, RAG, MCP, agentes, run modes)
++- [x] Hook: `project_files` + `fileIds` para W13 `@file`; packet v1 **n├úo** leva extract
++- [x] Sem D* novo; D1 packet continua sem ficheiros no envelope
++
++**Trust e correla├º├Áes**
++
++- [x] Renderer sem `fs`/`net`/SDKs; `fromDrop` resolve path s├│ no preload
++- [x] IPC Zod; `ingestDropped` removido da HubApi; `files:remove` exige `projectId`
++- [x] Extract cifrado; DTO sem path/extract; `inspectablePacket` omite body do ficheiro
++- [x] Sem fallback silencioso; imagem sem vision falha expl├¡cita
++- [x] DTOs em shared + main + renderer
++- [x] Migration 8 = schema
++- [x] i18n pt-BR + en
++- [x] Abort / crash-safe intactos
++- [x] `fileIds` em send / regenerate / continue / edit / fallback; caps depois dos slices
++
++**Falhas**
++
++- [x] `files:vision_required|too_large|unsupported|project_mismatch|limit` mapeados
++- [x] Empty attach n├úo crasha
++- [x] Windows-first; pasta com `realpath` + `isPathInsideRoot`
++
++**Testes**
++
++- [x] Extra├º├úo PDF literal + FlateDecode; folder-summary; send-gate; path-guard; packet-ui
++- [x] IPC extra keys em ingest/remove; extract n├úo aparece no dump SQLite
++- [x] Sem providers reais
++- [x] Nenhum teste apagado
++- [x] typecheck + testes de pacote + e2e files ap├│s fixes
++- [x] Este REVIEW + DIFF.patch + DIFF-post-review.patch + REVIEW-delta.md
++- [x] ADRs W12-001..004 + ├¡ndice
++
++**Produto**
++
++- [x] Chip com excerpt / truncated / vision hint; aviso de tokens em texto
++- [x] Erros de attach/send em i18n, n├úo dump
++
++## Achados
++
++| Severidade | Arquivo | Resumo | Status |
++|---|---|---|---|
++| High | `hub-api.ts` / preload | `ingestDropped` expunha paths crus ao renderer | **fixed** ÔÇö s├│ `fromDrop` |
++| High | `extract-pdf.ts` | S├│ literais Tj; PDF Flate real sa├¡a vazio | **fixed** ÔÇö inflate + ADR-W12-004 |
++| High | `files.ts` `persistFolder` | `resolve` sem garantir que `full` fica sob o root | **fixed** ÔÇö `realpath` + `isPathInsideRoot` |
++| Medium | `App.tsx` attach/drop | Erro gen├®rico em vez de `workspaceErrorText` | **fixed** |
++| Medium | `home-view.tsx` | Chip sem excerpt/truncated | **fixed** |
++| Medium | `App.tsx` send paths | `fileIds` s├│ em `mode: "send"` | **fixed** (incl. fallback preview) |
++| Medium | `chat-session.ts` | `inspectablePacket` + `console.info` vazavam extract | **fixed** |
++| Medium | `files:remove` | Qualquer UUID | **fixed** ÔÇö `projectId` obrigat├│rio |
++| Medium | ingest FS | ENOENT com path no erro IPC | **fixed** ÔÇö `files:unsupported` |
++| Medium | `secret-paste.ts` | Sem PEM / AKIA / `ghp_` | **fixed** |
++| Medium | testes | Sem vision/mismatch/Flate | **fixed** |
++| Medium | `extract-pdf.ts` | `inflateSync` sem teto | **fixed** ÔÇö `MAX_PDF_INFLATE_BYTES` 4 MiB |
++| Low | e2e | N├úo assertava ÔÇ£Section 3ÔÇØ / ÔÇ£Node.jsÔÇØ | **fixed** |
++| Low | `files:unsupported` para I/O | Copy fala em ÔÇ£tipoÔÇØ | **accepted** |
++| Low | paleta Inbox | N├úo limpa `attachedFiles` | **accepted** |
++| Low | PDF CID / ToUnicode | Extra├º├úo v1 best-effort | **accepted** ÔÇö ADR-W12-004 |
++| Low | `files:ingestPaths` | Canal ainda existe; renderer s├│ via `fromDrop` | **accepted** |
++| Low | `isPathInsideRoot` | Case-sensitive no Windows | **accepted** |
++| Out-of-wave | packet aplicado | Label `extra-system` pode clipar 200 chars de system antigo | **accepted** |
++| Out-of-wave | W13 | `@file` ainda n├úo existe | **accepted** |
++
++Sem Blocker. High e Medium in-wave corrigidos.
++
++## Correla├º├Áes
++
++- **W5:** gate `catalog.vision`; imagens s├│ em `ChatStreamRequest.images`.
++- **W7:** `loadSendAttachments` corre antes dos caps; sem bypass.
++- **W10:** export packet v1 **n├úo** inclui ficheiros (ADR-W12-002).
++- **W13:** `@file` deve reusar `project_files` + `fileIds` + `assertFileAttachmentAccess`.
++- **W14:** RAG n├úo assume extract no envelope port├ítil.
++
++## Riscos residuais
++
++- PDF sem ToUnicode / CID ainda pode sair vazio; e2e DoD usa fixture uncompressed (Flate s├│ no unit).
++- Nome do ficheiro em plaintext (como tags W6).
++- Canal `files:ingestPaths` continua no main para o preload.
++- `isPathInsideRoot` n├úo normaliza casing no Windows (falso negativo, n├úo escape).
++- macOS n├úo exercitado neste gate.
++
++## ADRs
++
++- `docs/ADR/ADR-W12-001-files-package-and-encrypted-extract.md`
++- `docs/ADR/ADR-W12-002-files-inject-as-compiler-slices.md`
++- `docs/ADR/ADR-W12-003-vision-images-on-stream-not-packet.md`
++- `docs/ADR/ADR-W12-004-pdf-flatedecode-inflate.md`
++
++## Patches
++
++- `docs/reviews/W12/DIFF.patch` (freeze: implementa├º├úo W12)
++- `docs/reviews/W12/DIFF-post-review.patch` (fixes do gate)
++- `docs/reviews/W12/REVIEW-delta.md` (delta estrutural: PDF + IPC)
+
+diff --git a/docs/reviews/W12/REVIEW-delta.md b/docs/reviews/W12/REVIEW-delta.md
+new file mode 100644
+index 0000000..834519d
+--- /dev/null
++++ b/docs/reviews/W12/REVIEW-delta.md
+@@ -0,0 +1,25 @@
++# REVIEW-delta ÔÇö W12
++
++- **Data:** 2026-09-18
++- **Reviewer:** [wave-reviewer](4cd0678c-2ad6-49c1-9a20-a49bda0ff89e) + s├¡ntese do agente
++- **├émbito:** corre├º├Áes p├│s-freeze (n├úo relitigar a onda inteira)
++
++## Highs do freeze
++
++Confirmados **gone**: `ingestDropped` fora da HubApi; PDF FlateDecode com teste; pasta com `realpath` + `isPathInsideRoot`.
++
++## Delta estrutural
++
++1. Extrator PDF passou de literais crus para inflate `zlib` com teto de 4 MiB (ADR-W12-004).
++2. Preload j├í n├úo aceita paths do renderer; drop s├│ via `File` + `webUtils`.
++3. Packet enviado ao renderer omite o body dos anexos; log `[hub:packet]` s├│ metadados.
++
++## Achados do delta
++
++Nenhum Blocker/High novo. Mediums do delta (fallback `fileIds`, teto de inflate, testes de path/strip) **fixed** no mesmo gate.
++
++## Verifica├º├úo
++
++- `pnpm --filter @ai-hub/files test` ÔÇö 14/14
++- `pnpm --filter @ai-hub/desktop typecheck`
++- e2e `files.spec.ts` 2/2 (antes deste ├║ltimo micro-delta de fallback/inflate; extra├º├úo e UI inalteradas nesse e2e)
