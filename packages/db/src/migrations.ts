@@ -232,6 +232,25 @@ CREATE TABLE prompts (
 CREATE INDEX prompts_folder_idx ON prompts(folder);
 `;
 
+export const MIGRATION_0011_SQL = `
+CREATE TABLE artifacts (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL,
+  family_id TEXT NOT NULL,
+  source_message_id TEXT,
+  kind TEXT NOT NULL,
+  title_cipher TEXT NOT NULL,
+  body_cipher TEXT NOT NULL,
+  language TEXT,
+  version INTEGER NOT NULL,
+  pinned INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX artifacts_conversation_idx ON artifacts(conversation_id);
+CREATE INDEX artifacts_family_idx ON artifacts(family_id);
+CREATE INDEX artifacts_message_idx ON artifacts(source_message_id);
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
@@ -243,4 +262,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 8, sql: MIGRATION_0008_SQL },
   { version: 9, sql: MIGRATION_0009_SQL },
   { version: 10, sql: MIGRATION_0010_SQL },
+  { version: 11, sql: MIGRATION_0011_SQL },
 ];
