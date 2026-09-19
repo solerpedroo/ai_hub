@@ -16,6 +16,7 @@ import {
   conversationListInputSchema,
   conversationListResultSchema,
   conversationMoveInputSchema,
+  conversationToProjectResultSchema,
   conversationTagsSetInputSchema,
   costsAggregateInputSchema,
   costsAggregateResultSchema,
@@ -51,6 +52,21 @@ import {
   filesAttachInputSchema,
   filesIngestPathsInputSchema,
   filesRemoveInputSchema,
+  memoryListInputSchema,
+  memoryListResultSchema,
+  memoryCreateInputSchema,
+  memoryUpdateInputSchema,
+  memorySuggestInputSchema,
+  memorySuggestResultSchema,
+  memoryOptOutInputSchema,
+  memoryOptOutStateSchema,
+  memorySetOptOutInputSchema,
+  projectMemoryDtoSchema,
+  conversationWorkspaceDtoSchema,
+  workspaceConversationInputSchema,
+  workspaceAddTaskInputSchema,
+  workspaceSetTaskDoneInputSchema,
+  conversationTaskDtoSchema,
   contextPacketDtoSchema,
   contextPacketListResultSchema,
   projectCreateInputSchema,
@@ -87,7 +103,9 @@ import {
   pickPacketFile,
 } from "./packet-file";
 import { attachFromDialog, ingestDroppedPaths, listProjectFileDtos, removeProjectFile } from "./files";
+import { suggestMemories } from "@ai-hub/memory";
 import { previewPacket } from "./packet-preview";
+import { getConversationWorkspaceDto, refreshConversationWorkspace } from "./workspace";
 import { getHubDatabase } from "./persistence";
 import { testProviderKey } from "./provider-health";
 import { localDayStartMs } from "./spend-guard";
@@ -201,6 +219,23 @@ export function registerWorkspaceIpc(): void {
       conversationDtoSchema.parse(
         getHubDatabase().repos.setConversationTags(input.conversationId, input.names),
       ),
+  );
+
+  registerHandler(IpcChannel.conversationsDuplicate, idInputSchema, conversationDtoSchema, (input) =>
+    conversationDtoSchema.parse(getHubDatabase().repos.duplicateConversation(input.id)),
+  );
+
+  registerHandler(
+    IpcChannel.conversationsToProject,
+    idInputSchema,
+    conversationToProjectResultSchema,
+    (input) => {
+      const result = getHubDatabase().repos.promoteConversationToProject(input.id);
+      return {
+        project: projectDtoSchema.parse(result.project),
+        conversation: conversationDtoSchema.parse(result.conversation),
+      };
+    },
   );
 
   registerHandler(
@@ -397,6 +432,81 @@ export function registerWorkspaceIpc(): void {
 
   registerHandler(IpcChannel.filesRemove, filesRemoveInputSchema, ipcAckResultSchema, (input) => {
     removeProjectFile(input.id, input.projectId);
+  });
+
+  registerHandler(IpcChannel.memoryList, memoryListInputSchema, memoryListResultSchema, (input) =>
+    getHubDatabase().repos.listProjectMemories(input.projectId).map((row) => projectMemoryDtoSchema.parse(row)),
+  );
+
+  registerHandler(IpcChannel.memoryCreate, memoryCreateInputSchema, projectMemoryDtoSchema, (input) =>
+    projectMemoryDtoSchema.parse(
+      getHubDatabase().repos.createProjectMemory({
+        projectId: input.projectId,
+        title: input.title,
+        body: input.body,
+        source: input.source ?? "manual",
+      }),
+    ),
+  );
+
+  registerHandler(IpcChannel.memoryUpdate, memoryUpdateInputSchema, projectMemoryDtoSchema, (input) =>
+    projectMemoryDtoSchema.parse(
+      getHubDatabase().repos.updateProjectMemory(input.id, {
+        ...(input.title !== undefined ? { title: input.title } : {}),
+        ...(input.body !== undefined ? { body: input.body } : {}),
+      }),
+    ),
+  );
+
+  registerHandler(IpcChannel.memoryRemove, idInputSchema, ipcAckResultSchema, (input) => {
+    getHubDatabase().repos.removeProjectMemory(input.id);
+  });
+
+  registerHandler(IpcChannel.memorySuggest, memorySuggestInputSchema, memorySuggestResultSchema, (input) => {
+    const repos = getHubDatabase().repos;
+    const optedOut = repos.getMemoryOptOut(input.projectId);
+    return {
+      optedOut,
+      suggestions: optedOut ? [] : suggestMemories(input.text),
+    };
+  });
+
+  registerHandler(IpcChannel.memoryGetOptOut, memoryOptOutInputSchema, memoryOptOutStateSchema, (input) => ({
+    optedOut: getHubDatabase().repos.getMemoryOptOut(input.projectId),
+  }));
+
+  registerHandler(IpcChannel.memorySetOptOut, memorySetOptOutInputSchema, memoryOptOutStateSchema, (input) => {
+    getHubDatabase().repos.setMemoryOptOut(input.projectId, input.optedOut);
+    return { optedOut: input.optedOut };
+  });
+
+  registerHandler(
+    IpcChannel.workspaceGet,
+    workspaceConversationInputSchema,
+    conversationWorkspaceDtoSchema,
+    (input) => getConversationWorkspaceDto(getHubDatabase().repos, input.conversationId),
+  );
+
+  registerHandler(
+    IpcChannel.workspaceRefresh,
+    workspaceConversationInputSchema,
+    conversationWorkspaceDtoSchema,
+    (input) => refreshConversationWorkspace(getHubDatabase().repos, input.conversationId),
+  );
+
+  registerHandler(IpcChannel.workspaceAddTask, workspaceAddTaskInputSchema, conversationTaskDtoSchema, (input) =>
+    conversationTaskDtoSchema.parse(getHubDatabase().repos.createConversationTask(input.conversationId, input.title)),
+  );
+
+  registerHandler(
+    IpcChannel.workspaceSetTaskDone,
+    workspaceSetTaskDoneInputSchema,
+    conversationTaskDtoSchema,
+    (input) => conversationTaskDtoSchema.parse(getHubDatabase().repos.setConversationTaskDone(input.id, input.done)),
+  );
+
+  registerHandler(IpcChannel.workspaceRemoveTask, idInputSchema, ipcAckResultSchema, (input) => {
+    getHubDatabase().repos.removeConversationTask(input.id);
   });
 
   registerHandler(IpcChannel.spendCapsGet, emptyIpcPayloadSchema, spendCapListResultSchema, () => {
