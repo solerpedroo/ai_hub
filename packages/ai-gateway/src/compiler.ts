@@ -1,5 +1,5 @@
 import type { MessageStatus, PacketPrivacyMode, PacketSlice, ProviderAgnosticPacket } from "@ai-hub/shared";
-import { activePath, clipPacketLabel, packetV0Schema, type MessageGraphNode } from "@ai-hub/shared";
+import { activePath, clipPacketLabel, effectivePrivacyMode, packetV0Schema, type MessageGraphNode } from "@ai-hub/shared";
 
 export interface CompilerMessage {
   id: string;
@@ -117,7 +117,7 @@ export function summarizeInactiveBranches(messages: CompilerGraphMessage[]): Ina
 }
 
 export function compilePacketDetailed(input: CompileInput): CompileDetailedResult {
-  const privacyMode: PacketPrivacyMode = input.privacyMode ?? "standard";
+  const privacyMode = effectivePrivacyMode(input.privacyMode);
   const included: PacketSlice[] = [];
   const omitted: PacketSlice[] = [];
   const systemParts: string[] = [];
@@ -125,7 +125,7 @@ export function compilePacketDetailed(input: CompileInput): CompileDetailedResul
   const project = input.projectInstructions?.trim() ?? "";
   if (project.length > 0) {
     const slice = sliceFor("project-instructions", null, project);
-    if (privacyMode === "strict") {
+    if (privacyMode === "private") {
       omitted.push({ ...slice, kind: "privacy", label: clipPacketLabel(`Project instructions omitted (${privacyMode})`, 200) });
     } else {
       systemParts.push(project);
@@ -139,7 +139,7 @@ export function compilePacketDetailed(input: CompileInput): CompileDetailedResul
     included.push(sliceFor("extra-system", null, extra));
   }
 
-  for (const file of input.files ?? []) {
+  for (const file of privacyMode === "private" ? [] : (input.files ?? [])) {
     const block = `Attached file: ${file.name}\n${file.text}`;
     systemParts.push(block);
     included.push({
@@ -152,7 +152,7 @@ export function compilePacketDetailed(input: CompileInput): CompileDetailedResul
 
   const inactive = input.inactiveSummaries ?? null;
   if (inactive && inactive.block.trim().length > 0) {
-    if (privacyMode === "strict") {
+    if (privacyMode !== "maximum") {
       omitted.push(
         sliceFor("privacy", null, "Inactive branch summaries omitted (strict)"),
         ...inactive.slices.map((item) => ({ ...item, kind: "inactive-branch" as const })),
