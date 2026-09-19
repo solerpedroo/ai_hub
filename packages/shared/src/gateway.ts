@@ -68,6 +68,7 @@ const chatSendBaseSchema = z.object({
   compactHistory: z.boolean().optional(),
   allowOnce: z.boolean().optional(),
   privacyMode: z.enum(["standard", "strict"]).optional(),
+  fileIds: z.array(z.string().uuid()).max(8).optional(),
 });
 
 export const chatSendInputSchema = z.discriminatedUnion("mode", [
