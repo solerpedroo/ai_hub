@@ -1,6 +1,10 @@
-import { type JSX, useState } from "react";
+import { type JSX } from "react";
 import { useTranslation } from "react-i18next";
-import type { ContextPacketDto, PacketPreviewResult, PacketPrivacyMode } from "@ai-hub/shared";
+import type {
+  ContextPacketDto,
+  PacketPreviewResult,
+  PacketPrivacyMode,
+} from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
@@ -17,6 +21,8 @@ export function PacketPanel({
   onImport,
   onApply,
   onClear,
+  open,
+  onOpenChange,
 }: {
   packetPreview: PacketPreviewResult | null;
   packets: ContextPacketDto[];
@@ -30,9 +36,10 @@ export function PacketPanel({
   onImport: () => Promise<void>;
   onApply: (packetId: string) => Promise<void>;
   onClear: () => Promise<void>;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
 }): JSX.Element {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
   const canMutate = projectId !== null && !busy;
 
   return (
@@ -43,12 +50,15 @@ export function PacketPanel({
         variant="outline"
         data-testid="packet-open"
         disabled={projectId === null && !packetPreview}
-        onClick={() => setOpen(true)}
+        onClick={() => onOpenChange(true)}
       >
         {t("workspace.packet.open")}
       </Button>
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent data-testid="packet-dialog" className="max-h-[80vh] overflow-y-auto">
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent
+          data-testid="packet-dialog"
+          className="max-h-[80vh] overflow-y-auto"
+        >
           <DialogHeader>
             <DialogTitle>{t("workspace.packet.title")}</DialogTitle>
           </DialogHeader>
@@ -69,42 +79,66 @@ export function PacketPanel({
                   </p>
                 ) : null}
                 <label className="flex items-center gap-2">
-                  <span className="text-muted-foreground">{t("workspace.packet.privacy")}</span>
+                  <span className="text-muted-foreground">
+                    {t("workspace.packet.privacy")}
+                  </span>
                   <select
                     className="h-8 rounded-md border bg-background px-2"
                     value={appliedPacketId ? packetPreview.privacyMode : privacyMode}
                     disabled={Boolean(appliedPacketId) || busy}
                     data-testid="packet-privacy"
                     aria-label={t("workspace.packet.privacy")}
-                    onChange={(event) => onPrivacyMode(event.target.value === "strict" ? "strict" : "standard")}
+                    onChange={(event) =>
+                      onPrivacyMode(
+                        event.target.value === "strict" ? "strict" : "standard",
+                      )
+                    }
                   >
-                    <option value="standard">{t("workspace.packet.privacy.standard")}</option>
+                    <option value="standard">
+                      {t("workspace.packet.privacy.standard")}
+                    </option>
                     <option value="strict">{t("workspace.packet.privacy.strict")}</option>
                   </select>
                 </label>
                 <section>
-                  <h3 className="mb-1 text-[12px] font-medium">{t("workspace.packet.included")}</h3>
+                  <h3 className="mb-1 text-[12px] font-medium">
+                    {t("workspace.packet.included")}
+                  </h3>
                   <ul className="flex flex-col gap-1" data-testid="packet-included">
                     {packetPreview.included.length === 0 ? (
-                      <li className="text-muted-foreground">{t("workspace.packet.empty")}</li>
+                      <li className="text-muted-foreground">
+                        {t("workspace.packet.empty")}
+                      </li>
                     ) : (
                       packetPreview.included.map((slice, index) => (
-                        <li key={`${slice.kind}-${slice.id ?? index}`} className="rounded-md border px-2 py-1">
-                          {t(`workspace.packet.kind.${slice.kind}`)} · {slice.label} · ~{slice.tokens}
+                        <li
+                          key={`${slice.kind}-${slice.id ?? index}`}
+                          className="rounded-md border px-2 py-1"
+                        >
+                          {t(`workspace.packet.kind.${slice.kind}`)} · {slice.label} · ~
+                          {slice.tokens}
                         </li>
                       ))
                     )}
                   </ul>
                 </section>
                 <section>
-                  <h3 className="mb-1 text-[12px] font-medium">{t("workspace.packet.omitted")}</h3>
+                  <h3 className="mb-1 text-[12px] font-medium">
+                    {t("workspace.packet.omitted")}
+                  </h3>
                   <ul className="flex flex-col gap-1" data-testid="packet-omitted">
                     {packetPreview.omitted.length === 0 ? (
-                      <li className="text-muted-foreground">{t("workspace.packet.empty")}</li>
+                      <li className="text-muted-foreground">
+                        {t("workspace.packet.empty")}
+                      </li>
                     ) : (
                       packetPreview.omitted.map((slice, index) => (
-                        <li key={`${slice.kind}-${slice.id ?? index}`} className="rounded-md border px-2 py-1">
-                          {t(`workspace.packet.kind.${slice.kind}`)} · {slice.label} · ~{slice.tokens}
+                        <li
+                          key={`${slice.kind}-${slice.id ?? index}`}
+                          className="rounded-md border px-2 py-1"
+                        >
+                          {t(`workspace.packet.kind.${slice.kind}`)} · {slice.label} · ~
+                          {slice.tokens}
                         </li>
                       ))
                     )}
@@ -154,16 +188,23 @@ export function PacketPanel({
               ) : null}
             </div>
             <section>
-              <h3 className="mb-1 text-[12px] font-medium">{t("workspace.packet.saved")}</h3>
+              <h3 className="mb-1 text-[12px] font-medium">
+                {t("workspace.packet.saved")}
+              </h3>
               {packets.length === 0 ? (
                 <p className="text-muted-foreground">{t("workspace.packet.none")}</p>
               ) : (
                 <ul className="flex flex-col gap-1">
                   {packets.map((packet) => (
-                    <li key={packet.id} className="flex items-center justify-between gap-2 rounded-md border px-2 py-1">
+                    <li
+                      key={packet.id}
+                      className="flex items-center justify-between gap-2 rounded-md border px-2 py-1"
+                    >
                       <span>
-                        {packet.origin.conversationLabel || t("workspace.packet.untitled")} · ~
-                        {packet.tokenEstimate ?? 0} · {t(`workspace.packet.privacy.${packet.privacyMode}`)}
+                        {packet.origin.conversationLabel ||
+                          t("workspace.packet.untitled")}{" "}
+                        · ~{packet.tokenEstimate ?? 0} ·{" "}
+                        {t(`workspace.packet.privacy.${packet.privacyMode}`)}
                       </span>
                       <span className="flex gap-1">
                         <Button
@@ -181,14 +222,18 @@ export function PacketPanel({
                         <Button
                           type="button"
                           size="sm"
-                          variant={appliedPacketId === packet.id ? "secondary" : "outline"}
+                          variant={
+                            appliedPacketId === packet.id ? "secondary" : "outline"
+                          }
                           disabled={busy}
                           data-testid="packet-apply"
                           onClick={() => {
                             void onApply(packet.id);
                           }}
                         >
-                          {appliedPacketId === packet.id ? t("workspace.packet.using") : t("workspace.packet.apply")}
+                          {appliedPacketId === packet.id
+                            ? t("workspace.packet.using")
+                            : t("workspace.packet.apply")}
                         </Button>
                       </span>
                     </li>
