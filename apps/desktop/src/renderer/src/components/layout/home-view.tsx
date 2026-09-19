@@ -23,6 +23,7 @@ import {
   type ProjectDto,
   type ProjectUpdateInput,
   type ProjectFileDto,
+  type PromptDto,
   type ProviderKeyDto,
 } from "@ai-hub/shared";
 import {
@@ -127,6 +128,8 @@ export function HomeView({
   onMentionsChange,
   onDuplicateConversation,
   onPromoteConversation,
+  composerInsert,
+  onComposerInsertConsumed,
 }: {
   project: ProjectDto | null;
   importedInbox: boolean;
@@ -191,6 +194,8 @@ export function HomeView({
   onAttachFolder: () => Promise<void>;
   onRemoveFile: (id: string) => Promise<void>;
   onDropFiles: (files: File[]) => Promise<void>;
+  composerInsert: string | null;
+  onComposerInsertConsumed: () => void;
 }): JSX.Element {
   const { t } = useTranslation();
   const modifier = window.hub.platform === "darwin" ? "⌘" : "Ctrl";
@@ -206,6 +211,7 @@ export function HomeView({
   const [memoryOpen, setMemoryOpen] = useState(false);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [projectMemories, setProjectMemories] = useState<ProjectMemoryDto[]>([]);
+  const [libraryPrompts, setLibraryPrompts] = useState<PromptDto[]>([]);
   const [memoryOptedOut, setMemoryOptedOut] = useState(false);
   const [memorySuggestions, setMemorySuggestions] = useState<string[]>([]);
   const [conversationWorkspace, setConversationWorkspace] = useState<ConversationWorkspaceDto | null>(
@@ -274,6 +280,40 @@ export function HomeView({
             available: conversation !== undefined && conversation.id !== selectedConversationId,
           };
         }
+        if (item.type === "memory") {
+          const memory = projectMemories.find(
+            (row) =>
+              row.title.toLowerCase() === item.query.toLowerCase() ||
+              row.body.toLowerCase().includes(item.query.toLowerCase()),
+          );
+          return {
+            type: item.type,
+            id: memory?.id ?? null,
+            query: item.query,
+            label: memory?.title ?? item.query,
+            excerpt: memory?.body.slice(0, 120) ?? item.query,
+            tokens: memory ? Math.ceil(memory.body.length / 4) : 0,
+            available: memory !== undefined,
+          };
+        }
+        if (item.type === "prompt") {
+          const prompt = libraryPrompts.find((row) => {
+            const label = row.factoryId ? t(`prompts.factory.${row.factoryId}`) : row.title;
+            return (
+              row.title.toLowerCase() === item.query.toLowerCase() ||
+              label.toLowerCase() === item.query.toLowerCase()
+            );
+          });
+          return {
+            type: item.type,
+            id: prompt?.id ?? null,
+            query: item.query,
+            label: prompt?.title ?? item.query,
+            excerpt: prompt?.body.slice(0, 120) ?? item.query,
+            tokens: prompt ? Math.ceil(prompt.body.length / 4) : 0,
+            available: prompt !== undefined,
+          };
+        }
         if (item.type === "packet") {
           const packet = packets.find(
             (row) =>
@@ -316,11 +356,27 @@ export function HomeView({
   }, [onComposerDraft, onMentionsChange, selectedConversationId]);
 
   useEffect(() => {
+    if (!composerInsert) {
+      return;
+    }
+    setDraft(composerInsert);
+    onComposerDraft(composerInsert);
+    onComposerInsertConsumed();
+  }, [composerInsert, onComposerDraft, onComposerInsertConsumed]);
+
+  useEffect(() => {
     void window.hub.files
       .list({ projectId: project?.id ?? null })
       .then(setProjectFiles)
       .catch(() => setProjectFiles([]));
   }, [attachedFiles, project?.id]);
+
+  useEffect(() => {
+    void window.hub.prompts
+      .list()
+      .then(setLibraryPrompts)
+      .catch(() => setLibraryPrompts([]));
+  }, []);
 
   useEffect(() => {
     if (!project) {
@@ -1271,6 +1327,32 @@ export function HomeView({
                             id: item.id,
                             query: item.title,
                             label: item.title,
+                            excerpt: item.body.slice(0, 120),
+                            tokens: Math.ceil(item.body.length / 4),
+                            available: true,
+                          })),
+                      );
+                      return;
+                    }
+                    if (parts.type === "prompt") {
+                      setMentionSuggestions(
+                        libraryPrompts
+                          .filter((item) => {
+                            const label = item.factoryId
+                              ? t(`prompts.factory.${item.factoryId}`)
+                              : item.title;
+                            return (
+                              label.toLowerCase().includes(query) ||
+                              item.title.toLowerCase().includes(query) ||
+                              item.body.toLowerCase().includes(query)
+                            );
+                          })
+                          .slice(0, 8)
+                          .map((item) => ({
+                            type: "prompt" as const,
+                            id: item.id,
+                            query: item.title,
+                            label: item.factoryId ? t(`prompts.factory.${item.factoryId}`) : item.title,
                             excerpt: item.body.slice(0, 120),
                             tokens: Math.ceil(item.body.length / 4),
                             available: true,
