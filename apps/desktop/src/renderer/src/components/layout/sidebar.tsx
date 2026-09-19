@@ -94,7 +94,9 @@ export function Sidebar({
           {searchQuery.trim().length >= 2 ? (
             <ul className="mt-1 flex flex-col gap-0.5">
               {searchHits.length === 0 ? (
-                <li className="px-1 py-1 text-[11px] text-muted-foreground">{t("workspace.searchEmpty")}</li>
+                <li className="px-1 py-1 text-[11px] text-muted-foreground">
+                  {t("workspace.searchEmpty")}
+                </li>
               ) : (
                 searchHits.map((hit) => (
                   <li key={`${hit.conversationId}:${hit.messageId ?? "title"}`}>
@@ -106,7 +108,9 @@ export function Sidebar({
                       onClick={() => onOpenSearchHit(hit)}
                     >
                       <span className="font-medium">{hit.conversationTitle}</span>
-                      <span className="mt-0.5 block text-muted-foreground">{hit.snippet}</span>
+                      <span className="mt-0.5 block text-muted-foreground">
+                        {hit.snippet}
+                      </span>
                     </Button>
                   </li>
                 ))
@@ -120,9 +124,18 @@ export function Sidebar({
         <div className="mt-1 flex flex-col gap-0.5">
           <Button
             type="button"
-            variant={view === "home" && selectedProjectId === null && !importedInbox ? "secondary" : "ghost"}
+            variant={
+              view === "home" && selectedProjectId === null && !importedInbox
+                ? "secondary"
+                : "ghost"
+            }
             className="h-8 w-full justify-start gap-2 truncate"
             data-testid="inbox-avulsas"
+            aria-current={
+              view === "home" && selectedProjectId === null && !importedInbox
+                ? "page"
+                : undefined
+            }
             onClick={() => {
               onSelectProject(null);
               onChange("home");
@@ -133,9 +146,18 @@ export function Sidebar({
           </Button>
           <Button
             type="button"
-            variant={view === "home" && selectedProjectId === null && importedInbox ? "secondary" : "ghost"}
+            variant={
+              view === "home" && selectedProjectId === null && importedInbox
+                ? "secondary"
+                : "ghost"
+            }
             className="h-8 w-full justify-start gap-2 truncate"
             data-testid="inbox-imported"
+            aria-current={
+              view === "home" && selectedProjectId === null && importedInbox
+                ? "page"
+                : undefined
+            }
             onClick={() => {
               onSelectImportedInbox();
               onChange("home");
@@ -145,7 +167,9 @@ export function Sidebar({
             {t("workspace.importedInbox")}
           </Button>
           {projects.length === 0 ? (
-            <p className="px-2 py-1 text-[11px] text-muted-foreground">{t("empty.body")}</p>
+            <p className="px-2 py-1 text-[11px] text-muted-foreground">
+              {t("empty.body")}
+            </p>
           ) : null}
           {projects.map((project) => (
             <Button
@@ -154,6 +178,9 @@ export function Sidebar({
               variant={selectedProjectId === project.id ? "secondary" : "ghost"}
               className="h-8 w-full justify-start gap-2 truncate"
               data-testid="project-item"
+              aria-current={
+                view === "home" && selectedProjectId === project.id ? "page" : undefined
+              }
               onClick={() => {
                 onSelectProject(project.id);
                 onChange("home");
@@ -184,7 +211,12 @@ export function Sidebar({
           aria-label={t("workspace.projectPlaceholder")}
           data-testid="workspace-new-project-name"
         />
-        <Button type="submit" size="sm" className="h-7 gap-1" data-testid="workspace-new-project">
+        <Button
+          type="submit"
+          size="sm"
+          className="h-7 gap-1"
+          data-testid="workspace-new-project"
+        >
           <Plus className="h-3 w-3" />
           {t("workspace.newProject")}
         </Button>
