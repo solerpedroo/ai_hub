@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { compileActivePath, compilePacket, compilePacketDetailed, mergePacketWithTail } from "./compiler";
+import {
+  appendMentionsToPacket,
+  compileActivePath,
+  compilePacket,
+  compilePacketDetailed,
+  mergePacketWithTail,
+} from "./compiler";
 
 describe("compilePacket", () => {
   it("joins project instructions and skips streaming messages", () => {
@@ -64,6 +70,33 @@ describe("compilePacket", () => {
     const fileSlice = detailed.included.find((item) => item.kind === "file");
     expect(fileSlice?.label).toBe("Attached file: spec.pdf");
     expect(fileSlice?.label).not.toContain("payments");
+  });
+
+  it("appends conversation mentions without putting the body in the slice label", () => {
+    const compiled = compilePacket({
+      projectInstructions: null,
+      extraSystem: null,
+      messages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          role: "user",
+          content: "compare with the other thread",
+          status: "complete",
+        },
+      ],
+    });
+    const withMentions = appendMentionsToPacket(compiled, [
+      {
+        kind: "conversation",
+        id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        name: "Old thread",
+        text: "user: we use PostgreSQL",
+      },
+    ]);
+    expect(withMentions.packet.system).toContain("Mentioned conversation: Old thread");
+    expect(withMentions.packet.system).toContain("PostgreSQL");
+    expect(withMentions.included[0]?.label).toBe("Mentioned conversation: Old thread");
+    expect(withMentions.included[0]?.label).not.toContain("PostgreSQL");
   });
 
   it("never puts an apiKey field on the packet", () => {
