@@ -69,6 +69,13 @@ import type {
   WorkspaceSetTaskDoneInput,
   ConversationTaskDto,
   ConversationToProjectResult,
+  PromptDto,
+  PromptCreateInput,
+  PromptUpdateInput,
+  PromptResolveInput,
+  PromptResolveResult,
+  PlaygroundRunInput,
+  PlaygroundRunResult,
   ProviderKeyDto,
   SecretsSaveInput,
   SecretsTestInput,
@@ -201,6 +208,18 @@ export interface HubWorkspaceApi {
   removeTask: (input: IdInput) => Promise<void>;
 }
 
+export interface HubPromptsApi {
+  list: () => Promise<PromptDto[]>;
+  create: (input: PromptCreateInput) => Promise<PromptDto>;
+  update: (input: PromptUpdateInput) => Promise<PromptDto>;
+  remove: (input: IdInput) => Promise<void>;
+  resolve: (input: PromptResolveInput) => Promise<PromptResolveResult>;
+}
+
+export interface HubPlaygroundApi {
+  run: (input: PlaygroundRunInput) => Promise<PlaygroundRunResult>;
+}
+
 export interface HubChatApi {
   send: (input: ChatSendInput) => Promise<ChatSendResult>;
   abort: (input: ChatAbortInput) => Promise<void>;
@@ -230,6 +249,8 @@ export interface HubApi {
   files: HubFilesApi;
   memory: HubMemoryApi;
   workspace: HubWorkspaceApi;
+  prompts: HubPromptsApi;
+  playground: HubPlaygroundApi;
 }
 
 export type { AppLocale, ThemeMode };
