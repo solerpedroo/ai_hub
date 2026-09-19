@@ -1,0 +1,1935 @@
+﻿diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index 08a053d..67c5807 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -82,6 +82,12 @@ import {
+   artifactPinInputSchema,
+   artifactExportInputSchema,
+   artifactExportResultSchema,
++  skillDtoSchema,
++  skillListResultSchema,
++  skillCreateInputSchema,
++  skillUpdateInputSchema,
++  skillResolveInputSchema,
++  skillResolveResultSchema,
+   contextPacketDtoSchema,
+   contextPacketListResultSchema,
+   projectCreateInputSchema,
+@@ -123,6 +129,7 @@ import { previewPacket } from "./packet-preview";
+ import { getConversationWorkspaceDto, refreshConversationWorkspace } from "./workspace";
+ import { getHubDatabase } from "./persistence";
+ import { listPromptDtos, resolvePromptDto, runPlayground } from "./playground";
++import { listSkillDtos, resolveSkillDto } from "./skills";
+ import { exportArtifact, toArtifactDto } from "./artifacts";
+ import { testProviderKey } from "./provider-health";
+ import { localDayStartMs } from "./spend-guard";
+@@ -624,6 +631,48 @@ export function registerWorkspaceIpc(): void {
+     (input, event) => exportArtifact(input, event.sender),
+   );
+ 
++  registerHandler(IpcChannel.skillsList, emptyIpcPayloadSchema, skillListResultSchema, () =>
++    listSkillDtos().map((row) => skillDtoSchema.parse(row)),
++  );
++
++  registerHandler(IpcChannel.skillsCreate, skillCreateInputSchema, skillDtoSchema, (input) =>
++    skillDtoSchema.parse({
++      ...getHubDatabase().repos.createSkill({
++        folder: input.folder,
++        title: input.title,
++        description: input.description,
++        prompt: input.prompt,
++        preferredModel: input.preferredModel,
++        defaultMentions: input.defaultMentions,
++        steps: input.steps,
++      }),
++      contractVersion: 1 as const,
++    }),
++  );
++
++  registerHandler(IpcChannel.skillsUpdate, skillUpdateInputSchema, skillDtoSchema, (input) =>
++    skillDtoSchema.parse({
++      ...getHubDatabase().repos.updateSkill(input.id, {
++        ...(input.folder !== undefined ? { folder: input.folder } : {}),
++        ...(input.title !== undefined ? { title: input.title } : {}),
++        ...(input.description !== undefined ? { description: input.description } : {}),
++        ...(input.prompt !== undefined ? { prompt: input.prompt } : {}),
++        ...(input.preferredModel !== undefined ? { preferredModel: input.preferredModel } : {}),
++        ...(input.defaultMentions !== undefined ? { defaultMentions: input.defaultMentions } : {}),
++        ...(input.steps !== undefined ? { steps: input.steps } : {}),
++      }),
++      contractVersion: 1 as const,
++    }),
++  );
++
++  registerHandler(IpcChannel.skillsRemove, idInputSchema, ipcAckResultSchema, (input) => {
++    getHubDatabase().repos.removeSkill(input.id);
++  });
++
++  registerHandler(IpcChannel.skillsResolve, skillResolveInputSchema, skillResolveResultSchema, (input) =>
++    skillResolveResultSchema.parse(resolveSkillDto(input.skillId, input.query, input.projectId)),
++  );
++
+   registerHandler(IpcChannel.spendCapsGet, emptyIpcPayloadSchema, spendCapListResultSchema, () => {
+     const rows = getHubDatabase().repos.listSpendCaps();
+     return SPEND_CAP_SCOPES.map((scope) => ({
+diff --git a/apps/desktop/src/main/mentions.ts b/apps/desktop/src/main/mentions.ts
+index e2f55b1..d41f5d5 100644
+--- a/apps/desktop/src/main/mentions.ts
++++ b/apps/desktop/src/main/mentions.ts
+@@ -3,6 +3,7 @@ import type { HubRepos } from "@ai-hub/db";
+ import { allowsProjectContext } from "@ai-hub/memory";
+ import { redactSecrets } from "@ai-hub/security";
+ import {
++  composeSkillPrompt,
+   MAX_MENTION_TOKENS,
+   MAX_MENTIONS_PER_SEND,
+   isMentionStubType,
+@@ -12,6 +13,7 @@ import {
+   type PacketPrivacyMode,
+ } from "@ai-hub/shared";
+ import { interpolateStoredPrompt } from "./prompt-vars";
++import { matchSkill } from "./skills";
+ 
+ export function resolveSendMentions(
+   repos: HubRepos,
+@@ -83,6 +85,16 @@ export function resolveSendMentions(
+         mentions.push(mention);
+         continue;
+       }
++      if (ref.type === "skill") {
++        const mention = resolveSkillMention(repos, projectId, ref, remaining);
++        if (seen.has(`skill:${mention.id}`)) {
++          continue;
++        }
++        seen.add(`skill:${mention.id}`);
++        usedTokens += mentionTokenEstimate(mention.text.length);
++        mentions.push(mention);
++        continue;
++      }
+       if (ref.type === "conversation") {
+         const mention = resolveConversationMention(repos, projectId, currentConversationId, ref, remaining);
+         if (mention) {
+@@ -172,6 +184,27 @@ function resolvePromptMention(
+   };
+ }
+ 
++function resolveSkillMention(
++  repos: HubRepos,
++  projectId: string | null,
++  ref: MentionRef,
++  remainingTokens: number,
++): CompilerMention {
++  const match = matchSkill(ref.query, ref.id);
++  if (!match) {
++    throw new Error("mentions:not_found");
++  }
++  const composed = composeSkillPrompt(match.prompt, match.steps);
++  const text = redactSecrets(interpolateStoredPrompt(repos, composed, projectId));
++  const maxChars = Math.max(4, remainingTokens * 4);
++  return {
++    kind: "skill",
++    id: match.id,
++    name: match.title,
++    text: text.length > maxChars ? `${text.slice(0, maxChars - 1)}ÔÇª` : text,
++  };
++}
++
+ function resolveProjectFile(
+   repos: HubRepos,
+   projectId: string | null,
+diff --git a/apps/desktop/src/main/persistence.ts b/apps/desktop/src/main/persistence.ts
+index ce58a1a..0b69b11 100644
+--- a/apps/desktop/src/main/persistence.ts
++++ b/apps/desktop/src/main/persistence.ts
+@@ -1,7 +1,7 @@
+ import { join } from "node:path";
+ import { app } from "electron";
+ import { openHubDatabase, type HubDatabase } from "@ai-hub/db";
+-import { FACTORY_PROMPTS } from "@ai-hub/shared";
++import { FACTORY_PROMPTS, FACTORY_SKILLS } from "@ai-hub/shared";
+ import { loadOrCreateMasterKey, MemorySecretStore } from "@ai-hub/security";
+ import { KeytarSecretStore } from "@ai-hub/security/keytar";
+ import { isE2eMode } from "./e2e-mode";
+@@ -41,6 +41,7 @@ export async function bootPersistence(): Promise<HubDatabase> {
+   const dbPath = join(app.getPath("userData"), "ai-hub.sqlite");
+   hub = openHubDatabase({ path: dbPath, masterKey, secretStore: store });
+   hub.repos.ensureFactoryPrompts(FACTORY_PROMPTS);
++  hub.repos.ensureFactorySkills(FACTORY_SKILLS);
+   if (isE2eMode() && process.env.AI_HUB_E2E_EMPTY !== "1") {
+     await seedE2eWorkspace(hub);
+   }
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index e3c5c37..d385130 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -85,6 +85,12 @@ import {
+   artifactPinInputSchema,
+   artifactExportInputSchema,
+   artifactExportResultSchema,
++  skillCreateInputSchema,
++  skillDtoSchema,
++  skillListResultSchema,
++  skillResolveInputSchema,
++  skillResolveResultSchema,
++  skillUpdateInputSchema,
+   contextPacketDtoSchema,
+   contextPacketListResultSchema,
+   projectCreateInputSchema,
+@@ -437,6 +443,14 @@ const hub: HubApi = {
+     exportFile: (input) =>
+       invokeParsed(IpcChannel.artifactsExport, input, artifactExportInputSchema, artifactExportResultSchema),
+   },
++  skills: {
++    list: () => invokeParsed(IpcChannel.skillsList, empty, emptyIpcPayloadSchema, skillListResultSchema),
++    create: (input) => invokeParsed(IpcChannel.skillsCreate, input, skillCreateInputSchema, skillDtoSchema),
++    update: (input) => invokeParsed(IpcChannel.skillsUpdate, input, skillUpdateInputSchema, skillDtoSchema),
++    remove: (input) => invokeAckWith(IpcChannel.skillsRemove, input, idInputSchema),
++    resolve: (input) =>
++      invokeParsed(IpcChannel.skillsResolve, input, skillResolveInputSchema, skillResolveResultSchema),
++  },
+ };
+ 
+ contextBridge.exposeInMainWorld("hub", hub);
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index a9a00d7..e1bc57d 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -36,6 +36,7 @@ import { SettingsView } from "@/components/layout/settings-view";
+ import { DebugView } from "@/components/layout/debug-view";
+ import { ImportView } from "@/components/layout/import-view";
+ import { PromptsView } from "@/components/layout/prompts-view";
++import { SkillsView } from "@/components/layout/skills-view";
+ import { OnboardingView } from "@/components/layout/onboarding-view";
+ import {
+   ChromeCommandPalette,
+@@ -167,6 +168,7 @@ export function App(): JSX.Element {
+   const [showAllowOnce, setShowAllowOnce] = useState(false);
+   const [composerDraft, setComposerDraft] = useState("");
+   const [composerInsert, setComposerInsert] = useState<string | null>(null);
++  const [pendingSkillQuery, setPendingSkillQuery] = useState<string | null>(null);
+   const [attachedFiles, setAttachedFiles] = useState<ProjectFileDto[]>([]);
+   const [mentionRefs, setMentionRefs] = useState<MentionRef[]>([]);
+   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+@@ -401,7 +403,7 @@ export function App(): JSX.Element {
+   ]);
+ 
+   useEffect(() => {
+-    if (view !== "home" && view !== "prompts") {
++    if (view !== "home" && view !== "prompts" && view !== "skills") {
+       return;
+     }
+     void loadKeys()
+@@ -813,6 +815,11 @@ export function App(): JSX.Element {
+         window.setTimeout(() => projectInputRef.current?.focus(), 0);
+         return;
+       }
++      if (event.shiftKey && event.key.toLowerCase() === "s") {
++        event.preventDefault();
++        navigateToView("skills");
++        return;
++      }
+       if (event.key.toLowerCase() === "n") {
+         event.preventDefault();
+         void createUntitledChat();
+@@ -820,7 +827,7 @@ export function App(): JSX.Element {
+     };
+     window.addEventListener("keydown", onKey);
+     return () => window.removeEventListener("keydown", onKey);
+-  }, [createUntitledChat]);
++  }, [createUntitledChat, navigateToView]);
+ 
+   if (showOnboarding === null) {
+     return (
+@@ -947,23 +954,59 @@ export function App(): JSX.Element {
+               onSelectTemperature={setTemperature}
+               onSelectMaxTokens={setMaxTokens}
+               onSelectExtraSystem={setExtraSystem}
+-              onSend={(content, mentions) => {
++              onSend={async (content, mentions) => {
+                 if (!selectedConversationId || !selectedKeyId) {
+-                  return Promise.resolve(false);
++                  return false;
++                }
++                let nextMentions = mentions;
++                let model = selectedModel;
++                let providerKeyId = selectedKeyId;
++                const skillRef = mentions.find((item) => item.type === "skill");
++                if (skillRef) {
++                  try {
++                    const resolved = await window.hub.skills.resolve({
++                      projectId: selectedProjectId,
++                      ...(skillRef.id !== undefined ? { skillId: skillRef.id } : {}),
++                      ...(skillRef.query !== undefined ? { query: skillRef.query } : {}),
++                    });
++                    nextMentions = [
++                      ...resolved.defaultMentions.map((item) => ({
++                        type: item.type,
++                        query: item.query,
++                      })),
++                      ...mentions,
++                    ].slice(0, 8);
++                    if (resolved.preferredModel) {
++                      const match = providerKeys.find((key) =>
++                        catalogModelsForProvider(key.providerSlug).some(
++                          (item) => item.id === resolved.preferredModel,
++                        ),
++                      );
++                      if (match) {
++                        model = resolved.preferredModel;
++                        providerKeyId = match.id;
++                        setSelectedModel(model);
++                        setSelectedKeyId(providerKeyId);
++                      }
++                    }
++                  } catch {
++                    fail();
++                    return false;
++                  }
+                 }
+-                setMentionRefs(mentions);
++                setMentionRefs(nextMentions);
+                 return sendToModel({
+                   mode: "send",
+                   conversationId: selectedConversationId,
+-                  providerKeyId: selectedKeyId,
+-                  model: selectedModel,
++                  providerKeyId,
++                  model,
+                   content,
+                   temperature,
+                   maxTokens,
+                   extraSystem,
+                   compactHistory,
+                   ...fileIdsPayload(attachedFiles),
+-                  ...mentionsPayload(mentions),
++                  ...mentionsPayload(nextMentions),
+                 });
+               }}
+               onMentionsChange={setMentionRefs}
+@@ -1194,6 +1237,9 @@ export function App(): JSX.Element {
+               onComposerDraft={reportComposerDraft}
+               composerInsert={composerInsert}
+               onComposerInsertConsumed={() => setComposerInsert(null)}
++              pendingSkillQuery={pendingSkillQuery}
++              onPendingSkillConsumed={() => setPendingSkillQuery(null)}
++              onOpenSkills={() => navigateToView("skills")}
+               onPin={async (id, pinned) => {
+                 try {
+                   const updated = await window.hub.messages.pin({ id, pinned });
+@@ -1366,6 +1412,13 @@ export function App(): JSX.Element {
+                 setView("home");
+               }}
+             />
++          ) : view === "skills" ? (
++            <SkillsView
++              onRunSkill={(query) => {
++                setPendingSkillQuery(query);
++                setView("home");
++              }}
++            />
+           ) : view === "import" ? (
+             <ImportView
+               projects={projects}
+@@ -1502,6 +1555,11 @@ export function App(): JSX.Element {
+         onDebug={() => navigateToView("debug")}
+         onImport={() => navigateToView("import")}
+         onPrompts={() => navigateToView("prompts")}
++        onSkills={() => navigateToView("skills")}
++        onRunSkill={(query) => {
++          setPendingSkillQuery(query);
++          navigateToView("home");
++        }}
+         onShortcuts={() => setShortcutsOpen(true)}
+       />
+     </div>
+diff --git a/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx b/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
+index 2254439..2b13a67 100644
+--- a/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
++++ b/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
+@@ -10,12 +10,13 @@ import { useTranslation } from "react-i18next";
+ import {
+   looksLikePastedSecret,
+   mentionTriggerIn,
++  parseSkillSlashDraft,
+   redactPastedSecrets,
+   type MentionType,
+ } from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
+ 
+-export type SlashCommandId = "model" | "clear" | "compact" | "packet" | "cap";
++export type SlashCommandId = "model" | "clear" | "compact" | "packet" | "cap" | "skill";
+ 
+ export interface MentionSuggestion {
+   type: MentionType;
+@@ -27,7 +28,7 @@ export interface MentionSuggestion {
+   available: boolean;
+ }
+ 
+-const SLASH_COMMANDS: SlashCommandId[] = ["model", "clear", "compact", "packet", "cap"];
++const SLASH_COMMANDS: SlashCommandId[] = ["model", "clear", "compact", "packet", "cap", "skill"];
+ 
+ export function matchKnownSlashCommand(draft: string): SlashCommandId | null {
+   const trimmed = draft.trim();
+@@ -44,6 +45,7 @@ export function ChatComposer({
+   onSend,
+   onAbort,
+   onSlashCommand,
++  onSkillSlash,
+   onFilesDrop,
+   mentionSuggestions,
+   onMentionQuery,
+@@ -59,6 +61,7 @@ export function ChatComposer({
+   onSend: () => void;
+   onAbort: () => void;
+   onSlashCommand: (command: SlashCommandId) => void;
++  onSkillSlash: (query: string | null, remainder: string) => void;
+   onFilesDrop: (files: File[]) => void;
+   mentionSuggestions: MentionSuggestion[];
+   onMentionQuery: (typed: string | null) => void;
+@@ -125,6 +128,12 @@ export function ChatComposer({
+       onSlashCommand(command);
+       return;
+     }
++    const skillSlash = parseSkillSlashDraft(value);
++    if (skillSlash) {
++      onChange(skillSlash.remainder);
++      onSkillSlash(skillSlash.query, skillSlash.remainder);
++      return;
++    }
+     onSend();
+   };
+ 
+@@ -224,6 +233,11 @@ export function ChatComposer({
+             );
+             return;
+           }
++          if (mentionOpen && event.key === "Enter" && parseSkillSlashDraft(value)?.query) {
++            event.preventDefault();
++            submit();
++            return;
++          }
+           if (mentionOpen && (event.key === "Enter" || event.key === "Tab") && trigger) {
+             event.preventDefault();
+             const item = mentionSuggestions[selectedMentionIndex] ?? mentionSuggestions[0];
+diff --git a/apps/desktop/src/renderer/src/components/layout/command-palette.tsx b/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
+index aaac8d6..d6f6d76 100644
+--- a/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
+@@ -57,6 +57,8 @@ export function ChromeCommandPalette({
+   onDebug,
+   onImport,
+   onPrompts,
++  onSkills,
++  onRunSkill,
+   onShortcuts,
+ }: {
+   projects: ProjectDto[];
+@@ -78,6 +80,8 @@ export function ChromeCommandPalette({
+   onDebug: () => void;
+   onImport: () => void;
+   onPrompts: () => void;
++  onSkills: () => void;
++  onRunSkill: (query: string) => void;
+   onShortcuts: () => void;
+ }): JSX.Element {
+   const { t } = useTranslation();
+@@ -169,6 +173,18 @@ export function ChromeCommandPalette({
+       keywords: "prompt library playground prompts biblioteca",
+       run: onPrompts,
+     },
++    {
++      id: "skills",
++      label: t("command.skills"),
++      keywords: "skill workflow skills fluxos code review",
++      run: onSkills,
++    },
++    {
++      id: "run-skill-code-review",
++      label: t("command.runSkill", { name: t("skills.factory.code-review") }),
++      keywords: "run skill code review executar skill",
++      run: () => onRunSkill("Code Review"),
++    },
+     {
+       id: "imported",
+       label: t("command.importedInbox"),
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index d768fb6..6d61ff4 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -24,6 +24,7 @@ import {
+   type ProjectUpdateInput,
+   type ProjectFileDto,
+   type PromptDto,
++  type SkillDto,
+   type ArtifactDto,
+   type ProviderKeyDto,
+ } from "@ai-hub/shared";
+@@ -132,6 +133,9 @@ export function HomeView({
+   onPromoteConversation,
+   composerInsert,
+   onComposerInsertConsumed,
++  pendingSkillQuery,
++  onPendingSkillConsumed,
++  onOpenSkills,
+ }: {
+   project: ProjectDto | null;
+   importedInbox: boolean;
+@@ -198,6 +202,9 @@ export function HomeView({
+   onDropFiles: (files: File[]) => Promise<void>;
+   composerInsert: string | null;
+   onComposerInsertConsumed: () => void;
++  pendingSkillQuery: string | null;
++  onPendingSkillConsumed: () => void;
++  onOpenSkills: () => void;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const modifier = window.hub.platform === "darwin" ? "Ôîÿ" : "Ctrl";
+@@ -218,6 +225,12 @@ export function HomeView({
+   const autoOpenedArtifactRef = useRef<string | null>(null);
+   const [projectMemories, setProjectMemories] = useState<ProjectMemoryDto[]>([]);
+   const [libraryPrompts, setLibraryPrompts] = useState<PromptDto[]>([]);
++  const [librarySkills, setLibrarySkills] = useState<SkillDto[]>([]);
++  const [skillRun, setSkillRun] = useState<{
++    title: string;
++    steps: Array<{ id: string; title: string }>;
++    status: "running" | "complete";
++  } | null>(null);
+   const [memoryOptedOut, setMemoryOptedOut] = useState(false);
+   const [memorySuggestions, setMemorySuggestions] = useState<string[]>([]);
+   const [conversationWorkspace, setConversationWorkspace] = useState<ConversationWorkspaceDto | null>(
+@@ -303,6 +316,25 @@ export function HomeView({
+             available: memory !== undefined,
+           };
+         }
++        if (item.type === "skill") {
++          const skill = librarySkills.find((row) => {
++            const label = row.factoryId ? t(`skills.factory.${row.factoryId}`) : row.title;
++            return (
++              row.title.toLowerCase() === item.query.toLowerCase() ||
++              label.toLowerCase() === item.query.toLowerCase() ||
++              (row.factoryId ?? "").toLowerCase() === item.query.toLowerCase()
++            );
++          });
++          return {
++            type: item.type,
++            id: skill?.id ?? null,
++            query: item.query,
++            label: skill?.title ?? item.query,
++            excerpt: skill?.description.slice(0, 120) ?? item.query,
++            tokens: skill ? Math.ceil(skill.prompt.length / 4) : 0,
++            available: skill !== undefined,
++          };
++        }
+         if (item.type === "prompt") {
+           const prompt = libraryPrompts.find((row) => {
+             const label = row.factoryId ? t(`prompts.factory.${row.factoryId}`) : row.title;
+@@ -371,6 +403,30 @@ export function HomeView({
+     onComposerInsertConsumed();
+   }, [composerInsert, onComposerDraft, onComposerInsertConsumed]);
+ 
++  useEffect(() => {
++    if (!pendingSkillQuery) {
++      return;
++    }
++    const remainder = draft;
++    const mentions: MentionRef[] = [
++      { type: "skill", query: pendingSkillQuery },
++      ...mentionRefsFrom(mentionChips, remainder),
++    ];
++    const next = mentionVisibleContent(remainder);
++    onPendingSkillConsumed();
++    sendDraft(next || `@skill:${pendingSkillQuery}`, mentions);
++  }, [pendingSkillQuery]);
++
++  useEffect(() => {
++    if (!skillRun || skillRun.status !== "running") {
++      return;
++    }
++    const last = messages.at(-1);
++    if (last?.role === "assistant" && last.status === "complete") {
++      setSkillRun({ ...skillRun, status: "complete" });
++    }
++  }, [messages, skillRun]);
++
+   useEffect(() => {
+     void window.hub.files
+       .list({ projectId: project?.id ?? null })
+@@ -383,6 +439,10 @@ export function HomeView({
+       .list()
+       .then(setLibraryPrompts)
+       .catch(() => setLibraryPrompts([]));
++    void window.hub.skills
++      .list()
++      .then(setLibrarySkills)
++      .catch(() => setLibrarySkills([]));
+   }, []);
+ 
+   useEffect(() => {
+@@ -480,9 +540,45 @@ export function HomeView({
+       case "cap":
+         onOpenCaps();
+         return;
++      case "skill":
++        onOpenSkills();
++        return;
+     }
+   };
+ 
++  const sendDraft = (content: string, mentions: MentionRef[]): void => {
++    const skillMention = mentions.find((item) => item.type === "skill");
++    if (skillMention) {
++      const skill = librarySkills.find((row) => {
++        const label = row.factoryId ? t(`skills.factory.${row.factoryId}`) : row.title;
++        const query = (skillMention.query ?? "").toLowerCase();
++        return (
++          row.id === skillMention.id ||
++          row.title.toLowerCase() === query ||
++          label.toLowerCase() === query ||
++          (row.factoryId ?? "").toLowerCase() === query
++        );
++      });
++      if (skill) {
++        setSkillRun({
++          title: skill.factoryId ? t(`skills.factory.${skill.factoryId}`) : skill.title,
++          steps: skill.steps.map((step) => ({ id: step.id, title: step.title })),
++          status: "running",
++        });
++      }
++    }
++    void onSend(content, mentions).then((ok) => {
++      if (ok) {
++        setDraft("");
++        setMentionChips([]);
++        onComposerDraft("");
++        onMentionsChange([]);
++      } else if (skillMention) {
++        setSkillRun(null);
++      }
++    });
++  };
++
+   return (
+     <div className="flex h-full min-h-0">
+       <section className="flex w-64 shrink-0 flex-col border-r">
+@@ -1300,6 +1396,34 @@ export function HomeView({
+                     </ul>
+                   ) : null}
+                 </div>
++                {skillRun ? (
++                  <div
++                    className="border-t px-2 py-1.5"
++                    data-testid="skill-run"
++                    data-status={skillRun.status}
++                  >
++                    <p className="text-[12px] font-medium">
++                      {t("skills.run.title", { name: skillRun.title })}
++                    </p>
++                    <ol className="mt-1 flex flex-wrap gap-1">
++                      {skillRun.steps.map((step, index) => {
++                        const current = skillRun.status === "running" && index === 0;
++                        return (
++                          <li
++                            key={step.id}
++                            data-testid="skill-step"
++                            data-current={current ? "true" : "false"}
++                            className={`rounded border px-1.5 py-0.5 text-[11px] ${
++                              current ? "border-foreground" : "border-border text-muted-foreground"
++                            }`}
++                          >
++                            {index + 1}. {step.title}
++                          </li>
++                        );
++                      })}
++                    </ol>
++                  </div>
++                ) : null}
+                 <ChatComposer
+                   key={selectedConversationId}
+                   value={draft}
+@@ -1333,20 +1457,6 @@ export function HomeView({
+                       );
+                       return;
+                     }
+-                    if (isMentionStubType(parts.type)) {
+-                      setMentionSuggestions([
+-                        {
+-                          type: parts.type,
+-                          id: null,
+-                          query: parts.query,
+-                          label: t(`mentions.type.${parts.type}`),
+-                          excerpt: t("mentions.stub"),
+-                          tokens: 0,
+-                          available: false,
+-                        },
+-                      ]);
+-                      return;
+-                    }
+                     const query = parts.query.toLowerCase();
+                     if (parts.type === "file") {
+                       setMentionSuggestions(
+@@ -1386,6 +1496,32 @@ export function HomeView({
+                       );
+                       return;
+                     }
++                    if (parts.type === "skill") {
++                      setMentionSuggestions(
++                        librarySkills
++                          .filter((item) => {
++                            const label = item.factoryId
++                              ? t(`skills.factory.${item.factoryId}`)
++                              : item.title;
++                            return (
++                              label.toLowerCase().includes(query) ||
++                              item.title.toLowerCase().includes(query) ||
++                              item.description.toLowerCase().includes(query)
++                            );
++                          })
++                          .slice(0, 8)
++                          .map((item) => ({
++                            type: "skill" as const,
++                            id: item.id,
++                            query: item.title,
++                            label: item.factoryId ? t(`skills.factory.${item.factoryId}`) : item.title,
++                            excerpt: item.description.slice(0, 120),
++                            tokens: Math.ceil(item.prompt.length / 4),
++                            available: true,
++                          })),
++                      );
++                      return;
++                    }
+                     if (parts.type === "prompt") {
+                       setMentionSuggestions(
+                         libraryPrompts
+@@ -1478,21 +1614,27 @@ export function HomeView({
+                     if (!next && mentions.length === 0) {
+                       return;
+                     }
+-                    void onSend(next || mentionChips.map((chip) => `@${chip.type}:${chip.query}`).join(" "), mentions).then(
+-                      (ok) => {
+-                        if (ok) {
+-                          setDraft("");
+-                          setMentionChips([]);
+-                          onComposerDraft("");
+-                          onMentionsChange([]);
+-                        }
+-                      },
++                    sendDraft(
++                      next || mentionChips.map((chip) => `@${chip.type}:${chip.query}`).join(" "),
++                      mentions,
+                     );
+                   }}
+                   onAbort={() => {
+                     void onAbort();
+                   }}
+                   onSlashCommand={runSlashCommand}
++                  onSkillSlash={(query, remainder) => {
++                    if (!query) {
++                      onOpenSkills();
++                      return;
++                    }
++                    const mentions: MentionRef[] = [
++                      { type: "skill", query },
++                      ...mentionRefsFrom(mentionChips, remainder),
++                    ];
++                    const next = mentionVisibleContent(remainder);
++                    sendDraft(next || `@skill:${query}`, mentions);
++                  }}
+                   onFilesDrop={(files) => {
+                     void onDropFiles(files);
+                   }}
+diff --git a/apps/desktop/src/renderer/src/components/layout/keyboard-shortcuts.tsx b/apps/desktop/src/renderer/src/components/layout/keyboard-shortcuts.tsx
+index 43876d0..3d54779 100644
+--- a/apps/desktop/src/renderer/src/components/layout/keyboard-shortcuts.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/keyboard-shortcuts.tsx
+@@ -16,11 +16,12 @@ export function KeyboardShortcutsDialog({
+     [`${modifier}+N`, t("shortcuts.newChat")],
+     [`${modifier}+Shift+N`, t("shortcuts.newProject")],
+     [`${modifier}+/`, t("shortcuts.cheatsheet")],
++    [`${modifier}+Shift+S`, t("shortcuts.skills")],
+     ["Enter", t("shortcuts.send")],
+     ["Shift+Enter", t("shortcuts.newline")],
+     ["Esc", t("shortcuts.stop")],
+   ] as const;
+-  const slashCommands = ["model", "clear", "compact", "packet", "cap"] as const;
++  const slashCommands = ["model", "clear", "compact", "packet", "cap", "skill"] as const;
+ 
+   return (
+     <Dialog open={open} onOpenChange={onOpenChange}>
+diff --git a/apps/desktop/src/renderer/src/components/layout/sidebar.tsx b/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
+index 3314b5b..327c4c7 100644
+--- a/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
+@@ -1,5 +1,5 @@
+ import { type JSX, type ReactNode, useState, type RefObject } from "react";
+-import { Activity, Home, Inbox, Library, Plus, Settings, Upload } from "lucide-react";
++import { Activity, Home, Inbox, Library, Plus, Settings, Upload, Workflow } from "lucide-react";
+ import { useTranslation } from "react-i18next";
+ import type { ProjectDto, SearchHit } from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
+@@ -67,6 +67,13 @@ export function Sidebar({
+             onClick={() => onChange("prompts")}
+             testId="nav-prompts"
+           />
++          <NavButton
++            active={view === "skills"}
++            icon={<Workflow className="h-3.5 w-3.5" />}
++            label={t("nav.skills")}
++            onClick={() => onChange("skills")}
++            testId="nav-skills"
++          />
+           <NavButton
+             active={view === "settings"}
+             icon={<Settings className="h-3.5 w-3.5" />}
+diff --git a/apps/desktop/src/renderer/src/components/layout/types.ts b/apps/desktop/src/renderer/src/components/layout/types.ts
+index 495a8f8..20cac3a 100644
+--- a/apps/desktop/src/renderer/src/components/layout/types.ts
++++ b/apps/desktop/src/renderer/src/components/layout/types.ts
+@@ -1,3 +1,3 @@
+-export type AppView = "home" | "settings" | "debug" | "import" | "prompts";
++export type AppView = "home" | "settings" | "debug" | "import" | "prompts" | "skills";
+ 
+ export type SettingsSection = "general" | "providers" | "caps";
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index a66e3fe..542b697 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -2,6 +2,7 @@
+   "app.name": "AI Hub",
+   "nav.home": "Home",
+   "nav.prompts": "Prompts",
++  "nav.skills": "Skills",
+   "nav.settings": "Settings",
+   "nav.debug": "Debug",
+   "nav.import": "Import",
+@@ -101,6 +102,7 @@
+   "workspace.packet.kind.memory": "Memory",
+   "workspace.packet.kind.rag": "Retrieved chunk",
+   "workspace.packet.kind.prompt": "Library prompt",
++  "workspace.packet.kind.skill": "Applied skill",
+   "memory.title": "Memory",
+   "memory.add": "Add memory",
+   "memory.update": "Update memory",
+@@ -253,6 +255,8 @@
+   "command.debug": "Open debug",
+   "command.import": "Open Import Hub",
+   "command.prompts": "Open prompt library",
++  "command.skills": "Open skill library",
++  "command.runSkill": "Run skill: {{name}}",
+   "command.exportActive": "Export active branch",
+   "command.exportTree": "Export tree JSON",
+   "command.providers": "Manage providers",
+@@ -269,6 +273,7 @@
+   "shortcuts.palette": "Open the Command Palette",
+   "shortcuts.newChat": "Create a conversation",
+   "shortcuts.newProject": "Focus project creation",
++  "shortcuts.skills": "Open the skill library",
+   "shortcuts.cheatsheet": "Open this guide",
+   "shortcuts.send": "Send a message or run a slash command",
+   "shortcuts.newline": "Insert a new line",
+@@ -279,6 +284,7 @@
+   "slash.compact.description": "Toggle compaction for the next send",
+   "slash.packet.description": "Open the context packet",
+   "slash.cap.description": "Open spend caps",
++  "slash.skill.description": "Open the skill library, or /skill Name to run one",
+   "workspace.sibling.prev": "Previous alternative",
+   "workspace.sibling.next": "Next alternative",
+   "workspace.sibling.count": "{{current}} / {{total}}",
+@@ -413,5 +419,30 @@
+   "artifacts.kind.html": "HTML",
+   "artifacts.kind.markdown": "Markdown",
+   "artifacts.kind.code": "Code",
+-  "artifacts.error": "Could not update that artifact."
++  "artifacts.error": "Could not update that artifact.",
++  "skills.library": "Skill library",
++  "skills.editor": "Skill",
++  "skills.new": "New",
++  "skills.save": "Save",
++  "skills.delete": "Delete",
++  "skills.run": "Run",
++  "skills.steps": "Steps",
++  "skills.addStep": "Add step",
++  "skills.titlePlaceholder": "Name",
++  "skills.descriptionPlaceholder": "What this skill does",
++  "skills.promptPlaceholder": "Skill prompt using project, language, and goal variables",
++  "skills.modelPlaceholder": "Preferred model id (optional)",
++  "skills.stepTitlePlaceholder": "Step title",
++  "skills.stepSectionPlaceholder": "Instructions for this step",
++  "skills.run.title": "Running {{name}}",
++  "skills.folder.development": "Development",
++  "skills.folder.studies": "Studies",
++  "skills.folder.work": "Work",
++  "skills.factory.code-review": "Code Review",
++  "skills.factory.summarize-pdf": "Summarize PDF",
++  "skills.factory.meeting-prep": "Prepare meeting",
++  "skills.factory.explain-error": "Explain error",
++  "skills.factory.write-rfc": "Write RFC",
++  "skills.error.generic": "Could not load the skill library.",
++  "skills.error.save": "Could not save that skill."
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index b33243e..5694d5d 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -2,6 +2,7 @@
+   "app.name": "AI Hub",
+   "nav.home": "In├¡cio",
+   "nav.prompts": "Prompts",
++  "nav.skills": "Skills",
+   "nav.settings": "Configura├º├Áes",
+   "nav.debug": "Debug",
+   "nav.import": "Importar",
+@@ -101,6 +102,7 @@
+   "workspace.packet.kind.memory": "Mem├│ria",
+   "workspace.packet.kind.rag": "Trecho recuperado",
+   "workspace.packet.kind.prompt": "Prompt da library",
++  "workspace.packet.kind.skill": "Skill aplicada",
+   "memory.title": "Mem├│ria",
+   "memory.add": "Adicionar mem├│ria",
+   "memory.update": "Atualizar mem├│ria",
+@@ -253,6 +255,8 @@
+   "command.debug": "Abrir debug",
+   "command.import": "Abrir Import Hub",
+   "command.prompts": "Abrir biblioteca de prompts",
++  "command.skills": "Abrir biblioteca de skills",
++  "command.runSkill": "Rodar skill: {{name}}",
+   "command.exportActive": "Exportar ramo ativo",
+   "command.exportTree": "Exportar ├írvore JSON",
+   "command.providers": "Gerenciar providers",
+@@ -269,6 +273,7 @@
+   "shortcuts.palette": "Abrir a Command Palette",
+   "shortcuts.newChat": "Criar uma conversa",
+   "shortcuts.newProject": "Focar a cria├º├úo de projeto",
++  "shortcuts.skills": "Abrir a biblioteca de skills",
+   "shortcuts.cheatsheet": "Abrir este guia",
+   "shortcuts.send": "Enviar mensagem ou executar slash command",
+   "shortcuts.newline": "Inserir nova linha",
+@@ -279,6 +284,7 @@
+   "slash.compact.description": "Alternar compacta├º├úo no pr├│ximo envio",
+   "slash.packet.description": "Abrir o packet de contexto",
+   "slash.cap.description": "Abrir os tetos de gasto",
++  "slash.skill.description": "Abrir a biblioteca de skills, ou /skill Nome para correr uma",
+   "workspace.sibling.prev": "Alternativa anterior",
+   "workspace.sibling.next": "Pr├│xima alternativa",
+   "workspace.sibling.count": "{{current}} / {{total}}",
+@@ -413,5 +419,30 @@
+   "artifacts.kind.html": "HTML",
+   "artifacts.kind.markdown": "Markdown",
+   "artifacts.kind.code": "C├│digo",
+-  "artifacts.error": "N├úo foi poss├¡vel atualizar esse artifact."
++  "artifacts.error": "N├úo foi poss├¡vel atualizar esse artifact.",
++  "skills.library": "Biblioteca de skills",
++  "skills.editor": "Skill",
++  "skills.new": "Nova",
++  "skills.save": "Guardar",
++  "skills.delete": "Apagar",
++  "skills.run": "Correr",
++  "skills.steps": "Passos",
++  "skills.addStep": "Adicionar passo",
++  "skills.titlePlaceholder": "Nome",
++  "skills.descriptionPlaceholder": "O que esta skill faz",
++  "skills.promptPlaceholder": "Prompt da skill com as vari├íveis de projeto, idioma e objetivo",
++  "skills.modelPlaceholder": "Id do modelo preferido (opcional)",
++  "skills.stepTitlePlaceholder": "T├¡tulo do passo",
++  "skills.stepSectionPlaceholder": "Instru├º├Áes deste passo",
++  "skills.run.title": "A correr {{name}}",
++  "skills.folder.development": "Desenvolvimento",
++  "skills.folder.studies": "Estudos",
++  "skills.folder.work": "Trabalho",
++  "skills.factory.code-review": "Code Review",
++  "skills.factory.summarize-pdf": "Resumir PDF",
++  "skills.factory.meeting-prep": "Preparar reuni├úo",
++  "skills.factory.explain-error": "Explicar erro",
++  "skills.factory.write-rfc": "Escrever RFC",
++  "skills.error.generic": "N├úo foi poss├¡vel carregar a biblioteca de skills.",
++  "skills.error.save": "N├úo foi poss├¡vel guardar essa skill."
+ }
+diff --git a/docs/ADR/ADR-W13-002-mention-stubs-until-later-waves.md b/docs/ADR/ADR-W13-002-mention-stubs-until-later-waves.md
+index 2b99b2b..e1874a6 100644
+--- a/docs/ADR/ADR-W13-002-mention-stubs-until-later-waves.md
++++ b/docs/ADR/ADR-W13-002-mention-stubs-until-later-waves.md
+@@ -1,11 +1,11 @@
+ # ADR-W13-002-mention-stubs-until-later-waves
+ 
+-- **Status:** accepted (`@skill`); `@memory` superseded by ADR-W14-002; `@prompt` superseded by ADR-W15-002
++- **Status:** accepted (hist├│rico); `@memory` superseded by ADR-W14-002; `@prompt` superseded by ADR-W15-002; `@skill` superseded by ADR-W17-003
+ - **Onda:** W13
+ - **Data:** 2026-09-18
+ - **Deciders:** agent / Pedro
+ - **Supersedes:** ÔÇö
+-- **Superseded by:** ADR-W14-002 (`@memory`), ADR-W15-002 (`@prompt`)
++- **Superseded by:** ADR-W14-002 (`@memory`), ADR-W15-002 (`@prompt`), ADR-W17-003 (`@skill`)
+ 
+ ## Contexto
+ 
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index ec28781..fbe7fb5 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -87,7 +87,7 @@ N├úo escrever ADR de detalhe cosm├®tica. Se mexe em seguran├ºa, custo, provider
+ | [ADR-W12-003](./ADR-W12-003-vision-images-on-stream-not-packet.md) | W12 | Imagens no stream, n├úo no packet; gate `vision` | accepted |
+ | [ADR-W12-004](./ADR-W12-004-pdf-flatedecode-inflate.md) | W12 | PDF: inflate FlateDecode + literais Tj | accepted |
+ | [ADR-W13-001](./ADR-W13-001-mentions-structured-not-in-user-text.md) | W13 | Men├º├Áes estruturadas, n├úo no texto do user | accepted |
+-| [ADR-W13-002](./ADR-W13-002-mention-stubs-until-later-waves.md) | W13 | `@skill` stub; `@prompt` superseded by W15-002 | accepted |
++| [ADR-W13-002](./ADR-W13-002-mention-stubs-until-later-waves.md) | W13 | stubs; `@skill` superseded by W17-003 | accepted |
+ | [ADR-W13-003](./ADR-W13-003-mention-token-cap-excludes-files.md) | W13 | Cap de men├º├úo n├úo inclui `@file` | accepted |
+ | [ADR-W14-001](./ADR-W14-001-local-hashed-embeddings.md) | W14 | Embeddings locais hashed; pacote `memory` | accepted |
+ | [ADR-W14-002](./ADR-W14-002-memories-in-packet-strict-excludes.md) | W14 | Mem├│rias no packet; `strict` exclui | accepted |
+@@ -98,3 +98,6 @@ N├úo escrever ADR de detalhe cosm├®tica. Se mexe em seguran├ºa, custo, provider
+ | [ADR-W16-001](./ADR-W16-001-artifacts-versioned-encrypted.md) | W16 | Artifacts versionados e cifrados | accepted |
+ | [ADR-W16-002](./ADR-W16-002-html-sandbox-custom-protocol.md) | W16 | HTML sandbox via `ai-hub-artifact:` | accepted |
+ | [ADR-W16-003](./ADR-W16-003-artifact-detector-thresholds.md) | W16 | Limiares do detector de artifacts | accepted |
++| [ADR-W17-001](./ADR-W17-001-skill-contract-json.md) | W17 | Contrato JSON v1; steps = sec├º├Áes; tools `[]` | accepted |
++| [ADR-W17-002](./ADR-W17-002-skill-slash-arguments.md) | W17 | `/skill Nome` parse-on-send local | accepted |
++| [ADR-W17-003](./ADR-W17-003-skills-encrypted-library.md) | W17 | Library de skills cifrada; `@skill` no compiler | accepted |
+diff --git a/docs/IMPLEMENTATION_PLAN.md b/docs/IMPLEMENTATION_PLAN.md
+index 8ee3b46..bd05e83 100644
+--- a/docs/IMPLEMENTATION_PLAN.md
++++ b/docs/IMPLEMENTATION_PLAN.md
+@@ -723,12 +723,12 @@ O que **n├úo** entra no MVP (W0ÔÇôW8), mesmo sendo tentador: RAG, Council, MCP,
+ 
+ **Sub-tasks:**
+ 
+-- [ ] Entidade Skill: nome, descri├º├úo, prompt, modelo preferido, men├º├Áes padr├úo, `steps[]`
+-- [ ] CRUD + pastas; skills de f├íbrica (Code Review, Resumir PDF, Preparar reuni├úo, Explicar erro, Escrever RFC)
+-- [ ] Rodar via palette, `/skill`, atalho, men├º├úo `@skill`
+-- [ ] UI de execu├º├úo: passo atual (mesmo sem tools: passos s├úo se├º├Áes do prompt)
+-- [ ] Skill respeita spend cap e privacy mode
+-- [ ] Contrato JSON versionado para no futuro ligar MCP/tools
++- [x] Entidade Skill: nome, descri├º├úo, prompt, modelo preferido, men├º├Áes padr├úo, `steps[]`
++- [x] CRUD + pastas; skills de f├íbrica (Code Review, Resumir PDF, Preparar reuni├úo, Explicar erro, Escrever RFC)
++- [x] Rodar via palette, `/skill`, atalho, men├º├úo `@skill`
++- [x] UI de execu├º├úo: passo atual (mesmo sem tools: passos s├úo se├º├Áes do prompt)
++- [x] Skill respeita spend cap e privacy mode
++- [x] Contrato JSON versionado para no futuro ligar MCP/tools
+ 
+ **DoD:** `/skill Code Review` + `@file:diff` produz revis├úo no formato da skill, no modelo configurado.
+ 
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index e28c6de..8a09994 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave
+ |---|---|
+ | Wave | **W17** |
+ | Marco | C ÔÇö V1 |
+-| State | `pending` |
++| State | `review` |
+ | Last completed | **W16** |
+-| Next action | Start Wave 17 (Skills / workflows) |
++| Next action | Gate ┬º9 Wave 17 |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+diff --git a/packages/ai-gateway/src/compiler.test.ts b/packages/ai-gateway/src/compiler.test.ts
+index 501120a..6ebf598 100644
+--- a/packages/ai-gateway/src/compiler.test.ts
++++ b/packages/ai-gateway/src/compiler.test.ts
+@@ -159,6 +159,33 @@ describe("compilePacket", () => {
+     expect(withPrompt.included[0]?.label).not.toContain("senior");
+   });
+ 
++  it("appends an applied skill slice without leaking the body into the label", () => {
++    const compiled = compilePacket({
++      projectInstructions: null,
++      extraSystem: null,
++      messages: [
++        {
++          id: "11111111-1111-4111-8111-111111111111",
++          role: "user",
++          content: "review this",
++          status: "complete",
++        },
++      ],
++    });
++    const withSkill = appendMentionsToPacket(compiled, [
++      {
++        kind: "skill",
++        id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
++        name: "Code Review",
++        text: "You are a senior code reviewer for E2E.\n## Step 1: Summary\nSummarize.",
++      },
++    ]);
++    expect(withSkill.packet.system).toContain("Applied skill: Code Review");
++    expect(withSkill.included[0]?.kind).toBe("skill");
++    expect(withSkill.included[0]?.label).toBe("Applied skill: Code Review");
++    expect(withSkill.included[0]?.label).not.toContain("senior");
++  });
++
+   it("never puts an apiKey field on the packet", () => {
+     const packet = compilePacket({
+       projectInstructions: null,
+diff --git a/packages/ai-gateway/src/compiler.ts b/packages/ai-gateway/src/compiler.ts
+index 776a683..d3f7660 100644
+--- a/packages/ai-gateway/src/compiler.ts
++++ b/packages/ai-gateway/src/compiler.ts
+@@ -16,7 +16,7 @@ export interface CompilerFile {
+ }
+ 
+ export interface CompilerMention {
+-  kind: "conversation" | "packet" | "memory" | "rag" | "prompt";
++  kind: "conversation" | "packet" | "memory" | "rag" | "prompt" | "skill";
+   id: string;
+   name: string;
+   text: string;
+@@ -258,6 +258,8 @@ function mentionHeading(mention: CompilerMention): string {
+       return `Retrieved chunk: ${mention.name}`;
+     case "prompt":
+       return `Library prompt: ${mention.name}`;
++    case "skill":
++      return `Applied skill: ${mention.name}`;
+     default: {
+       const _never: never = mention.kind;
+       return String(_never);
+diff --git a/packages/ai-gateway/src/mock-adapter.test.ts b/packages/ai-gateway/src/mock-adapter.test.ts
+index 3f13e62..06055e2 100644
+--- a/packages/ai-gateway/src/mock-adapter.test.ts
++++ b/packages/ai-gateway/src/mock-adapter.test.ts
+@@ -1,5 +1,10 @@
+ import { describe, expect, it } from "vitest";
+-import { createMockOpenAIAdapter, MOCK_ASSISTANT_TEXT, MOCK_MERMAID_TEXT } from "./mock-adapter";
++import {
++  createMockOpenAIAdapter,
++  MOCK_ASSISTANT_TEXT,
++  MOCK_MERMAID_TEXT,
++  MOCK_SKILL_REVIEW_TEXT,
++} from "./mock-adapter";
+ import { GatewayError } from "./errors";
+ import type { ProviderAgnosticPacket } from "@ai-hub/shared";
+ 
+@@ -84,4 +89,25 @@ describe("createMockOpenAIAdapter", () => {
+     expect(events.join("")).toBe(MOCK_MERMAID_TEXT);
+     expect(events.join("")).toContain("```mermaid");
+   });
++
++  it("streams a structured review when an applied skill is in the system", async () => {
++    const adapter = createMockOpenAIAdapter();
++    const events: string[] = [];
++    for await (const event of adapter.chatStream({
++      secret: "sk-e2efixtureABCDEFGH",
++      model: "gpt-4o-mini",
++      packet: {
++        ...packet,
++        system: "Applied skill: Code Review\nFollow Summary, Risks, Suggestions.",
++        messages: [{ role: "user", content: "@skill:Code Review @file:diff" }],
++      },
++      signal: new AbortController().signal,
++    })) {
++      if (event.type === "delta") {
++        events.push(event.text);
++      }
++    }
++    expect(events.join("")).toBe(MOCK_SKILL_REVIEW_TEXT);
++    expect(events.join("")).toContain("## Risks");
++  });
+ });
+diff --git a/packages/ai-gateway/src/mock-adapter.ts b/packages/ai-gateway/src/mock-adapter.ts
+index b152766..7b83ea3 100644
+--- a/packages/ai-gateway/src/mock-adapter.ts
++++ b/packages/ai-gateway/src/mock-adapter.ts
+@@ -9,6 +9,17 @@ import type {
+ import { GatewayError } from "./errors";
+ 
+ export const MOCK_ASSISTANT_TEXT = "Hello from mock";
++export const MOCK_SKILL_REVIEW_TEXT = `# Code Review
++
++## Summary
++The attached diff is internally consistent for the fixture.
++
++## Risks
++- None found in the fixture.
++
++## Suggestions
++- Keep this heading format for future reviews.
++`;
+ export const MOCK_MERMAID_TEXT = `Here is the architecture.
+ 
+ \`\`\`mermaid
+@@ -36,7 +47,10 @@ function waitForAbortOrTimeout(ms: number, signal: AbortSignal): Promise<void> {
+   });
+ }
+ 
+-function mockReply(packet: { messages: Array<{ role: string; content: string }> }): string {
++function mockReply(packet: { system?: string; messages: Array<{ role: string; content: string }> }): string {
++  if (packet.system && /Applied skill: Code Review/i.test(packet.system)) {
++    return MOCK_SKILL_REVIEW_TEXT;
++  }
+   const lastUser = [...packet.messages].reverse().find((item) => item.role === "user");
+   if (lastUser && /desenhe a arquitetura|draw the architecture/i.test(lastUser.content)) {
+     return MOCK_MERMAID_TEXT;
+@@ -48,6 +62,9 @@ function splitReply(text: string): [string, string] {
+   if (text === MOCK_ASSISTANT_TEXT) {
+     return ["Hello", " from mock"];
+   }
++  if (text === MOCK_SKILL_REVIEW_TEXT) {
++    return [text.slice(0, text.indexOf("## Risks")), text.slice(text.indexOf("## Risks"))];
++  }
+   const cut = text.indexOf("```mermaid");
+   if (cut > 0) {
+     return [text.slice(0, cut), text.slice(cut)];
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index 288de75..d285595 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -1,5 +1,5 @@
+ export { applyMigrations } from "./migrate";
+-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL } from "./migrations";
++export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL } from "./migrations";
+ export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
+ export {
+   HubRepos,
+@@ -28,6 +28,8 @@ export {
+   type ConversationTaskRecord,
+   type PromptRecord,
+   type PromptFolder,
++  type SkillRecord,
++  type SkillFolder,
+   type ArtifactRecord,
+   type ArtifactKind,
+ } from "./repos";
+diff --git a/packages/db/src/migrations.ts b/packages/db/src/migrations.ts
+index 0464b1b..331d377 100644
+--- a/packages/db/src/migrations.ts
++++ b/packages/db/src/migrations.ts
+@@ -251,6 +251,21 @@ CREATE INDEX artifacts_family_idx ON artifacts(family_id);
+ CREATE INDEX artifacts_message_idx ON artifacts(source_message_id);
+ `;
+ 
++export const MIGRATION_0012_SQL = `
++CREATE TABLE skills (
++  id TEXT PRIMARY KEY,
++  folder TEXT NOT NULL,
++  title_cipher TEXT NOT NULL,
++  description_cipher TEXT NOT NULL,
++  definition_cipher TEXT NOT NULL,
++  preferred_model TEXT,
++  factory_id TEXT UNIQUE,
++  created_at INTEGER NOT NULL,
++  updated_at INTEGER NOT NULL
++);
++CREATE INDEX skills_folder_idx ON skills(folder);
++`;
++
+ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 1, sql: MIGRATION_0001_SQL },
+   { version: 2, sql: MIGRATION_0002_SQL },
+@@ -263,4 +278,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 9, sql: MIGRATION_0009_SQL },
+   { version: 10, sql: MIGRATION_0010_SQL },
+   { version: 11, sql: MIGRATION_0011_SQL },
++  { version: 12, sql: MIGRATION_0012_SQL },
+ ];
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index ec8b46f..cc0ec82 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -125,7 +125,7 @@ describe("hub database", () => {
+       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
+       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
+       applyMigrations(second.sqlite);
+-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(11);
++      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(12);
+       second.close();
+     } finally {
+       rmSync(dir, { recursive: true, force: true });
+@@ -721,6 +721,49 @@ describe("hub database", () => {
+     hub.close();
+   });
+ 
++  it("stores skills encrypted and seeds factory once", () => {
++    const { hub } = openTestDb();
++    hub.repos.ensureFactorySkills([
++      {
++        factoryId: "code-review",
++        folder: "development",
++        title: "Code Review",
++        description: "Review a diff",
++        preferredModel: null,
++        prompt: "Review {{project}}",
++        steps: [{ id: "summary", title: "Summary", section: "Summarize." }],
++        defaultMentions: [],
++      },
++    ]);
++    hub.repos.ensureFactorySkills([
++      {
++        factoryId: "code-review",
++        folder: "development",
++        title: "Code Review",
++        description: "Review a diff",
++        preferredModel: null,
++        prompt: "Review {{project}}",
++        steps: [{ id: "summary", title: "Summary", section: "Summarize." }],
++        defaultMentions: [],
++      },
++    ]);
++    expect(hub.repos.listSkills()).toHaveLength(1);
++    const custom = hub.repos.createSkill({
++      folder: "work",
++      title: "Prep",
++      description: "Meeting prep",
++      prompt: "Prepare {{project}}",
++      preferredModel: null,
++      defaultMentions: [{ type: "file", query: "diff" }],
++      steps: [{ id: "agenda", title: "Agenda", section: "List items." }],
++    });
++    expect(dumpAllText(hub.sqlite)).not.toContain("Meeting prep");
++    expect(dumpAllText(hub.sqlite)).not.toContain("Prepare {{project}}");
++    expect(hub.repos.getSkill(custom.id)?.prompt).toBe("Prepare {{project}}");
++    expect(hub.repos.getSkill(custom.id)?.defaultMentions).toEqual([{ type: "file", query: "diff" }]);
++    hub.close();
++  });
++
+   it("stores artifacts encrypted, versions a family, and clones them", () => {
+     const { hub } = openTestDb();
+     const project = hub.repos.createProject("Alpha");
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 084eb2c..169142c 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -23,6 +23,7 @@ import {
+   projectFiles,
+   projectMemories,
+   prompts,
++  skills,
+   artifacts,
+   messageReceipts,
+   messages,
+@@ -219,6 +220,23 @@ export interface PromptRecord {
+   updatedAt: string;
+ }
+ 
++export type SkillFolder = PromptFolder;
++
++export interface SkillRecord {
++  id: string;
++  folder: SkillFolder;
++  title: string;
++  description: string;
++  prompt: string;
++  preferredModel: string | null;
++  defaultMentions: Array<{ type: "file" | "conversation" | "memory" | "prompt" | "skill" | "packet"; query: string }>;
++  steps: Array<{ id: string; title: string; section: string }>;
++  factoryId: string | null;
++  contractVersion: 1;
++  createdAt: string;
++  updatedAt: string;
++}
++
+ export type ArtifactKind = "mermaid" | "html" | "markdown" | "code";
+ 
+ export interface ArtifactRecord {
+@@ -298,6 +316,7 @@ const CUSTOM_BASE_URL_PREFIX = "custom-base-url:";
+ const SPEND_CAP_OVERRIDES_KEY = "spend-cap-overrides";
+ const MEMORY_OPT_OUT_PREFIX = "memory-opt-out:";
+ const PROMPT_FACTORY_SEEDED_KEY = "prompt-factory-seeded";
++const SKILL_FACTORY_SEEDED_KEY = "skill-factory-seeded";
+ const DEFAULT_SESSION: WorkspaceSessionRecord = {
+   projectId: null,
+   conversationId: null,
+@@ -2168,6 +2187,144 @@ export class HubRepos {
+     this.db.delete(prompts).where(eq(prompts.id, id)).run();
+   }
+ 
++  ensureFactorySkills(
++    items: readonly {
++      factoryId: string;
++      folder: SkillFolder;
++      title: string;
++      description: string;
++      preferredModel: string | null;
++      prompt: string;
++      steps: SkillRecord["steps"];
++      defaultMentions: SkillRecord["defaultMentions"];
++    }[],
++  ): void {
++    const seeded = this.db.select().from(settings).where(eq(settings.key, SKILL_FACTORY_SEEDED_KEY)).get();
++    if (seeded?.value === "1") {
++      return;
++    }
++    for (const item of items) {
++      const existing = this.db.select().from(skills).where(eq(skills.factoryId, item.factoryId)).get();
++      if (existing) {
++        continue;
++      }
++      this.createSkill({
++        folder: item.folder,
++        title: item.title,
++        description: item.description,
++        prompt: item.prompt,
++        preferredModel: item.preferredModel,
++        defaultMentions: item.defaultMentions,
++        steps: item.steps,
++        factoryId: item.factoryId,
++      });
++    }
++    const now = Date.now();
++    this.db
++      .insert(settings)
++      .values({ key: SKILL_FACTORY_SEEDED_KEY, value: "1", updatedAt: now })
++      .onConflictDoUpdate({
++        target: settings.key,
++        set: { value: "1", updatedAt: now },
++      })
++      .run();
++  }
++
++  createSkill(input: {
++    folder: SkillFolder;
++    title: string;
++    description: string;
++    prompt: string;
++    preferredModel?: string | null;
++    defaultMentions: SkillRecord["defaultMentions"];
++    steps: SkillRecord["steps"];
++    factoryId?: string | null;
++  }): SkillRecord {
++    const id = randomUUID();
++    const now = Date.now();
++    this.db
++      .insert(skills)
++      .values({
++        id,
++        folder: input.folder,
++        titleCipher: encryptUtf8(input.title.slice(0, 120), this.masterKey),
++        descriptionCipher: encryptUtf8(input.description.slice(0, 400), this.masterKey),
++        definitionCipher: encryptUtf8(this.skillDefinitionJson(input), this.masterKey),
++        preferredModel: input.preferredModel ?? null,
++        factoryId: input.factoryId ?? null,
++        createdAt: now,
++        updatedAt: now,
++      })
++      .run();
++    const created = this.getSkill(id);
++    if (!created) {
++      throw new Error("Skill not found");
++    }
++    return created;
++  }
++
++  getSkill(id: string): SkillRecord | null {
++    const row = this.db.select().from(skills).where(eq(skills.id, id)).get();
++    return row ? this.toSkill(row) : null;
++  }
++
++  listSkills(): SkillRecord[] {
++    return this.db
++      .select()
++      .from(skills)
++      .all()
++      .map((row) => this.toSkill(row))
++      .sort((a, b) => a.folder.localeCompare(b.folder) || a.title.localeCompare(b.title));
++  }
++
++  updateSkill(
++    id: string,
++    patch: {
++      folder?: SkillFolder;
++      title?: string;
++      description?: string;
++      prompt?: string;
++      preferredModel?: string | null;
++      defaultMentions?: SkillRecord["defaultMentions"];
++      steps?: SkillRecord["steps"];
++    },
++  ): SkillRecord {
++    const existing = this.getSkill(id);
++    if (!existing) {
++      throw new Error("Skill not found");
++    }
++    const next = {
++      folder: patch.folder ?? existing.folder,
++      title: patch.title ?? existing.title,
++      description: patch.description ?? existing.description,
++      prompt: patch.prompt ?? existing.prompt,
++      preferredModel: patch.preferredModel !== undefined ? patch.preferredModel : existing.preferredModel,
++      defaultMentions: patch.defaultMentions ?? existing.defaultMentions,
++      steps: patch.steps ?? existing.steps,
++    };
++    this.db
++      .update(skills)
++      .set({
++        folder: next.folder,
++        titleCipher: encryptUtf8(next.title.slice(0, 120), this.masterKey),
++        descriptionCipher: encryptUtf8(next.description.slice(0, 400), this.masterKey),
++        definitionCipher: encryptUtf8(this.skillDefinitionJson(next), this.masterKey),
++        preferredModel: next.preferredModel,
++        updatedAt: Date.now(),
++      })
++      .where(eq(skills.id, id))
++      .run();
++    const updated = this.getSkill(id);
++    if (!updated) {
++      throw new Error("Skill not found");
++    }
++    return updated;
++  }
++
++  removeSkill(id: string): void {
++    this.db.delete(skills).where(eq(skills.id, id)).run();
++  }
++
+   createArtifact(input: {
+     conversationId: string;
+     familyId?: string;
+@@ -2521,6 +2678,90 @@ export class HubRepos {
+     };
+   }
+ 
++  private skillDefinitionJson(input: {
++    prompt: string;
++    steps: SkillRecord["steps"];
++    defaultMentions: SkillRecord["defaultMentions"];
++  }): string {
++    return JSON.stringify({
++      version: 1,
++      kind: "skill",
++      prompt: input.prompt.slice(0, 16_000),
++      steps: input.steps.slice(0, 12),
++      defaultMentions: input.defaultMentions.slice(0, 8),
++      tools: [],
++    });
++  }
++
++  private toSkill(row: typeof skills.$inferSelect): SkillRecord {
++    const folder =
++      row.folder === "development" || row.folder === "studies" || row.folder === "work"
++        ? row.folder
++        : "work";
++    let definition: {
++      prompt: string;
++      steps: SkillRecord["steps"];
++      defaultMentions: SkillRecord["defaultMentions"];
++    } = { prompt: "", steps: [], defaultMentions: [] };
++    try {
++      const parsed: unknown = JSON.parse(decryptUtf8(row.definitionCipher, this.masterKey));
++      if (
++        parsed &&
++        typeof parsed === "object" &&
++        "prompt" in parsed &&
++        typeof parsed.prompt === "string" &&
++        "steps" in parsed &&
++        Array.isArray(parsed.steps) &&
++        "defaultMentions" in parsed &&
++        Array.isArray(parsed.defaultMentions)
++      ) {
++        definition = {
++          prompt: parsed.prompt,
++          steps: parsed.steps.filter(
++            (step): step is SkillRecord["steps"][number] =>
++              Boolean(
++                step &&
++                  typeof step === "object" &&
++                  "id" in step &&
++                  "title" in step &&
++                  "section" in step &&
++                  typeof step.id === "string" &&
++                  typeof step.title === "string" &&
++                  typeof step.section === "string",
++              ),
++          ),
++          defaultMentions: parsed.defaultMentions.filter(
++            (item): item is SkillRecord["defaultMentions"][number] =>
++              Boolean(
++                item &&
++                  typeof item === "object" &&
++                  "type" in item &&
++                  "query" in item &&
++                  typeof item.type === "string" &&
++                  typeof item.query === "string",
++              ),
++          ),
++        };
++      }
++    } catch {
++      definition = { prompt: "", steps: [], defaultMentions: [] };
++    }
++    return {
++      id: row.id,
++      folder,
++      title: decryptUtf8(row.titleCipher, this.masterKey),
++      description: decryptUtf8(row.descriptionCipher, this.masterKey),
++      prompt: definition.prompt,
++      preferredModel: row.preferredModel ?? null,
++      defaultMentions: definition.defaultMentions,
++      steps: definition.steps,
++      factoryId: row.factoryId ?? null,
++      contractVersion: 1,
++      createdAt: iso(row.createdAt),
++      updatedAt: iso(row.updatedAt),
++    };
++  }
++
+   private toPrompt(row: typeof prompts.$inferSelect): PromptRecord {
+     const folder =
+       row.folder === "development" || row.folder === "studies" || row.folder === "work"
+diff --git a/packages/db/src/schema.ts b/packages/db/src/schema.ts
+index ea255f1..c711011 100644
+--- a/packages/db/src/schema.ts
++++ b/packages/db/src/schema.ts
+@@ -189,6 +189,18 @@ export const prompts = sqliteTable("prompts", {
+   updatedAt: integer("updated_at", { mode: "number" }).notNull(),
+ });
+ 
++export const skills = sqliteTable("skills", {
++  id: text("id").primaryKey(),
++  folder: text("folder").notNull(),
++  titleCipher: text("title_cipher").notNull(),
++  descriptionCipher: text("description_cipher").notNull(),
++  definitionCipher: text("definition_cipher").notNull(),
++  preferredModel: text("preferred_model"),
++  factoryId: text("factory_id"),
++  createdAt: integer("created_at", { mode: "number" }).notNull(),
++  updatedAt: integer("updated_at", { mode: "number" }).notNull(),
++});
++
+ export const artifacts = sqliteTable("artifacts", {
+   id: text("id").primaryKey(),
+   conversationId: text("conversation_id").notNull(),
+@@ -223,5 +235,6 @@ export const schema = {
+   conversationWorkspace,
+   conversationTasks,
+   prompts,
++  skills,
+   artifacts,
+ };
+diff --git a/packages/files/src/packet-ui.test.ts b/packages/files/src/packet-ui.test.ts
+index c77a8e1..fa01a42 100644
+--- a/packages/files/src/packet-ui.test.ts
++++ b/packages/files/src/packet-ui.test.ts
+@@ -36,4 +36,11 @@ describe("stripAttachedFileBodiesForRenderer", () => {
+     expect(stripped).toContain("Library prompt: Code review");
+     expect(stripped).not.toContain("senior");
+   });
++
++  it("omits applied skill bodies", () => {
++    const system = "Be brief.\n\nApplied skill: Code Review\nYou are a senior code reviewer for E2E.";
++    const stripped = stripAttachedFileBodiesForRenderer(system);
++    expect(stripped).toContain("Applied skill: Code Review");
++    expect(stripped).not.toContain("senior");
++  });
+ });
+diff --git a/packages/files/src/packet-ui.ts b/packages/files/src/packet-ui.ts
+index 4c58483..9e31f75 100644
+--- a/packages/files/src/packet-ui.ts
++++ b/packages/files/src/packet-ui.ts
+@@ -1,6 +1,6 @@
+ export function stripAttachedFileBodiesForRenderer(system: string): string {
+   const heading =
+-    "(?:Attached file|Mentioned conversation|Mentioned packet|Project memory|Retrieved chunk|Library prompt)";
++    "(?:Attached file|Mentioned conversation|Mentioned packet|Project memory|Retrieved chunk|Library prompt|Applied skill)";
+   const omitted = system.replace(
+     new RegExp(
+       `((?:${heading}): [^\\n]+)(?:\\n(?!${heading}:)[\\s\\S]*?)?(?=(?:\\n\\n(?:${heading}): )|$)`,
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index 8349cf4..42be272 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -82,6 +82,11 @@ import type {
+   ArtifactPinInput,
+   ArtifactExportInput,
+   ArtifactExportResult,
++  SkillDto,
++  SkillCreateInput,
++  SkillUpdateInput,
++  SkillResolveInput,
++  SkillResolveResult,
+   ProviderKeyDto,
+   SecretsSaveInput,
+   SecretsTestInput,
+@@ -234,6 +239,14 @@ export interface HubArtifactsApi {
+   exportFile: (input: ArtifactExportInput) => Promise<ArtifactExportResult>;
+ }
+ 
++export interface HubSkillsApi {
++  list: () => Promise<SkillDto[]>;
++  create: (input: SkillCreateInput) => Promise<SkillDto>;
++  update: (input: SkillUpdateInput) => Promise<SkillDto>;
++  remove: (input: IdInput) => Promise<void>;
++  resolve: (input: SkillResolveInput) => Promise<SkillResolveResult>;
++}
++
+ export interface HubChatApi {
+   send: (input: ChatSendInput) => Promise<ChatSendResult>;
+   abort: (input: ChatAbortInput) => Promise<void>;
+@@ -266,6 +279,7 @@ export interface HubApi {
+   prompts: HubPromptsApi;
+   playground: HubPlaygroundApi;
+   artifacts: HubArtifactsApi;
++  skills: HubSkillsApi;
+ }
+ 
+ export type { AppLocale, ThemeMode };
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 0f2da49..3dc1991 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -22,6 +22,7 @@ export {
+   type HubPromptsApi,
+   type HubPlaygroundApi,
+   type HubArtifactsApi,
++  type HubSkillsApi,
+   type HubWindowApi,
+ } from "./hub-api";
+ export {
+@@ -84,6 +85,23 @@ export {
+   type ArtifactKind,
+   type DetectedArtifact,
+ } from "./artifacts";
++export {
++  composeSkillPrompt,
++  FACTORY_SKILLS,
++  factorySkillContract,
++  interpolateSkillText,
++  isSkillFolder,
++  parseSkillSlashDraft,
++  SKILL_CONTRACT_VERSION,
++  SKILL_FOLDERS,
++  skillContractV1Schema,
++  skillDefaultMentionSchema,
++  skillStepSchema,
++  type SkillContractV1,
++  type SkillDefaultMention,
++  type SkillFolder,
++  type SkillStep,
++} from "./skills";
+ export {
+   shouldShowOnboarding,
+   sortProvidersForWizard,
+@@ -139,6 +157,15 @@ export {
+   artifactExportFormatSchema,
+   artifactExportInputSchema,
+   artifactExportResultSchema,
++  skillDtoSchema,
++  skillFolderSchema,
++  skillListResultSchema,
++  skillCreateInputSchema,
++  skillUpdateInputSchema,
++  skillResolveInputSchema,
++  skillResolveResultSchema,
++  skillStepDtoSchema,
++  skillDefaultMentionDtoSchema,
+   emptyIpcPayloadSchema,
+   idInputSchema,
+   ipcAckResultSchema,
+@@ -246,6 +273,12 @@ export {
+   type PromptResolveResult,
+   type PlaygroundRunInput,
+   type PlaygroundRunResult,
++  type SkillDto,
++  type SkillFolderDto,
++  type SkillCreateInput,
++  type SkillUpdateInput,
++  type SkillResolveInput,
++  type SkillResolveResult,
+   type ArtifactDto,
+   type ArtifactKindDto,
+   type ArtifactsListInput,
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index 1b5fecc..524b9e9 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -82,6 +82,11 @@ export const IpcChannel = {
+   artifactsSaveVersion: "artifacts:saveVersion",
+   artifactsSetPinned: "artifacts:setPinned",
+   artifactsExport: "artifacts:export",
++  skillsList: "skills:list",
++  skillsCreate: "skills:create",
++  skillsUpdate: "skills:update",
++  skillsRemove: "skills:remove",
++  skillsResolve: "skills:resolve",
+ } as const;
+ 
+ export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index 526d43b..2ce0018 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -29,6 +29,8 @@ import {
+   playgroundRunInputSchema,
+   artifactDtoSchema,
+   artifactExportInputSchema,
++  skillCreateInputSchema,
++  skillDtoSchema,
+   conversationWorkspaceDtoSchema,
+ } from "./ipc-schemas";
+ 
+@@ -482,3 +484,35 @@ describe("wave 16 artifact contracts", () => {
+     ).toThrow();
+   });
+ });
++
++describe("wave 17 skill contracts", () => {
++  it("accepts a skill dto and rejects tools on create", () => {
++    const dto = {
++      id: "11111111-1111-4111-8111-111111111111",
++      folder: "development",
++      title: "Code Review",
++      description: "Review a diff",
++      prompt: "Review {{project}}",
++      preferredModel: null,
++      defaultMentions: [],
++      steps: [{ id: "summary", title: "Summary", section: "Summarize." }],
++      factoryId: "code-review",
++      contractVersion: 1,
++      createdAt: "2026-09-19T00:00:00.000Z",
++      updatedAt: "2026-09-19T00:00:00.000Z",
++    };
++    expect(skillDtoSchema.parse(dto).title).toBe("Code Review");
++    expect(() => skillDtoSchema.parse({ ...dto, extra: true })).toThrow();
++    expect(
++      skillCreateInputSchema.parse({
++        folder: "development",
++        title: "Custom",
++        description: "A custom skill",
++        prompt: "Do the work",
++        preferredModel: null,
++        defaultMentions: [{ type: "file", query: "diff" }],
++        steps: [{ id: "one", title: "One", section: "First section." }],
++      }).steps,
++    ).toHaveLength(1);
++  });
++});
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index 7c3099c..b06a702 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -3,6 +3,7 @@ import { localeSchema, themeModeSchema } from "./appearance";
+ import {
+   gatewayErrorCodeSchema,
+   mentionRefListSchema,
++  mentionTypeSchema,
+   packetV0Schema,
+   receiptDtoSchema,
+ } from "./gateway";
+@@ -1149,3 +1150,98 @@ export const artifactExportResultSchema = z.discriminatedUnion("status", [
+ 
+ export type ArtifactExportResult = z.infer<typeof artifactExportResultSchema>;
+ 
++export const skillFolderSchema = promptFolderSchema;
++
++export type SkillFolderDto = z.infer<typeof skillFolderSchema>;
++
++export const skillStepDtoSchema = z
++  .object({
++    id: z.string().min(1).max(40),
++    title: z.string().min(1).max(80),
++    section: z.string().min(1).max(4_000),
++  })
++  .strict();
++
++export const skillDefaultMentionDtoSchema = z
++  .object({
++    type: mentionTypeSchema,
++    query: z.string().min(1).max(260),
++  })
++  .strict();
++
++export const skillDtoSchema = z
++  .object({
++    id: z.string().uuid(),
++    folder: skillFolderSchema,
++    title: z.string().min(1).max(120),
++    description: z.string().min(1).max(400),
++    prompt: z.string().min(1).max(16_000),
++    preferredModel: z.string().min(1).max(128).nullable(),
++    defaultMentions: z.array(skillDefaultMentionDtoSchema).max(8),
++    steps: z.array(skillStepDtoSchema).max(12),
++    factoryId: z.string().min(1).max(40).nullable(),
++    contractVersion: z.literal(1),
++    createdAt: isoTimestampSchema,
++    updatedAt: isoTimestampSchema,
++  })
++  .strict();
++
++export type SkillDto = z.infer<typeof skillDtoSchema>;
++
++export const skillListResultSchema = z.array(skillDtoSchema).max(200);
++
++export const skillCreateInputSchema = z
++  .object({
++    folder: skillFolderSchema,
++    title: z.string().trim().min(1).max(120),
++    description: z.string().trim().min(1).max(400),
++    prompt: z.string().trim().min(1).max(16_000),
++    preferredModel: z.string().trim().min(1).max(128).nullable(),
++    defaultMentions: z.array(skillDefaultMentionDtoSchema).max(8),
++    steps: z.array(skillStepDtoSchema).max(12),
++  })
++  .strict();
++
++export type SkillCreateInput = z.infer<typeof skillCreateInputSchema>;
++
++export const skillUpdateInputSchema = z
++  .object({
++    id: z.string().uuid(),
++    folder: skillFolderSchema.optional(),
++    title: z.string().trim().min(1).max(120).optional(),
++    description: z.string().trim().min(1).max(400).optional(),
++    prompt: z.string().trim().min(1).max(16_000).optional(),
++    preferredModel: z.string().trim().min(1).max(128).nullable().optional(),
++    defaultMentions: z.array(skillDefaultMentionDtoSchema).max(8).optional(),
++    steps: z.array(skillStepDtoSchema).max(12).optional(),
++  })
++  .strict();
++
++export type SkillUpdateInput = z.infer<typeof skillUpdateInputSchema>;
++
++export const skillResolveInputSchema = z
++  .object({
++    skillId: z.string().uuid().optional(),
++    query: z.string().trim().min(1).max(260).optional(),
++    projectId: z.string().uuid().nullable(),
++  })
++  .strict()
++  .refine((value) => value.skillId !== undefined || value.query !== undefined, {
++    message: "skill resolve needs id or query",
++  });
++
++export type SkillResolveInput = z.infer<typeof skillResolveInputSchema>;
++
++export const skillResolveResultSchema = z
++  .object({
++    id: z.string().uuid(),
++    title: z.string().min(1).max(120),
++    text: z.string().min(1).max(32_000),
++    preferredModel: z.string().min(1).max(128).nullable(),
++    defaultMentions: z.array(skillDefaultMentionDtoSchema).max(8),
++    steps: z.array(skillStepDtoSchema).max(12),
++  })
++  .strict();
++
++export type SkillResolveResult = z.infer<typeof skillResolveResultSchema>;
++
+diff --git a/packages/shared/src/mentions.ts b/packages/shared/src/mentions.ts
+index f72d4aa..58afcd8 100644
+--- a/packages/shared/src/mentions.ts
++++ b/packages/shared/src/mentions.ts
+@@ -2,7 +2,7 @@ export const MENTION_TYPES = ["file", "conversation", "memory", "prompt", "skill
+ 
+ export type MentionType = (typeof MENTION_TYPES)[number];
+ 
+-export const MENTION_STUB_TYPES = ["skill"] as const;
++export const MENTION_STUB_TYPES = [] as const;
+ 
+ export type MentionStubType = (typeof MENTION_STUB_TYPES)[number];
+ 
+diff --git a/packages/shared/src/portable-packet.ts b/packages/shared/src/portable-packet.ts
+index 8cb3f67..5161422 100644
+--- a/packages/shared/src/portable-packet.ts
++++ b/packages/shared/src/portable-packet.ts
+@@ -18,6 +18,7 @@ export const packetSliceKindSchema = z.enum([
+   "memory",
+   "rag",
+   "prompt",
++  "skill",
+ ]);
+ 
+ export type PacketSliceKind = z.infer<typeof packetSliceKindSchema>;
+
+diff --git a/apps/desktop/e2e/skills.spec.ts b/apps/desktop/e2e/skills.spec.ts new file mode 100644 index 0000000..92ec21d --- /dev/null +++ b/apps/desktop/e2e/skills.spec.ts @@ -0,0 +1,55 @@ +import { mkdtempSync, writeFileSync } from "node:fs"; +import { createRequire } from "node:module"; +import { tmpdir } from "node:os"; +import path from "node:path"; +import { fileURLToPath } from "node:url"; +import { _electron as electron, expect, test, type ElectronApplication } from "@playwright/test"; + +const require = createRequire(import.meta.url); +const electronBinary = require("electron") as string; +const appRoot = path.join(fileURLToPath(new URL("..", import.meta.url))); + +async function launchHub(env: Record<string, string> = {}): Promise<ElectronApplication> { +  return electron.launch({ +    executablePath: electronBinary, +    args: [path.join(appRoot, "out/main/index.js")], +    cwd: appRoot, +    env: { +      ...process.env, +      AI_HUB_E2E: "1", +      NODE_ENV: "production", +      ...env, +    }, +  }); +} + +test("lists factory skills and runs Code Review with a mentioned diff", async () => { +  const dir = mkdtempSync(path.join(tmpdir(), "ai-hub-skill-")); +  const diff = path.join(dir, "diff.md"); +  writeFileSync(diff, "--- a/app.ts\n+++ b/app.ts\n+export const ok = true;\n"); +  const app = await launchHub({ AI_HUB_E2E_ATTACH_FILE: diff }); +  try { +    const window = await app.firstWindow(); +    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 }); +    await window.getByTestId("files-attach").click(); +    await expect(window.getByTestId("files-chip")).toContainText("diff.md", { timeout: 30_000 }); +    await window.getByTestId("nav-skills").click(); +    await expect(window.getByTestId("skills-view")).toBeVisible(); +    await window.getByTestId("skill-folder-development").click(); +    await expect(window.getByTestId("skill-item").filter({ hasText: "Code Review" })).toBeVisible(); + +    await window.getByTestId("nav-home").click(); +    const composer = window.getByTestId("chat-composer"); +    await composer.fill("/skill Code Review @file:diff.md"); +    await window.getByTestId("chat-send").click(); +    await expect(window.getByTestId("skill-run")).toBeVisible(); +    await expect(window.getByTestId("skill-step").first()).toHaveAttribute("data-current", "true"); +    const assistant = window.getByTestId("message-assistant"); +    await expect(assistant).toHaveAttribute("data-status", "complete", { timeout: 30_000 }); +    await expect(assistant).toContainText("Risks"); +    await expect(assistant).toContainText("Suggestions"); +    await expect(assistant).toContainText("gpt-4o-mini"); +  } finally { +    await app.close(); +  } +});
+diff --git a/apps/desktop/src/main/skills.ts b/apps/desktop/src/main/skills.ts new file mode 100644 index 0000000..fcb7829 --- /dev/null +++ b/apps/desktop/src/main/skills.ts @@ -0,0 +1,69 @@ +import type { SkillRecord } from "@ai-hub/db"; +import { composeSkillPrompt, FACTORY_SKILLS } from "@ai-hub/shared"; +import type { SkillDto, SkillResolveResult } from "@ai-hub/shared"; +import { getHubDatabase } from "./persistence"; +import { interpolateStoredPrompt } from "./prompt-vars"; + +export function seedFactorySkills(): void { +  getHubDatabase().repos.ensureFactorySkills(FACTORY_SKILLS); +} + +export function listSkillDtos(): SkillDto[] { +  seedFactorySkills(); +  return getHubDatabase().repos.listSkills().map((row) => ({ +    id: row.id, +    folder: row.folder, +    title: row.title, +    description: row.description, +    prompt: row.prompt, +    preferredModel: row.preferredModel, +    defaultMentions: row.defaultMentions, +    steps: row.steps, +    factoryId: row.factoryId, +    contractVersion: 1 as const, +    createdAt: row.createdAt, +    updatedAt: row.updatedAt, +  })); +} + +export function matchSkill(query: string | undefined, id: string | undefined): SkillRecord | null { +  seedFactorySkills(); +  const skills = getHubDatabase().repos.listSkills(); +  if (id) { +    return skills.find((item) => item.id === id) ?? null; +  } +  const needle = (query ?? "").toLowerCase(); +  return ( +    skills.find((item) => { +      const factory = (item.factoryId ?? "").toLowerCase().replace(/-/g, " "); +      return ( +        item.title.toLowerCase() === needle || +        item.title.toLowerCase().includes(needle) || +        factory === needle || +        factory.includes(needle) || +        (item.factoryId ?? "").toLowerCase() === needle +      ); +    }) ?? null +  ); +} + +export function resolveSkillDto( +  skillId: string | undefined, +  query: string | undefined, +  projectId: string | null, +): SkillResolveResult { +  const skill = matchSkill(query, skillId); +  if (!skill) { +    throw new Error("mentions:not_found"); +  } +  const composed = composeSkillPrompt(skill.prompt, skill.steps); +  const text = interpolateStoredPrompt(getHubDatabase().repos, composed, projectId); +  return { +    id: skill.id, +    title: skill.title, +    text, +    preferredModel: skill.preferredModel, +    defaultMentions: skill.defaultMentions, +    steps: skill.steps, +  }; +}
+diff --git a/apps/desktop/src/renderer/src/components/layout/skills-view.tsx b/apps/desktop/src/renderer/src/components/layout/skills-view.tsx new file mode 100644 index 0000000..42e3092 --- /dev/null +++ b/apps/desktop/src/renderer/src/components/layout/skills-view.tsx @@ -0,0 +1,268 @@ +import { type JSX, useEffect, useState } from "react"; +import { useTranslation } from "react-i18next"; +import { +  SKILL_FOLDERS, +  type SkillDto, +  type SkillFolder, +  type SkillStep, +} from "@ai-hub/shared"; +import { Button } from "@/components/ui/button"; +import { Input } from "@/components/ui/input"; +import { ScrollArea } from "@/components/ui/scroll-area"; + +const EMPTY_STEP: SkillStep = { id: "step-1", title: "", section: "" }; + +export function SkillsView({ +  onRunSkill, +}: { +  onRunSkill: (query: string) => void; +}): JSX.Element { +  const { t } = useTranslation(); +  const [skills, setSkills] = useState<SkillDto[]>([]); +  const [folder, setFolder] = useState<SkillFolder>("development"); +  const [selectedId, setSelectedId] = useState<string | null>(null); +  const [title, setTitle] = useState(""); +  const [description, setDescription] = useState(""); +  const [prompt, setPrompt] = useState(""); +  const [preferredModel, setPreferredModel] = useState(""); +  const [steps, setSteps] = useState<SkillStep[]>([EMPTY_STEP]); +  const [error, setError] = useState<string | null>(null); + +  const selected = skills.find((item) => item.id === selectedId) ?? null; +  const folderSkills = skills.filter((item) => item.folder === folder); + +  const reload = async (): Promise<void> => { +    setSkills(await window.hub.skills.list()); +  }; + +  useEffect(() => { +    void reload().catch(() => setError(t("skills.error.generic"))); +  }, [t]); + +  const startNew = (): void => { +    setSelectedId(null); +    setTitle(""); +    setDescription(""); +    setPrompt(""); +    setPreferredModel(""); +    setSteps([{ ...EMPTY_STEP }]); +  }; + +  const selectSkill = (item: SkillDto): void => { +    setSelectedId(item.id); +    setTitle(item.title); +    setDescription(item.description); +    setPrompt(item.prompt); +    setPreferredModel(item.preferredModel ?? ""); +    setSteps(item.steps.length > 0 ? item.steps : [{ ...EMPTY_STEP }]); +  }; + +  const saveSkill = async (): Promise<void> => { +    const nextSteps = steps +      .map((step, index) => ({ +        id: step.id.trim() || `step-${index + 1}`, +        title: step.title.trim(), +        section: step.section.trim(), +      })) +      .filter((step) => step.title.length > 0 && step.section.length > 0); +    if (title.trim().length === 0 || description.trim().length === 0 || prompt.trim().length === 0) { +      setError(t("skills.error.save")); +      return; +    } +    try { +      if (selectedId) { +        const updated = await window.hub.skills.update({ +          id: selectedId, +          folder, +          title: title.trim(), +          description: description.trim(), +          prompt: prompt.trim(), +          preferredModel: preferredModel.trim().length > 0 ? preferredModel.trim() : null, +          defaultMentions: selected?.defaultMentions ?? [], +          steps: nextSteps, +        }); +        setSkills((current) => current.map((item) => (item.id === updated.id ? updated : item))); +        selectSkill(updated); +      } else { +        const created = await window.hub.skills.create({ +          folder, +          title: title.trim(), +          description: description.trim(), +          prompt: prompt.trim(), +          preferredModel: preferredModel.trim().length > 0 ? preferredModel.trim() : null, +          defaultMentions: [], +          steps: nextSteps, +        }); +        setSkills((current) => [...current, created]); +        selectSkill(created); +      } +      setError(null); +    } catch { +      setError(t("skills.error.save")); +    } +  }; + +  return ( +    <div className="flex h-full min-h-0" data-testid="skills-view"> +      <aside className="flex w-64 shrink-0 flex-col border-r"> +        <div className="flex items-center justify-between border-b px-2 py-1.5"> +          <p className="text-[12px] font-medium">{t("skills.library")}</p> +          <Button type="button" size="sm" data-testid="skill-new" onClick={startNew}> +            {t("skills.new")} +          </Button> +        </div> +        <div className="flex gap-1 border-b px-2 py-1"> +          {SKILL_FOLDERS.map((item) => ( +            <Button +              key={item} +              type="button" +              size="sm" +              variant={folder === item ? "default" : "ghost"} +              data-testid={`skill-folder-${item}`} +              onClick={() => setFolder(item)} +            > +              {t(`skills.folder.${item}`)} +            </Button> +          ))} +        </div> +        <ScrollArea className="flex-1"> +          <ul className="p-1" data-testid="skill-list"> +            {folderSkills.map((item) => ( +              <li key={item.id}> +                <button +                  type="button" +                  className={`w-full rounded px-2 py-1 text-left text-[12px] ${ +                    item.id === selectedId ? "bg-muted" : "hover:bg-muted/60" +                  }`} +                  data-testid="skill-item" +                  data-factory={item.factoryId ?? ""} +                  onClick={() => selectSkill(item)} +                > +                  {item.factoryId ? t(`skills.factory.${item.factoryId}`) : item.title} +                </button> +              </li> +            ))} +          </ul> +        </ScrollArea> +      </aside> +      <section className="flex min-w-0 flex-1 flex-col p-2"> +        <p className="mb-1 text-[12px] font-medium">{t("skills.editor")}</p> +        {error ? ( +          <p className="mb-2 text-[12px] text-destructive" data-testid="skill-error"> +            {error} +          </p> +        ) : null} +        <Input +          className="mb-1" +          data-testid="skill-title" +          value={title} +          onChange={(event) => setTitle(event.target.value)} +          placeholder={t("skills.titlePlaceholder")} +        /> +        <Input +          className="mb-1" +          data-testid="skill-description" +          value={description} +          onChange={(event) => setDescription(event.target.value)} +          placeholder={t("skills.descriptionPlaceholder")} +        /> +        <Input +          className="mb-1" +          data-testid="skill-model" +          value={preferredModel} +          onChange={(event) => setPreferredModel(event.target.value)} +          placeholder={t("skills.modelPlaceholder")} +        /> +        <textarea +          className="mb-2 min-h-[120px] resize-none rounded border bg-background p-2 text-[12px]" +          data-testid="skill-prompt" +          value={prompt} +          onChange={(event) => setPrompt(event.target.value)} +          placeholder={t("skills.promptPlaceholder")} +        /> +        <p className="mb-1 text-[12px] font-medium">{t("skills.steps")}</p> +        <div className="mb-2 flex min-h-0 flex-1 flex-col gap-2 overflow-auto"> +          {steps.map((step, index) => ( +            <div key={`${step.id}-${index}`} className="rounded border p-2"> +              <Input +                className="mb-1" +                data-testid="skill-step-title" +                value={step.title} +                onChange={(event) => { +                  const titleValue = event.target.value; +                  setSteps((current) => +                    current.map((row, rowIndex) => +                      rowIndex === index ? { ...row, title: titleValue } : row, +                    ), +                  ); +                }} +                placeholder={t("skills.stepTitlePlaceholder")} +              /> +              <textarea +                className="min-h-[72px] w-full resize-none rounded border bg-background p-2 text-[12px]" +                data-testid="skill-step-section" +                value={step.section} +                onChange={(event) => { +                  const section = event.target.value; +                  setSteps((current) => +                    current.map((row, rowIndex) => (rowIndex === index ? { ...row, section } : row)), +                  ); +                }} +                placeholder={t("skills.stepSectionPlaceholder")} +              /> +            </div> +          ))} +        </div> +        <div className="flex flex-wrap gap-1"> +          <Button +            type="button" +            size="sm" +            variant="secondary" +            data-testid="skill-add-step" +            onClick={() => +              setSteps((current) => [ +                ...current, +                { id: `step-${current.length + 1}`, title: "", section: "" }, +              ]) +            } +          > +            {t("skills.addStep")} +          </Button> +          <Button type="button" size="sm" data-testid="skill-save" onClick={() => void saveSkill()}> +            {t("skills.save")} +          </Button> +          <Button +            type="button" +            size="sm" +            variant="secondary" +            data-testid="skill-run" +            disabled={!selected} +            onClick={() => { +              if (selected) { +                onRunSkill(selected.factoryId ? t(`skills.factory.${selected.factoryId}`) : selected.title); +              } +            }} +          > +            {t("skills.run")} +          </Button> +          {selectedId && !selected?.factoryId ? ( +            <Button +              type="button" +              size="sm" +              variant="ghost" +              data-testid="skill-delete" +              onClick={() => { +                void window.hub.skills.remove({ id: selectedId }).then(() => { +                  setSkills((current) => current.filter((item) => item.id !== selectedId)); +                  startNew(); +                }); +              }} +            > +              {t("skills.delete")} +            </Button> +          ) : null} +        </div> +      </section> +    </div> +  ); +}
+diff --git a/docs/ADR/ADR-W17-001-skill-contract-json.md b/docs/ADR/ADR-W17-001-skill-contract-json.md new file mode 100644 index 0000000..fb6eec6 --- /dev/null +++ b/docs/ADR/ADR-W17-001-skill-contract-json.md @@ -0,0 +1,33 @@ +# ADR-W17-001-skill-contract-json + +- **Status:** accepted +- **Onda:** W17 +- **Data:** 2026-09-19 +- **Deciders:** agent / Pedro +- **Supersedes:** ÔÇö +- **Superseded by:** ÔÇö + +## Contexto + +D8 pede uma entidade Skill com `steps[]` e um contrato que a W23 possa ligar a MCP/tools sem reescrever a library. N├úo h├í tools nesta onda. + +## Decis├úo + +O contrato versionado ├® JSON `version: 1`, `kind: "skill"`, com `prompt`, `steps[]` (`id`, `title`, `section`), `defaultMentions[]` e `tools: []` (tuplo vazio). Os passos s├úo sec├º├Áes do prompt, compostos numa ├║nica fatia `Applied skill:` no Compiler. Um run de skill ├® um `sendChat` (caps e `privacyMode` iguais ao chat). + +## Alternativas consideradas + +- **Um send por passo:** multiplicaria custo e caps; o plano diz que passos s├úo sec├º├Áes do prompt. +- **Permitir `tools` j├í na v1:** half-build de W23. + +## Consequ├¬ncias + +- Positivas: W23 pode evoluir o contrato sem mudar a tabela. +- Negativas: o ÔÇ£passo atualÔÇØ na UI ├® um stepper do SOP, n├úo orquestra├º├úo. +- Riscos aceitos: `tools: []` ├® s├│ hook. + +## Refer├¬ncias + +- `docs/IMPLEMENTATION_PLAN.md` Wave 17 / D8 +- `docs/reviews/W17/REVIEW.md` +- ADR-W15-002 (`@prompt`), ADR-W13-002 (`@skill` stub)
+diff --git a/docs/ADR/ADR-W17-002-skill-slash-arguments.md b/docs/ADR/ADR-W17-002-skill-slash-arguments.md new file mode 100644 index 0000000..47c6884 --- /dev/null +++ b/docs/ADR/ADR-W17-002-skill-slash-arguments.md @@ -0,0 +1,33 @@ +# ADR-W17-002-skill-slash-arguments + +- **Status:** accepted +- **Onda:** W17 +- **Data:** 2026-09-19 +- **Deciders:** agent / Pedro +- **Supersedes:** ÔÇö +- **Superseded by:** ÔÇö + +## Contexto + +O DoD pede `/skill Code Review`. Slash W11 s├│ aceita um token sem espa├ºos (ADR-W11-001). Enviar `/skill ÔÇª` ao modelo violaria ÔÇ£slash conhecido = a├º├úo localÔÇØ. + +## Decis├úo + +`/skill` sem argumentos continua slash local e abre a library. `/skill Nome` (com espa├ºos e men├º├Áes na mesma linha ou nas seguintes) ├® parse-on-send: o texto `/skill ÔÇª` **n├úo** entra em `chat:send`; resolve-se a skill e enviam-se as men├º├Áes restantes (`@file:diff`, etc.). Atalho `Ctrl/Cmd+Shift+S` abre a library; a palette corre ÔÇ£Run skill: Code ReviewÔÇØ. + +## Alternativas consideradas + +- **S├│ picker ap├│s `/skill`:** falha o DoD literal. +- **Enviar a linha `/skill` como user:** mistura UI local com o provider. + +## Consequ├¬ncias + +- Positivas: DoD e ADR-W11-001 coexistem. +- Negativas: `/skill` com argumentos n├úo ├® o `matchKnownSlashCommand` de um token. +- Riscos aceitos: `/unknown` continua mensagem normal. + +## Refer├¬ncias + +- `docs/IMPLEMENTATION_PLAN.md` Wave 17 +- ADR-W11-001 +- `docs/reviews/W17/REVIEW.md`
+diff --git a/docs/ADR/ADR-W17-003-skills-encrypted-library.md b/docs/ADR/ADR-W17-003-skills-encrypted-library.md new file mode 100644 index 0000000..3d4ff81 --- /dev/null +++ b/docs/ADR/ADR-W17-003-skills-encrypted-library.md @@ -0,0 +1,33 @@ +# ADR-W17-003-skills-encrypted-library + +- **Status:** accepted +- **Onda:** W17 +- **Data:** 2026-09-19 +- **Deciders:** agent / Pedro +- **Supersedes:** ÔÇö +- **Superseded by:** ÔÇö + +## Contexto + +Skills s├úo SOP reutiliz├íveis (prompt + passos + men├º├Áes). O conte├║do ├® privado. Prompts W15 j├í usam tabela global cifrada, sem pacote extra. + +## Decis├úo + +Tabela `skills` (migration 12): `title`, `description` e `definition` (JSON do contrato) cifrados com o envelope existente. `folder`, `preferred_model` e `factory_id` em plaintext para listar/seed. Sem pacote `packages/skills`. `@skill` sai de `MENTION_STUB_TYPES` e resolve como `@prompt`. Modelo preferido s├│ se aplica se existir uma chave do utilizador que sirva esse id; sen├úo mant├®m-se o modelo da sess├úo (sem fallback silencioso para outro modelo). + +## Alternativas consideradas + +- **Reusar a tabela `prompts`:** mistura contratos e pastas. +- **Novo pacote:** viola o layout MVP. + +## Consequ├¬ncias + +- Positivas: mesmo trust boundary da library W15. +- Negativas: `preferred_model` em plaintext (como tags/prefer├¬ncias de projeto). +- Riscos aceitos: seed factory em ingl├¬s na DB; labels i18n na UI. + +## Refer├¬ncias + +- `docs/IMPLEMENTATION_PLAN.md` Wave 17 +- ADR-W15-001, ADR-W01-001 +- `docs/reviews/W17/REVIEW.md`
+diff --git a/packages/shared/src/skills.test.ts b/packages/shared/src/skills.test.ts new file mode 100644 index 0000000..7ed9970 --- /dev/null +++ b/packages/shared/src/skills.test.ts @@ -0,0 +1,72 @@ +import { describe, expect, it } from "vitest"; +import { +  composeSkillPrompt, +  FACTORY_SKILLS, +  factorySkillContract, +  interpolateSkillText, +  isSkillFolder, +  parseSkillSlashDraft, +  skillContractV1Schema, +} from "./skills"; + +describe("skills contract", () => { +  it("seeds five factory skills with a versioned empty tools hook", () => { +    expect(FACTORY_SKILLS.map((item) => item.factoryId)).toEqual([ +      "code-review", +      "summarize-pdf", +      "meeting-prep", +      "explain-error", +      "write-rfc", +    ]); +    expect(new Set(FACTORY_SKILLS.map((item) => item.folder))).toEqual( +      new Set(["development", "work"]), +    ); +    for (const skill of FACTORY_SKILLS) { +      const contract = factorySkillContract(skill); +      expect(contract.version).toBe(1); +      expect(contract.kind).toBe("skill"); +      expect(contract.tools).toEqual([]); +      expect(contract.steps.length).toBeGreaterThan(0); +      expect(isSkillFolder(skill.folder)).toBe(true); +    } +    const review = FACTORY_SKILLS.find((item) => item.factoryId === "code-review"); +    expect(review?.steps.map((step) => step.title)).toEqual(["Summary", "Risks", "Suggestions"]); +  }); + +  it("rejects tools in the v1 contract", () => { +    expect(() => +      skillContractV1Schema.parse({ +        version: 1, +        kind: "skill", +        prompt: "Review", +        steps: [{ id: "one", title: "One", section: "Do one thing." }], +        defaultMentions: [], +        tools: [{ name: "bash" }], +      }), +    ).toThrow(); +  }); + +  it("composes step sections and interpolates project variables", () => { +    const text = composeSkillPrompt("Review {{project}}.", [ +      { id: "summary", title: "Summary", section: "Write a summary." }, +    ]); +    expect(text).toContain("Review {{project}}."); +    expect(text).toContain("## Step 1: Summary"); +    expect( +      interpolateSkillText(text, { project: "E2E", language: "English", goal: "Ship" }), +    ).toContain("Review E2E."); +  }); + +  it("parses /skill with a name and leftover mentions", () => { +    expect(parseSkillSlashDraft("/skill Code Review\n@file:diff")).toEqual({ +      query: "Code Review", +      remainder: "@file:diff", +    }); +    expect(parseSkillSlashDraft("/skill Code Review @file:diff extra")).toEqual({ +      query: "Code Review", +      remainder: "@file:diff extra", +    }); +    expect(parseSkillSlashDraft("/skill")).toEqual({ query: null, remainder: "" }); +    expect(parseSkillSlashDraft("just text")).toBeNull(); +  }); +});
+diff --git a/packages/shared/src/skills.ts b/packages/shared/src/skills.ts new file mode 100644 index 0000000..2e24003 --- /dev/null +++ b/packages/shared/src/skills.ts @@ -0,0 +1,243 @@ +import { z } from "zod"; +import { mentionTypeSchema } from "./gateway"; +import { interpolatePrompt, PROMPT_FOLDERS, type PromptFolder, type PromptVariableValues } from "./prompts"; + +export const SKILL_FOLDERS = PROMPT_FOLDERS; +export type SkillFolder = PromptFolder; + +export const SKILL_CONTRACT_VERSION = 1 as const; + +export const skillStepSchema = z +  .object({ +    id: z.string().min(1).max(40), +    title: z.string().trim().min(1).max(80), +    section: z.string().trim().min(1).max(4_000), +  }) +  .strict(); + +export type SkillStep = z.infer<typeof skillStepSchema>; + +export const skillDefaultMentionSchema = z +  .object({ +    type: mentionTypeSchema, +    query: z.string().trim().min(1).max(260), +  }) +  .strict(); + +export type SkillDefaultMention = z.infer<typeof skillDefaultMentionSchema>; + +export const skillContractV1Schema = z +  .object({ +    version: z.literal(SKILL_CONTRACT_VERSION), +    kind: z.literal("skill"), +    prompt: z.string().trim().min(1).max(16_000), +    steps: z.array(skillStepSchema).max(12), +    defaultMentions: z.array(skillDefaultMentionSchema).max(8), +    tools: z.tuple([]), +  }) +  .strict(); + +export type SkillContractV1 = z.infer<typeof skillContractV1Schema>; + +export function isSkillFolder(value: string): value is SkillFolder { +  return (SKILL_FOLDERS as readonly string[]).includes(value); +} + +export function composeSkillPrompt(prompt: string, steps: readonly SkillStep[]): string { +  const parts = [prompt.trim()]; +  steps.forEach((step, index) => { +    parts.push(`## Step ${index + 1}: ${step.title}\n${step.section.trim()}`); +  }); +  return parts.filter((part) => part.length > 0).join("\n\n"); +} + +export function interpolateSkillText(template: string, vars: PromptVariableValues): string { +  return interpolatePrompt(template, vars); +} + +export function parseSkillSlashDraft(draft: string): { query: string | null; remainder: string } | null { +  const match = /(^|\n)[ \t]*\/skill(?=\s|$)[ \t]*([^\n]*)/i.exec(draft); +  if (!match || match.index === undefined) { +    return null; +  } +  const afterSkill = (match[2] ?? "").trim(); +  const at = afterSkill.search(/@/); +  const query = (at >= 0 ? afterSkill.slice(0, at) : afterSkill).trim() || null; +  const leftover = at >= 0 ? afterSkill.slice(at).trim() : ""; +  const lineStart = match.index + (match[1] === "\n" ? 1 : 0); +  const before = draft.slice(0, lineStart); +  const after = draft.slice(match.index + match[0].length); +  const remainder = `${before}${leftover}${leftover && after.trim().length > 0 ? "\n" : ""}${after}` +    .replace(/^\n/, "") +    .trim(); +  return { query, remainder }; +} + +export const FACTORY_SKILLS: readonly { +  factoryId: "code-review" | "summarize-pdf" | "meeting-prep" | "explain-error" | "write-rfc"; +  folder: SkillFolder; +  title: string; +  description: string; +  preferredModel: string | null; +  prompt: string; +  steps: SkillStep[]; +  defaultMentions: SkillDefaultMention[]; +}[] = [ +  { +    factoryId: "code-review", +    folder: "development", +    title: "Code Review", +    description: "Review a diff with summary, risks, and suggestions.", +    preferredModel: null, +    prompt: `You are a senior code reviewer for {{project}}. +Project goal: {{goal}} +Respond in {{language}}. +Follow every step heading below in the same order. Do not skip a heading.`, +    steps: [ +      { +        id: "summary", +        title: "Summary", +        section: "Summarize what the change does in 3-6 sentences. Name the main files or areas touched.", +      }, +      { +        id: "risks", +        title: "Risks", +        section: +          "List findings by severity (blocker, high, medium, low). If the diff looks safe, say so under Risks.", +      }, +      { +        id: "suggestions", +        title: "Suggestions", +        section: "Propose the smallest concrete follow-ups. Ask for a missing diff if none was provided.", +      }, +    ], +    defaultMentions: [], +  }, +  { +    factoryId: "summarize-pdf", +    folder: "work", +    title: "Summarize PDF", +    description: "Turn a PDF extract into decisions and open questions.", +    preferredModel: null, +    prompt: `Summarize the attached document for {{project}}. +Goal: {{goal}} +Write in {{language}}. +Follow every step heading below.`, +    steps: [ +      { +        id: "overview", +        title: "Overview", +        section: "Give a short overview of the document and who it is for.", +      }, +      { +        id: "decisions", +        title: "Decisions", +        section: "List explicit decisions or claims. Quote only when needed.", +      }, +      { +        id: "questions", +        title: "Open questions", +        section: "List gaps, contradictions, and what to verify next.", +      }, +    ], +    defaultMentions: [], +  }, +  { +    factoryId: "meeting-prep", +    folder: "work", +    title: "Prepare meeting", +    description: "Build an agenda and talking points from context.", +    preferredModel: null, +    prompt: `Prepare a meeting brief for {{project}}. +Goal: {{goal}} +Write in {{language}}. +Follow every step heading below.`, +    steps: [ +      { +        id: "agenda", +        title: "Agenda", +        section: "Propose a timed agenda with owners when known.", +      }, +      { +        id: "talking-points", +        title: "Talking points", +        section: "List the points the user should raise, with evidence from the context.", +      }, +      { +        id: "risks", +        title: "Risks", +        section: "Call out sensitive topics and missing brief items.", +      }, +    ], +    defaultMentions: [], +  }, +  { +    factoryId: "explain-error", +    folder: "development", +    title: "Explain error", +    description: "Diagnose an error and propose the smallest next experiment.", +    preferredModel: null, +    prompt: `You are debugging an issue in {{project}}. +Project goal: {{goal}} +Respond in {{language}}. +Follow every step heading below.`, +    steps: [ +      { +        id: "read", +        title: "What failed", +        section: "Restate the error, stack, and the last successful step.", +      }, +      { +        id: "hypotheses", +        title: "Hypotheses", +        section: "Give the two most likely causes, with what would disprove each.", +      }, +      { +        id: "next", +        title: "Next experiment", +        section: "Propose the smallest next experiment. Do not rewrite the whole system.", +      }, +    ], +    defaultMentions: [], +  }, +  { +    factoryId: "write-rfc", +    folder: "development", +    title: "Write RFC", +    description: "Draft a short RFC from the current context.", +    preferredModel: null, +    prompt: `Draft an RFC for {{project}}. +Goal: {{goal}} +Write in {{language}}. +Follow every step heading below.`, +    steps: [ +      { +        id: "context", +        title: "Context", +        section: "State the problem, constraints, and non-goals.", +      }, +      { +        id: "proposal", +        title: "Proposal", +        section: "Describe the proposed change and why it is the smallest that works.", +      }, +      { +        id: "rollout", +        title: "Rollout", +        section: "List rollout, rollback, and open questions.", +      }, +    ], +    defaultMentions: [], +  }, +]; + +export function factorySkillContract(item: (typeof FACTORY_SKILLS)[number]): SkillContractV1 { +  return skillContractV1Schema.parse({ +    version: SKILL_CONTRACT_VERSION, +    kind: "skill", +    prompt: item.prompt, +    steps: item.steps, +    defaultMentions: item.defaultMentions, +    tools: [], +  }); +}
