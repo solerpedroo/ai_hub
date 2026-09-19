@@ -1,4 +1,4 @@
-import { type FormEvent, type JSX, useEffect, useState } from "react";
+import { type FormEvent, type JSX, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type {
   AppLocale,
@@ -14,8 +14,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { persistLocale } from "@/lib/i18n";
 import { useTheme } from "@/lib/theme";
+import type { SettingsSection } from "./types";
 
-export function SettingsView(): JSX.Element {
+export function SettingsView({
+  focusSection = "general",
+}: {
+  focusSection?: SettingsSection;
+}): JSX.Element {
   const { t, i18n } = useTranslation();
   const { theme, setTheme } = useTheme();
   const [providers, setProviders] = useState<ProviderDto[]>([]);
@@ -36,6 +41,23 @@ export function SettingsView(): JSX.Element {
   const [prefs, setPrefs] = useState<AppPrefs | null>(null);
   const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const generalRef = useRef<HTMLHeadingElement>(null);
+  const providerRef = useRef<HTMLSelectElement>(null);
+  const capRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const handle = window.setTimeout(() => {
+      const target =
+        focusSection === "providers"
+          ? providerRef.current
+          : focusSection === "caps"
+            ? capRef.current
+            : generalRef.current;
+      target?.scrollIntoView({ block: "center" });
+      target?.focus();
+    }, 0);
+    return () => window.clearTimeout(handle);
+  }, [focusSection]);
 
   const reloadKeys = (): void => {
     void window.hub.secrets
@@ -135,7 +157,9 @@ export function SettingsView(): JSX.Element {
   return (
     <div className="mx-auto flex w-full max-w-lg flex-col gap-6 p-6">
       <div>
-        <h1 className="text-base font-semibold">{t("settings.title")}</h1>
+        <h1 ref={generalRef} tabIndex={-1} className="text-base font-semibold">
+          {t("settings.title")}
+        </h1>
         <p className="mt-1 text-muted-foreground">{t("settings.hint")}</p>
       </div>
       <section className="flex flex-col gap-2">
@@ -179,6 +203,7 @@ export function SettingsView(): JSX.Element {
           <label className="flex flex-col gap-1 text-[12px]">
             {t("secrets.provider")}
             <select
+              ref={providerRef}
               className="h-8 rounded-md border border-input bg-background px-2 text-[13px]"
               value={providerSlug}
               onChange={(event) => setProviderSlug(event.target.value)}
@@ -222,7 +247,10 @@ export function SettingsView(): JSX.Element {
           {keys.map((key) => {
             const result = testResults[key.id];
             return (
-              <li key={key.id} className="flex flex-col gap-1 rounded-md border px-2 py-1">
+              <li
+                key={key.id}
+                className="flex flex-col gap-1 rounded-md border px-2 py-1"
+              >
                 <div className="flex items-center justify-between gap-2">
                   <span>
                     {key.providerSlug} · {key.label} · {key.maskedKey}
@@ -268,7 +296,10 @@ export function SettingsView(): JSX.Element {
                   <p className="text-[11px] text-muted-foreground" role="status">
                     {result.ok
                       ? t("secrets.testOk", { ms: result.latencyMs })
-                      : t("secrets.testFail", { code: result.errorCode ?? "unknown", ms: result.latencyMs })}
+                      : t("secrets.testFail", {
+                          code: result.errorCode ?? "unknown",
+                          ms: result.latencyMs,
+                        })}
                   </p>
                 ) : null}
               </li>
@@ -294,7 +325,8 @@ export function SettingsView(): JSX.Element {
             });
             if (
               nextCaps.some(
-                (item) => item.limitUsd !== null && !/^\d+(\.\d{1,6})?$/.test(item.limitUsd),
+                (item) =>
+                  item.limitUsd !== null && !/^\d+(\.\d{1,6})?$/.test(item.limitUsd),
               )
             ) {
               setError(t("workspace.error.generic"));
@@ -320,9 +352,12 @@ export function SettingsView(): JSX.Element {
             <label key={scope} className="flex flex-col gap-1 text-[12px]">
               {t(`caps.scope.${scope}`)}
               <Input
+                ref={scope === "request" ? capRef : undefined}
                 value={caps[scope]}
                 placeholder={t("caps.unlimited")}
-                onChange={(event) => setCaps((current) => ({ ...current, [scope]: event.target.value }))}
+                onChange={(event) =>
+                  setCaps((current) => ({ ...current, [scope]: event.target.value }))
+                }
                 data-testid={`spend-cap-${scope}`}
                 inputMode="decimal"
               />
@@ -388,7 +423,9 @@ export function SettingsView(): JSX.Element {
             data-testid="updates-status"
             data-status={updateResult.status}
           >
-            {t(`updates.status.${updateResult.status}`, { version: updateResult.version ?? "—" })}
+            {t(`updates.status.${updateResult.status}`, {
+              version: updateResult.version ?? "—",
+            })}
           </p>
         ) : prefs?.lastUpdateStatus && prefs.lastUpdateStatus !== "idle" ? (
           <p
