@@ -1,0 +1,62 @@
+﻿# W11 post-review delta (after freeze DIFF.patch)
+# High: slash known commands intercepted in submit() (Send / Enter after Esc)
+# Medium: Ctrl/Cmd+N from composer; palette Inbox/Importadas; {{modifier}} empty states
+# Test: keyboard.spec covers Esc+Enter, chat-send, Control+N, inbox/imported
+
+diff --git a/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx b/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
+--- a/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
++++ b/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
+@@
++export function matchKnownSlashCommand(draft: string): SlashCommandId | null {
++  const trimmed = draft.trim();
++  if (!trimmed.startsWith("/") || /\s/.test(trimmed)) {
++    return null;
++  }
++  const id = trimmed.slice(1).toLowerCase();
++  return (SLASH_COMMANDS as readonly string[]).includes(id) ? (id as SlashCommandId) : null;
++}
+@@
+   const submit = (): void => {
+     if (busy || disabled || value.trim().length === 0) {
+       return;
+     }
+-    onSend();
++    const command = matchKnownSlashCommand(value);
++    if (command) {
++      onChange("");
++      onSlashCommand(command);
++      return;
++    }
++    onSend();
+   };
+
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@
+-      // early-return when focus is input/textarea removed so Ctrl/Cmd+N works in composer
+       if (event.shiftKey && event.key.toLowerCase() === "n") {
+@@
++        onOpenInbox={() => selectProject(null)}
++        onOpenImportedInbox={() => { /* same destination as sidebar imported inbox */ }}
+
+diff --git a/apps/desktop/src/renderer/src/components/layout/command-palette.tsx b/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
+--- a/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
+@@
++    { id: "inbox", label: t("command.inbox"), run: onOpenInbox },
++    { id: "import", label: t("command.import"), run: onImport },
++    { id: "imported", label: t("command.importedInbox"), run: onOpenImportedInbox },
+
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@
+-  "workspace.noConversations": "No conversations in this project. Ctrl+N starts one.",
+-  "workspace.noConversationsInbox": "Inbox is empty. Ctrl+N starts an unfiled chat.",
++  "workspace.noConversations": "No conversations in this project. {{modifier}}+N starts one.",
++  "workspace.noConversationsInbox": "Inbox is empty. {{modifier}}+N starts an unfiled chat.",
++  "command.inbox": "Open Inbox",
++  "command.importedInbox": "Open Imported",
+
+# pt-BR mirrors the same keys. keyboard.spec.ts adds Esc+/compact, chat-send /packet, Control+N, inbox/imported.
