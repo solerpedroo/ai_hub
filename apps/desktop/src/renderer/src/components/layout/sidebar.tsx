@@ -1,5 +1,5 @@
 import { type JSX, type ReactNode, useState, type RefObject } from "react";
-import { Activity, Home, Inbox, Library, Plus, Settings, Upload } from "lucide-react";
+import { Activity, Home, Inbox, Library, Plus, Settings, Upload, Workflow } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { ProjectDto, SearchHit } from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
@@ -66,6 +66,13 @@ export function Sidebar({
             label={t("nav.prompts")}
             onClick={() => onChange("prompts")}
             testId="nav-prompts"
+          />
+          <NavButton
+            active={view === "skills"}
+            icon={<Workflow className="h-3.5 w-3.5" />}
+            label={t("nav.skills")}
+            onClick={() => onChange("skills")}
+            testId="nav-skills"
           />
           <NavButton
             active={view === "settings"}
