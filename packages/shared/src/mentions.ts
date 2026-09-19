@@ -2,7 +2,7 @@ export const MENTION_TYPES = ["file", "conversation", "memory", "prompt", "skill
 
 export type MentionType = (typeof MENTION_TYPES)[number];
 
-export const MENTION_STUB_TYPES = ["prompt", "skill"] as const;
+export const MENTION_STUB_TYPES = ["skill"] as const;
 
 export type MentionStubType = (typeof MENTION_STUB_TYPES)[number];
 
