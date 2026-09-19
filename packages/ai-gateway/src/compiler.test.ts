@@ -76,6 +76,7 @@ describe("compilePacket", () => {
     const compiled = compilePacket({
       projectInstructions: null,
       extraSystem: null,
+      privacyMode: "maximum",
       messages: [
         {
           id: "11111111-1111-4111-8111-111111111111",
@@ -319,6 +320,7 @@ describe("compilePacket", () => {
     const packet = compileActivePath({
       projectInstructions: null,
       extraSystem: null,
+      privacyMode: "maximum",
       messages: [
         {
           id: "11111111-1111-4111-8111-111111111111",
@@ -425,6 +427,19 @@ describe("compilePacket", () => {
     expect(packet.system).not.toMatch(/Secret project voice/);
     expect(packet.system).not.toMatch(/old-secret-turn/);
     expect(packet.messages.map((item) => item.content)).toEqual(["prompt", "new"]);
+  });
+
+  it("keeps private packets to the active conversation and omits attached files", () => {
+    const packet = compilePacket({
+      projectInstructions: "private project rule",
+      extraSystem: null,
+      privacyMode: "private",
+      files: [{ id: "file-1", name: "secret.txt", text: "do not share" }],
+      messages: [{ id: "m-1", role: "user", content: "only this", status: "complete" }],
+    });
+    expect(packet.system).not.toContain("private project rule");
+    expect(packet.system).not.toContain("secret.txt");
+    expect(packet.messages).toEqual([{ role: "user", content: "only this" }]);
   });
 
   it("merges an applied packet with only the active tail", () => {
