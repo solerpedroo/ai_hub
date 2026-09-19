@@ -251,6 +251,21 @@ CREATE INDEX artifacts_family_idx ON artifacts(family_id);
 CREATE INDEX artifacts_message_idx ON artifacts(source_message_id);
 `;
 
+export const MIGRATION_0012_SQL = `
+CREATE TABLE skills (
+  id TEXT PRIMARY KEY,
+  folder TEXT NOT NULL,
+  title_cipher TEXT NOT NULL,
+  description_cipher TEXT NOT NULL,
+  definition_cipher TEXT NOT NULL,
+  preferred_model TEXT,
+  factory_id TEXT UNIQUE,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX skills_folder_idx ON skills(folder);
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
@@ -263,4 +278,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 9, sql: MIGRATION_0009_SQL },
   { version: 10, sql: MIGRATION_0010_SQL },
   { version: 11, sql: MIGRATION_0011_SQL },
+  { version: 12, sql: MIGRATION_0012_SQL },
 ];
