@@ -831,3 +831,152 @@ export const filesRemoveInputSchema = z
 
 export type FilesRemoveInput = z.infer<typeof filesRemoveInputSchema>;
 
+export const memorySourceSchema = z.enum(["manual", "suggested"]);
+
+export const projectMemoryDtoSchema = z
+  .object({
+    id: z.string().uuid(),
+    projectId: z.string().uuid(),
+    title: z.string().min(1).max(120),
+    body: z.string().min(1).max(4000),
+    source: memorySourceSchema,
+    createdAt: isoTimestampSchema,
+    updatedAt: isoTimestampSchema,
+  })
+  .strict();
+
+export type ProjectMemoryDto = z.infer<typeof projectMemoryDtoSchema>;
+
+export const memoryListInputSchema = z
+  .object({
+    projectId: z.string().uuid(),
+  })
+  .strict();
+
+export type MemoryListInput = z.infer<typeof memoryListInputSchema>;
+
+export const memoryListResultSchema = z.array(projectMemoryDtoSchema).max(100);
+
+export const memoryCreateInputSchema = z
+  .object({
+    projectId: z.string().uuid(),
+    title: z.string().min(1).max(120),
+    body: z.string().min(1).max(4000),
+    source: memorySourceSchema.optional(),
+  })
+  .strict();
+
+export type MemoryCreateInput = z.infer<typeof memoryCreateInputSchema>;
+
+export const memoryUpdateInputSchema = z
+  .object({
+    id: z.string().uuid(),
+    title: z.string().min(1).max(120).optional(),
+    body: z.string().min(1).max(4000).optional(),
+  })
+  .strict();
+
+export type MemoryUpdateInput = z.infer<typeof memoryUpdateInputSchema>;
+
+export const memorySuggestInputSchema = z
+  .object({
+    projectId: z.string().uuid(),
+    text: z.string().min(1).max(16_000),
+  })
+  .strict();
+
+export type MemorySuggestInput = z.infer<typeof memorySuggestInputSchema>;
+
+export const memorySuggestResultSchema = z
+  .object({
+    suggestions: z.array(z.string().min(1).max(240)).max(4),
+    optedOut: z.boolean(),
+  })
+  .strict();
+
+export type MemorySuggestResult = z.infer<typeof memorySuggestResultSchema>;
+
+export const memoryOptOutInputSchema = z
+  .object({
+    projectId: z.string().uuid(),
+  })
+  .strict();
+
+export type MemoryOptOutInput = z.infer<typeof memoryOptOutInputSchema>;
+
+export const memoryOptOutStateSchema = z
+  .object({
+    optedOut: z.boolean(),
+  })
+  .strict();
+
+export type MemoryOptOutState = z.infer<typeof memoryOptOutStateSchema>;
+
+export const memorySetOptOutInputSchema = z
+  .object({
+    projectId: z.string().uuid(),
+    optedOut: z.boolean(),
+  })
+  .strict();
+
+export type MemorySetOptOutInput = z.infer<typeof memorySetOptOutInputSchema>;
+
+export const conversationTaskDtoSchema = z
+  .object({
+    id: z.string().uuid(),
+    conversationId: z.string().uuid(),
+    title: z.string().min(1).max(240),
+    done: z.boolean(),
+    createdAt: isoTimestampSchema,
+  })
+  .strict();
+
+export type ConversationTaskDto = z.infer<typeof conversationTaskDtoSchema>;
+
+export const conversationWorkspaceDtoSchema = z
+  .object({
+    conversationId: z.string().uuid(),
+    summary: z.string().max(4000),
+    decisions: z.array(z.string().max(180)).max(20),
+    tasks: z.array(conversationTaskDtoSchema).max(50),
+    pins: z.array(z.string().uuid()).max(50),
+  })
+  .strict();
+
+export type ConversationWorkspaceDto = z.infer<typeof conversationWorkspaceDtoSchema>;
+
+export const workspaceConversationInputSchema = z
+  .object({
+    conversationId: z.string().uuid(),
+  })
+  .strict();
+
+export type WorkspaceConversationInput = z.infer<typeof workspaceConversationInputSchema>;
+
+export const workspaceAddTaskInputSchema = z
+  .object({
+    conversationId: z.string().uuid(),
+    title: z.string().min(1).max(240),
+  })
+  .strict();
+
+export type WorkspaceAddTaskInput = z.infer<typeof workspaceAddTaskInputSchema>;
+
+export const workspaceSetTaskDoneInputSchema = z
+  .object({
+    id: z.string().uuid(),
+    done: z.boolean(),
+  })
+  .strict();
+
+export type WorkspaceSetTaskDoneInput = z.infer<typeof workspaceSetTaskDoneInputSchema>;
+
+export const conversationToProjectResultSchema = z
+  .object({
+    project: projectDtoSchema,
+    conversation: conversationDtoSchema,
+  })
+  .strict();
+
+export type ConversationToProjectResult = z.infer<typeof conversationToProjectResultSchema>;
+
