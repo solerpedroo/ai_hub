@@ -7,6 +7,7 @@ import {
 import { randomUUID } from "node:crypto";
 import {
   findCatalogModel,
+  mentionVisibleContent,
   packetPreviewResultSchema,
   portablePacketV1Schema,
   type PacketPreviewInput,
@@ -15,6 +16,7 @@ import {
 import { loadSendAttachments } from "./files";
 import { resolveSendMentions } from "./mentions";
 import { getHubDatabase } from "./persistence";
+import { loadAutoProjectContext } from "./project-context";
 import { estimateOutgoingCostUsd, evaluateOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
 
 export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
@@ -130,6 +132,7 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
     conversation.projectId,
     input.conversationId,
     "preview",
+    privacyMode,
   );
   const fileIds = [...new Set([...(input.fileIds ?? []), ...resolvedMentions.fileIds])];
   const attachments = loadSendAttachments(
@@ -137,6 +140,19 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
     conversation.projectId,
     catalog?.vision === true,
     "preview",
+  );
+  const lastUser = [...path].reverse().find((item) => item.role === "user")?.content ?? "";
+  const rawQuery = pending ?? lastUser;
+  const query = mentionVisibleContent(rawQuery) || rawQuery;
+  const skipMemoryIds = new Set(
+    resolvedMentions.mentions.filter((item) => item.kind === "memory").map((item) => item.id),
+  );
+  const autoContext = loadAutoProjectContext(
+    repos,
+    conversation.projectId,
+    query,
+    privacyMode,
+    skipMemoryIds,
   );
   const dummyPacket = {
     version: 1 as const,
@@ -146,7 +162,7 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
     excluded: [],
   };
   const filesOnly = appendFilesToPacket(dummyPacket, attachments.files);
-  const mentionsOnly = appendMentionsToPacket(dummyPacket, resolvedMentions.mentions);
+  const mentionsOnly = appendMentionsToPacket(dummyPacket, [...resolvedMentions.mentions, ...autoContext]);
   tokenEstimate += filesOnly.packet.tokenEstimate + mentionsOnly.packet.tokenEstimate;
   included = [...included, ...filesOnly.included, ...mentionsOnly.included].slice(0, 200);
 
