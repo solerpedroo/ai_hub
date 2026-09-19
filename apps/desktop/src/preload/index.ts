@@ -15,6 +15,7 @@ import {
   conversationListInputSchema,
   conversationListResultSchema,
   conversationMoveInputSchema,
+  conversationToProjectResultSchema,
   conversationDtoSchema,
   conversationExportInputSchema,
   conversationExportResultSchema,
@@ -54,6 +55,21 @@ import {
   filesAttachInputSchema,
   filesIngestPathsInputSchema,
   filesRemoveInputSchema,
+  memoryListInputSchema,
+  memoryListResultSchema,
+  memoryCreateInputSchema,
+  memoryUpdateInputSchema,
+  memorySuggestInputSchema,
+  memorySuggestResultSchema,
+  memoryOptOutInputSchema,
+  memoryOptOutStateSchema,
+  memorySetOptOutInputSchema,
+  projectMemoryDtoSchema,
+  conversationWorkspaceDtoSchema,
+  workspaceConversationInputSchema,
+  workspaceAddTaskInputSchema,
+  workspaceSetTaskDoneInputSchema,
+  conversationTaskDtoSchema,
   contextPacketDtoSchema,
   contextPacketListResultSchema,
   projectCreateInputSchema,
@@ -181,6 +197,10 @@ const hub: HubApi = {
       ),
     move: (input) =>
       invokeParsed(IpcChannel.conversationsMove, input, conversationMoveInputSchema, conversationDtoSchema),
+    duplicate: (input) =>
+      invokeParsed(IpcChannel.conversationsDuplicate, input, idInputSchema, conversationDtoSchema),
+    toProject: (input) =>
+      invokeParsed(IpcChannel.conversationsToProject, input, idInputSchema, conversationToProjectResultSchema),
   },
   messages: {
     list: (input) =>
@@ -335,6 +355,47 @@ const hub: HubApi = {
       );
     },
     remove: (input) => invokeAckWith(IpcChannel.filesRemove, input, filesRemoveInputSchema),
+  },
+  memory: {
+    list: (input) =>
+      invokeParsed(IpcChannel.memoryList, input, memoryListInputSchema, memoryListResultSchema),
+    create: (input) =>
+      invokeParsed(IpcChannel.memoryCreate, input, memoryCreateInputSchema, projectMemoryDtoSchema),
+    update: (input) =>
+      invokeParsed(IpcChannel.memoryUpdate, input, memoryUpdateInputSchema, projectMemoryDtoSchema),
+    remove: (input) => invokeAckWith(IpcChannel.memoryRemove, input, idInputSchema),
+    suggest: (input) =>
+      invokeParsed(IpcChannel.memorySuggest, input, memorySuggestInputSchema, memorySuggestResultSchema),
+    getOptOut: (input) =>
+      invokeParsed(IpcChannel.memoryGetOptOut, input, memoryOptOutInputSchema, memoryOptOutStateSchema),
+    setOptOut: (input) =>
+      invokeParsed(IpcChannel.memorySetOptOut, input, memorySetOptOutInputSchema, memoryOptOutStateSchema),
+  },
+  workspace: {
+    get: (input) =>
+      invokeParsed(
+        IpcChannel.workspaceGet,
+        input,
+        workspaceConversationInputSchema,
+        conversationWorkspaceDtoSchema,
+      ),
+    refresh: (input) =>
+      invokeParsed(
+        IpcChannel.workspaceRefresh,
+        input,
+        workspaceConversationInputSchema,
+        conversationWorkspaceDtoSchema,
+      ),
+    addTask: (input) =>
+      invokeParsed(IpcChannel.workspaceAddTask, input, workspaceAddTaskInputSchema, conversationTaskDtoSchema),
+    setTaskDone: (input) =>
+      invokeParsed(
+        IpcChannel.workspaceSetTaskDone,
+        input,
+        workspaceSetTaskDoneInputSchema,
+        conversationTaskDtoSchema,
+      ),
+    removeTask: (input) => invokeAckWith(IpcChannel.workspaceRemoveTask, input, idInputSchema),
   },
 };
 
