@@ -50,6 +50,10 @@ import type {
   PacketsImportInput,
   PacketsListInput,
   MessagePinInput,
+  ProjectFileDto,
+  ProjectFileListInput,
+  FilesAttachInput,
+  FilesRemoveInput,
   ProviderKeyDto,
   SecretsSaveInput,
   SecretsTestInput,
@@ -155,6 +159,13 @@ export interface HubPacketsApi {
   clear: (input: PacketsClearInput) => Promise<ConversationDto>;
 }
 
+export interface HubFilesApi {
+  list: (input: ProjectFileListInput) => Promise<ProjectFileDto[]>;
+  attach: (input: FilesAttachInput) => Promise<ProjectFileDto[]>;
+  fromDrop: (input: { projectId: string | null; files: unknown }) => Promise<ProjectFileDto[]>;
+  remove: (input: FilesRemoveInput) => Promise<void>;
+}
+
 export interface HubChatApi {
   send: (input: ChatSendInput) => Promise<ChatSendResult>;
   abort: (input: ChatAbortInput) => Promise<void>;
@@ -181,6 +192,7 @@ export interface HubApi {
   chat: HubChatApi;
   import: HubImportApi;
   packets: HubPacketsApi;
+  files: HubFilesApi;
 }
 
 export type { AppLocale, ThemeMode };
