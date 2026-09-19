@@ -13,4 +13,12 @@ describe("secret paste hints", () => {
     expect(redacted).not.toContain("sk-testfixture");
     expect(redacted).toContain("[REDACTED]");
   });
+
+  it("redacts PEM blocks, AWS access keys, and GitHub PATs", () => {
+    const pem = "-----BEGIN PRIVATE KEY-----\nMIIBfixtureKEY\n-----END PRIVATE KEY-----";
+    expect(looksLikePastedSecret(pem)).toBe(true);
+    expect(redactPastedSecrets(pem)).not.toContain("MIIBfixtureKEY");
+    expect(redactPastedSecrets("id AKIATESTFIXTUREKEY12 leftover")).not.toContain("AKIATESTFIXTUREKEY12");
+    expect(redactPastedSecrets("token ghp_abcdefghijklmnopqrstuvwxyz")).not.toContain("ghp_abcdefghijklmnop");
+  });
 });
