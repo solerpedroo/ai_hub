@@ -1,14 +1,29 @@
 import { join } from "node:path";
 import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { BrowserWindow, app, dialog, session, shell } from "electron";
+import { BrowserWindow, app, dialog, protocol, session, shell } from "electron";
 import { electronApp, is, optimizer } from "@electron-toolkit/utils";
+import { ARTIFACT_PROTOCOL } from "@ai-hub/shared";
 import { safeErrorMessage } from "@ai-hub/security";
 import { registerWindowIpc, registerWorkspaceIpc } from "./ipc";
+import { ARTIFACT_HTML_CSP, registerArtifactProtocol } from "./artifacts";
 import { applyCrashReporterOptIn } from "./crash-reporter";
 import { bootPersistence, getHubDatabase } from "./persistence";
 import { isE2eMode } from "./e2e-mode";
 import { checkForAppUpdates } from "./updater";
+
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: ARTIFACT_PROTOCOL,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: false,
+      corsEnabled: false,
+      stream: true,
+    },
+  },
+]);
 
 if (isE2eMode()) {
   app.setPath("userData", mkdtempSync(join(tmpdir(), "ai-hub-e2e-")));
@@ -22,6 +37,7 @@ function applyContentSecurityPolicy(): void {
     "img-src 'self' data:",
     "font-src 'self' data:",
     "connect-src 'self' ws://localhost:* http://localhost:*",
+    "frame-src 'self' ai-hub-artifact:",
     "object-src 'none'",
     "base-uri 'self'",
     "form-action 'self'",
@@ -34,6 +50,7 @@ function applyContentSecurityPolicy(): void {
     "img-src 'self' data:",
     "font-src 'self' data:",
     "connect-src 'self'",
+    "frame-src 'self' ai-hub-artifact:",
     "object-src 'none'",
     "base-uri 'self'",
     "form-action 'self'",
@@ -41,11 +58,20 @@ function applyContentSecurityPolicy(): void {
 
   const policy = is.dev ? developmentCsp : productionCsp;
 
+  session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
+    if (details.resourceType === "subFrame" && !isAllowedArtifactFrame(details.url)) {
+      callback({ cancel: true });
+      return;
+    }
+    callback({});
+  });
+
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    const artifactPreview = details.url.startsWith(`${ARTIFACT_PROTOCOL}:`);
     callback({
       responseHeaders: {
         ...details.responseHeaders,
-        "Content-Security-Policy": [policy],
+        "Content-Security-Policy": [artifactPreview ? ARTIFACT_HTML_CSP : policy],
       },
     });
   });
@@ -65,6 +91,17 @@ function isAllowedAppNavigation(url: string): boolean {
   return parsed.protocol === "file:";
 }
 
+function isAllowedArtifactFrame(url: string): boolean {
+  if (url === "about:blank" || url === "about:srcdoc") {
+    return true;
+  }
+  try {
+    return new URL(url).protocol === `${ARTIFACT_PROTOCOL}:`;
+  } catch {
+    return false;
+  }
+}
+
 function isAllowedExternalOpen(url: string): boolean {
   try {
     return new URL(url).protocol === "https:";
@@ -82,6 +119,19 @@ function attachNavigationLocks(window: BrowserWindow): void {
 
   window.webContents.on("will-redirect", (event, url) => {
     if (!isAllowedAppNavigation(url)) {
+      event.preventDefault();
+    }
+  });
+
+  window.webContents.on("will-frame-navigate", (event) => {
+    const url = event.url;
+    if (event.isMainFrame) {
+      if (!isAllowedAppNavigation(url)) {
+        event.preventDefault();
+      }
+      return;
+    }
+    if (!isAllowedArtifactFrame(url)) {
       event.preventDefault();
     }
   });
@@ -158,6 +208,7 @@ app.whenReady().then(async () => {
     app.quit();
     return;
   }
+  registerArtifactProtocol();
   registerWorkspaceIpc();
   applyCrashReporterOptIn(getHubDatabase().repos.getAppPrefs().crashReporterOptIn);
   void checkForAppUpdates()
