@@ -13,9 +13,16 @@ function healthState(summary: HealthSummaryDto): "ok" | "down" | "unknown" {
   return "unknown";
 }
 
-export function StatusBar({ health }: { health: HealthSummaryDto[] }): JSX.Element {
+export function StatusBar({
+  health,
+  onOpenShortcuts,
+}: {
+  health: HealthSummaryDto[];
+  onOpenShortcuts: () => void;
+}): JSX.Element {
   const { t } = useTranslation();
   const { theme } = useTheme();
+  const modifier = window.hub.platform === "darwin" ? "⌘" : "Ctrl";
 
   return (
     <footer className="flex h-6 shrink-0 items-center justify-between gap-3 border-t bg-background px-3 text-[11px] text-muted-foreground">
@@ -29,16 +36,30 @@ export function StatusBar({ health }: { health: HealthSummaryDto[] }): JSX.Eleme
                   provider: item.providerSlug,
                   state: t(`status.health.${state}`),
                   latency:
-                    item.lastLatencyMs === null ? "" : t("status.health.latency", { ms: item.lastLatencyMs }),
+                    item.lastLatencyMs === null
+                      ? ""
+                      : t("status.health.latency", { ms: item.lastLatencyMs }),
                   errors:
                     item.sampleCount === 0
                       ? ""
-                      : t("status.health.errors", { pct: Math.round(item.errorRate * 100) }),
+                      : t("status.health.errors", {
+                          pct: Math.round(item.errorRate * 100),
+                        }),
                 });
               })
               .join(" · ")}
       </span>
-      <span>{t("status.theme", { theme: t(`theme.${theme}`) })}</span>
+      <span className="flex shrink-0 items-center gap-3">
+        <button
+          type="button"
+          className="rounded px-1 hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          data-testid="shortcuts-open"
+          onClick={onOpenShortcuts}
+        >
+          {t("shortcuts.status", { modifier })}
+        </button>
+        <span>{t("status.theme", { theme: t(`theme.${theme}`) })}</span>
+      </span>
     </footer>
   );
 }
