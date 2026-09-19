@@ -14,6 +14,7 @@ import {
 } from "./portable-packet";
 
 export const spendCapScopeSchema = z.enum(["request", "day", "global"]);
+export const capBlockScopeSchema = z.enum(["request", "day", "global", "project", "provider"]);
 
 export const emptyIpcPayloadSchema = z.object({}).strict();
 
@@ -201,8 +202,8 @@ export const packetPreviewResultSchema = z
     compacted: z.boolean(),
     excludedCount: z.number().int().nonnegative(),
     estimatedCostUsd: z.string().nullable(),
-    capWarnings: z.array(spendCapScopeSchema),
-    capBlocked: spendCapScopeSchema.nullable(),
+    capWarnings: z.array(capBlockScopeSchema),
+    capBlocked: capBlockScopeSchema.nullable(),
     included: z.array(packetSliceSchema).max(200),
     omitted: z.array(packetSliceSchema).max(200),
     destinationModel: z.string().min(1).max(128),
@@ -484,6 +485,16 @@ export const spendCapSetInputSchema = z
 
 export type SpendCapSetInput = z.infer<typeof spendCapSetInputSchema>;
 
+export const scopedSpendCapDtoSchema = z.object({
+  dimension: z.enum(["project", "provider"]),
+  subjectId: z.string().min(1).max(128),
+  limitUsd: usdAmountSchema.nullable(),
+}).strict();
+export type ScopedSpendCapDto = z.infer<typeof scopedSpendCapDtoSchema>;
+export const scopedSpendCapListResultSchema = z.array(scopedSpendCapDtoSchema).max(256);
+export const scopedSpendCapSetInputSchema = z.object({ caps: scopedSpendCapListResultSchema }).strict();
+export type ScopedSpendCapSetInput = z.infer<typeof scopedSpendCapSetInputSchema>;
+
 export const healthSummarySchema = z
   .object({
     providerSlug: z.string().min(1).max(64),
@@ -518,6 +529,12 @@ export const costsAggregateResultSchema = z
 
 export type CostsAggregateResult = z.infer<typeof costsAggregateResultSchema>;
 
+export const monthlyCostsInputSchema = z.object({ month: z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/) }).strict();
+export type MonthlyCostsInput = z.infer<typeof monthlyCostsInputSchema>;
+const costBreakdownSchema = z.object({ key: z.string().min(1).max(256), tokens: z.number().int().nonnegative(), requests: z.number().int().nonnegative(), costUsd: z.string() }).strict();
+export const monthlyCostsResultSchema = z.object({ month: z.string(), tokens: z.number().int().nonnegative(), requests: z.number().int().nonnegative(), costUsd: z.string(), byModel: z.array(costBreakdownSchema), byProject: z.array(costBreakdownSchema) }).strict();
+export type MonthlyCostsResult = z.infer<typeof monthlyCostsResultSchema>;
+
 export const debugSnapshotSchema = z
   .object({
     at: isoTimestampSchema,
@@ -528,7 +545,7 @@ export const debugSnapshotSchema = z
     tokenEstimate: z.number().int().nonnegative(),
     estimatedCostUsd: z.string().nullable(),
     capDecision: z.enum(["ok", "warn", "block", "override"]),
-    capScope: spendCapScopeSchema.nullable(),
+    capScope: capBlockScopeSchema.nullable(),
     overflow: z.boolean(),
   })
   .strict();
@@ -548,6 +565,16 @@ export const appPrefsSchema = z
     lastUpdateCheckAt: isoTimestampSchema.nullable(),
     lastUpdateStatus: updateCheckStatusSchema,
     lastWizardTtftMs: z.number().int().nonnegative().nullable(),
+    privacyMode: z.enum(["private", "normal", "maximum"]),
+    firewallPolicy: z
+      .object({
+        secret: z.enum(["block", "mask", "allow"]),
+        token: z.enum(["block", "mask", "allow"]),
+        email: z.enum(["block", "mask", "allow"]),
+        cpf: z.enum(["block", "mask", "allow"]),
+        prompt_injection: z.enum(["block", "mask", "allow"]),
+      })
+      .strict(),
   })
   .strict();
 
@@ -1245,4 +1272,3 @@ export const skillResolveResultSchema = z
   .strict();
 
 export type SkillResolveResult = z.infer<typeof skillResolveResultSchema>;
-
