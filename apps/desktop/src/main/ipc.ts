@@ -20,6 +20,8 @@ import {
   conversationTagsSetInputSchema,
   costsAggregateInputSchema,
   costsAggregateResultSchema,
+  monthlyCostsInputSchema,
+  monthlyCostsResultSchema,
   debugSnapshotResultSchema,
   emptyIpcPayloadSchema,
   healthSummaryListSchema,
@@ -104,6 +106,8 @@ import {
   secretsTestResultSchema,
   spendCapListResultSchema,
   spendCapSetInputSchema,
+  scopedSpendCapListResultSchema,
+  scopedSpendCapSetInputSchema,
   SPEND_CAP_SCOPES,
   summarizeProviderHealth,
   windowIsMaximizedResultSchema,
@@ -700,6 +704,21 @@ export function registerWorkspaceIpc(): void {
     },
   );
 
+  registerHandler(IpcChannel.scopedSpendCapsGet, emptyIpcPayloadSchema, scopedSpendCapListResultSchema, () =>
+    getHubDatabase().repos.listScopedSpendCaps().map(({ dimension, subjectId, limitUsd }) => ({ dimension, subjectId, limitUsd })),
+  );
+
+  registerHandler(
+    IpcChannel.scopedSpendCapsSet,
+    scopedSpendCapSetInputSchema,
+    scopedSpendCapListResultSchema,
+    (input) => {
+      const repos = getHubDatabase().repos;
+      for (const cap of input.caps) repos.upsertScopedSpendCap(cap.dimension, cap.subjectId, cap.limitUsd);
+      return repos.listScopedSpendCaps().map(({ dimension, subjectId, limitUsd }) => ({ dimension, subjectId, limitUsd }));
+    },
+  );
+
   registerHandler(IpcChannel.healthSummary, emptyIpcPayloadSchema, healthSummaryListSchema, async () => {
     const repos = getHubDatabase().repos;
     const samples = summarizeProviderHealth(repos.listRecentHealthSamples());
@@ -737,6 +756,13 @@ export function registerWorkspaceIpc(): void {
       };
     },
   );
+
+  registerHandler(IpcChannel.costsMonthly, monthlyCostsInputSchema, monthlyCostsResultSchema, (input) => {
+    const [year, month] = input.month.split("-").map(Number);
+    const from = new Date(year ?? 1970, (month ?? 1) - 1, 1).getTime();
+    const to = new Date(year ?? 1970, month ?? 1, 1).getTime();
+    return { month: input.month, ...getHubDatabase().repos.summarizeReceipts(from, to) };
+  });
 
   registerHandler(IpcChannel.debugGetLatest, emptyIpcPayloadSchema, debugSnapshotResultSchema, () =>
     getLatestDebugSnapshot(),
