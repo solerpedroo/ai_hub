@@ -704,13 +704,13 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 
 **Sub-tasks:**
 
-- [ ] Detector de artifact na resposta (fence `mermaid`, `html`, doc longo, código >N linhas)
-- [ ] Painel split chat | canvas
-- [ ] Render: Markdown doc, Mermaid, HTML sandbox (sem rede)
-- [ ] Code artifact: highlight + copy; **sem** execução nativa nesta onda
-- [ ] Versionamento do artifact (v1, v2…)
-- [ ] Pin no projeto; export MD/HTML/SVG (mermaid)
-- [ ] Abrir artifact antigo a partir do workspace da conversa
+- [x] Detector de artifact na resposta (fence `mermaid`, `html`, doc longo, código >N linhas)
+- [x] Painel split chat | canvas
+- [x] Render: Markdown doc, Mermaid, HTML sandbox (sem rede)
+- [x] Code artifact: highlight + copy; **sem** execução nativa nesta onda
+- [x] Versionamento do artifact (v1, v2…)
+- [x] Pin no projeto; export MD/HTML/SVG (mermaid)
+- [x] Abrir artifact antigo a partir do workspace da conversa
 
 **DoD:** “desenhe a arquitetura deste fluxo” abre Mermaid editável/versionado ao lado do chat.
 
