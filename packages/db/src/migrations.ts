@@ -218,6 +218,20 @@ CREATE TABLE conversation_tasks (
 CREATE INDEX conversation_tasks_conversation_idx ON conversation_tasks(conversation_id);
 `;
 
+export const MIGRATION_0010_SQL = `
+ALTER TABLE conversations ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat';
+CREATE TABLE prompts (
+  id TEXT PRIMARY KEY,
+  folder TEXT NOT NULL,
+  title_cipher TEXT NOT NULL,
+  body_cipher TEXT NOT NULL,
+  factory_id TEXT UNIQUE,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX prompts_folder_idx ON prompts(folder);
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
@@ -228,4 +242,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 7, sql: MIGRATION_0007_SQL },
   { version: 8, sql: MIGRATION_0008_SQL },
   { version: 9, sql: MIGRATION_0009_SQL },
+  { version: 10, sql: MIGRATION_0010_SQL },
 ];
