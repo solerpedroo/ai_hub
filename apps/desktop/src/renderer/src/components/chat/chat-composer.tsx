@@ -10,12 +10,13 @@ import { useTranslation } from "react-i18next";
 import {
   looksLikePastedSecret,
   mentionTriggerIn,
+  parseSkillSlashDraft,
   redactPastedSecrets,
   type MentionType,
 } from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
 
-export type SlashCommandId = "model" | "clear" | "compact" | "packet" | "cap";
+export type SlashCommandId = "model" | "clear" | "compact" | "packet" | "cap" | "skill";
 
 export interface MentionSuggestion {
   type: MentionType;
@@ -27,7 +28,7 @@ export interface MentionSuggestion {
   available: boolean;
 }
 
-const SLASH_COMMANDS: SlashCommandId[] = ["model", "clear", "compact", "packet", "cap"];
+const SLASH_COMMANDS: SlashCommandId[] = ["model", "clear", "compact", "packet", "cap", "skill"];
 
 export function matchKnownSlashCommand(draft: string): SlashCommandId | null {
   const trimmed = draft.trim();
@@ -44,6 +45,7 @@ export function ChatComposer({
   onSend,
   onAbort,
   onSlashCommand,
+  onSkillSlash,
   onFilesDrop,
   mentionSuggestions,
   onMentionQuery,
@@ -59,6 +61,7 @@ export function ChatComposer({
   onSend: () => void;
   onAbort: () => void;
   onSlashCommand: (command: SlashCommandId) => void;
+  onSkillSlash: (query: string | null, remainder: string) => void;
   onFilesDrop: (files: File[]) => void;
   mentionSuggestions: MentionSuggestion[];
   onMentionQuery: (typed: string | null) => void;
@@ -123,6 +126,12 @@ export function ChatComposer({
     if (command) {
       onChange("");
       onSlashCommand(command);
+      return;
+    }
+    const skillSlash = parseSkillSlashDraft(value);
+    if (skillSlash) {
+      onChange(skillSlash.remainder);
+      onSkillSlash(skillSlash.query, skillSlash.remainder);
       return;
     }
     onSend();
@@ -222,6 +231,11 @@ export function ChatComposer({
             setSelectedMentionIndex(
               (current) => (current - 1 + mentionSuggestions.length) % mentionSuggestions.length,
             );
+            return;
+          }
+          if (mentionOpen && event.key === "Enter" && parseSkillSlashDraft(value)?.query) {
+            event.preventDefault();
+            submit();
             return;
           }
           if (mentionOpen && (event.key === "Enter" || event.key === "Tab") && trigger) {
