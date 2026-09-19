@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, gte, isNotNull, isNull, ne } from "drizzle-orm";
+import { and, desc, eq, gte, isNotNull, isNull, lt, ne } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import type Database from "better-sqlite3";
 import {
@@ -32,6 +32,7 @@ import {
   providers,
   settings,
   spendCaps,
+  scopedSpendCaps,
   tags,
   type schema,
 } from "./schema";
@@ -140,11 +141,19 @@ export interface SpendCapRecord {
   createdAt: string;
 }
 
+export interface ScopedSpendCapRecord {
+  id: string;
+  dimension: "project" | "provider";
+  subjectId: string;
+  limitUsd: string;
+  createdAt: string;
+}
+
 export interface ContextPacketRecord {
   id: string;
   projectId: string | null;
   tokenEstimate: number | null;
-  privacyMode: "standard" | "strict";
+  privacyMode: "private" | "normal" | "maximum" | "standard" | "strict";
   origin: {
     source: "compile" | "import";
     projectLabel: string;
@@ -290,6 +299,14 @@ export interface AppPrefsRecord {
   lastUpdateCheckAt: string | null;
   lastUpdateStatus: "idle" | "skipped" | "uptodate" | "available" | "unavailable";
   lastWizardTtftMs: number | null;
+  privacyMode: "private" | "normal" | "maximum";
+  firewallPolicy: {
+    secret: "block" | "mask" | "allow";
+    token: "block" | "mask" | "allow";
+    email: "block" | "mask" | "allow";
+    cpf: "block" | "mask" | "allow";
+    prompt_injection: "block" | "mask" | "allow";
+  };
 }
 
 const DEFAULT_APP_PREFS: AppPrefsRecord = {
@@ -298,6 +315,8 @@ const DEFAULT_APP_PREFS: AppPrefsRecord = {
   lastUpdateCheckAt: null,
   lastUpdateStatus: "idle",
   lastWizardTtftMs: null,
+  privacyMode: "normal",
+  firewallPolicy: { secret: "mask", token: "mask", email: "mask", cpf: "mask", prompt_injection: "block" },
 };
 
 const UPDATE_STATUSES: readonly AppPrefsRecord["lastUpdateStatus"][] = [
@@ -307,6 +326,15 @@ const UPDATE_STATUSES: readonly AppPrefsRecord["lastUpdateStatus"][] = [
   "available",
   "unavailable",
 ];
+
+function isFirewallPolicy(value: unknown): value is AppPrefsRecord["firewallPolicy"] {
+  if (typeof value !== "object" || value === null) return false;
+  const row = value as Record<string, unknown>;
+  const actions = ["block", "mask", "allow"];
+  return ["secret", "token", "email", "cpf", "prompt_injection"].every(
+    (key) => typeof row[key] === "string" && actions.includes(row[key] as string),
+  );
+}
 
 const APPEARANCE_KEY = "appearance";
 const APP_PREFS_KEY = "app-prefs";
@@ -1351,6 +1379,11 @@ export class HubRepos {
         record.lastWizardTtftMs >= 0
           ? record.lastWizardTtftMs
           : null,
+      privacyMode:
+        record.privacyMode === "private" || record.privacyMode === "maximum" || record.privacyMode === "normal"
+          ? record.privacyMode
+          : DEFAULT_APP_PREFS.privacyMode,
+      firewallPolicy: isFirewallPolicy(record.firewallPolicy) ? record.firewallPolicy : DEFAULT_APP_PREFS.firewallPolicy,
     };
   }
 
@@ -1360,6 +1393,8 @@ export class HubRepos {
     lastUpdateCheckAt?: string | null | undefined;
     lastUpdateStatus?: AppPrefsRecord["lastUpdateStatus"] | undefined;
     lastWizardTtftMs?: number | null | undefined;
+    privacyMode?: AppPrefsRecord["privacyMode"] | undefined;
+    firewallPolicy?: AppPrefsRecord["firewallPolicy"] | undefined;
   }): AppPrefsRecord {
     const current = this.getAppPrefs();
     const next: AppPrefsRecord = {
@@ -1368,6 +1403,8 @@ export class HubRepos {
       lastUpdateCheckAt: patch.lastUpdateCheckAt === undefined ? current.lastUpdateCheckAt : patch.lastUpdateCheckAt,
       lastUpdateStatus: patch.lastUpdateStatus ?? current.lastUpdateStatus,
       lastWizardTtftMs: patch.lastWizardTtftMs === undefined ? current.lastWizardTtftMs : patch.lastWizardTtftMs,
+      privacyMode: patch.privacyMode ?? current.privacyMode,
+      firewallPolicy: patch.firewallPolicy ?? current.firewallPolicy,
     };
     const now = Date.now();
     this.db
@@ -1587,9 +1624,43 @@ export class HubRepos {
       .run();
   }
 
+  listScopedSpendCaps(): ScopedSpendCapRecord[] {
+    return this.db
+      .select()
+      .from(scopedSpendCaps)
+      .all()
+      .flatMap((row) =>
+        row.dimension === "project" || row.dimension === "provider"
+          ? [{ id: row.id, dimension: row.dimension, subjectId: row.subjectId, limitUsd: row.limitUsd, createdAt: iso(row.createdAt) }]
+          : [],
+      );
+  }
+
+  upsertScopedSpendCap(
+    dimension: "project" | "provider",
+    subjectId: string,
+    limitUsd: string | null,
+  ): void {
+    const existing = this.db
+      .select()
+      .from(scopedSpendCaps)
+      .where(and(eq(scopedSpendCaps.dimension, dimension), eq(scopedSpendCaps.subjectId, subjectId)))
+      .get();
+    if (limitUsd === null) {
+      if (existing) this.db.delete(scopedSpendCaps).where(eq(scopedSpendCaps.id, existing.id)).run();
+      return;
+    }
+    if (existing) {
+      this.db.update(scopedSpendCaps).set({ limitUsd }).where(eq(scopedSpendCaps.id, existing.id)).run();
+      return;
+    }
+    this.db.insert(scopedSpendCaps).values({ id: randomUUID(), dimension, subjectId, limitUsd, createdAt: Date.now() }).run();
+  }
+
   sumReceiptCostUsd(filter: {
     conversationId?: string | null;
     projectId?: string | null;
+    providerSlug?: string;
     sinceMs?: number;
   }): string {
     const clauses = [];
@@ -1601,6 +1672,9 @@ export class HubRepos {
     }
     if (filter.projectId) {
       clauses.push(eq(conversations.projectId, filter.projectId));
+    }
+    if (filter.providerSlug) {
+      clauses.push(eq(messageReceipts.provider, filter.providerSlug));
     }
     const query = this.db
       .select({
@@ -1615,6 +1689,48 @@ export class HubRepos {
       micros += parseUsdMicros(row.costUsd);
     }
     return microsToUsdText(micros);
+  }
+
+  summarizeReceipts(fromMs: number, toMs: number): {
+    tokens: number;
+    requests: number;
+    costUsd: string;
+    byModel: Array<{ key: string; tokens: number; requests: number; costUsd: string }>;
+    byProject: Array<{ key: string; tokens: number; requests: number; costUsd: string }>;
+  } {
+    const rows = this.db
+      .select({
+        provider: messageReceipts.provider,
+        model: messageReceipts.model,
+        tokensIn: messageReceipts.tokensIn,
+        tokensOut: messageReceipts.tokensOut,
+        costUsd: messageReceipts.costUsd,
+        projectId: conversations.projectId,
+      })
+      .from(messageReceipts)
+      .innerJoin(messages, eq(messages.id, messageReceipts.messageId))
+      .innerJoin(conversations, eq(conversations.id, messages.conversationId))
+      .where(and(gte(messageReceipts.createdAt, fromMs), lt(messageReceipts.createdAt, toMs)))
+      .all();
+    const bucket = (keyOf: (row: (typeof rows)[number]) => string) => {
+      const map = new Map<string, { micros: number; tokens: number; requests: number }>();
+      for (const row of rows) {
+        const key = keyOf(row);
+        const current = map.get(key) ?? { micros: 0, tokens: 0, requests: 0 };
+        current.micros += parseUsdMicros(row.costUsd);
+        current.tokens += (row.tokensIn ?? 0) + (row.tokensOut ?? 0);
+        current.requests += 1;
+        map.set(key, current);
+      }
+      return [...map.entries()]
+        .map(([key, value]) => ({ key, tokens: value.tokens, requests: value.requests, costUsd: microsToUsdText(value.micros), micros: value.micros }))
+        .sort((a, b) => b.micros - a.micros)
+        .map(({ micros: _micros, ...row }) => row);
+    };
+    const byModel = bucket((row) => `${row.provider ?? "unknown"} / ${row.model ?? "unknown"}`);
+    const byProject = bucket((row) => row.projectId ?? "inbox");
+    const tokens = rows.reduce((sum, row) => sum + (row.tokensIn ?? 0) + (row.tokensOut ?? 0), 0);
+    return { tokens, requests: rows.length, costUsd: microsToUsdText(rows.reduce((sum, row) => sum + parseUsdMicros(row.costUsd), 0)), byModel, byProject };
   }
 
   listSpendCapOverrides(): SpendCapOverrideRecord[] {
@@ -1788,7 +1904,14 @@ export class HubRepos {
       id: row.id,
       projectId: row.projectId,
       tokenEstimate: row.tokenEstimate,
-      privacyMode: row.privacyMode === "strict" ? "strict" : "standard",
+    privacyMode:
+      row.privacyMode === "strict" || row.privacyMode === "private"
+        ? row.privacyMode
+        : row.privacyMode === "maximum"
+          ? "maximum"
+          : row.privacyMode === "normal"
+            ? "normal"
+            : "standard",
       origin: this.parsePacketOrigin(row.origin),
       version: row.version,
       createdAt: iso(row.createdAt),
@@ -1819,7 +1942,7 @@ export class HubRepos {
 
   createContextPacket(input: {
     projectId: string | null;
-    privacyMode: "standard" | "strict";
+    privacyMode: "private" | "normal" | "maximum" | "standard" | "strict";
     origin: { source: "compile" | "import"; projectLabel: string; conversationLabel: string };
     tokenEstimate: number;
     payloadJson: string;
