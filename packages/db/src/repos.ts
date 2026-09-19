@@ -23,6 +23,7 @@ import {
   projectFiles,
   projectMemories,
   prompts,
+  skills,
   artifacts,
   messageReceipts,
   messages,
@@ -219,6 +220,23 @@ export interface PromptRecord {
   updatedAt: string;
 }
 
+export type SkillFolder = PromptFolder;
+
+export interface SkillRecord {
+  id: string;
+  folder: SkillFolder;
+  title: string;
+  description: string;
+  prompt: string;
+  preferredModel: string | null;
+  defaultMentions: Array<{ type: "file" | "conversation" | "memory" | "prompt" | "skill" | "packet"; query: string }>;
+  steps: Array<{ id: string; title: string; section: string }>;
+  factoryId: string | null;
+  contractVersion: 1;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type ArtifactKind = "mermaid" | "html" | "markdown" | "code";
 
 export interface ArtifactRecord {
@@ -298,6 +316,7 @@ const CUSTOM_BASE_URL_PREFIX = "custom-base-url:";
 const SPEND_CAP_OVERRIDES_KEY = "spend-cap-overrides";
 const MEMORY_OPT_OUT_PREFIX = "memory-opt-out:";
 const PROMPT_FACTORY_SEEDED_KEY = "prompt-factory-seeded";
+const SKILL_FACTORY_SEEDED_KEY = "skill-factory-seeded";
 const DEFAULT_SESSION: WorkspaceSessionRecord = {
   projectId: null,
   conversationId: null,
@@ -2168,6 +2187,144 @@ export class HubRepos {
     this.db.delete(prompts).where(eq(prompts.id, id)).run();
   }
 
+  ensureFactorySkills(
+    items: readonly {
+      factoryId: string;
+      folder: SkillFolder;
+      title: string;
+      description: string;
+      preferredModel: string | null;
+      prompt: string;
+      steps: SkillRecord["steps"];
+      defaultMentions: SkillRecord["defaultMentions"];
+    }[],
+  ): void {
+    const seeded = this.db.select().from(settings).where(eq(settings.key, SKILL_FACTORY_SEEDED_KEY)).get();
+    if (seeded?.value === "1") {
+      return;
+    }
+    for (const item of items) {
+      const existing = this.db.select().from(skills).where(eq(skills.factoryId, item.factoryId)).get();
+      if (existing) {
+        continue;
+      }
+      this.createSkill({
+        folder: item.folder,
+        title: item.title,
+        description: item.description,
+        prompt: item.prompt,
+        preferredModel: item.preferredModel,
+        defaultMentions: item.defaultMentions,
+        steps: item.steps,
+        factoryId: item.factoryId,
+      });
+    }
+    const now = Date.now();
+    this.db
+      .insert(settings)
+      .values({ key: SKILL_FACTORY_SEEDED_KEY, value: "1", updatedAt: now })
+      .onConflictDoUpdate({
+        target: settings.key,
+        set: { value: "1", updatedAt: now },
+      })
+      .run();
+  }
+
+  createSkill(input: {
+    folder: SkillFolder;
+    title: string;
+    description: string;
+    prompt: string;
+    preferredModel?: string | null;
+    defaultMentions: SkillRecord["defaultMentions"];
+    steps: SkillRecord["steps"];
+    factoryId?: string | null;
+  }): SkillRecord {
+    const id = randomUUID();
+    const now = Date.now();
+    this.db
+      .insert(skills)
+      .values({
+        id,
+        folder: input.folder,
+        titleCipher: encryptUtf8(input.title.slice(0, 120), this.masterKey),
+        descriptionCipher: encryptUtf8(input.description.slice(0, 400), this.masterKey),
+        definitionCipher: encryptUtf8(this.skillDefinitionJson(input), this.masterKey),
+        preferredModel: input.preferredModel ?? null,
+        factoryId: input.factoryId ?? null,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+    const created = this.getSkill(id);
+    if (!created) {
+      throw new Error("Skill not found");
+    }
+    return created;
+  }
+
+  getSkill(id: string): SkillRecord | null {
+    const row = this.db.select().from(skills).where(eq(skills.id, id)).get();
+    return row ? this.toSkill(row) : null;
+  }
+
+  listSkills(): SkillRecord[] {
+    return this.db
+      .select()
+      .from(skills)
+      .all()
+      .map((row) => this.toSkill(row))
+      .sort((a, b) => a.folder.localeCompare(b.folder) || a.title.localeCompare(b.title));
+  }
+
+  updateSkill(
+    id: string,
+    patch: {
+      folder?: SkillFolder;
+      title?: string;
+      description?: string;
+      prompt?: string;
+      preferredModel?: string | null;
+      defaultMentions?: SkillRecord["defaultMentions"];
+      steps?: SkillRecord["steps"];
+    },
+  ): SkillRecord {
+    const existing = this.getSkill(id);
+    if (!existing) {
+      throw new Error("Skill not found");
+    }
+    const next = {
+      folder: patch.folder ?? existing.folder,
+      title: patch.title ?? existing.title,
+      description: patch.description ?? existing.description,
+      prompt: patch.prompt ?? existing.prompt,
+      preferredModel: patch.preferredModel !== undefined ? patch.preferredModel : existing.preferredModel,
+      defaultMentions: patch.defaultMentions ?? existing.defaultMentions,
+      steps: patch.steps ?? existing.steps,
+    };
+    this.db
+      .update(skills)
+      .set({
+        folder: next.folder,
+        titleCipher: encryptUtf8(next.title.slice(0, 120), this.masterKey),
+        descriptionCipher: encryptUtf8(next.description.slice(0, 400), this.masterKey),
+        definitionCipher: encryptUtf8(this.skillDefinitionJson(next), this.masterKey),
+        preferredModel: next.preferredModel,
+        updatedAt: Date.now(),
+      })
+      .where(eq(skills.id, id))
+      .run();
+    const updated = this.getSkill(id);
+    if (!updated) {
+      throw new Error("Skill not found");
+    }
+    return updated;
+  }
+
+  removeSkill(id: string): void {
+    this.db.delete(skills).where(eq(skills.id, id)).run();
+  }
+
   createArtifact(input: {
     conversationId: string;
     familyId?: string;
@@ -2518,6 +2675,90 @@ export class HubRepos {
       title: decryptUtf8(row.titleCipher, this.masterKey),
       done: row.done === 1,
       createdAt: iso(row.createdAt),
+    };
+  }
+
+  private skillDefinitionJson(input: {
+    prompt: string;
+    steps: SkillRecord["steps"];
+    defaultMentions: SkillRecord["defaultMentions"];
+  }): string {
+    return JSON.stringify({
+      version: 1,
+      kind: "skill",
+      prompt: input.prompt.slice(0, 16_000),
+      steps: input.steps.slice(0, 12),
+      defaultMentions: input.defaultMentions.slice(0, 8),
+      tools: [],
+    });
+  }
+
+  private toSkill(row: typeof skills.$inferSelect): SkillRecord {
+    const folder =
+      row.folder === "development" || row.folder === "studies" || row.folder === "work"
+        ? row.folder
+        : "work";
+    let definition: {
+      prompt: string;
+      steps: SkillRecord["steps"];
+      defaultMentions: SkillRecord["defaultMentions"];
+    } = { prompt: "", steps: [], defaultMentions: [] };
+    try {
+      const parsed: unknown = JSON.parse(decryptUtf8(row.definitionCipher, this.masterKey));
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        "prompt" in parsed &&
+        typeof parsed.prompt === "string" &&
+        "steps" in parsed &&
+        Array.isArray(parsed.steps) &&
+        "defaultMentions" in parsed &&
+        Array.isArray(parsed.defaultMentions)
+      ) {
+        definition = {
+          prompt: parsed.prompt,
+          steps: parsed.steps.filter(
+            (step): step is SkillRecord["steps"][number] =>
+              Boolean(
+                step &&
+                  typeof step === "object" &&
+                  "id" in step &&
+                  "title" in step &&
+                  "section" in step &&
+                  typeof step.id === "string" &&
+                  typeof step.title === "string" &&
+                  typeof step.section === "string",
+              ),
+          ),
+          defaultMentions: parsed.defaultMentions.filter(
+            (item): item is SkillRecord["defaultMentions"][number] =>
+              Boolean(
+                item &&
+                  typeof item === "object" &&
+                  "type" in item &&
+                  "query" in item &&
+                  typeof item.type === "string" &&
+                  typeof item.query === "string",
+              ),
+          ),
+        };
+      }
+    } catch {
+      definition = { prompt: "", steps: [], defaultMentions: [] };
+    }
+    return {
+      id: row.id,
+      folder,
+      title: decryptUtf8(row.titleCipher, this.masterKey),
+      description: decryptUtf8(row.descriptionCipher, this.masterKey),
+      prompt: definition.prompt,
+      preferredModel: row.preferredModel ?? null,
+      defaultMentions: definition.defaultMentions,
+      steps: definition.steps,
+      factoryId: row.factoryId ?? null,
+      contractVersion: 1,
+      createdAt: iso(row.createdAt),
+      updatedAt: iso(row.updatedAt),
     };
   }
 
