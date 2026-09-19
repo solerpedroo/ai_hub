@@ -19,4 +19,14 @@ describe("stripAttachedFileBodiesForRenderer", () => {
     expect(stripped).not.toContain("PostgreSQL");
     expect(stripped).not.toContain("packet-secret-body");
   });
+
+  it("omits project memory and retrieved chunk bodies", () => {
+    const system =
+      "Be brief.\n\nProject memory: DB\nusamos PostgreSQL\n\nRetrieved chunk: spec.pdf#c0\nSection 3 secret-doc";
+    const stripped = stripAttachedFileBodiesForRenderer(system);
+    expect(stripped).toContain("Project memory: DB");
+    expect(stripped).toContain("Retrieved chunk: spec.pdf#c0");
+    expect(stripped).not.toContain("PostgreSQL");
+    expect(stripped).not.toContain("secret-doc");
+  });
 });
