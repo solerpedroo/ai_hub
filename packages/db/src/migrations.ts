@@ -266,6 +266,18 @@ CREATE TABLE skills (
 CREATE INDEX skills_folder_idx ON skills(folder);
 `;
 
+export const MIGRATION_0013_SQL = `
+CREATE TABLE scoped_spend_caps (
+  id TEXT PRIMARY KEY,
+  dimension TEXT NOT NULL,
+  subject_id TEXT NOT NULL,
+  limit_usd TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX scoped_spend_caps_dimension_subject_idx
+  ON scoped_spend_caps(dimension, subject_id);
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
@@ -279,4 +291,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 10, sql: MIGRATION_0010_SQL },
   { version: 11, sql: MIGRATION_0011_SQL },
   { version: 12, sql: MIGRATION_0012_SQL },
+  { version: 13, sql: MIGRATION_0013_SQL },
 ];
