@@ -8,6 +8,7 @@ const gateway = resolve(__dirname, "../../packages/ai-gateway/src");
 const securityIndex = resolve(__dirname, "../../packages/security/src/index.ts");
 const securityKeytar = resolve(__dirname, "../../packages/security/src/keytar-store.ts");
 const files = resolve(__dirname, "../../packages/files/src");
+const memory = resolve(__dirname, "../../packages/memory/src");
 
 const mainAliases = {
   "@ai-hub/shared/import": resolve(__dirname, "../../packages/shared/src/import/index.ts"),
@@ -17,13 +18,14 @@ const mainAliases = {
   "@ai-hub/security/keytar": securityKeytar,
   "@ai-hub/security": securityIndex,
   "@ai-hub/files": files,
+  "@ai-hub/memory": memory,
 };
 
 export default defineConfig({
   main: {
     plugins: [
       externalizeDepsPlugin({
-        exclude: ["@ai-hub/shared", "@ai-hub/db", "@ai-hub/security", "@ai-hub/ai-gateway", "@ai-hub/files"],
+        exclude: ["@ai-hub/shared", "@ai-hub/db", "@ai-hub/security", "@ai-hub/ai-gateway", "@ai-hub/files", "@ai-hub/memory"],
       }),
     ],
     resolve: {
