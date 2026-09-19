@@ -9,6 +9,17 @@ import type {
 import { GatewayError } from "./errors";
 
 export const MOCK_ASSISTANT_TEXT = "Hello from mock";
+export const MOCK_SKILL_REVIEW_TEXT = `# Code Review
+
+## Summary
+The attached diff is internally consistent for the fixture.
+
+## Risks
+- None found in the fixture.
+
+## Suggestions
+- Keep this heading format for future reviews.
+`;
 export const MOCK_MERMAID_TEXT = `Here is the architecture.
 
 \`\`\`mermaid
@@ -36,7 +47,10 @@ function waitForAbortOrTimeout(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-function mockReply(packet: { messages: Array<{ role: string; content: string }> }): string {
+function mockReply(packet: { system?: string; messages: Array<{ role: string; content: string }> }): string {
+  if (packet.system && /Applied skill: Code Review/i.test(packet.system)) {
+    return MOCK_SKILL_REVIEW_TEXT;
+  }
   const lastUser = [...packet.messages].reverse().find((item) => item.role === "user");
   if (lastUser && /desenhe a arquitetura|draw the architecture/i.test(lastUser.content)) {
     return MOCK_MERMAID_TEXT;
@@ -47,6 +61,9 @@ function mockReply(packet: { messages: Array<{ role: string; content: string }> 
 function splitReply(text: string): [string, string] {
   if (text === MOCK_ASSISTANT_TEXT) {
     return ["Hello", " from mock"];
+  }
+  if (text === MOCK_SKILL_REVIEW_TEXT) {
+    return [text.slice(0, text.indexOf("## Risks")), text.slice(text.indexOf("## Risks"))];
   }
   const cut = text.indexOf("```mermaid");
   if (cut > 0) {
