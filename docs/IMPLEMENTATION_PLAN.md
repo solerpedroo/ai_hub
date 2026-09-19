@@ -618,10 +618,10 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 
 **Sub-tasks:**
 
-- [ ] Command Palette `Ctrl/Cmd+K`: nova conversa, modelo, projeto, export, providers, settings, import
-- [ ] Cheatsheet de atalhos (in-app)
-- [ ] Slash commands no composer: `/model`, `/clear`, `/compact`, `/packet`, `/cap`
-- [ ] Paleta busca conversas/projetos (FTS)
+- [x] Command Palette `Ctrl/Cmd+K`: nova conversa, modelo, projeto, export, providers, settings, import
+- [x] Cheatsheet de atalhos (in-app)
+- [x] Slash commands no composer: `/model`, `/clear`, `/compact`, `/packet`, `/cap`
+- [x] Paleta busca conversas/projetos (FTS)
 
 **DoD:** usuário avançado usa o Hub 10 minutos sem mouse para os fluxos principais.
 
