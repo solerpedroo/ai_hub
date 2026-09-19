@@ -15,6 +15,13 @@ export interface CompilerFile {
   text: string;
 }
 
+export interface CompilerMention {
+  kind: "conversation" | "packet";
+  id: string;
+  name: string;
+  text: string;
+}
+
 export interface CompileInput {
   projectInstructions: string | null;
   extraSystem: string | null;
@@ -235,6 +242,37 @@ export function appendFilesToPacket(
       id: file.id,
       label: clipPacketLabel(`Attached file: ${file.name}`, 200),
       tokens: tokenEstimateFromChars(`Attached file: ${file.name}\n${file.text}`.length),
+    })),
+  };
+}
+
+function mentionHeading(mention: CompilerMention): string {
+  return mention.kind === "conversation"
+    ? `Mentioned conversation: ${mention.name}`
+    : `Mentioned packet: ${mention.name}`;
+}
+
+export function appendMentionsToPacket(
+  packet: ProviderAgnosticPacket,
+  mentions: CompilerMention[],
+): { packet: ProviderAgnosticPacket; included: PacketSlice[] } {
+  if (mentions.length === 0) {
+    return { packet, included: [] };
+  }
+  const blocks = mentions.map((mention) => `${mentionHeading(mention)}\n${mention.text}`);
+  const extra = blocks.join("\n\n");
+  const system = packet.system.length > 0 ? `${packet.system}\n\n${extra}` : extra;
+  return {
+    packet: packetV0Schema.parse({
+      ...packet,
+      system,
+      tokenEstimate: packet.tokenEstimate + tokenEstimateFromChars(extra.length),
+    }),
+    included: mentions.map((mention) => ({
+      kind: mention.kind,
+      id: mention.id,
+      label: clipPacketLabel(mentionHeading(mention), 200),
+      tokens: tokenEstimateFromChars(`${mentionHeading(mention)}\n${mention.text}`.length),
     })),
   };
 }
