@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { WebContents } from "electron";
 import {
   composeReceipt,
+  appendFilesToPacket,
   compileActivePath,
   compilePacket,
   consumeCrashSafeStream,
@@ -18,6 +19,7 @@ import {
   type ProviderAdapter,
 } from "@ai-hub/ai-gateway";
 import type { ConversationRecord, MessageRecord } from "@ai-hub/db";
+import { stripAttachedFileBodiesForRenderer } from "@ai-hub/files";
 import { redactSecrets } from "@ai-hub/security";
 import {
   activePath,
@@ -40,6 +42,7 @@ import {
 import { recordDebugSnapshot } from "./debug-snapshot";
 import { isE2eMode } from "./e2e-mode";
 import { toMessageDto } from "./message-dto";
+import { loadSendAttachments } from "./files";
 import { getHubDatabase } from "./persistence";
 import { estimateOutgoingCostUsd, evaluateOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
 
@@ -72,7 +75,11 @@ function adapterFor(slug: string, baseUrl: string | null): ProviderAdapter {
 }
 
 function inspectablePacket(packet: ProviderAgnosticPacket): ProviderAgnosticPacket {
-  return packetV0Schema.parse(JSON.parse(redactSecrets(JSON.stringify(packet))) as unknown);
+  const stripped = {
+    ...packet,
+    system: stripAttachedFileBodiesForRenderer(packet.system),
+  };
+  return packetV0Schema.parse(JSON.parse(redactSecrets(JSON.stringify(stripped))) as unknown);
 }
 
 function emit(sender: WebContents, event: ChatEvent): void {
@@ -332,7 +339,21 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
   }
 
   const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
-  const packet = compileOutgoing(input, project?.instructions ?? null, compileRows, key.providerSlug, conversation);
+  const catalogForVision = findCatalogModel(input.model, key.providerSlug);
+  const attachments = loadSendAttachments(
+    input.fileIds,
+    conversation.projectId,
+    catalogForVision?.vision === true,
+    "send",
+  );
+  const compiled = compileOutgoing(
+    input,
+    project?.instructions ?? null,
+    compileRows,
+    key.providerSlug,
+    conversation,
+  );
+  const packet = appendFilesToPacket(compiled, attachments.files).packet;
   if (packet.messages.length === 0) {
     throw new Error("Add a user message before sending");
   }
@@ -387,7 +408,11 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     });
   }
 
-  console.info("[hub:packet]", redactSecrets(JSON.stringify(packet)));
+  console.info("[hub:packet]", {
+    tokens: packet.tokenEstimate,
+    messages: packet.messages.length,
+    systemChars: packet.system.length,
+  });
   const publicPacket = inspectablePacket(packet);
 
   const userMessage = persistUser ? persistUser() : null;
@@ -468,6 +493,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
               signal: run.abort.signal,
               temperature: input.temperature ?? 1,
               maxTokens: input.maxTokens ?? null,
+              ...(attachments.images.length > 0 ? { images: attachments.images } : {}),
             }),
             onDelta: (text) => {
               streamed = true;
