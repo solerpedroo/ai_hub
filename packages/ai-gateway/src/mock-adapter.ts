@@ -9,14 +9,21 @@ import type {
 import { GatewayError } from "./errors";
 
 export const MOCK_ASSISTANT_TEXT = "Hello from mock";
+export const MOCK_MERMAID_TEXT = `Here is the architecture.
+
+\`\`\`mermaid
+flowchart LR
+  A[Composer] --> B[Compiler]
+  B --> C[Gateway]
+\`\`\`
+`;
 export const MOCK_STREAM_PAUSE_MS = 400;
 
 function waitForAbortOrTimeout(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return Promise.reject(new GatewayError("aborted", "aborted"));
+  }
   return new Promise((resolve, reject) => {
-    if (signal.aborted) {
-      reject(new GatewayError("aborted", "aborted"));
-      return;
-    }
     const timer = setTimeout(() => {
       signal.removeEventListener("abort", onAbort);
       resolve();
@@ -27,6 +34,25 @@ function waitForAbortOrTimeout(ms: number, signal: AbortSignal): Promise<void> {
     };
     signal.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+function mockReply(packet: { messages: Array<{ role: string; content: string }> }): string {
+  const lastUser = [...packet.messages].reverse().find((item) => item.role === "user");
+  if (lastUser && /desenhe a arquitetura|draw the architecture/i.test(lastUser.content)) {
+    return MOCK_MERMAID_TEXT;
+  }
+  return MOCK_ASSISTANT_TEXT;
+}
+
+function splitReply(text: string): [string, string] {
+  if (text === MOCK_ASSISTANT_TEXT) {
+    return ["Hello", " from mock"];
+  }
+  const cut = text.indexOf("```mermaid");
+  if (cut > 0) {
+    return [text.slice(0, cut), text.slice(cut)];
+  }
+  return [text.slice(0, Math.min(12, text.length)), text.slice(Math.min(12, text.length))];
 }
 
 export function createMockOpenAIAdapter(): ProviderAdapter {
@@ -44,13 +70,15 @@ export function createMockOpenAIAdapter(): ProviderAdapter {
       if (request.signal.aborted) {
         throw new GatewayError("aborted", "aborted");
       }
-      yield { type: "delta", text: "Hello" };
+      const text = mockReply(request.packet);
+      const [first, second] = splitReply(text);
+      yield { type: "delta", text: first };
       await waitForAbortOrTimeout(MOCK_STREAM_PAUSE_MS, request.signal);
-      yield { type: "delta", text: " from mock" };
+      yield { type: "delta", text: second };
       if (request.signal.aborted) {
         throw new GatewayError("aborted", "aborted");
       }
-      yield { type: "usage", tokensIn: 4, tokensOut: MOCK_ASSISTANT_TEXT.length };
+      yield { type: "usage", tokensIn: 4, tokensOut: text.length };
     },
   };
 }
