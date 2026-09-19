@@ -76,6 +76,12 @@ import type {
   PromptResolveResult,
   PlaygroundRunInput,
   PlaygroundRunResult,
+  ArtifactDto,
+  ArtifactsListInput,
+  ArtifactSaveVersionInput,
+  ArtifactPinInput,
+  ArtifactExportInput,
+  ArtifactExportResult,
   ProviderKeyDto,
   SecretsSaveInput,
   SecretsTestInput,
@@ -220,6 +226,14 @@ export interface HubPlaygroundApi {
   run: (input: PlaygroundRunInput) => Promise<PlaygroundRunResult>;
 }
 
+export interface HubArtifactsApi {
+  list: (input: ArtifactsListInput) => Promise<ArtifactDto[]>;
+  get: (input: IdInput) => Promise<ArtifactDto>;
+  saveVersion: (input: ArtifactSaveVersionInput) => Promise<ArtifactDto>;
+  setPinned: (input: ArtifactPinInput) => Promise<ArtifactDto>;
+  exportFile: (input: ArtifactExportInput) => Promise<ArtifactExportResult>;
+}
+
 export interface HubChatApi {
   send: (input: ChatSendInput) => Promise<ChatSendResult>;
   abort: (input: ChatAbortInput) => Promise<void>;
@@ -251,6 +265,7 @@ export interface HubApi {
   workspace: HubWorkspaceApi;
   prompts: HubPromptsApi;
   playground: HubPlaygroundApi;
+  artifacts: HubArtifactsApi;
 }
 
 export type { AppLocale, ThemeMode };
