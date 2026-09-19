@@ -22,6 +22,8 @@ import {
   secretsTestResultSchema,
   windowIsMaximizedResultSchema,
   workspaceSessionSchema,
+  filesIngestPathsInputSchema,
+  filesRemoveInputSchema,
 } from "./ipc-schemas";
 
 describe("emptyIpcPayloadSchema", () => {
@@ -384,5 +386,19 @@ describe("wave 8 contracts", () => {
     };
     expect(appPrefsSchema.parse(prefs).crashReporterOptIn).toBe(false);
     expect(() => appPrefsSchema.parse({ ...prefs, apiKey: "sk-test" })).toThrow();
+  });
+});
+
+describe("wave 12 file contracts", () => {
+  it("rejects extra keys on ingest paths and remove", () => {
+    const ingest = {
+      projectId: null,
+      items: [{ path: "C:\\\\docs\\\\spec.pdf", name: "spec.pdf" }],
+    };
+    expect(filesIngestPathsInputSchema.parse(ingest).items).toHaveLength(1);
+    expect(() => filesIngestPathsInputSchema.parse({ ...ingest, extra: true })).toThrow();
+    const remove = { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", projectId: null };
+    expect(filesRemoveInputSchema.parse(remove).projectId).toBeNull();
+    expect(() => filesRemoveInputSchema.parse({ ...remove, extra: true })).toThrow();
   });
 });
