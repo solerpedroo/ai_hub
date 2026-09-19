@@ -668,13 +668,13 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 
 **Sub-tasks:**
 
-- [ ] Chunking + embeddings (local se possível; senão API **explícita** e paga no cap)
-- [ ] Retrieval por projeto; citações na resposta (link para o chunk/arquivo)
-- [ ] Memória por projeto: sugerir salvar, editar, apagar, opt-out
-- [ ] `@memory` passa a resolver de verdade
-- [ ] Workspace da conversa: resumo, decisões, pins, tarefas extraídas
-- [ ] Duplicar conversa; transformar conversa → projeto
-- [ ] Memórias entram no packet; modo Privado as exclui (W18 liga o modo)
+- [x] Chunking + embeddings (local se possível; senão API **explícita** e paga no cap)
+- [x] Retrieval por projeto; citações na resposta (link para o chunk/arquivo)
+- [x] Memória por projeto: sugerir salvar, editar, apagar, opt-out
+- [x] `@memory` passa a resolver de verdade
+- [x] Workspace da conversa: resumo, decisões, pins, tarefas extraídas
+- [x] Duplicar conversa; transformar conversa → projeto
+- [x] Memórias entram no packet; modo Privado as exclui (W18 liga o modo)
 
 **DoD:** projeto com 10 PDFs responde com citação; memória “usamos PostgreSQL” reaparece na conversa seguinte; usuário pode apagar a memória.
 
