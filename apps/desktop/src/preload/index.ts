@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
 import { ZodError, type ZodType } from "zod";
 import {
   IpcChannel,
@@ -49,6 +49,11 @@ import {
   packetsExportResultSchema,
   packetsImportInputSchema,
   packetsListInputSchema,
+  projectFileListInputSchema,
+  projectFileListResultSchema,
+  filesAttachInputSchema,
+  filesIngestPathsInputSchema,
+  filesRemoveInputSchema,
   contextPacketDtoSchema,
   contextPacketListResultSchema,
   projectCreateInputSchema,
@@ -303,6 +308,33 @@ const hub: HubApi = {
       invokeParsed(IpcChannel.packetsApply, input, packetsApplyInputSchema, conversationDtoSchema),
     clear: (input) =>
       invokeParsed(IpcChannel.packetsClear, input, packetsClearInputSchema, conversationDtoSchema),
+  },
+  files: {
+    list: (input) =>
+      invokeParsed(
+        IpcChannel.filesList,
+        input,
+        projectFileListInputSchema,
+        projectFileListResultSchema,
+      ),
+    attach: (input) =>
+      invokeParsed(IpcChannel.filesAttach, input, filesAttachInputSchema, projectFileListResultSchema),
+    fromDrop: (input) => {
+      const list = Array.isArray(input.files) ? input.files : [];
+      const items = list.flatMap((item) => {
+        if (typeof File !== "undefined" && item instanceof File) {
+          return [{ path: webUtils.getPathForFile(item), name: item.name }];
+        }
+        return [];
+      });
+      return invokeParsed(
+        IpcChannel.filesIngestPaths,
+        { projectId: input.projectId, items },
+        filesIngestPathsInputSchema,
+        projectFileListResultSchema,
+      );
+    },
+    remove: (input) => invokeAckWith(IpcChannel.filesRemove, input, filesRemoveInputSchema),
   },
 };
 
