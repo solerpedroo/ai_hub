@@ -162,6 +162,23 @@ ALTER TABLE conversations ADD COLUMN packet_applied_at INTEGER;
 ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
 `;
 
+export const MIGRATION_0008_SQL = `
+CREATE TABLE project_files (
+  id TEXT PRIMARY KEY,
+  project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  mime TEXT NOT NULL,
+  byte_size INTEGER NOT NULL,
+  token_estimate INTEGER NOT NULL,
+  extract_cipher TEXT NOT NULL,
+  image_cipher TEXT,
+  truncated INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX project_files_project_idx ON project_files(project_id);
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
@@ -170,4 +187,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 5, sql: MIGRATION_0005_SQL },
   { version: 6, sql: MIGRATION_0006_SQL },
   { version: 7, sql: MIGRATION_0007_SQL },
+  { version: 8, sql: MIGRATION_0008_SQL },
 ];
