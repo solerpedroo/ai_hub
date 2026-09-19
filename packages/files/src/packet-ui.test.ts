@@ -36,4 +36,11 @@ describe("stripAttachedFileBodiesForRenderer", () => {
     expect(stripped).toContain("Library prompt: Code review");
     expect(stripped).not.toContain("senior");
   });
+
+  it("omits applied skill bodies", () => {
+    const system = "Be brief.\n\nApplied skill: Code Review\nYou are a senior code reviewer for E2E.";
+    const stripped = stripAttachedFileBodiesForRenderer(system);
+    expect(stripped).toContain("Applied skill: Code Review");
+    expect(stripped).not.toContain("senior");
+  });
 });
