@@ -107,6 +107,10 @@ import {
   secretsTestResultSchema,
   spendCapListResultSchema,
   spendCapSetInputSchema,
+  scopedSpendCapListResultSchema,
+  scopedSpendCapSetInputSchema,
+  monthlyCostsInputSchema,
+  monthlyCostsResultSchema,
   windowIsMaximizedResultSchema,
   workspaceSessionSchema,
 } from "@ai-hub/shared";
@@ -278,6 +282,12 @@ const hub: HubApi = {
     set: (input) =>
       invokeParsed(IpcChannel.spendCapsSet, input, spendCapSetInputSchema, spendCapListResultSchema),
   },
+  scopedSpendCaps: {
+    get: () =>
+      invokeParsed(IpcChannel.scopedSpendCapsGet, empty, emptyIpcPayloadSchema, scopedSpendCapListResultSchema),
+    set: (input) =>
+      invokeParsed(IpcChannel.scopedSpendCapsSet, input, scopedSpendCapSetInputSchema, scopedSpendCapListResultSchema),
+  },
   health: {
     summary: () =>
       invokeParsed(IpcChannel.healthSummary, empty, emptyIpcPayloadSchema, healthSummaryListSchema),
@@ -285,6 +295,8 @@ const hub: HubApi = {
   costs: {
     aggregate: (input) =>
       invokeParsed(IpcChannel.costsAggregate, input, costsAggregateInputSchema, costsAggregateResultSchema),
+    monthly: (input) =>
+      invokeParsed(IpcChannel.costsMonthly, input, monthlyCostsInputSchema, monthlyCostsResultSchema),
   },
   debug: {
     getLatest: () =>
