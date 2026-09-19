@@ -27,6 +27,8 @@ import {
   memoryCreateInputSchema,
   promptCreateInputSchema,
   playgroundRunInputSchema,
+  artifactDtoSchema,
+  artifactExportInputSchema,
   conversationWorkspaceDtoSchema,
 } from "./ipc-schemas";
 
@@ -451,5 +453,32 @@ describe("wave 15 prompt and playground contracts", () => {
     });
     expect(run.slots).toHaveLength(2);
     expect(() => playgroundRunInputSchema.parse({ ...run, slots: run.slots.slice(0, 1) })).toThrow();
+  });
+});
+
+describe("wave 16 artifact contracts", () => {
+  it("accepts a mermaid artifact dto and rejects extra keys", () => {
+    const dto = {
+      id: "11111111-1111-4111-8111-111111111111",
+      conversationId: "22222222-2222-4222-8222-222222222222",
+      familyId: "33333333-3333-4333-8333-333333333333",
+      sourceMessageId: "44444444-4444-4444-8444-444444444444",
+      kind: "mermaid",
+      title: "Mermaid",
+      body: "flowchart LR\n  A --> B",
+      language: null,
+      version: 1,
+      pinned: false,
+      createdAt: "2026-09-19T00:00:00.000Z",
+    };
+    expect(artifactDtoSchema.parse(dto).kind).toBe("mermaid");
+    expect(() => artifactDtoSchema.parse({ ...dto, extra: true })).toThrow();
+    expect(() =>
+      artifactExportInputSchema.parse({
+        id: dto.id,
+        format: "svg",
+        extra: true,
+      }),
+    ).toThrow();
   });
 });
