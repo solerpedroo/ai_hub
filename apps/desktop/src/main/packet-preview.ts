@@ -1,4 +1,9 @@
-import { appendFilesToPacket, compileActivePathDetailed, mergePacketWithTail } from "@ai-hub/ai-gateway";
+import {
+  appendFilesToPacket,
+  appendMentionsToPacket,
+  compileActivePathDetailed,
+  mergePacketWithTail,
+} from "@ai-hub/ai-gateway";
 import { randomUUID } from "node:crypto";
 import {
   findCatalogModel,
@@ -8,6 +13,7 @@ import {
   type PacketPreviewResult,
 } from "@ai-hub/shared";
 import { loadSendAttachments } from "./files";
+import { resolveSendMentions } from "./mentions";
 import { getHubDatabase } from "./persistence";
 import { estimateOutgoingCostUsd, evaluateOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
 
@@ -118,26 +124,31 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
     included = detailed.included;
     omitted = detailed.omitted;
   }
+  const resolvedMentions = resolveSendMentions(
+    repos,
+    input.mentions,
+    conversation.projectId,
+    input.conversationId,
+    "preview",
+  );
+  const fileIds = [...new Set([...(input.fileIds ?? []), ...resolvedMentions.fileIds])];
   const attachments = loadSendAttachments(
-    input.fileIds,
+    fileIds,
     conversation.projectId,
     catalog?.vision === true,
     "preview",
   );
-  if (attachments.files.length > 0) {
-    const withFiles = appendFilesToPacket(
-      {
-        version: 1,
-        system: "",
-        messages: [],
-        tokenEstimate: 0,
-        excluded: [],
-      },
-      attachments.files,
-    );
-    tokenEstimate += withFiles.packet.tokenEstimate;
-    included = [...included, ...withFiles.included].slice(0, 200);
-  }
+  const dummyPacket = {
+    version: 1 as const,
+    system: "",
+    messages: [],
+    tokenEstimate: 0,
+    excluded: [],
+  };
+  const filesOnly = appendFilesToPacket(dummyPacket, attachments.files);
+  const mentionsOnly = appendMentionsToPacket(dummyPacket, resolvedMentions.mentions);
+  tokenEstimate += filesOnly.packet.tokenEstimate + mentionsOnly.packet.tokenEstimate;
+  included = [...included, ...filesOnly.included, ...mentionsOnly.included].slice(0, 200);
 
   const estimatedCostUsd = estimateOutgoingCostUsd(
     input.model,
