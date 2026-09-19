@@ -3,6 +3,7 @@ import {
   mentionTriggerIn,
   mentionVisibleContent,
   parseMentionTokens,
+  projectFileNameMatches,
 } from "./mentions";
 
 describe("parseMentionTokens", () => {
@@ -25,6 +26,15 @@ describe("parseMentionTokens", () => {
     const parsed = parseMentionTokens("see @unknown:thing please");
     expect(parsed.mentions).toEqual([]);
     expect(parsed.body).toContain("@unknown:thing");
+  });
+});
+
+describe("projectFileNameMatches", () => {
+  it("matches a stem so @file:diff resolves diff.md", () => {
+    expect(projectFileNameMatches("diff.md", "diff")).toBe(true);
+    expect(projectFileNameMatches("README.md", "README.md")).toBe(true);
+    expect(projectFileNameMatches("src/app.ts", "app")).toBe(true);
+    expect(projectFileNameMatches("notes.txt", "diff")).toBe(false);
   });
 });
 
