@@ -16,7 +16,7 @@ export interface CompilerFile {
 }
 
 export interface CompilerMention {
-  kind: "conversation" | "packet" | "memory" | "rag" | "prompt";
+  kind: "conversation" | "packet" | "memory" | "rag" | "prompt" | "skill";
   id: string;
   name: string;
   text: string;
@@ -258,6 +258,8 @@ function mentionHeading(mention: CompilerMention): string {
       return `Retrieved chunk: ${mention.name}`;
     case "prompt":
       return `Library prompt: ${mention.name}`;
+    case "skill":
+      return `Applied skill: ${mention.name}`;
     default: {
       const _never: never = mention.kind;
       return String(_never);
