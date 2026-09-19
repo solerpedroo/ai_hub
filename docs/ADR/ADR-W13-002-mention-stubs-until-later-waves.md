@@ -1,11 +1,11 @@
 # ADR-W13-002-mention-stubs-until-later-waves
 
-- **Status:** accepted (`@prompt` / `@skill`); `@memory` superseded by ADR-W14-002
+- **Status:** accepted (`@skill`); `@memory` superseded by ADR-W14-002; `@prompt` superseded by ADR-W15-002
 - **Onda:** W13
 - **Data:** 2026-09-18
 - **Deciders:** agent / Pedro
 - **Supersedes:** —
-- **Superseded by:** ADR-W14-002 (apenas `@memory`)
+- **Superseded by:** ADR-W14-002 (`@memory`), ADR-W15-002 (`@prompt`)
 
 ## Contexto
 
