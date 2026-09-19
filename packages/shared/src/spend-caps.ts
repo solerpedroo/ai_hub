@@ -92,6 +92,37 @@ export function evaluateSpendCaps(input: {
   return { blocked, warnings, requestUsd, dayUsd, globalUsd };
 }
 
+export function evaluatePlaygroundCaps(input: {
+  estimates: readonly (string | null)[];
+  daySpentUsd: string;
+  globalSpentUsd: string;
+  limits: SpendCapLimits;
+}): SpendCapEvaluation {
+  const hasUsdCap = SPEND_CAP_SCOPES.some((scope) => input.limits[scope] !== undefined);
+  if (hasUsdCap && input.estimates.some((item) => item === null)) {
+    const blocked = SPEND_CAP_SCOPES.find((scope) => input.limits[scope] !== undefined) ?? "request";
+    return {
+      blocked,
+      warnings: [],
+      requestUsd: "0.000000",
+      dayUsd: input.daySpentUsd,
+      globalUsd: input.globalSpentUsd,
+    };
+  }
+  let combined = "0.000000";
+  for (const item of input.estimates) {
+    if (item !== null) {
+      combined = addUsd(combined, item);
+    }
+  }
+  return evaluateSpendCaps({
+    estimatedRequestUsd: input.estimates.length === 0 ? null : combined,
+    daySpentUsd: input.daySpentUsd,
+    globalSpentUsd: input.globalSpentUsd,
+    limits: input.limits,
+  });
+}
+
 export function parseSpendCapError(message: string): SpendCapScope | null {
   const match = /cap_exceeded:(request|day|global)/.exec(message);
   if (!match) {
