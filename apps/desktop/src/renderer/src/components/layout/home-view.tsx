@@ -417,6 +417,8 @@ export function HomeView({
     const next = mentionVisibleContent(remainder);
     onPendingSkillConsumed();
     sendDraft(next || `@skill:${pendingSkill.query}`, mentions);
+    // The parent clears pendingSkill synchronously; adding unstable composer callbacks here would duplicate a send.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingSkill]);
 
   useEffect(() => {
