@@ -57,6 +57,20 @@ export const IpcChannel = {
   filesAttach: "files:attach",
   filesIngestPaths: "files:ingestPaths",
   filesRemove: "files:remove",
+  memoryList: "memory:list",
+  memoryCreate: "memory:create",
+  memoryUpdate: "memory:update",
+  memoryRemove: "memory:remove",
+  memorySuggest: "memory:suggest",
+  memoryGetOptOut: "memory:getOptOut",
+  memorySetOptOut: "memory:setOptOut",
+  workspaceGet: "workspace:get",
+  workspaceRefresh: "workspace:refresh",
+  workspaceAddTask: "workspace:addTask",
+  workspaceSetTaskDone: "workspace:setTaskDone",
+  workspaceRemoveTask: "workspace:removeTask",
+  conversationsDuplicate: "conversations:duplicate",
+  conversationsToProject: "conversations:toProject",
 } as const;
 
 export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
