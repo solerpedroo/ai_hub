@@ -25,6 +25,8 @@ import {
   filesIngestPathsInputSchema,
   filesRemoveInputSchema,
   memoryCreateInputSchema,
+  promptCreateInputSchema,
+  playgroundRunInputSchema,
   conversationWorkspaceDtoSchema,
 } from "./ipc-schemas";
 
@@ -427,5 +429,27 @@ describe("wave 14 memory and workspace contracts", () => {
     };
     expect(conversationWorkspaceDtoSchema.parse(dto).decisions).toHaveLength(1);
     expect(() => conversationWorkspaceDtoSchema.parse({ ...dto, extra: true })).toThrow();
+  });
+});
+
+describe("wave 15 prompt and playground contracts", () => {
+  it("accepts a prompt create and a two-slot playground run", () => {
+    const created = promptCreateInputSchema.parse({
+      folder: "development",
+      title: "Code review",
+      body: "Review {{project}} in {{language}}. Goal: {{goal}}.",
+    });
+    expect(created.folder).toBe("development");
+    expect(() => promptCreateInputSchema.parse({ ...created, extra: true })).toThrow();
+    const run = playgroundRunInputSchema.parse({
+      projectId: "11111111-1111-4111-8111-111111111111",
+      content: "review this function",
+      slots: [
+        { providerKeyId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", model: "gpt-4o-mini" },
+        { providerKeyId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", model: "claude-sonnet-4-20250514" },
+      ],
+    });
+    expect(run.slots).toHaveLength(2);
+    expect(() => playgroundRunInputSchema.parse({ ...run, slots: run.slots.slice(0, 1) })).toThrow();
   });
 });
