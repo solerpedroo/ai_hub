@@ -1,5 +1,5 @@
 import type { GatewayErrorCode } from "./gateway";
-import { parseSpendCapError, type SpendCapScope } from "./spend-caps";
+import { parseSpendCapError, type CapBlockScope } from "./spend-caps";
 
 export type HubIpcErrorKind =
   | "cap"
@@ -9,7 +9,7 @@ export type HubIpcErrorKind =
 
 export interface HubIpcError {
   kind: HubIpcErrorKind;
-  scope: SpendCapScope | null;
+  scope: CapBlockScope | null;
   code: GatewayErrorCode | null;
 }
 
