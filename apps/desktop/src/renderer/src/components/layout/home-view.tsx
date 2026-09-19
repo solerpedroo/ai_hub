@@ -1,4 +1,4 @@
-import { type JSX, useEffect, useState } from "react";
+import { type JSX, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   activePath,
@@ -15,7 +15,7 @@ import {
   type ProjectUpdateInput,
   type ProviderKeyDto,
 } from "@ai-hub/shared";
-import { ChatComposer } from "@/components/chat/chat-composer";
+import { ChatComposer, type SlashCommandId } from "@/components/chat/chat-composer";
 import { ConversationTree } from "@/components/chat/conversation-tree";
 import { MessageBubble } from "@/components/chat/message-bubble";
 import { PacketPanel } from "@/components/chat/packet-panel";
@@ -23,7 +23,16 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 
-const PROJECT_COLORS = ["#64748b", "#2563eb", "#7c3aed", "#db2777", "#dc2626", "#d97706", "#16a34a", "#0891b2"] as const;
+const PROJECT_COLORS = [
+  "#64748b",
+  "#2563eb",
+  "#7c3aed",
+  "#db2777",
+  "#dc2626",
+  "#d97706",
+  "#16a34a",
+  "#0891b2",
+] as const;
 
 export function HomeView({
   project,
@@ -80,6 +89,7 @@ export function HomeView({
   onImportPacket,
   onApplyPacket,
   onClearPacket,
+  onOpenCaps,
 }: {
   project: ProjectDto | null;
   importedInbox: boolean;
@@ -135,35 +145,50 @@ export function HomeView({
   onImportPacket: () => Promise<void>;
   onApplyPacket: (packetId: string) => Promise<void>;
   onClearPacket: () => Promise<void>;
+  onOpenCaps: () => void;
 }): JSX.Element {
   const { t } = useTranslation();
+  const modifier = window.hub.platform === "darwin" ? "⌘" : "Ctrl";
   const [title, setTitle] = useState("");
   const [draft, setDraft] = useState("");
   const [editing, setEditing] = useState(false);
   const [treeOpen, setTreeOpen] = useState(false);
+  const [packetOpen, setPacketOpen] = useState(false);
   const [tagDraft, setTagDraft] = useState("");
   const [projectName, setProjectName] = useState(project?.name ?? "");
   const [projectColor, setProjectColor] = useState<string | null>(project?.color ?? null);
-  const [projectInstructions, setProjectInstructions] = useState(project?.instructions ?? "");
-  const [preferredProvider, setPreferredProvider] = useState(project?.preferredProvider ?? "");
+  const [projectInstructions, setProjectInstructions] = useState(
+    project?.instructions ?? "",
+  );
+  const [preferredProvider, setPreferredProvider] = useState(
+    project?.preferredProvider ?? "",
+  );
   const [preferredModel, setPreferredModel] = useState(project?.preferredModel ?? "");
-  const selectedKey = providerKeys.find((key) => key.id === selectedKeyId) ?? providerKeys[0] ?? null;
+  const modelSelectRef = useRef<HTMLSelectElement>(null);
+  const customModelRef = useRef<HTMLInputElement>(null);
+  const selectedKey =
+    providerKeys.find((key) => key.id === selectedKeyId) ?? providerKeys[0] ?? null;
   const providerSlug = selectedKey?.providerSlug ?? null;
   const models = providerSlug ? catalogModelsForProvider(providerSlug) : [];
   const selectedCatalog: CatalogModel | null =
     providerSlug && selectedModel ? findCatalogModel(selectedModel, providerSlug) : null;
-  const hasKey = selectedKeyId !== null && providerKeys.some((key) => key.id === selectedKeyId);
+  const hasKey =
+    selectedKeyId !== null && providerKeys.some((key) => key.id === selectedKeyId);
   const busy = streaming || sending;
   const path = activePath(messages);
   const activeIds = new Set(path.map((item) => item.id));
   const leaf = path[path.length - 1] ?? null;
-  const selectedConversation = conversations.find((item) => item.id === selectedConversationId) ?? null;
+  const selectedConversation =
+    conversations.find((item) => item.id === selectedConversationId) ?? null;
   const providerSlugs = [...new Set(providerKeys.map((item) => item.providerSlug))];
-  const preferredModels = preferredProvider ? catalogModelsForProvider(preferredProvider) : [];
+  const preferredModels = preferredProvider
+    ? catalogModelsForProvider(preferredProvider)
+    : [];
 
   useEffect(() => {
     setEditing(false);
     setTreeOpen(false);
+    setPacketOpen(false);
     setTagDraft("");
     setDraft("");
     onComposerDraft("");
@@ -177,12 +202,36 @@ export function HomeView({
     setPreferredModel(project?.preferredModel ?? "");
   }, [project]);
 
+  const runSlashCommand = (command: SlashCommandId): void => {
+    switch (command) {
+      case "model":
+        (customModelRef.current ?? modelSelectRef.current)?.focus();
+        return;
+      case "clear":
+        void onCreateConversation(t("workspace.untitledChat"));
+        return;
+      case "compact":
+        onToggleCompact(!compactHistory);
+        return;
+      case "packet":
+        setPacketOpen(true);
+        return;
+      case "cap":
+        onOpenCaps();
+        return;
+    }
+  };
+
   return (
     <div className="flex h-full min-h-0">
       <section className="flex w-64 shrink-0 flex-col border-r">
         <div className="border-b p-3">
           <h1 className="truncate text-sm font-semibold">
-            {project ? project.name : importedInbox ? t("workspace.importedInbox") : t("workspace.inbox")}
+            {project
+              ? project.name
+              : importedInbox
+                ? t("workspace.importedInbox")
+                : t("workspace.inbox")}
           </h1>
           <p className="text-muted-foreground">
             {project
@@ -196,10 +245,10 @@ export function HomeView({
           {conversations.length === 0 ? (
             <p className="px-2 text-muted-foreground">
               {project
-                ? t("workspace.noConversations")
+                ? t("workspace.noConversations", { modifier })
                 : importedInbox
                   ? t("workspace.noConversationsImported")
-                  : t("workspace.noConversationsInbox")}
+                  : t("workspace.noConversationsInbox", { modifier })}
             </p>
           ) : (
             <div className="flex flex-col gap-0.5">
@@ -207,10 +256,14 @@ export function HomeView({
                 <Button
                   key={conversation.id}
                   type="button"
-                  variant={selectedConversationId === conversation.id ? "secondary" : "ghost"}
+                  variant={
+                    selectedConversationId === conversation.id ? "secondary" : "ghost"
+                  }
                   className="h-8 w-full justify-start truncate"
                   data-testid="conversation-item"
-                  aria-current={selectedConversationId === conversation.id ? "true" : undefined}
+                  aria-current={
+                    selectedConversationId === conversation.id ? "true" : undefined
+                  }
                   onClick={() => onSelectConversation(conversation.id)}
                 >
                   {conversation.title}
@@ -233,7 +286,9 @@ export function HomeView({
                 void onSetTags(names).then(() => setTagDraft(""));
               }}
             >
-              <p className="px-1 text-[11px] text-muted-foreground">{t("workspace.tags")}</p>
+              <p className="px-1 text-[11px] text-muted-foreground">
+                {t("workspace.tags")}
+              </p>
               <div className="flex flex-wrap gap-1 px-1">
                 {selectedConversation.tags.map((tag) => (
                   <Button
@@ -244,7 +299,9 @@ export function HomeView({
                     className="h-6 px-2 text-[11px]"
                     aria-label={t("workspace.tagRemove", { tag })}
                     onClick={() => {
-                      void onSetTags(selectedConversation.tags.filter((item) => item !== tag));
+                      void onSetTags(
+                        selectedConversation.tags.filter((item) => item !== tag),
+                      );
                     }}
                   >
                     {tag} ×
@@ -258,7 +315,12 @@ export function HomeView({
                 aria-label={t("workspace.tagPlaceholder")}
                 data-testid="conversation-tag"
               />
-              <Button type="submit" size="sm" className="h-7" data-testid="conversation-tag-add">
+              <Button
+                type="submit"
+                size="sm"
+                className="h-7"
+                data-testid="conversation-tag-add"
+              >
                 {t("workspace.tagAdd")}
               </Button>
             </form>
@@ -275,9 +337,12 @@ export function HomeView({
                 void onSaveProject({
                   name,
                   color: projectColor,
-                  instructions: projectInstructions.trim().length > 0 ? projectInstructions : null,
-                  preferredModel: preferredModel.trim().length > 0 ? preferredModel.trim() : null,
-                  preferredProvider: preferredProvider.trim().length > 0 ? preferredProvider.trim() : null,
+                  instructions:
+                    projectInstructions.trim().length > 0 ? projectInstructions : null,
+                  preferredModel:
+                    preferredModel.trim().length > 0 ? preferredModel.trim() : null,
+                  preferredProvider:
+                    preferredProvider.trim().length > 0 ? preferredProvider.trim() : null,
                 });
               }}
             >
@@ -364,7 +429,11 @@ export function HomeView({
                 className="h-7"
                 data-testid="project-delete"
                 onClick={() => {
-                  if (window.confirm(t("workspace.deleteProjectConfirm", { name: project.name }))) {
+                  if (
+                    window.confirm(
+                      t("workspace.deleteProjectConfirm", { name: project.name }),
+                    )
+                  ) {
                     void onRemoveProject();
                   }
                 }}
@@ -375,28 +444,33 @@ export function HomeView({
           ) : null}
         </ScrollArea>
         {importedInbox ? null : (
-        <form
-          className="flex flex-col gap-1 border-t p-2"
-          onSubmit={(event) => {
-            event.preventDefault();
-            const next = title.trim();
-            if (!next) {
-              return;
-            }
-            void onCreateConversation(next).then(() => setTitle(""));
-          }}
-        >
-          <Input
-            value={title}
-            onChange={(event) => setTitle(event.target.value)}
-            placeholder={t("workspace.conversationPlaceholder")}
-            aria-label={t("workspace.conversationPlaceholder")}
-            data-testid="workspace-new-conversation-title"
-          />
-          <Button type="submit" size="sm" className="h-7" data-testid="workspace-new-conversation">
-            {t("workspace.newConversation")}
-          </Button>
-        </form>
+          <form
+            className="flex flex-col gap-1 border-t p-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const next = title.trim();
+              if (!next) {
+                return;
+              }
+              void onCreateConversation(next).then(() => setTitle(""));
+            }}
+          >
+            <Input
+              value={title}
+              onChange={(event) => setTitle(event.target.value)}
+              placeholder={t("workspace.conversationPlaceholder")}
+              aria-label={t("workspace.conversationPlaceholder")}
+              data-testid="workspace-new-conversation-title"
+            />
+            <Button
+              type="submit"
+              size="sm"
+              className="h-7"
+              data-testid="workspace-new-conversation"
+            >
+              {t("workspace.newConversation")}
+            </Button>
+          </form>
         )}
       </section>
       <section className="flex min-w-0 flex-1 flex-col">
@@ -427,6 +501,7 @@ export function HomeView({
                     <span className="text-muted-foreground">{t("workspace.model")}</span>
                     {providerSlug === "custom" ? (
                       <Input
+                        ref={customModelRef}
                         className="h-8 w-52"
                         value={selectedModel}
                         onChange={(event) => onSelectModel(event.target.value)}
@@ -435,6 +510,7 @@ export function HomeView({
                       />
                     ) : (
                       <select
+                        ref={modelSelectRef}
                         className="h-8 max-w-72 rounded-md border bg-background px-2 text-sm"
                         value={selectedModel}
                         onChange={(event) => onSelectModel(event.target.value)}
@@ -461,7 +537,9 @@ export function HomeView({
                     </span>
                   ) : null}
                   <label className="flex items-center gap-1">
-                    <span className="text-muted-foreground">{t("workspace.temperature")}</span>
+                    <span className="text-muted-foreground">
+                      {t("workspace.temperature")}
+                    </span>
                     <Input
                       className="h-8 w-16"
                       type="number"
@@ -479,7 +557,9 @@ export function HomeView({
                     />
                   </label>
                   <label className="flex items-center gap-1">
-                    <span className="text-muted-foreground">{t("workspace.maxTokens")}</span>
+                    <span className="text-muted-foreground">
+                      {t("workspace.maxTokens")}
+                    </span>
                     <Input
                       className="h-8 w-20"
                       type="number"
@@ -504,12 +584,18 @@ export function HomeView({
               )}
               <div className="ml-auto flex flex-wrap items-center gap-1">
                 {conversationCost ? (
-                  <span className="text-[11px] text-muted-foreground" data-testid="cost-conversation">
+                  <span
+                    className="text-[11px] text-muted-foreground"
+                    data-testid="cost-conversation"
+                  >
                     {t("workspace.cost.conversation", { usd: conversationCost })}
                   </span>
                 ) : null}
                 {projectCost ? (
-                  <span className="text-[11px] text-muted-foreground" data-testid="cost-project">
+                  <span
+                    className="text-[11px] text-muted-foreground"
+                    data-testid="cost-project"
+                  >
                     {t("workspace.cost.project", { usd: projectCost })}
                   </span>
                 ) : null}
@@ -534,13 +620,20 @@ export function HomeView({
                   onImport={onImportPacket}
                   onApply={onApplyPacket}
                   onClear={onClearPacket}
+                  open={packetOpen}
+                  onOpenChange={setPacketOpen}
                 />
                 {packetPreview?.estimatedCostUsd ? (
-                  <span className="text-[11px] text-muted-foreground" data-testid="send-estimate">
+                  <span
+                    className="text-[11px] text-muted-foreground"
+                    data-testid="send-estimate"
+                  >
                     {t("workspace.estimate", { usd: packetPreview.estimatedCostUsd })}
                   </span>
                 ) : packetPreview && selectedCatalog === null ? (
-                  <span className="text-[11px] text-muted-foreground">{t("workspace.estimate.none")}</span>
+                  <span className="text-[11px] text-muted-foreground">
+                    {t("workspace.estimate.none")}
+                  </span>
                 ) : null}
                 <Button
                   type="button"
@@ -599,12 +692,19 @@ export function HomeView({
               </div>
             </header>
             {modelSwitchNotice ? (
-              <p className="border-b px-3 py-1 text-[11px] text-muted-foreground" role="status" data-testid="model-switch-notice">
+              <p
+                className="border-b px-3 py-1 text-[11px] text-muted-foreground"
+                role="status"
+                data-testid="model-switch-notice"
+              >
                 {t("workspace.modelSwitch", { model: selectedModel })}
               </p>
             ) : null}
             {packetPreview?.overflow ? (
-              <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2 text-[12px]" role="status">
+              <div
+                className="flex flex-wrap items-center gap-2 border-b px-3 py-2 text-[12px]"
+                role="status"
+              >
                 <p>
                   {t("workspace.overflow", {
                     window: packetPreview.contextWindow,
@@ -622,107 +722,130 @@ export function HomeView({
                 </Button>
               </div>
             ) : compactHistory ? (
-              <p className="border-b px-3 py-1 text-[11px] text-muted-foreground">{t("workspace.compact.on")}</p>
+              <p
+                className="border-b px-3 py-1 text-[11px] text-muted-foreground"
+                data-testid="compact-enabled"
+              >
+                {t("workspace.compact.on")}
+              </p>
             ) : null}
             {packetPreview?.capBlocked ? (
-              <p className="border-b px-3 py-1 text-[12px] text-destructive" role="status" data-testid="cap-block">
-                {t("workspace.cap.block", { scope: t(`caps.scope.${packetPreview.capBlocked}`) })}
+              <p
+                className="border-b px-3 py-1 text-[12px] text-destructive"
+                role="status"
+                data-testid="cap-block"
+              >
+                {t("workspace.cap.block", {
+                  scope: t(`caps.scope.${packetPreview.capBlocked}`),
+                })}
               </p>
             ) : packetPreview && packetPreview.capWarnings.length > 0 ? (
-              <p className="border-b px-3 py-1 text-[12px]" role="status" data-testid="cap-warn">
-                {t("workspace.cap.warn", { scope: t(`caps.scope.${packetPreview.capWarnings[0]}`) })}
+              <p
+                className="border-b px-3 py-1 text-[12px]"
+                role="status"
+                data-testid="cap-warn"
+              >
+                {t("workspace.cap.warn", {
+                  scope: t(`caps.scope.${packetPreview.capWarnings[0]}`),
+                })}
               </p>
             ) : null}
             {exportNotice ? (
-              <p className="border-b px-3 py-1 text-[11px] text-muted-foreground" role="status">
+              <p
+                className="border-b px-3 py-1 text-[11px] text-muted-foreground"
+                role="status"
+              >
                 {exportNotice}
               </p>
             ) : null}
             <div className="flex min-h-0 flex-1">
-            <div className="flex min-w-0 flex-1 flex-col">
-            <ScrollArea className="flex-1 p-4">
-              {path.length === 0 ? (
-                <p className="text-muted-foreground">{t("workspace.noMessages")}</p>
-              ) : (
-                <ol className="flex flex-col gap-2" aria-live="polite">
-                  {path.map((message, index) => (
-                    <MessageBubble
-                      key={message.id}
-                      message={message}
-                      messages={messages}
-                      isLast={index === path.length - 1}
-                      busy={busy}
-                      hasKey={hasKey}
-                      onRegenerate={() => {
-                        void onRegenerate(message.id);
-                      }}
-                      onContinue={() => {
-                        void onContinue();
-                      }}
-                      onEdit={async (content) => {
-                        await onEditUser(message.id, content);
-                      }}
-                      onEditingChange={setEditing}
-                      onActivateSibling={(id) => {
-                        void onActivate(id);
-                      }}
-                      onPin={(pinned) => {
-                        void onPin(message.id, pinned);
-                      }}
-                    />
-                  ))}
-                </ol>
-              )}
-            </ScrollArea>
-            <label className="flex flex-col gap-1 border-t px-3 py-2 text-[12px]">
-              <span className="text-muted-foreground">{t("workspace.extraSystem")}</span>
-              <textarea
-                className="min-h-[2.5rem] resize-y rounded-md border bg-background px-2 py-1 text-[13px]"
-                value={extraSystem}
-                onChange={(event) => onSelectExtraSystem(event.target.value)}
-                aria-label={t("workspace.extraSystem")}
-              />
-            </label>
-            <ChatComposer
-              key={selectedConversationId}
-              value={draft}
-              onChange={(value) => {
-                setDraft(value);
-                onComposerDraft(value);
-              }}
-              streaming={streaming}
-              sending={sending}
-              disabled={!hasKey || editing}
-              onSend={() => {
-                const next = draft.trim();
-                if (!next) {
-                  return;
-                }
-                void onSend(next).then((ok) => {
-                  if (ok) {
-                    setDraft("");
-                    onComposerDraft("");
-                  }
-                });
-              }}
-              onAbort={() => {
-                void onAbort();
-              }}
-            />
-            </div>
-            {treeOpen ? (
-              <ConversationTree
-                messages={messages}
-                activeIds={activeIds}
-                labels={branchLabels}
-                activeBranchId={leaf?.branchId ?? null}
-                busy={busy}
-                onJump={(id) => {
-                  void onActivate(id);
-                }}
-                onRename={onRenameBranch}
-              />
-            ) : null}
+              <div className="flex min-w-0 flex-1 flex-col">
+                <ScrollArea className="flex-1 p-4">
+                  {path.length === 0 ? (
+                    <p className="text-muted-foreground">{t("workspace.noMessages")}</p>
+                  ) : (
+                    <ol className="flex flex-col gap-2" aria-live="polite">
+                      {path.map((message, index) => (
+                        <MessageBubble
+                          key={message.id}
+                          message={message}
+                          messages={messages}
+                          isLast={index === path.length - 1}
+                          busy={busy}
+                          hasKey={hasKey}
+                          onRegenerate={() => {
+                            void onRegenerate(message.id);
+                          }}
+                          onContinue={() => {
+                            void onContinue();
+                          }}
+                          onEdit={async (content) => {
+                            await onEditUser(message.id, content);
+                          }}
+                          onEditingChange={setEditing}
+                          onActivateSibling={(id) => {
+                            void onActivate(id);
+                          }}
+                          onPin={(pinned) => {
+                            void onPin(message.id, pinned);
+                          }}
+                        />
+                      ))}
+                    </ol>
+                  )}
+                </ScrollArea>
+                <label className="flex flex-col gap-1 border-t px-3 py-2 text-[12px]">
+                  <span className="text-muted-foreground">
+                    {t("workspace.extraSystem")}
+                  </span>
+                  <textarea
+                    className="min-h-[2.5rem] resize-y rounded-md border bg-background px-2 py-1 text-[13px]"
+                    value={extraSystem}
+                    onChange={(event) => onSelectExtraSystem(event.target.value)}
+                    aria-label={t("workspace.extraSystem")}
+                  />
+                </label>
+                <ChatComposer
+                  key={selectedConversationId}
+                  value={draft}
+                  onChange={(value) => {
+                    setDraft(value);
+                    onComposerDraft(value);
+                  }}
+                  streaming={streaming}
+                  sending={sending}
+                  disabled={!hasKey || editing}
+                  onSend={() => {
+                    const next = draft.trim();
+                    if (!next) {
+                      return;
+                    }
+                    void onSend(next).then((ok) => {
+                      if (ok) {
+                        setDraft("");
+                        onComposerDraft("");
+                      }
+                    });
+                  }}
+                  onAbort={() => {
+                    void onAbort();
+                  }}
+                  onSlashCommand={runSlashCommand}
+                />
+              </div>
+              {treeOpen ? (
+                <ConversationTree
+                  messages={messages}
+                  activeIds={activeIds}
+                  labels={branchLabels}
+                  activeBranchId={leaf?.branchId ?? null}
+                  busy={busy}
+                  onJump={(id) => {
+                    void onActivate(id);
+                  }}
+                  onRename={onRenameBranch}
+                />
+              ) : null}
             </div>
           </>
         ) : (
@@ -736,7 +859,13 @@ export function HomeView({
               {error}
             </p>
             {showAllowOnce ? (
-              <Button type="button" size="sm" data-testid="cap-allow-once" onClick={onAllowOnce} disabled={busy}>
+              <Button
+                type="button"
+                size="sm"
+                data-testid="cap-allow-once"
+                onClick={onAllowOnce}
+                disabled={busy}
+              >
                 {t("workspace.cap.allowOnce")}
               </Button>
             ) : null}
