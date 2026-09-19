@@ -1079,3 +1079,73 @@ export const playgroundRunResultSchema = z
 
 export type PlaygroundRunResult = z.infer<typeof playgroundRunResultSchema>;
 
+export const artifactKindSchema = z.enum(["mermaid", "html", "markdown", "code"]);
+
+export type ArtifactKindDto = z.infer<typeof artifactKindSchema>;
+
+export const artifactDtoSchema = z
+  .object({
+    id: z.string().uuid(),
+    conversationId: z.string().uuid(),
+    familyId: z.string().uuid(),
+    sourceMessageId: z.string().uuid().nullable(),
+    kind: artifactKindSchema,
+    title: z.string().min(1).max(120),
+    body: z.string().min(1).max(100_000),
+    language: z.string().min(1).max(40).nullable(),
+    version: z.number().int().min(1).max(10_000),
+    pinned: z.boolean(),
+    createdAt: isoTimestampSchema,
+  })
+  .strict();
+
+export type ArtifactDto = z.infer<typeof artifactDtoSchema>;
+
+export const artifactListResultSchema = z.array(artifactDtoSchema).max(100);
+
+export const artifactsListInputSchema = z
+  .object({
+    conversationId: z.string().uuid(),
+  })
+  .strict();
+
+export type ArtifactsListInput = z.infer<typeof artifactsListInputSchema>;
+
+export const artifactSaveVersionInputSchema = z
+  .object({
+    id: z.string().uuid(),
+    body: z.string().trim().min(1).max(100_000),
+    title: z.string().trim().min(1).max(120).optional(),
+  })
+  .strict();
+
+export type ArtifactSaveVersionInput = z.infer<typeof artifactSaveVersionInputSchema>;
+
+export const artifactPinInputSchema = z
+  .object({
+    id: z.string().uuid(),
+    pinned: z.boolean(),
+  })
+  .strict();
+
+export type ArtifactPinInput = z.infer<typeof artifactPinInputSchema>;
+
+export const artifactExportFormatSchema = z.enum(["md", "html", "svg"]);
+
+export const artifactExportInputSchema = z
+  .object({
+    id: z.string().uuid(),
+    format: artifactExportFormatSchema,
+    svg: z.string().min(1).max(2_000_000).optional(),
+  })
+  .strict();
+
+export type ArtifactExportInput = z.infer<typeof artifactExportInputSchema>;
+
+export const artifactExportResultSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("saved") }).strict(),
+  z.object({ status: z.literal("cancelled") }).strict(),
+]);
+
+export type ArtifactExportResult = z.infer<typeof artifactExportResultSchema>;
+
