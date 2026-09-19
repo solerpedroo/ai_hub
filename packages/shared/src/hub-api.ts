@@ -29,9 +29,13 @@ import type {
   SearchInput,
   SpendCapDto,
   SpendCapSetInput,
+  ScopedSpendCapDto,
+  ScopedSpendCapSetInput,
   HealthSummaryDto,
   CostsAggregateInput,
   CostsAggregateResult,
+  MonthlyCostsInput,
+  MonthlyCostsResult,
   DebugSnapshot,
   AppPrefs,
   AppPrefsPatch,
@@ -164,6 +168,10 @@ export interface HubSpendCapsApi {
   get: () => Promise<SpendCapDto[]>;
   set: (input: SpendCapSetInput) => Promise<SpendCapDto[]>;
 }
+export interface HubScopedSpendCapsApi {
+  get: () => Promise<ScopedSpendCapDto[]>;
+  set: (input: ScopedSpendCapSetInput) => Promise<ScopedSpendCapDto[]>;
+}
 
 export interface HubHealthApi {
   summary: () => Promise<HealthSummaryDto[]>;
@@ -171,6 +179,7 @@ export interface HubHealthApi {
 
 export interface HubCostsApi {
   aggregate: (input: CostsAggregateInput) => Promise<CostsAggregateResult>;
+  monthly: (input: MonthlyCostsInput) => Promise<MonthlyCostsResult>;
 }
 
 export interface HubDebugApi {
@@ -267,6 +276,7 @@ export interface HubApi {
   secrets: HubSecretsApi;
   search: HubSearchApi;
   spendCaps: HubSpendCapsApi;
+  scopedSpendCaps: HubScopedSpendCapsApi;
   health: HubHealthApi;
   costs: HubCostsApi;
   debug: HubDebugApi;
