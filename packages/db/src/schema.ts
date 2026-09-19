@@ -102,6 +102,18 @@ export const spendCaps = sqliteTable("spend_caps", {
   createdAt: integer("created_at", { mode: "number" }).notNull(),
 });
 
+export const scopedSpendCaps = sqliteTable(
+  "scoped_spend_caps",
+  {
+    id: text("id").primaryKey(),
+    dimension: text("dimension").notNull(),
+    subjectId: text("subject_id").notNull(),
+    limitUsd: text("limit_usd").notNull(),
+    createdAt: integer("created_at", { mode: "number" }).notNull(),
+  },
+  (table) => [uniqueIndex("scoped_spend_caps_dimension_subject_idx").on(table.dimension, table.subjectId)],
+);
+
 export const healthSamples = sqliteTable("health_samples", {
   id: text("id").primaryKey(),
   providerSlug: text("provider_slug").notNull(),
@@ -226,6 +238,7 @@ export const schema = {
   tags,
   conversationTags,
   spendCaps,
+  scopedSpendCaps,
   healthSamples,
   importJobs,
   contextPackets,
