@@ -86,3 +86,6 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W12-002](./ADR-W12-002-files-inject-as-compiler-slices.md) | W12 | Anexos entram como fatias do compiler, não no packet v1 | accepted |
 | [ADR-W12-003](./ADR-W12-003-vision-images-on-stream-not-packet.md) | W12 | Imagens no stream, não no packet; gate `vision` | accepted |
 | [ADR-W12-004](./ADR-W12-004-pdf-flatedecode-inflate.md) | W12 | PDF: inflate FlateDecode + literais Tj | accepted |
+| [ADR-W13-001](./ADR-W13-001-mentions-structured-not-in-user-text.md) | W13 | Menções estruturadas, não no texto do user | accepted |
+| [ADR-W13-002](./ADR-W13-002-mention-stubs-until-later-waves.md) | W13 | `@memory`/`@prompt`/`@skill` são stub | accepted |
+| [ADR-W13-003](./ADR-W13-003-mention-token-cap-excludes-files.md) | W13 | Cap de menção não inclui `@file` | accepted |
