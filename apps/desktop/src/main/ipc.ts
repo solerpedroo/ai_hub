@@ -82,6 +82,12 @@ import {
   artifactPinInputSchema,
   artifactExportInputSchema,
   artifactExportResultSchema,
+  skillDtoSchema,
+  skillListResultSchema,
+  skillCreateInputSchema,
+  skillUpdateInputSchema,
+  skillResolveInputSchema,
+  skillResolveResultSchema,
   contextPacketDtoSchema,
   contextPacketListResultSchema,
   projectCreateInputSchema,
@@ -123,6 +129,7 @@ import { previewPacket } from "./packet-preview";
 import { getConversationWorkspaceDto, refreshConversationWorkspace } from "./workspace";
 import { getHubDatabase } from "./persistence";
 import { listPromptDtos, resolvePromptDto, runPlayground } from "./playground";
+import { listSkillDtos, resolveSkillDto } from "./skills";
 import { exportArtifact, toArtifactDto } from "./artifacts";
 import { testProviderKey } from "./provider-health";
 import { localDayStartMs } from "./spend-guard";
@@ -622,6 +629,50 @@ export function registerWorkspaceIpc(): void {
     artifactExportInputSchema,
     artifactExportResultSchema,
     (input, event) => exportArtifact(input, event.sender),
+  );
+
+  registerHandler(IpcChannel.skillsList, emptyIpcPayloadSchema, skillListResultSchema, () =>
+    listSkillDtos().map((row) => skillDtoSchema.parse(row)),
+  );
+
+  registerHandler(IpcChannel.skillsCreate, skillCreateInputSchema, skillDtoSchema, (input) =>
+    skillDtoSchema.parse({
+      ...getHubDatabase().repos.createSkill({
+        folder: input.folder,
+        title: input.title,
+        description: input.description,
+        prompt: input.prompt,
+        preferredModel: input.preferredModel,
+        defaultMentions: input.defaultMentions,
+        steps: input.steps,
+      }),
+      contractVersion: 1 as const,
+    }),
+  );
+
+  registerHandler(IpcChannel.skillsUpdate, skillUpdateInputSchema, skillDtoSchema, (input) =>
+    skillDtoSchema.parse({
+      ...getHubDatabase().repos.updateSkill(input.id, {
+        ...(input.folder !== undefined ? { folder: input.folder } : {}),
+        ...(input.title !== undefined ? { title: input.title } : {}),
+        ...(input.description !== undefined ? { description: input.description } : {}),
+        ...(input.prompt !== undefined ? { prompt: input.prompt } : {}),
+        ...(input.preferredModel !== undefined ? { preferredModel: input.preferredModel } : {}),
+        ...(input.defaultMentions !== undefined ? { defaultMentions: input.defaultMentions } : {}),
+        ...(input.steps !== undefined ? { steps: input.steps } : {}),
+      }),
+      contractVersion: 1 as const,
+    }),
+  );
+
+  registerHandler(IpcChannel.skillsRemove, idInputSchema, ipcAckResultSchema, (input) => {
+    getHubDatabase().repos.removeSkill(input.id);
+  });
+
+  registerHandler(IpcChannel.skillsResolve, skillResolveInputSchema, skillResolveResultSchema, (input) =>
+    skillResolveResultSchema.parse(
+      resolveSkillDto(input.skillId, input.query, input.projectId, input.privacyMode ?? "standard"),
+    ),
   );
 
   registerHandler(IpcChannel.spendCapsGet, emptyIpcPayloadSchema, spendCapListResultSchema, () => {
