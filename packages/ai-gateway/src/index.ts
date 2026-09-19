@@ -37,7 +37,7 @@ export { createGroqAdapter, GROQ_BASE_URL } from "./groq-adapter";
 export { createOpenAIAdapter, createOpenAICompatibleAdapter, type OpenAIAdapterOptions } from "./openai-adapter";
 export { createOpenRouterAdapter, OPENROUTER_BASE_URL } from "./openrouter-adapter";
 export { isKnownProviderSlug, resolveAdapter, type ProviderSlug, type ResolveAdapterOptions } from "./registry";
-export { createMockOpenAIAdapter, MOCK_ASSISTANT_TEXT } from "./mock-adapter";
+export { createMockOpenAIAdapter, MOCK_ASSISTANT_TEXT, MOCK_MERMAID_TEXT } from "./mock-adapter";
 export {
   composeReceipt,
   estimateTokensFromChars,
