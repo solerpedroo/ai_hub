@@ -95,3 +95,6 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W15-001](./ADR-W15-001-prompt-library-encrypted.md) | W15 | Library global cifrada + pastas + factory | accepted |
 | [ADR-W15-002](./ADR-W15-002-prompt-variables-and-mention.md) | W15 | Variáveis + `@prompt` no compiler | accepted |
 | [ADR-W15-003](./ADR-W15-003-playground-n-sends-caps.md) | W15 | Playground = N sends + preflight N× caps | accepted |
+| [ADR-W16-001](./ADR-W16-001-artifacts-versioned-encrypted.md) | W16 | Artifacts versionados e cifrados | accepted |
+| [ADR-W16-002](./ADR-W16-002-html-sandbox-custom-protocol.md) | W16 | HTML sandbox via `ai-hub-artifact:` | accepted |
+| [ADR-W16-003](./ADR-W16-003-artifact-detector-thresholds.md) | W16 | Limiares do detector de artifacts | accepted |
