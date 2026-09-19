@@ -46,6 +46,11 @@ import {
   packetsExportResultSchema,
   packetsImportInputSchema,
   packetsListInputSchema,
+  projectFileListInputSchema,
+  projectFileListResultSchema,
+  filesAttachInputSchema,
+  filesIngestPathsInputSchema,
+  filesRemoveInputSchema,
   contextPacketDtoSchema,
   contextPacketListResultSchema,
   projectCreateInputSchema,
@@ -81,6 +86,7 @@ import {
   listProjectPackets,
   pickPacketFile,
 } from "./packet-file";
+import { attachFromDialog, ingestDroppedPaths, listProjectFileDtos, removeProjectFile } from "./files";
 import { previewPacket } from "./packet-preview";
 import { getHubDatabase } from "./persistence";
 import { testProviderKey } from "./provider-health";
@@ -367,6 +373,31 @@ export function registerWorkspaceIpc(): void {
     packetPreviewResultSchema,
     (input) => previewPacket(input),
   );
+
+  registerHandler(
+    IpcChannel.filesList,
+    projectFileListInputSchema,
+    projectFileListResultSchema,
+    (input) => listProjectFileDtos(input.projectId),
+  );
+
+  registerHandler(
+    IpcChannel.filesAttach,
+    filesAttachInputSchema,
+    projectFileListResultSchema,
+    (input, event) => attachFromDialog(input, event.sender),
+  );
+
+  registerHandler(
+    IpcChannel.filesIngestPaths,
+    filesIngestPathsInputSchema,
+    projectFileListResultSchema,
+    (input) => ingestDroppedPaths(input),
+  );
+
+  registerHandler(IpcChannel.filesRemove, filesRemoveInputSchema, ipcAckResultSchema, (input) => {
+    removeProjectFile(input.id, input.projectId);
+  });
 
   registerHandler(IpcChannel.spendCapsGet, emptyIpcPayloadSchema, spendCapListResultSchema, () => {
     const rows = getHubDatabase().repos.listSpendCaps();
