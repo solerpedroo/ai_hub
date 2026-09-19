@@ -723,12 +723,12 @@ O que **não** entra no MVP (W0–W8), mesmo sendo tentador: RAG, Council, MCP, 
 
 **Sub-tasks:**
 
-- [ ] Entidade Skill: nome, descrição, prompt, modelo preferido, menções padrão, `steps[]`
-- [ ] CRUD + pastas; skills de fábrica (Code Review, Resumir PDF, Preparar reunião, Explicar erro, Escrever RFC)
-- [ ] Rodar via palette, `/skill`, atalho, menção `@skill`
-- [ ] UI de execução: passo atual (mesmo sem tools: passos são seções do prompt)
-- [ ] Skill respeita spend cap e privacy mode
-- [ ] Contrato JSON versionado para no futuro ligar MCP/tools
+- [x] Entidade Skill: nome, descrição, prompt, modelo preferido, menções padrão, `steps[]`
+- [x] CRUD + pastas; skills de fábrica (Code Review, Resumir PDF, Preparar reunião, Explicar erro, Escrever RFC)
+- [x] Rodar via palette, `/skill`, atalho, menção `@skill`
+- [x] UI de execução: passo atual (mesmo sem tools: passos são seções do prompt)
+- [x] Skill respeita spend cap e privacy mode
+- [x] Contrato JSON versionado para no futuro ligar MCP/tools
 
 **DoD:** `/skill Code Review` + `@file:diff` produz revisão no formato da skill, no modelo configurado.
 
