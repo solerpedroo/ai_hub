@@ -84,13 +84,31 @@ function classifyTransport(error: unknown, userSignal: AbortSignal, timeout: Abo
   throw new GatewayError("network", message);
 }
 
-function packetToAnthropic(packet: ProviderAgnosticPacket): {
+function packetToAnthropic(
+  packet: ProviderAgnosticPacket,
+  images?: ChatStreamRequest["images"],
+): {
   system: string | undefined;
-  messages: Array<{ role: "user" | "assistant"; content: string }>;
+  messages: Array<{ role: "user" | "assistant"; content: unknown }>;
 } {
+  const lastUser = [...packet.messages].reverse().find((item) => item.role === "user");
   return {
     system: packet.system.length > 0 ? packet.system : undefined,
-    messages: packet.messages.map((message) => ({ role: message.role, content: message.content })),
+    messages: packet.messages.map((message) => {
+      if (images && images.length > 0 && lastUser && message === lastUser) {
+        return {
+          role: message.role,
+          content: [
+            { type: "text", text: message.content },
+            ...images.map((image) => ({
+              type: "image",
+              source: { type: "base64", media_type: image.mime, data: image.data },
+            })),
+          ],
+        };
+      }
+      return { role: message.role, content: message.content };
+    }),
   };
 }
 
@@ -146,7 +164,7 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): P
       }
     },
     async *chatStream(input: ChatStreamRequest): AsyncIterable<ChatStreamEvent> {
-      const converted = packetToAnthropic(input.packet);
+      const converted = packetToAnthropic(input.packet, input.images);
       const body: Record<string, unknown> = {
         model: input.model,
         stream: true,
