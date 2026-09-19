@@ -128,6 +128,20 @@ export const contextPackets = sqliteTable("context_packets", {
   version: integer("version", { mode: "number" }).notNull().default(1),
 });
 
+export const projectFiles = sqliteTable("project_files", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id"),
+  name: text("name").notNull(),
+  kind: text("kind").notNull(),
+  mime: text("mime").notNull(),
+  byteSize: integer("byte_size", { mode: "number" }).notNull(),
+  tokenEstimate: integer("token_estimate", { mode: "number" }).notNull(),
+  extractCipher: text("extract_cipher").notNull(),
+  imageCipher: text("image_cipher"),
+  truncated: integer("truncated", { mode: "number" }).notNull().default(0),
+  createdAt: integer("created_at", { mode: "number" }).notNull(),
+});
+
 export const schema = {
   projects,
   conversations,
@@ -142,4 +156,5 @@ export const schema = {
   healthSamples,
   importJobs,
   contextPackets,
+  projectFiles,
 };
