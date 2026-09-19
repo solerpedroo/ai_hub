@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createMockOpenAIAdapter, MOCK_ASSISTANT_TEXT } from "./mock-adapter";
+import { createMockOpenAIAdapter, MOCK_ASSISTANT_TEXT, MOCK_MERMAID_TEXT } from "./mock-adapter";
 import { GatewayError } from "./errors";
 import type { ProviderAgnosticPacket } from "@ai-hub/shared";
 
@@ -63,5 +63,25 @@ describe("createMockOpenAIAdapter", () => {
     })();
     await expect(consume).rejects.toBeInstanceOf(GatewayError);
     expect(events.join("")).toBe("Hello");
+  });
+
+  it("streams a mermaid fence when asked to draw the architecture", async () => {
+    const adapter = createMockOpenAIAdapter();
+    const events: string[] = [];
+    for await (const event of adapter.chatStream({
+      secret: "sk-e2efixtureABCDEFGH",
+      model: "gpt-4o-mini",
+      packet: {
+        ...packet,
+        messages: [{ role: "user", content: "desenhe a arquitetura deste fluxo" }],
+      },
+      signal: new AbortController().signal,
+    })) {
+      if (event.type === "delta") {
+        events.push(event.text);
+      }
+    }
+    expect(events.join("")).toBe(MOCK_MERMAID_TEXT);
+    expect(events.join("")).toContain("```mermaid");
   });
 });
