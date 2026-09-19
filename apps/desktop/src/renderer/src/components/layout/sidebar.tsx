@@ -1,5 +1,5 @@
 import { type JSX, type ReactNode, useState, type RefObject } from "react";
-import { Activity, Home, Inbox, Plus, Settings, Upload } from "lucide-react";
+import { Activity, Home, Inbox, Library, Plus, Settings, Upload } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { ProjectDto, SearchHit } from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
@@ -59,6 +59,13 @@ export function Sidebar({
             label={t("nav.home")}
             onClick={() => onChange("home")}
             testId="nav-home"
+          />
+          <NavButton
+            active={view === "prompts"}
+            icon={<Library className="h-3.5 w-3.5" />}
+            label={t("nav.prompts")}
+            onClick={() => onChange("prompts")}
+            testId="nav-prompts"
           />
           <NavButton
             active={view === "settings"}
