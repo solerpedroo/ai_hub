@@ -1,0 +1,2782 @@
+diff --git a/apps/desktop/e2e/keyboard.spec.ts b/apps/desktop/e2e/keyboard.spec.ts
+new file mode 100644
+index 0000000..e70c16f
+--- /dev/null
++++ b/apps/desktop/e2e/keyboard.spec.ts
+@@ -0,0 +1,162 @@
++import { createRequire } from "node:module";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import {
++  _electron as electron,
++  expect,
++  test,
++  type ElectronApplication,
++  type Page,
++} from "@playwright/test";
++
++const require = createRequire(import.meta.url);
++const electronBinary = require("electron") as string;
++const appRoot = path.join(fileURLToPath(new URL("..", import.meta.url)));
++
++async function launchHub(): Promise<ElectronApplication> {
++  return electron.launch({
++    executablePath: electronBinary,
++    args: [path.join(appRoot, "out/main/index.js")],
++    cwd: appRoot,
++    env: {
++      ...process.env,
++      AI_HUB_E2E: "1",
++      NODE_ENV: "production",
++    },
++  });
++}
++
++async function openPalette(window: Page, query?: string): Promise<void> {
++  await window.keyboard.press("Control+K");
++  await expect(window.getByTestId("command-palette")).toBeVisible();
++  await expect(window.getByTestId("command-input")).toBeFocused();
++  if (query) {
++    await window.getByTestId("command-input").fill(query);
++  }
++}
++
++test("command palette exposes actions, models, projects, search, and shortcuts by keyboard", async () => {
++  const app = await launchHub();
++  try {
++    const window = await app.firstWindow();
++    const composer = window.getByTestId("chat-composer");
++    await composer.waitFor({ state: "visible", timeout: 30_000 });
++
++    await composer.fill("palette-needle-42");
++    await composer.press("Enter");
++    await expect(window.getByTestId("message-assistant")).toHaveAttribute(
++      "data-status",
++      "complete",
++      {
++        timeout: 30_000,
++      },
++    );
++
++    await openPalette(window, "export active");
++    await expect(window.getByTestId("command-export-active")).toBeVisible();
++    await expect(window.getByTestId("command-export-active")).toHaveAttribute(
++      "aria-disabled",
++      "false",
++    );
++    await window.keyboard.press("Escape");
++
++    await openPalette(window, "E2E");
++    await expect(window.getByTestId("command-project")).toHaveText("E2E");
++    await window.keyboard.press("Enter");
++    await expect(
++      window.getByTestId("project-item").filter({ hasText: "E2E" }),
++    ).toHaveAttribute("aria-current", "page");
++
++    await openPalette(window, "palette-needle-42");
++    await expect(window.getByTestId("command-search-hit")).toContainText(
++      "palette-needle-42",
++      {
++        timeout: 10_000,
++      },
++    );
++    await window.keyboard.press("Enter");
++    await expect(window.getByTestId("message-user")).toContainText("palette-needle-42");
++
++    await openPalette(window, "Claude 3.5 Haiku");
++    await expect(window.getByTestId("command-model")).toHaveCount(1);
++    await window.keyboard.press("Enter");
++    await expect(window.getByTestId("workspace-model")).toHaveValue(
++      "claude-3-5-haiku-20241022",
++    );
++
++    await window.keyboard.press("Control+/");
++    await expect(window.getByTestId("shortcuts-dialog")).toBeVisible();
++    await expect(window.getByTestId("shortcuts-dialog")).toContainText("/packet");
++    await window.keyboard.press("Escape");
++    await expect(window.getByTestId("shortcuts-dialog")).toHaveCount(0);
++
++    await openPalette(window, "providers");
++    await window.keyboard.press("Enter");
++    await expect(window.getByTestId("secrets-provider")).toBeFocused();
++
++    await openPalette(window, "import");
++    await window.keyboard.press("Enter");
++    await expect(window.getByRole("heading", { name: "Import Hub" })).toBeVisible();
++
++    await openPalette(window, "settings");
++    await window.keyboard.press("Enter");
++    await expect(
++      window.getByRole("heading", { name: /Apar├¬ncia e chaves|Appearance and keys/ }),
++    ).toBeFocused();
++  } finally {
++    await app.close();
++  }
++});
++
++test("slash commands execute UI actions without being sent to the provider", async () => {
++  const app = await launchHub();
++  try {
++    const window = await app.firstWindow();
++    const composer = window.getByTestId("chat-composer");
++    await composer.waitFor({ state: "visible", timeout: 30_000 });
++    await expect(window.getByTestId("conversation-item")).toHaveCount(1);
++
++    await composer.fill("/");
++    await expect(window.getByTestId("slash-command-list")).toBeVisible();
++    await composer.press("ArrowDown");
++    await composer.press("Enter");
++    await expect(window.getByTestId("conversation-item")).toHaveCount(2);
++    await expect(window.getByTestId("message-user")).toHaveCount(0);
++
++    await composer.fill("/model");
++    await composer.press("Enter");
++    await expect(window.getByTestId("workspace-model")).toBeFocused();
++    await expect(composer).toHaveValue("");
++
++    await composer.fill("/compact");
++    await composer.press("Enter");
++    await expect(window.getByTestId("compact-enabled")).toBeVisible();
++    await expect(window.getByTestId("message-user")).toHaveCount(0);
++
++    await composer.fill("/packet");
++    await composer.press("Enter");
++    await expect(window.getByTestId("packet-dialog")).toBeVisible();
++    await window.keyboard.press("Escape");
++
++    await composer.fill("/cap");
++    await composer.press("Enter");
++    await expect(window.getByTestId("spend-cap-request")).toBeFocused();
++
++    await openPalette(window, "new chat");
++    await window.keyboard.press("Enter");
++    const nextComposer = window.getByTestId("chat-composer");
++    await nextComposer.waitFor({ state: "visible" });
++    await nextComposer.fill("/unknown");
++    await nextComposer.press("Enter");
++    await expect(window.getByTestId("message-user")).toContainText("/unknown");
++    await expect(window.getByTestId("message-assistant")).toHaveAttribute(
++      "data-status",
++      "complete",
++      {
++        timeout: 30_000,
++      },
++    );
++  } finally {
++    await app.close();
++  }
++});
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index 45d2e17..395a273 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -34,8 +34,12 @@ import { SettingsView } from "@/components/layout/settings-view";
+ import { DebugView } from "@/components/layout/debug-view";
+ import { ImportView } from "@/components/layout/import-view";
+ import { OnboardingView } from "@/components/layout/onboarding-view";
+-import { ChromeCommandPalette } from "@/components/layout/command-palette";
+-import type { AppView } from "@/components/layout/types";
++import {
++  ChromeCommandPalette,
++  type PaletteModelOption,
++} from "@/components/layout/command-palette";
++import { KeyboardShortcutsDialog } from "@/components/layout/keyboard-shortcuts";
++import type { AppView, SettingsSection } from "@/components/layout/types";
+ import { Button } from "@/components/ui/button";
+ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+ 
+@@ -57,16 +61,26 @@ const GATEWAY_ERROR_KEYS = new Set<GatewayErrorCode>([
+   "unknown",
+ ]);
+ 
+-function workspaceErrorText(t: TFunction, error: unknown): { text: string; cap: boolean } {
++function workspaceErrorText(
++  t: TFunction,
++  error: unknown,
++): { text: string; cap: boolean } {
+   const message = error instanceof Error ? error.message : String(error);
+   const classified = classifyHubIpcError(message);
+   if (classified.kind === "cap" && classified.scope) {
+-    return { text: t("workspace.error.cap", { scope: t(`caps.scope.${classified.scope}`) }), cap: true };
++    return {
++      text: t("workspace.error.cap", { scope: t(`caps.scope.${classified.scope}`) }),
++      cap: true,
++    };
+   }
+   if (classified.kind === "unknown_model") {
+     return { text: t("workspace.error.unknownModel"), cap: false };
+   }
+-  if (classified.kind === "gateway" && classified.code && GATEWAY_ERROR_KEYS.has(classified.code)) {
++  if (
++    classified.kind === "gateway" &&
++    classified.code &&
++    GATEWAY_ERROR_KEYS.has(classified.code)
++  ) {
+     return { text: t(`workspace.error.${classified.code}`), cap: false };
+   }
+   return { text: t("workspace.error.generic"), cap: false };
+@@ -86,7 +100,9 @@ export function App(): JSX.Element {
+   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+   const [importedInbox, setImportedInbox] = useState(false);
+   const [conversations, setConversations] = useState<ConversationDto[]>([]);
+-  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
++  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(
++    null,
++  );
+   const [messages, setMessages] = useState<MessageDto[]>([]);
+   const [providerKeys, setProviderKeys] = useState<ProviderKeyDto[]>([]);
+   const [selectedKeyId, setSelectedKeyId] = useState<string | null>(null);
+@@ -113,6 +129,8 @@ export function App(): JSX.Element {
+   const [costs, setCosts] = useState<CostsAggregateResult | null>(null);
+   const [showAllowOnce, setShowAllowOnce] = useState(false);
+   const [composerDraft, setComposerDraft] = useState("");
++  const [shortcutsOpen, setShortcutsOpen] = useState(false);
++  const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
+   const [fallback, setFallback] = useState<{
+     messageId: string;
+     code: GatewayErrorCode;
+@@ -121,7 +139,9 @@ export function App(): JSX.Element {
+     suggestKeyId: string;
+     suggestModel: string;
+   } | null>(null);
+-  const [fallbackPreview, setFallbackPreview] = useState<PacketPreviewResult | null>(null);
++  const [fallbackPreview, setFallbackPreview] = useState<PacketPreviewResult | null>(
++    null,
++  );
+   const projectInputRef = useRef<HTMLInputElement | null>(null);
+   const searchInputRef = useRef<HTMLInputElement | null>(null);
+   const selectedModelRef = useRef(selectedModel);
+@@ -144,7 +164,10 @@ export function App(): JSX.Element {
+   }, []);
+ 
+   const loadConversations = useCallback(
+-    async (projectId: string | null, inboxImported = false): Promise<ConversationDto[]> => {
++    async (
++      projectId: string | null,
++      inboxImported = false,
++    ): Promise<ConversationDto[]> => {
+       const list = await window.hub.conversations.list(
+         projectId === null
+           ? { projectId: null, inbox: inboxImported ? "imported" : "avulsas" }
+@@ -156,13 +179,16 @@ export function App(): JSX.Element {
+     [],
+   );
+ 
+-  const loadMessages = useCallback(async (conversationId: string): Promise<MessageDto[]> => {
+-    const list = await window.hub.messages.list({ conversationId });
+-    setMessages(list);
+-    const labels = await window.hub.conversations.getBranchLabels({ conversationId });
+-    setBranchLabels(labels);
+-    return list;
+-  }, []);
++  const loadMessages = useCallback(
++    async (conversationId: string): Promise<MessageDto[]> => {
++      const list = await window.hub.messages.list({ conversationId });
++      setMessages(list);
++      const labels = await window.hub.conversations.getBranchLabels({ conversationId });
++      setBranchLabels(labels);
++      return list;
++    },
++    [],
++  );
+ 
+   const loadPackets = useCallback(async (projectId: string | null): Promise<void> => {
+     try {
+@@ -197,17 +223,24 @@ export function App(): JSX.Element {
+         ]);
+         const matchingKey =
+           keys.find(
+-            (item) => item.status === "active" && findCatalogModel(session.model, item.providerSlug) !== null,
++            (item) =>
++              item.status === "active" &&
++              findCatalogModel(session.model, item.providerSlug) !== null,
+           ) ??
+           keys.find((item) => item.status === "active") ??
+           null;
+         setSelectedKeyId(matchingKey?.id ?? null);
+         if (matchingKey?.providerSlug === "custom") {
+           setSelectedModel(session.model);
+-        } else if (matchingKey && findCatalogModel(session.model, matchingKey.providerSlug)) {
++        } else if (
++          matchingKey &&
++          findCatalogModel(session.model, matchingKey.providerSlug)
++        ) {
+           setSelectedModel(session.model);
+         } else if (matchingKey) {
+-          setSelectedModel(catalogModelsForProvider(matchingKey.providerSlug)[0]?.id ?? session.model);
++          setSelectedModel(
++            catalogModelsForProvider(matchingKey.providerSlug)[0]?.id ?? session.model,
++          );
+         }
+         if (session.temperature !== undefined) {
+           setTemperature(session.temperature);
+@@ -227,13 +260,16 @@ export function App(): JSX.Element {
+           wizardStartedAt.current = Date.now();
+         }
+         if (session.projectId) {
+-          const project = projectList.find((item) => item.id === session.projectId) ?? null;
++          const project =
++            projectList.find((item) => item.id === session.projectId) ?? null;
+           if (!project) {
+             setSelectedProjectId(null);
+             setImportedInbox(false);
+             const convos = await loadConversations(null, false);
+             const conversation =
+-              convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
++              convos.find((item) => item.id === session.conversationId) ??
++              convos[0] ??
++              null;
+             if (conversation) {
+               setSelectedConversationId(conversation.id);
+               await loadMessages(conversation.id);
+@@ -245,7 +281,9 @@ export function App(): JSX.Element {
+           setImportedInbox(false);
+           const convos = await loadConversations(project.id, false);
+           const conversation =
+-            convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
++            convos.find((item) => item.id === session.conversationId) ??
++            convos[0] ??
++            null;
+           if (conversation) {
+             setSelectedConversationId(conversation.id);
+             await loadMessages(conversation.id);
+@@ -256,7 +294,9 @@ export function App(): JSX.Element {
+           setImportedInbox(imported);
+           const convos = await loadConversations(null, imported);
+           const conversation =
+-            convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
++            convos.find((item) => item.id === session.conversationId) ??
++            convos[0] ??
++            null;
+           if (conversation) {
+             setSelectedConversationId(conversation.id);
+             await loadMessages(conversation.id);
+@@ -379,6 +419,10 @@ export function App(): JSX.Element {
+     return () => window.clearTimeout(handle);
+   }, [fail, searchQuery]);
+ 
++  const activePacketId =
++    conversations.find((item) => item.id === selectedConversationId)?.activePacketId ??
++    null;
++
+   useEffect(() => {
+     if (!selectedConversationId) {
+       setPacketPreview(null);
+@@ -419,7 +463,7 @@ export function App(): JSX.Element {
+     selectedKeyId,
+     selectedModel,
+     privacyMode,
+-    conversations.find((item) => item.id === selectedConversationId)?.activePacketId,
++    activePacketId,
+   ]);
+ 
+   useEffect(() => {
+@@ -448,7 +492,9 @@ export function App(): JSX.Element {
+       }
+       if (event.type === "done") {
+         setMessages((current) =>
+-          current.map((message) => (message.id === event.message.id ? event.message : message)),
++          current.map((message) =>
++            message.id === event.message.id ? event.message : message,
++          ),
+         );
+         setRun((current) => (current?.runId === event.runId ? null : current));
+         void loadHealth();
+@@ -460,7 +506,8 @@ export function App(): JSX.Element {
+         setShowAllowOnce(false);
+         if (event.suggestKeyId && event.suggestProviderSlug && event.suggestModel) {
+           const failed =
+-            providerKeys.find((item) => item.id === selectedKeyId)?.providerSlug ?? event.suggestProviderSlug;
++            providerKeys.find((item) => item.id === selectedKeyId)?.providerSlug ??
++            event.suggestProviderSlug;
+           setFallback({
+             messageId: event.messageId,
+             code: event.code,
+@@ -500,13 +547,21 @@ export function App(): JSX.Element {
+       })
+       .then(setFallbackPreview)
+       .catch(() => setFallbackPreview(null));
+-  }, [compactHistory, extraSystem, fallback, maxTokens, privacyMode, selectedConversationId]);
++  }, [
++    compactHistory,
++    extraSystem,
++    fallback,
++    maxTokens,
++    privacyMode,
++    selectedConversationId,
++  ]);
+ 
+   const applyProjectPreferences = useCallback(
+     (project: ProjectDto, keys: ProviderKeyDto[]): void => {
+       if (project.preferredProvider) {
+         const key = keys.find(
+-          (item) => item.status === "active" && item.providerSlug === project.preferredProvider,
++          (item) =>
++            item.status === "active" && item.providerSlug === project.preferredProvider,
+         );
+         if (!key) {
+           return;
+@@ -552,7 +607,11 @@ export function App(): JSX.Element {
+     lastSendRef.current = input;
+     setSending(true);
+     try {
+-      const result = await window.hub.chat.send({ ...input, compactHistory, privacyMode });
++      const result = await window.hub.chat.send({
++        ...input,
++        compactHistory,
++        privacyMode,
++      });
+       setError(null);
+       setShowAllowOnce(false);
+       setFallback(null);
+@@ -569,13 +628,123 @@ export function App(): JSX.Element {
+     }
+   };
+ 
+-  const abortIfLeaving = (nextConversationId: string | null): void => {
+-    if (run && run.conversationId !== nextConversationId) {
+-      void window.hub.chat.abort({ runId: run.runId }).catch(fail);
+-    }
+-  };
++  const abortIfLeaving = useCallback(
++    (nextConversationId: string | null): void => {
++      if (run && run.conversationId !== nextConversationId) {
++        void window.hub.chat.abort({ runId: run.runId }).catch(fail);
++      }
++    },
++    [fail, run],
++  );
++
++  const navigateToView = useCallback(
++    (next: AppView): void => {
++      if (next !== "home") {
++        abortIfLeaving(null);
++      }
++      setView(next);
++    },
++    [abortIfLeaving],
++  );
++
++  const openSettings = useCallback(
++    (section: SettingsSection): void => {
++      setSettingsSection(section);
++      navigateToView("settings");
++    },
++    [navigateToView],
++  );
++
++  const selectProject = useCallback(
++    (id: string | null): void => {
++      abortIfLeaving(null);
++      setSelectedProjectId(id);
++      setImportedInbox(false);
++      setSelectedConversationId(null);
++      setMessages([]);
++      setBranchLabels({});
++      if (id) {
++        const next = projects.find((item) => item.id === id);
++        if (next) {
++          applyProjectPreferences(next, providerKeys);
++        }
++      }
++      void loadConversations(id, false).catch(fail);
++      setView("home");
++    },
++    [
++      abortIfLeaving,
++      applyProjectPreferences,
++      fail,
++      loadConversations,
++      projects,
++      providerKeys,
++    ],
++  );
++
++  const openSearchHit = useCallback(
++    (hit: SearchHit): void => {
++      abortIfLeaving(hit.conversationId);
++      setSelectedProjectId(hit.projectId);
++      setView("home");
++      void (async () => {
++        try {
++          let convos = await loadConversations(hit.projectId, false);
++          let imported = false;
++          if (
++            hit.projectId === null &&
++            !convos.some((item) => item.id === hit.conversationId)
++          ) {
++            convos = await loadConversations(null, true);
++            imported = true;
++          }
++          setImportedInbox(imported);
++          setSelectedConversationId(hit.conversationId);
++          await loadMessages(hit.conversationId);
++          if (hit.messageId) {
++            await window.hub.messages.activate({ id: hit.messageId });
++            await loadMessages(hit.conversationId);
++          }
++          setSearchQuery("");
++          setSearchHits([]);
++        } catch {
++          fail();
++        }
++      })();
++    },
++    [abortIfLeaving, fail, loadConversations, loadMessages],
++  );
++
++  const exportConversation = useCallback(
++    async (mode: "active" | "tree"): Promise<void> => {
++      if (!selectedConversationId) {
++        return;
++      }
++      try {
++        const result = await window.hub.conversations.export({
++          conversationId: selectedConversationId,
++          mode,
++        });
++        if (result.status === "saved") {
++          const parts = result.path.split(/[/\\]/);
++          const name = parts[parts.length - 1] ?? result.path;
++          setExportNotice(t("workspace.export.saved", { path: name }));
++        } else {
++          setExportNotice(null);
++        }
++      } catch {
++        fail();
++      }
++    },
++    [fail, selectedConversationId, t],
++  );
+ 
+-  const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
++  const searchWorkspace = useCallback((query: string): Promise<SearchHit[]> => {
++    return window.hub.search.query({ query });
++  }, []);
++
++  const selectedProject =
++    projects.find((project) => project.id === selectedProjectId) ?? null;
+ 
+   useEffect(() => {
+     const onKey = (event: KeyboardEvent): void => {
+@@ -583,6 +752,20 @@ export function App(): JSX.Element {
+       if (!modifier) {
+         return;
+       }
++      if (event.key === "/") {
++        event.preventDefault();
++        setShortcutsOpen(true);
++        return;
++      }
++      const target = event.target;
++      if (
++        target instanceof HTMLInputElement ||
++        target instanceof HTMLTextAreaElement ||
++        target instanceof HTMLSelectElement ||
++        (target instanceof HTMLElement && target.isContentEditable)
++      ) {
++        return;
++      }
+       if (event.shiftKey && event.key.toLowerCase() === "n") {
+         event.preventDefault();
+         setView("home");
+@@ -636,30 +819,11 @@ export function App(): JSX.Element {
+       <div className="flex min-h-0 flex-1">
+         <Sidebar
+           view={view}
+-          onChange={(next) => {
+-            if (next !== "home" && run) {
+-              void window.hub.chat.abort({ runId: run.runId }).catch(fail);
+-            }
+-            setView(next);
+-          }}
++          onChange={navigateToView}
+           projects={projects}
+           selectedProjectId={selectedProjectId}
+           importedInbox={importedInbox}
+-          onSelectProject={(id) => {
+-            abortIfLeaving(null);
+-            setSelectedProjectId(id);
+-            setImportedInbox(false);
+-            setSelectedConversationId(null);
+-            setMessages([]);
+-            setBranchLabels({});
+-            if (id) {
+-              const next = projects.find((item) => item.id === id);
+-              if (next) {
+-                applyProjectPreferences(next, providerKeys);
+-              }
+-            }
+-            void loadConversations(id, false).catch(fail);
+-          }}
++          onSelectProject={selectProject}
+           onSelectImportedInbox={() => {
+             abortIfLeaving(null);
+             setSelectedProjectId(null);
+@@ -692,32 +856,7 @@ export function App(): JSX.Element {
+           searchHits={searchHits}
+           onSearchQuery={setSearchQuery}
+           searchInputRef={searchInputRef}
+-          onOpenSearchHit={(hit) => {
+-            abortIfLeaving(hit.conversationId);
+-            setSelectedProjectId(hit.projectId);
+-            setView("home");
+-            void (async () => {
+-              try {
+-                let convos = await loadConversations(hit.projectId, false);
+-                let imported = false;
+-                if (hit.projectId === null && !convos.some((item) => item.id === hit.conversationId)) {
+-                  convos = await loadConversations(null, true);
+-                  imported = true;
+-                }
+-                setImportedInbox(imported);
+-                setSelectedConversationId(hit.conversationId);
+-                await loadMessages(hit.conversationId);
+-                if (hit.messageId) {
+-                  await window.hub.messages.activate({ id: hit.messageId });
+-                  await loadMessages(hit.conversationId);
+-                }
+-                setSearchQuery("");
+-                setSearchHits([]);
+-              } catch {
+-                fail();
+-              }
+-            })();
+-          }}
++          onOpenSearchHit={openSearchHit}
+         />
+         <main className="min-w-0 flex-1 bg-background">
+           {view === "home" ? (
+@@ -868,26 +1007,7 @@ export function App(): JSX.Element {
+                   fail();
+                 }
+               }}
+-              onExport={async (mode) => {
+-                if (!selectedConversationId) {
+-                  return;
+-                }
+-                try {
+-                  const result = await window.hub.conversations.export({
+-                    conversationId: selectedConversationId,
+-                    mode,
+-                  });
+-                  if (result.status === "saved") {
+-                    const parts = result.path.split(/[/\\]/);
+-                    const name = parts[parts.length - 1] ?? result.path;
+-                    setExportNotice(t("workspace.export.saved", { path: name }));
+-                  } else {
+-                    setExportNotice(null);
+-                  }
+-                } catch {
+-                  fail();
+-                }
+-              }}
++              onExport={exportConversation}
+               onMoveConversation={async (projectId) => {
+                 if (!selectedConversationId) {
+                   return;
+@@ -922,7 +1042,10 @@ export function App(): JSX.Element {
+                   return;
+                 }
+                 try {
+-                  const updated = await window.hub.projects.update({ id: selectedProjectId, ...input });
++                  const updated = await window.hub.projects.update({
++                    id: selectedProjectId,
++                    ...input,
++                  });
+                   setError(null);
+                   await loadProjects();
+                   applyProjectPreferences(updated, providerKeys);
+@@ -934,7 +1057,9 @@ export function App(): JSX.Element {
+                 if (!selectedProjectId) {
+                   return;
+                 }
+-                const leaving = conversations.find((item) => item.id === selectedConversationId);
++                const leaving = conversations.find(
++                  (item) => item.id === selectedConversationId,
++                );
+                 const imported = leaving?.importSource != null;
+                 try {
+                   abortIfLeaving(null);
+@@ -1010,7 +1135,9 @@ export function App(): JSX.Element {
+                     conversationId: selectedConversationId,
+                     compact: compactHistory,
+                     privacyMode,
+-                    ...(key ? { model: selectedModel, providerSlug: key.providerSlug } : {}),
++                    ...(key
++                      ? { model: selectedModel, providerSlug: key.providerSlug }
++                      : {}),
+                     ...(extra !== undefined ? { extraSystem: extra } : {}),
+                   });
+                   await loadPackets(selectedProjectId);
+@@ -1041,7 +1168,10 @@ export function App(): JSX.Element {
+                     setExportNotice(t("workspace.packet.cancelled"));
+                     return;
+                   }
+-                  await window.hub.packets.import({ ticket: picked.ticket, projectId: selectedProjectId });
++                  await window.hub.packets.import({
++                    ticket: picked.ticket,
++                    projectId: selectedProjectId,
++                  });
+                   await loadPackets(selectedProjectId);
+                   setExportNotice(t("workspace.packet.imported"));
+                 } catch {
+@@ -1070,7 +1200,9 @@ export function App(): JSX.Element {
+                   return;
+                 }
+                 try {
+-                  const updated = await window.hub.packets.clear({ conversationId: selectedConversationId });
++                  const updated = await window.hub.packets.clear({
++                    conversationId: selectedConversationId,
++                  });
+                   setConversations((current) =>
+                     current.map((item) => (item.id === updated.id ? updated : item)),
+                   );
+@@ -1079,6 +1211,7 @@ export function App(): JSX.Element {
+                   fail();
+                 }
+               }}
++              onOpenCaps={() => openSettings("caps")}
+             />
+           ) : view === "debug" ? (
+             <DebugView />
+@@ -1104,17 +1237,20 @@ export function App(): JSX.Element {
+               }}
+             />
+           ) : (
+-            <SettingsView />
++            <SettingsView focusSection={settingsSection} />
+           )}
+         </main>
+       </div>
+-      <StatusBar health={health} />
+-      <Dialog open={fallback !== null} onOpenChange={(open) => {
+-        if (!open) {
+-          setFallback(null);
+-          setFallbackPreview(null);
+-        }
+-      }}>
++      <StatusBar health={health} onOpenShortcuts={() => setShortcutsOpen(true)} />
++      <Dialog
++        open={fallback !== null}
++        onOpenChange={(open) => {
++          if (!open) {
++            setFallback(null);
++            setFallbackPreview(null);
++          }
++        }}
++      >
+         <DialogContent data-testid="fallback-dialog">
+           <DialogHeader>
+             <DialogTitle>{t("fallback.title")}</DialogTitle>
+@@ -1129,7 +1265,10 @@ export function App(): JSX.Element {
+                 })}
+               </p>
+               {fallbackPreview?.estimatedCostUsd ? (
+-                <p className="text-[12px] text-muted-foreground" data-testid="fallback-estimate">
++                <p
++                  className="text-[12px] text-muted-foreground"
++                  data-testid="fallback-estimate"
++                >
+                   {t("fallback.estimate", {
+                     usd: fallbackPreview.estimatedCostUsd,
+                     suggested: fallback.suggestProviderSlug,
+@@ -1170,20 +1309,36 @@ export function App(): JSX.Element {
+           ) : null}
+         </DialogContent>
+       </Dialog>
++      <KeyboardShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
+       <ChromeCommandPalette
++        projects={projects}
++        providerKeys={providerKeys}
++        selectedModel={selectedModel}
++        selectedConversationId={selectedConversationId}
++        busy={sending || run !== null}
+         onNewProject={() => {
+-          setView("home");
++          navigateToView("home");
+           window.setTimeout(() => projectInputRef.current?.focus(), 0);
+         }}
+         onNewChat={() => {
+           void createUntitledChat();
+         }}
+-        onSearch={() => {
+-          setView("home");
+-          window.setTimeout(() => searchInputRef.current?.focus(), 0);
++        onOpenProject={(projectId) => selectProject(projectId)}
++        onOpenSearchHit={openSearchHit}
++        onSearchWorkspace={searchWorkspace}
++        onSelectModel={(option: PaletteModelOption) => {
++          setSelectedKeyId(option.keyId);
++          setSelectedModel(option.modelId);
++          navigateToView("home");
++        }}
++        onExport={(mode) => {
++          void exportConversation(mode);
+         }}
+-        onDebug={() => setView("debug")}
+-        onImport={() => setView("import")}
++        onProviders={() => openSettings("providers")}
++        onSettings={() => openSettings("general")}
++        onDebug={() => navigateToView("debug")}
++        onImport={() => navigateToView("import")}
++        onShortcuts={() => setShortcutsOpen(true)}
+       />
+     </div>
+   );
+diff --git a/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx b/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
+index f2e8458..3d0fae3 100644
+--- a/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
++++ b/apps/desktop/src/renderer/src/components/chat/chat-composer.tsx
+@@ -1,13 +1,25 @@
+-import { type FormEvent, type JSX, type KeyboardEvent, useEffect, useRef } from "react";
++import {
++  type FormEvent,
++  type JSX,
++  type KeyboardEvent,
++  useEffect,
++  useRef,
++  useState,
++} from "react";
+ import { useTranslation } from "react-i18next";
+ import { looksLikePastedSecret, redactPastedSecrets } from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
+ 
++export type SlashCommandId = "model" | "clear" | "compact" | "packet" | "cap";
++
++const SLASH_COMMANDS: SlashCommandId[] = ["model", "clear", "compact", "packet", "cap"];
++
+ export function ChatComposer({
+   value,
+   onChange,
+   onSend,
+   onAbort,
++  onSlashCommand,
+   streaming,
+   sending,
+   disabled,
+@@ -16,19 +28,35 @@ export function ChatComposer({
+   onChange: (value: string) => void;
+   onSend: () => void;
+   onAbort: () => void;
++  onSlashCommand: (command: SlashCommandId) => void;
+   streaming: boolean;
+   sending: boolean;
+   disabled: boolean;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const areaRef = useRef<HTMLTextAreaElement>(null);
++  const [selectedSlashIndex, setSelectedSlashIndex] = useState(0);
++  const [slashDismissed, setSlashDismissed] = useState(false);
+   const busy = streaming || sending;
+   const secretWarning = looksLikePastedSecret(value);
++  const slashQuery =
++    value.startsWith("/") && !/\s/.test(value) ? value.slice(1).toLowerCase() : null;
++  const slashCommands = slashDismissed
++    ? []
++    : SLASH_COMMANDS.filter(
++        (command) => slashQuery !== null && command.startsWith(slashQuery),
++      );
++  const slashOpen = slashCommands.length > 0 && !busy;
+ 
+   useEffect(() => {
+     areaRef.current?.focus();
+   }, []);
+ 
++  useEffect(() => {
++    setSelectedSlashIndex(0);
++    setSlashDismissed(false);
++  }, [value]);
++
+   const submit = (): void => {
+     if (busy || disabled || value.trim().length === 0) {
+       return;
+@@ -57,6 +85,14 @@ export function ChatComposer({
+         rows={3}
+         className="min-h-[4.5rem] w-full resize-none rounded-md border border-input bg-background px-2.5 py-2 text-[13px] shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+         placeholder={t("workspace.composer.placeholder")}
++        aria-autocomplete="list"
++        aria-controls={slashOpen ? "slash-command-list" : undefined}
++        aria-expanded={slashOpen}
++        aria-activedescendant={
++          slashOpen
++            ? `slash-command-${slashCommands[selectedSlashIndex] ?? slashCommands[0]}`
++            : undefined
++        }
+         onChange={(event) => onChange(event.target.value)}
+         onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
+           if (event.key === "Escape" && streaming) {
+@@ -64,15 +100,75 @@ export function ChatComposer({
+             onAbort();
+             return;
+           }
++          if (slashOpen && event.key === "ArrowDown") {
++            event.preventDefault();
++            setSelectedSlashIndex((current) => (current + 1) % slashCommands.length);
++            return;
++          }
++          if (slashOpen && event.key === "ArrowUp") {
++            event.preventDefault();
++            setSelectedSlashIndex(
++              (current) => (current - 1 + slashCommands.length) % slashCommands.length,
++            );
++            return;
++          }
++          if (slashOpen && (event.key === "Enter" || event.key === "Tab")) {
++            event.preventDefault();
++            const command = slashCommands[selectedSlashIndex] ?? slashCommands[0];
++            if (command) {
++              onChange("");
++              onSlashCommand(command);
++            }
++            return;
++          }
++          if (slashOpen && event.key === "Escape") {
++            event.preventDefault();
++            setSlashDismissed(true);
++            return;
++          }
+           if (event.key === "Enter" && !event.shiftKey) {
+             event.preventDefault();
+             submit();
+           }
+         }}
+       />
++      {slashOpen ? (
++        <div
++          id="slash-command-list"
++          role="listbox"
++          className="overflow-hidden rounded-md border bg-popover p-1 shadow-md"
++          data-testid="slash-command-list"
++        >
++          {slashCommands.map((command, index) => (
++            <button
++              key={command}
++              id={`slash-command-${command}`}
++              type="button"
++              role="option"
++              aria-selected={index === selectedSlashIndex}
++              className="flex w-full items-center gap-3 rounded-sm px-2 py-1.5 text-left text-[12px] hover:bg-accent aria-selected:bg-accent"
++              data-testid={`slash-command-${command}`}
++              onMouseDown={(event) => event.preventDefault()}
++              onClick={() => {
++                onChange("");
++                onSlashCommand(command);
++              }}
++            >
++              <code className="font-mono">/{command}</code>
++              <span className="text-muted-foreground">
++                {t(`slash.${command}.description`)}
++              </span>
++            </button>
++          ))}
++        </div>
++      ) : null}
+       <div className="flex items-center justify-between gap-2">
+         {secretWarning ? (
+-          <p className="text-[11px] text-destructive" role="status" data-testid="composer-secret-warning">
++          <p
++            className="text-[11px] text-destructive"
++            role="status"
++            data-testid="composer-secret-warning"
++          >
+             {t("workspace.composer.secretWarning")}{" "}
+             <button
+               type="button"
+@@ -84,7 +180,9 @@ export function ChatComposer({
+             </button>
+           </p>
+         ) : (
+-          <p className="text-[11px] text-muted-foreground">{t("workspace.composer.hint")}</p>
++          <p className="text-[11px] text-muted-foreground">
++            {t("workspace.composer.hint")}
++          </p>
+         )}
+         {streaming ? (
+           <Button
+@@ -98,7 +196,11 @@ export function ChatComposer({
+             {t("workspace.composer.stop")}
+           </Button>
+         ) : (
+-          <Button type="submit" data-testid="chat-send" disabled={disabled || sending || value.trim().length === 0}>
++          <Button
++            type="submit"
++            data-testid="chat-send"
++            disabled={disabled || sending || value.trim().length === 0}
++          >
+             {t("workspace.composer.send")}
+           </Button>
+         )}
+diff --git a/apps/desktop/src/renderer/src/components/chat/packet-panel.tsx b/apps/desktop/src/renderer/src/components/chat/packet-panel.tsx
+index 533f951..e6e5623 100644
+--- a/apps/desktop/src/renderer/src/components/chat/packet-panel.tsx
++++ b/apps/desktop/src/renderer/src/components/chat/packet-panel.tsx
+@@ -1,6 +1,10 @@
+-import { type JSX, useState } from "react";
++import { type JSX } from "react";
+ import { useTranslation } from "react-i18next";
+-import type { ContextPacketDto, PacketPreviewResult, PacketPrivacyMode } from "@ai-hub/shared";
++import type {
++  ContextPacketDto,
++  PacketPreviewResult,
++  PacketPrivacyMode,
++} from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
+ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+ 
+@@ -17,6 +21,8 @@ export function PacketPanel({
+   onImport,
+   onApply,
+   onClear,
++  open,
++  onOpenChange,
+ }: {
+   packetPreview: PacketPreviewResult | null;
+   packets: ContextPacketDto[];
+@@ -30,9 +36,10 @@ export function PacketPanel({
+   onImport: () => Promise<void>;
+   onApply: (packetId: string) => Promise<void>;
+   onClear: () => Promise<void>;
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
+ }): JSX.Element {
+   const { t } = useTranslation();
+-  const [open, setOpen] = useState(false);
+   const canMutate = projectId !== null && !busy;
+ 
+   return (
+@@ -43,12 +50,15 @@ export function PacketPanel({
+         variant="outline"
+         data-testid="packet-open"
+         disabled={projectId === null && !packetPreview}
+-        onClick={() => setOpen(true)}
++        onClick={() => onOpenChange(true)}
+       >
+         {t("workspace.packet.open")}
+       </Button>
+-      <Dialog open={open} onOpenChange={setOpen}>
+-        <DialogContent data-testid="packet-dialog" className="max-h-[80vh] overflow-y-auto">
++      <Dialog open={open} onOpenChange={onOpenChange}>
++        <DialogContent
++          data-testid="packet-dialog"
++          className="max-h-[80vh] overflow-y-auto"
++        >
+           <DialogHeader>
+             <DialogTitle>{t("workspace.packet.title")}</DialogTitle>
+           </DialogHeader>
+@@ -69,42 +79,66 @@ export function PacketPanel({
+                   </p>
+                 ) : null}
+                 <label className="flex items-center gap-2">
+-                  <span className="text-muted-foreground">{t("workspace.packet.privacy")}</span>
++                  <span className="text-muted-foreground">
++                    {t("workspace.packet.privacy")}
++                  </span>
+                   <select
+                     className="h-8 rounded-md border bg-background px-2"
+                     value={appliedPacketId ? packetPreview.privacyMode : privacyMode}
+                     disabled={Boolean(appliedPacketId) || busy}
+                     data-testid="packet-privacy"
+                     aria-label={t("workspace.packet.privacy")}
+-                    onChange={(event) => onPrivacyMode(event.target.value === "strict" ? "strict" : "standard")}
++                    onChange={(event) =>
++                      onPrivacyMode(
++                        event.target.value === "strict" ? "strict" : "standard",
++                      )
++                    }
+                   >
+-                    <option value="standard">{t("workspace.packet.privacy.standard")}</option>
++                    <option value="standard">
++                      {t("workspace.packet.privacy.standard")}
++                    </option>
+                     <option value="strict">{t("workspace.packet.privacy.strict")}</option>
+                   </select>
+                 </label>
+                 <section>
+-                  <h3 className="mb-1 text-[12px] font-medium">{t("workspace.packet.included")}</h3>
++                  <h3 className="mb-1 text-[12px] font-medium">
++                    {t("workspace.packet.included")}
++                  </h3>
+                   <ul className="flex flex-col gap-1" data-testid="packet-included">
+                     {packetPreview.included.length === 0 ? (
+-                      <li className="text-muted-foreground">{t("workspace.packet.empty")}</li>
++                      <li className="text-muted-foreground">
++                        {t("workspace.packet.empty")}
++                      </li>
+                     ) : (
+                       packetPreview.included.map((slice, index) => (
+-                        <li key={`${slice.kind}-${slice.id ?? index}`} className="rounded-md border px-2 py-1">
+-                          {t(`workspace.packet.kind.${slice.kind}`)} ┬À {slice.label} ┬À ~{slice.tokens}
++                        <li
++                          key={`${slice.kind}-${slice.id ?? index}`}
++                          className="rounded-md border px-2 py-1"
++                        >
++                          {t(`workspace.packet.kind.${slice.kind}`)} ┬À {slice.label} ┬À ~
++                          {slice.tokens}
+                         </li>
+                       ))
+                     )}
+                   </ul>
+                 </section>
+                 <section>
+-                  <h3 className="mb-1 text-[12px] font-medium">{t("workspace.packet.omitted")}</h3>
++                  <h3 className="mb-1 text-[12px] font-medium">
++                    {t("workspace.packet.omitted")}
++                  </h3>
+                   <ul className="flex flex-col gap-1" data-testid="packet-omitted">
+                     {packetPreview.omitted.length === 0 ? (
+-                      <li className="text-muted-foreground">{t("workspace.packet.empty")}</li>
++                      <li className="text-muted-foreground">
++                        {t("workspace.packet.empty")}
++                      </li>
+                     ) : (
+                       packetPreview.omitted.map((slice, index) => (
+-                        <li key={`${slice.kind}-${slice.id ?? index}`} className="rounded-md border px-2 py-1">
+-                          {t(`workspace.packet.kind.${slice.kind}`)} ┬À {slice.label} ┬À ~{slice.tokens}
++                        <li
++                          key={`${slice.kind}-${slice.id ?? index}`}
++                          className="rounded-md border px-2 py-1"
++                        >
++                          {t(`workspace.packet.kind.${slice.kind}`)} ┬À {slice.label} ┬À ~
++                          {slice.tokens}
+                         </li>
+                       ))
+                     )}
+@@ -154,16 +188,23 @@ export function PacketPanel({
+               ) : null}
+             </div>
+             <section>
+-              <h3 className="mb-1 text-[12px] font-medium">{t("workspace.packet.saved")}</h3>
++              <h3 className="mb-1 text-[12px] font-medium">
++                {t("workspace.packet.saved")}
++              </h3>
+               {packets.length === 0 ? (
+                 <p className="text-muted-foreground">{t("workspace.packet.none")}</p>
+               ) : (
+                 <ul className="flex flex-col gap-1">
+                   {packets.map((packet) => (
+-                    <li key={packet.id} className="flex items-center justify-between gap-2 rounded-md border px-2 py-1">
++                    <li
++                      key={packet.id}
++                      className="flex items-center justify-between gap-2 rounded-md border px-2 py-1"
++                    >
+                       <span>
+-                        {packet.origin.conversationLabel || t("workspace.packet.untitled")} ┬À ~
+-                        {packet.tokenEstimate ?? 0} ┬À {t(`workspace.packet.privacy.${packet.privacyMode}`)}
++                        {packet.origin.conversationLabel ||
++                          t("workspace.packet.untitled")}{" "}
++                        ┬À ~{packet.tokenEstimate ?? 0} ┬À{" "}
++                        {t(`workspace.packet.privacy.${packet.privacyMode}`)}
+                       </span>
+                       <span className="flex gap-1">
+                         <Button
+@@ -181,14 +222,18 @@ export function PacketPanel({
+                         <Button
+                           type="button"
+                           size="sm"
+-                          variant={appliedPacketId === packet.id ? "secondary" : "outline"}
++                          variant={
++                            appliedPacketId === packet.id ? "secondary" : "outline"
++                          }
+                           disabled={busy}
+                           data-testid="packet-apply"
+                           onClick={() => {
+                             void onApply(packet.id);
+                           }}
+                         >
+-                          {appliedPacketId === packet.id ? t("workspace.packet.using") : t("workspace.packet.apply")}
++                          {appliedPacketId === packet.id
++                            ? t("workspace.packet.using")
++                            : t("workspace.packet.apply")}
+                         </Button>
+                       </span>
+                     </li>
+diff --git a/apps/desktop/src/renderer/src/components/layout/command-palette.tsx b/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
+index dcb4e96..4d3f668 100644
+--- a/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/command-palette.tsx
+@@ -1,6 +1,12 @@
+-import { useEffect, useState, type JSX } from "react";
++import { useEffect, useMemo, useRef, useState, type JSX } from "react";
+ import { useTranslation } from "react-i18next";
+-import type { ThemeMode } from "@ai-hub/shared";
++import {
++  catalogModelsForProvider,
++  type ProjectDto,
++  type ProviderKeyDto,
++  type SearchHit,
++  type ThemeMode,
++} from "@ai-hub/shared";
+ import {
+   Command,
+   CommandEmpty,
+@@ -11,22 +17,70 @@ import {
+ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+ import { useTheme } from "@/lib/theme";
+ 
++export interface PaletteModelOption {
++  keyId: string;
++  keyLabel: string;
++  modelId: string;
++  providerSlug: string;
++  label: string;
++}
++
++interface PaletteAction {
++  id: string;
++  label: string;
++  keywords: string;
++  disabled?: boolean;
++  run: () => void;
++}
++
++function matchesQuery(value: string, query: string): boolean {
++  return value.toLocaleLowerCase().includes(query.toLocaleLowerCase());
++}
++
+ export function ChromeCommandPalette({
++  projects,
++  providerKeys,
++  selectedModel,
++  selectedConversationId,
++  busy,
+   onNewProject,
+   onNewChat,
+-  onSearch,
++  onOpenProject,
++  onOpenSearchHit,
++  onSearchWorkspace,
++  onSelectModel,
++  onExport,
++  onProviders,
++  onSettings,
+   onDebug,
+   onImport,
++  onShortcuts,
+ }: {
++  projects: ProjectDto[];
++  providerKeys: ProviderKeyDto[];
++  selectedModel: string;
++  selectedConversationId: string | null;
++  busy: boolean;
+   onNewProject: () => void;
+   onNewChat: () => void;
+-  onSearch: () => void;
++  onOpenProject: (projectId: string) => void;
++  onOpenSearchHit: (hit: SearchHit) => void;
++  onSearchWorkspace: (query: string) => Promise<SearchHit[]>;
++  onSelectModel: (option: PaletteModelOption) => void;
++  onExport: (mode: "active" | "tree") => void;
++  onProviders: () => void;
++  onSettings: () => void;
+   onDebug: () => void;
+   onImport: () => void;
++  onShortcuts: () => void;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const { setTheme } = useTheme();
+   const [open, setOpen] = useState(false);
++  const [query, setQuery] = useState("");
++  const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
++  const [searching, setSearching] = useState(false);
++  const searchGeneration = useRef(0);
+ 
+   useEffect(() => {
+     const onKey = (event: KeyboardEvent): void => {
+@@ -40,70 +94,287 @@ export function ChromeCommandPalette({
+     return () => window.removeEventListener("keydown", onKey);
+   }, []);
+ 
+-  const applyTheme = (mode: ThemeMode): void => {
+-    setTheme(mode);
++  useEffect(() => {
++    const trimmed = query.trim();
++    const generation = searchGeneration.current + 1;
++    searchGeneration.current = generation;
++    if (!open || trimmed.length < 2) {
++      setSearchHits([]);
++      setSearching(false);
++      return;
++    }
++    setSearching(true);
++    const handle = window.setTimeout(() => {
++      void onSearchWorkspace(trimmed)
++        .then((hits) => {
++          if (searchGeneration.current === generation) {
++            setSearchHits(hits);
++          }
++        })
++        .catch(() => {
++          if (searchGeneration.current === generation) {
++            setSearchHits([]);
++          }
++        })
++        .finally(() => {
++          if (searchGeneration.current === generation) {
++            setSearching(false);
++          }
++        });
++    }, 150);
++    return () => window.clearTimeout(handle);
++  }, [onSearchWorkspace, open, query]);
++
++  const closeAndRun = (action: () => void): void => {
+     setOpen(false);
++    setQuery("");
++    setSearchHits([]);
++    action();
+   };
+ 
++  const actions: PaletteAction[] = [
++    {
++      id: "new-chat",
++      label: t("command.newChat"),
++      keywords: "new chat conversation nova conversa",
++      run: onNewChat,
++    },
++    {
++      id: "new-project",
++      label: t("command.newProject"),
++      keywords: "new create project novo criar projeto",
++      run: onNewProject,
++    },
++    {
++      id: "export-active",
++      label: t("command.exportActive"),
++      keywords: "export active branch conversation exportar conversa ramo ativo",
++      disabled: selectedConversationId === null || busy,
++      run: () => onExport("active"),
++    },
++    {
++      id: "export-tree",
++      label: t("command.exportTree"),
++      keywords: "export tree json exportar arvore ├írvore",
++      disabled: selectedConversationId === null || busy,
++      run: () => onExport("tree"),
++    },
++    {
++      id: "providers",
++      label: t("command.providers"),
++      keywords: "providers api keys provedores chaves",
++      run: onProviders,
++    },
++    {
++      id: "settings",
++      label: t("command.settings"),
++      keywords: "settings preferences configura├º├Áes configuracoes preferencias",
++      run: onSettings,
++    },
++    {
++      id: "import",
++      label: t("command.import"),
++      keywords: "import chatgpt claude gemini importar",
++      run: onImport,
++    },
++    {
++      id: "shortcuts",
++      label: t("command.shortcuts"),
++      keywords: "keyboard shortcuts help atalhos teclado ajuda",
++      run: onShortcuts,
++    },
++    {
++      id: "debug",
++      label: t("command.debug"),
++      keywords: "debug observability observabilidade",
++      run: onDebug,
++    },
++    {
++      id: "theme-light",
++      label: `${t("command.theme")}: ${t("theme.light")}`,
++      keywords: "theme light tema claro",
++      run: () => setTheme("light" satisfies ThemeMode),
++    },
++    {
++      id: "theme-dark",
++      label: `${t("command.theme")}: ${t("theme.dark")}`,
++      keywords: "theme dark tema escuro",
++      run: () => setTheme("dark" satisfies ThemeMode),
++    },
++    {
++      id: "theme-system",
++      label: `${t("command.theme")}: ${t("theme.system")}`,
++      keywords: "theme system tema sistema",
++      run: () => setTheme("system" satisfies ThemeMode),
++    },
++  ];
++
++  const modelOptions = useMemo<PaletteModelOption[]>(
++    () =>
++      providerKeys.flatMap((key) => {
++        const catalog = catalogModelsForProvider(key.providerSlug);
++        if (catalog.length === 0 && key.providerSlug === "custom") {
++          return [
++            {
++              keyId: key.id,
++              keyLabel: key.label,
++              modelId: selectedModel,
++              providerSlug: key.providerSlug,
++              label: selectedModel,
++            },
++          ];
++        }
++        return catalog.map((model) => ({
++          keyId: key.id,
++          keyLabel: key.label,
++          modelId: model.id,
++          providerSlug: key.providerSlug,
++          label: model.label,
++        }));
++      }),
++    [providerKeys, selectedModel],
++  );
++
++  const normalizedQuery = query.trim();
++  const visibleActions = actions.filter(
++    (action) =>
++      normalizedQuery.length === 0 ||
++      matchesQuery(`${action.label} ${action.keywords}`, normalizedQuery),
++  );
++  const visibleProjects = projects.filter(
++    (project) =>
++      normalizedQuery.length === 0 || matchesQuery(project.name, normalizedQuery),
++  );
++  const visibleModels = modelOptions.filter(
++    (option) =>
++      normalizedQuery.length === 0 ||
++      matchesQuery(
++        `${option.label} ${option.modelId} ${option.providerSlug} ${option.keyLabel} model modelo`,
++        normalizedQuery,
++      ),
++  );
++  const resultCount =
++    visibleActions.length +
++    visibleProjects.length +
++    visibleModels.length +
++    searchHits.length;
++
+   return (
+-    <Dialog open={open} onOpenChange={setOpen}>
+-      <DialogContent className="overflow-hidden p-0">
++    <Dialog
++      open={open}
++      onOpenChange={(next) => {
++        setOpen(next);
++        if (!next) {
++          setQuery("");
++          setSearchHits([]);
++        }
++      }}
++    >
++      <DialogContent className="overflow-hidden p-0" data-testid="command-palette">
+         <DialogHeader className="sr-only">
+           <DialogTitle>{t("command.placeholder")}</DialogTitle>
+         </DialogHeader>
+-        <Command>
+-          <CommandInput placeholder={t("command.placeholder")} />
+-          <CommandList>
+-            <CommandEmpty>{t("command.empty")}</CommandEmpty>
+-            <CommandItem
+-              onSelect={() => {
+-                onNewProject();
+-                setOpen(false);
+-              }}
+-            >
+-              {t("command.newProject")}
+-            </CommandItem>
+-            <CommandItem
+-              onSelect={() => {
+-                onNewChat();
+-                setOpen(false);
+-              }}
+-            >
+-              {t("command.newChat")}
+-            </CommandItem>
+-            <CommandItem
+-              onSelect={() => {
+-                onSearch();
+-                setOpen(false);
+-              }}
+-            >
+-              {t("command.search")}
+-            </CommandItem>
+-            <CommandItem
+-              onSelect={() => {
+-                onDebug();
+-                setOpen(false);
+-              }}
+-            >
+-              {t("command.debug")}
+-            </CommandItem>
+-            <CommandItem
+-              onSelect={() => {
+-                onImport();
+-                setOpen(false);
+-              }}
+-            >
+-              {t("command.import")}
+-            </CommandItem>
+-            <CommandItem onSelect={() => applyTheme("light")}>
+-              {t("command.theme")}: {t("theme.light")}
+-            </CommandItem>
+-            <CommandItem onSelect={() => applyTheme("dark")}>
+-              {t("command.theme")}: {t("theme.dark")}
+-            </CommandItem>
+-            <CommandItem onSelect={() => applyTheme("system")}>
+-              {t("command.theme")}: {t("theme.system")}
+-            </CommandItem>
++        <Command shouldFilter={false}>
++          <CommandInput
++            value={query}
++            onValueChange={setQuery}
++            placeholder={t("command.placeholder")}
++            data-testid="command-input"
++          />
++          <CommandList className="max-h-96">
++            {resultCount === 0 && !searching ? (
++              <CommandEmpty>{t("command.empty")}</CommandEmpty>
++            ) : null}
++            {visibleActions.length > 0 ? (
++              <section aria-label={t("command.group.actions")}>
++                <p className="px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
++                  {t("command.group.actions")}
++                </p>
++                {visibleActions.map((action) => (
++                  <CommandItem
++                    key={action.id}
++                    value={`action:${action.id}`}
++                    disabled={action.disabled === true}
++                    data-testid={`command-${action.id}`}
++                    onSelect={() => closeAndRun(action.run)}
++                  >
++                    {action.label}
++                    {action.disabled ? (
++                      <span className="ml-auto text-[11px] text-muted-foreground">
++                        {t("command.unavailable")}
++                      </span>
++                    ) : null}
++                  </CommandItem>
++                ))}
++              </section>
++            ) : null}
++            {visibleProjects.length > 0 ? (
++              <section aria-label={t("command.group.projects")}>
++                <p className="px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
++                  {t("command.group.projects")}
++                </p>
++                {visibleProjects.map((project) => (
++                  <CommandItem
++                    key={project.id}
++                    value={`project:${project.id}`}
++                    data-testid="command-project"
++                    onSelect={() => closeAndRun(() => onOpenProject(project.id))}
++                  >
++                    {project.name}
++                  </CommandItem>
++                ))}
++              </section>
++            ) : null}
++            {visibleModels.length > 0 ? (
++              <section aria-label={t("command.group.models")}>
++                <p className="px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
++                  {t("command.group.models")}
++                </p>
++                {visibleModels.map((option) => (
++                  <CommandItem
++                    key={`${option.keyId}:${option.modelId}`}
++                    value={`model:${option.keyId}:${option.modelId}`}
++                    disabled={busy}
++                    data-testid="command-model"
++                    onSelect={() => closeAndRun(() => onSelectModel(option))}
++                  >
++                    <span>{option.label}</span>
++                    <span className="ml-auto text-[11px] text-muted-foreground">
++                      {option.providerSlug} ┬À {option.keyLabel}
++                    </span>
++                  </CommandItem>
++                ))}
++              </section>
++            ) : null}
++            {searchHits.length > 0 ? (
++              <section aria-label={t("command.group.conversations")}>
++                <p className="px-2 py-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
++                  {t("command.group.conversations")}
++                </p>
++                {searchHits.map((hit) => (
++                  <CommandItem
++                    key={`${hit.conversationId}:${hit.messageId ?? "title"}`}
++                    value={`conversation:${hit.conversationId}:${hit.messageId ?? "title"}`}
++                    data-testid="command-search-hit"
++                    onSelect={() => closeAndRun(() => onOpenSearchHit(hit))}
++                  >
++                    <span className="min-w-0">
++                      <span className="block truncate font-medium">
++                        {hit.conversationTitle}
++                      </span>
++                      <span className="block truncate text-[11px] text-muted-foreground">
++                        {hit.snippet}
++                      </span>
++                    </span>
++                  </CommandItem>
++                ))}
++              </section>
++            ) : null}
++            {searching ? (
++              <p className="px-2 py-2 text-[11px] text-muted-foreground" role="status">
++                {t("command.searching")}
++              </p>
++            ) : null}
+           </CommandList>
+         </Command>
+       </DialogContent>
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index f563823..d6c1ff6 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -1,4 +1,4 @@
+-import { type JSX, useEffect, useState } from "react";
++import { type JSX, useEffect, useRef, useState } from "react";
+ import { useTranslation } from "react-i18next";
+ import {
+   activePath,
+@@ -15,7 +15,7 @@ import {
+   type ProjectUpdateInput,
+   type ProviderKeyDto,
+ } from "@ai-hub/shared";
+-import { ChatComposer } from "@/components/chat/chat-composer";
++import { ChatComposer, type SlashCommandId } from "@/components/chat/chat-composer";
+ import { ConversationTree } from "@/components/chat/conversation-tree";
+ import { MessageBubble } from "@/components/chat/message-bubble";
+ import { PacketPanel } from "@/components/chat/packet-panel";
+@@ -23,7 +23,16 @@ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import { ScrollArea } from "@/components/ui/scroll-area";
+ 
+-const PROJECT_COLORS = ["#64748b", "#2563eb", "#7c3aed", "#db2777", "#dc2626", "#d97706", "#16a34a", "#0891b2"] as const;
++const PROJECT_COLORS = [
++  "#64748b",
++  "#2563eb",
++  "#7c3aed",
++  "#db2777",
++  "#dc2626",
++  "#d97706",
++  "#16a34a",
++  "#0891b2",
++] as const;
+ 
+ export function HomeView({
+   project,
+@@ -80,6 +89,7 @@ export function HomeView({
+   onImportPacket,
+   onApplyPacket,
+   onClearPacket,
++  onOpenCaps,
+ }: {
+   project: ProjectDto | null;
+   importedInbox: boolean;
+@@ -135,35 +145,49 @@ export function HomeView({
+   onImportPacket: () => Promise<void>;
+   onApplyPacket: (packetId: string) => Promise<void>;
+   onClearPacket: () => Promise<void>;
++  onOpenCaps: () => void;
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const [title, setTitle] = useState("");
+   const [draft, setDraft] = useState("");
+   const [editing, setEditing] = useState(false);
+   const [treeOpen, setTreeOpen] = useState(false);
++  const [packetOpen, setPacketOpen] = useState(false);
+   const [tagDraft, setTagDraft] = useState("");
+   const [projectName, setProjectName] = useState(project?.name ?? "");
+   const [projectColor, setProjectColor] = useState<string | null>(project?.color ?? null);
+-  const [projectInstructions, setProjectInstructions] = useState(project?.instructions ?? "");
+-  const [preferredProvider, setPreferredProvider] = useState(project?.preferredProvider ?? "");
++  const [projectInstructions, setProjectInstructions] = useState(
++    project?.instructions ?? "",
++  );
++  const [preferredProvider, setPreferredProvider] = useState(
++    project?.preferredProvider ?? "",
++  );
+   const [preferredModel, setPreferredModel] = useState(project?.preferredModel ?? "");
+-  const selectedKey = providerKeys.find((key) => key.id === selectedKeyId) ?? providerKeys[0] ?? null;
++  const modelSelectRef = useRef<HTMLSelectElement>(null);
++  const customModelRef = useRef<HTMLInputElement>(null);
++  const selectedKey =
++    providerKeys.find((key) => key.id === selectedKeyId) ?? providerKeys[0] ?? null;
+   const providerSlug = selectedKey?.providerSlug ?? null;
+   const models = providerSlug ? catalogModelsForProvider(providerSlug) : [];
+   const selectedCatalog: CatalogModel | null =
+     providerSlug && selectedModel ? findCatalogModel(selectedModel, providerSlug) : null;
+-  const hasKey = selectedKeyId !== null && providerKeys.some((key) => key.id === selectedKeyId);
++  const hasKey =
++    selectedKeyId !== null && providerKeys.some((key) => key.id === selectedKeyId);
+   const busy = streaming || sending;
+   const path = activePath(messages);
+   const activeIds = new Set(path.map((item) => item.id));
+   const leaf = path[path.length - 1] ?? null;
+-  const selectedConversation = conversations.find((item) => item.id === selectedConversationId) ?? null;
++  const selectedConversation =
++    conversations.find((item) => item.id === selectedConversationId) ?? null;
+   const providerSlugs = [...new Set(providerKeys.map((item) => item.providerSlug))];
+-  const preferredModels = preferredProvider ? catalogModelsForProvider(preferredProvider) : [];
++  const preferredModels = preferredProvider
++    ? catalogModelsForProvider(preferredProvider)
++    : [];
+ 
+   useEffect(() => {
+     setEditing(false);
+     setTreeOpen(false);
++    setPacketOpen(false);
+     setTagDraft("");
+     setDraft("");
+     onComposerDraft("");
+@@ -177,12 +201,36 @@ export function HomeView({
+     setPreferredModel(project?.preferredModel ?? "");
+   }, [project]);
+ 
++  const runSlashCommand = (command: SlashCommandId): void => {
++    switch (command) {
++      case "model":
++        (customModelRef.current ?? modelSelectRef.current)?.focus();
++        return;
++      case "clear":
++        void onCreateConversation(t("workspace.untitledChat"));
++        return;
++      case "compact":
++        onToggleCompact(!compactHistory);
++        return;
++      case "packet":
++        setPacketOpen(true);
++        return;
++      case "cap":
++        onOpenCaps();
++        return;
++    }
++  };
++
+   return (
+     <div className="flex h-full min-h-0">
+       <section className="flex w-64 shrink-0 flex-col border-r">
+         <div className="border-b p-3">
+           <h1 className="truncate text-sm font-semibold">
+-            {project ? project.name : importedInbox ? t("workspace.importedInbox") : t("workspace.inbox")}
++            {project
++              ? project.name
++              : importedInbox
++                ? t("workspace.importedInbox")
++                : t("workspace.inbox")}
+           </h1>
+           <p className="text-muted-foreground">
+             {project
+@@ -207,10 +255,14 @@ export function HomeView({
+                 <Button
+                   key={conversation.id}
+                   type="button"
+-                  variant={selectedConversationId === conversation.id ? "secondary" : "ghost"}
++                  variant={
++                    selectedConversationId === conversation.id ? "secondary" : "ghost"
++                  }
+                   className="h-8 w-full justify-start truncate"
+                   data-testid="conversation-item"
+-                  aria-current={selectedConversationId === conversation.id ? "true" : undefined}
++                  aria-current={
++                    selectedConversationId === conversation.id ? "true" : undefined
++                  }
+                   onClick={() => onSelectConversation(conversation.id)}
+                 >
+                   {conversation.title}
+@@ -233,7 +285,9 @@ export function HomeView({
+                 void onSetTags(names).then(() => setTagDraft(""));
+               }}
+             >
+-              <p className="px-1 text-[11px] text-muted-foreground">{t("workspace.tags")}</p>
++              <p className="px-1 text-[11px] text-muted-foreground">
++                {t("workspace.tags")}
++              </p>
+               <div className="flex flex-wrap gap-1 px-1">
+                 {selectedConversation.tags.map((tag) => (
+                   <Button
+@@ -244,7 +298,9 @@ export function HomeView({
+                     className="h-6 px-2 text-[11px]"
+                     aria-label={t("workspace.tagRemove", { tag })}
+                     onClick={() => {
+-                      void onSetTags(selectedConversation.tags.filter((item) => item !== tag));
++                      void onSetTags(
++                        selectedConversation.tags.filter((item) => item !== tag),
++                      );
+                     }}
+                   >
+                     {tag} ├ù
+@@ -258,7 +314,12 @@ export function HomeView({
+                 aria-label={t("workspace.tagPlaceholder")}
+                 data-testid="conversation-tag"
+               />
+-              <Button type="submit" size="sm" className="h-7" data-testid="conversation-tag-add">
++              <Button
++                type="submit"
++                size="sm"
++                className="h-7"
++                data-testid="conversation-tag-add"
++              >
+                 {t("workspace.tagAdd")}
+               </Button>
+             </form>
+@@ -275,9 +336,12 @@ export function HomeView({
+                 void onSaveProject({
+                   name,
+                   color: projectColor,
+-                  instructions: projectInstructions.trim().length > 0 ? projectInstructions : null,
+-                  preferredModel: preferredModel.trim().length > 0 ? preferredModel.trim() : null,
+-                  preferredProvider: preferredProvider.trim().length > 0 ? preferredProvider.trim() : null,
++                  instructions:
++                    projectInstructions.trim().length > 0 ? projectInstructions : null,
++                  preferredModel:
++                    preferredModel.trim().length > 0 ? preferredModel.trim() : null,
++                  preferredProvider:
++                    preferredProvider.trim().length > 0 ? preferredProvider.trim() : null,
+                 });
+               }}
+             >
+@@ -364,7 +428,11 @@ export function HomeView({
+                 className="h-7"
+                 data-testid="project-delete"
+                 onClick={() => {
+-                  if (window.confirm(t("workspace.deleteProjectConfirm", { name: project.name }))) {
++                  if (
++                    window.confirm(
++                      t("workspace.deleteProjectConfirm", { name: project.name }),
++                    )
++                  ) {
+                     void onRemoveProject();
+                   }
+                 }}
+@@ -375,28 +443,33 @@ export function HomeView({
+           ) : null}
+         </ScrollArea>
+         {importedInbox ? null : (
+-        <form
+-          className="flex flex-col gap-1 border-t p-2"
+-          onSubmit={(event) => {
+-            event.preventDefault();
+-            const next = title.trim();
+-            if (!next) {
+-              return;
+-            }
+-            void onCreateConversation(next).then(() => setTitle(""));
+-          }}
+-        >
+-          <Input
+-            value={title}
+-            onChange={(event) => setTitle(event.target.value)}
+-            placeholder={t("workspace.conversationPlaceholder")}
+-            aria-label={t("workspace.conversationPlaceholder")}
+-            data-testid="workspace-new-conversation-title"
+-          />
+-          <Button type="submit" size="sm" className="h-7" data-testid="workspace-new-conversation">
+-            {t("workspace.newConversation")}
+-          </Button>
+-        </form>
++          <form
++            className="flex flex-col gap-1 border-t p-2"
++            onSubmit={(event) => {
++              event.preventDefault();
++              const next = title.trim();
++              if (!next) {
++                return;
++              }
++              void onCreateConversation(next).then(() => setTitle(""));
++            }}
++          >
++            <Input
++              value={title}
++              onChange={(event) => setTitle(event.target.value)}
++              placeholder={t("workspace.conversationPlaceholder")}
++              aria-label={t("workspace.conversationPlaceholder")}
++              data-testid="workspace-new-conversation-title"
++            />
++            <Button
++              type="submit"
++              size="sm"
++              className="h-7"
++              data-testid="workspace-new-conversation"
++            >
++              {t("workspace.newConversation")}
++            </Button>
++          </form>
+         )}
+       </section>
+       <section className="flex min-w-0 flex-1 flex-col">
+@@ -427,6 +500,7 @@ export function HomeView({
+                     <span className="text-muted-foreground">{t("workspace.model")}</span>
+                     {providerSlug === "custom" ? (
+                       <Input
++                        ref={customModelRef}
+                         className="h-8 w-52"
+                         value={selectedModel}
+                         onChange={(event) => onSelectModel(event.target.value)}
+@@ -435,6 +509,7 @@ export function HomeView({
+                       />
+                     ) : (
+                       <select
++                        ref={modelSelectRef}
+                         className="h-8 max-w-72 rounded-md border bg-background px-2 text-sm"
+                         value={selectedModel}
+                         onChange={(event) => onSelectModel(event.target.value)}
+@@ -461,7 +536,9 @@ export function HomeView({
+                     </span>
+                   ) : null}
+                   <label className="flex items-center gap-1">
+-                    <span className="text-muted-foreground">{t("workspace.temperature")}</span>
++                    <span className="text-muted-foreground">
++                      {t("workspace.temperature")}
++                    </span>
+                     <Input
+                       className="h-8 w-16"
+                       type="number"
+@@ -479,7 +556,9 @@ export function HomeView({
+                     />
+                   </label>
+                   <label className="flex items-center gap-1">
+-                    <span className="text-muted-foreground">{t("workspace.maxTokens")}</span>
++                    <span className="text-muted-foreground">
++                      {t("workspace.maxTokens")}
++                    </span>
+                     <Input
+                       className="h-8 w-20"
+                       type="number"
+@@ -504,12 +583,18 @@ export function HomeView({
+               )}
+               <div className="ml-auto flex flex-wrap items-center gap-1">
+                 {conversationCost ? (
+-                  <span className="text-[11px] text-muted-foreground" data-testid="cost-conversation">
++                  <span
++                    className="text-[11px] text-muted-foreground"
++                    data-testid="cost-conversation"
++                  >
+                     {t("workspace.cost.conversation", { usd: conversationCost })}
+                   </span>
+                 ) : null}
+                 {projectCost ? (
+-                  <span className="text-[11px] text-muted-foreground" data-testid="cost-project">
++                  <span
++                    className="text-[11px] text-muted-foreground"
++                    data-testid="cost-project"
++                  >
+                     {t("workspace.cost.project", { usd: projectCost })}
+                   </span>
+                 ) : null}
+@@ -534,13 +619,20 @@ export function HomeView({
+                   onImport={onImportPacket}
+                   onApply={onApplyPacket}
+                   onClear={onClearPacket}
++                  open={packetOpen}
++                  onOpenChange={setPacketOpen}
+                 />
+                 {packetPreview?.estimatedCostUsd ? (
+-                  <span className="text-[11px] text-muted-foreground" data-testid="send-estimate">
++                  <span
++                    className="text-[11px] text-muted-foreground"
++                    data-testid="send-estimate"
++                  >
+                     {t("workspace.estimate", { usd: packetPreview.estimatedCostUsd })}
+                   </span>
+                 ) : packetPreview && selectedCatalog === null ? (
+-                  <span className="text-[11px] text-muted-foreground">{t("workspace.estimate.none")}</span>
++                  <span className="text-[11px] text-muted-foreground">
++                    {t("workspace.estimate.none")}
++                  </span>
+                 ) : null}
+                 <Button
+                   type="button"
+@@ -599,12 +691,19 @@ export function HomeView({
+               </div>
+             </header>
+             {modelSwitchNotice ? (
+-              <p className="border-b px-3 py-1 text-[11px] text-muted-foreground" role="status" data-testid="model-switch-notice">
++              <p
++                className="border-b px-3 py-1 text-[11px] text-muted-foreground"
++                role="status"
++                data-testid="model-switch-notice"
++              >
+                 {t("workspace.modelSwitch", { model: selectedModel })}
+               </p>
+             ) : null}
+             {packetPreview?.overflow ? (
+-              <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2 text-[12px]" role="status">
++              <div
++                className="flex flex-wrap items-center gap-2 border-b px-3 py-2 text-[12px]"
++                role="status"
++              >
+                 <p>
+                   {t("workspace.overflow", {
+                     window: packetPreview.contextWindow,
+@@ -622,107 +721,130 @@ export function HomeView({
+                 </Button>
+               </div>
+             ) : compactHistory ? (
+-              <p className="border-b px-3 py-1 text-[11px] text-muted-foreground">{t("workspace.compact.on")}</p>
++              <p
++                className="border-b px-3 py-1 text-[11px] text-muted-foreground"
++                data-testid="compact-enabled"
++              >
++                {t("workspace.compact.on")}
++              </p>
+             ) : null}
+             {packetPreview?.capBlocked ? (
+-              <p className="border-b px-3 py-1 text-[12px] text-destructive" role="status" data-testid="cap-block">
+-                {t("workspace.cap.block", { scope: t(`caps.scope.${packetPreview.capBlocked}`) })}
++              <p
++                className="border-b px-3 py-1 text-[12px] text-destructive"
++                role="status"
++                data-testid="cap-block"
++              >
++                {t("workspace.cap.block", {
++                  scope: t(`caps.scope.${packetPreview.capBlocked}`),
++                })}
+               </p>
+             ) : packetPreview && packetPreview.capWarnings.length > 0 ? (
+-              <p className="border-b px-3 py-1 text-[12px]" role="status" data-testid="cap-warn">
+-                {t("workspace.cap.warn", { scope: t(`caps.scope.${packetPreview.capWarnings[0]}`) })}
++              <p
++                className="border-b px-3 py-1 text-[12px]"
++                role="status"
++                data-testid="cap-warn"
++              >
++                {t("workspace.cap.warn", {
++                  scope: t(`caps.scope.${packetPreview.capWarnings[0]}`),
++                })}
+               </p>
+             ) : null}
+             {exportNotice ? (
+-              <p className="border-b px-3 py-1 text-[11px] text-muted-foreground" role="status">
++              <p
++                className="border-b px-3 py-1 text-[11px] text-muted-foreground"
++                role="status"
++              >
+                 {exportNotice}
+               </p>
+             ) : null}
+             <div className="flex min-h-0 flex-1">
+-            <div className="flex min-w-0 flex-1 flex-col">
+-            <ScrollArea className="flex-1 p-4">
+-              {path.length === 0 ? (
+-                <p className="text-muted-foreground">{t("workspace.noMessages")}</p>
+-              ) : (
+-                <ol className="flex flex-col gap-2" aria-live="polite">
+-                  {path.map((message, index) => (
+-                    <MessageBubble
+-                      key={message.id}
+-                      message={message}
+-                      messages={messages}
+-                      isLast={index === path.length - 1}
+-                      busy={busy}
+-                      hasKey={hasKey}
+-                      onRegenerate={() => {
+-                        void onRegenerate(message.id);
+-                      }}
+-                      onContinue={() => {
+-                        void onContinue();
+-                      }}
+-                      onEdit={async (content) => {
+-                        await onEditUser(message.id, content);
+-                      }}
+-                      onEditingChange={setEditing}
+-                      onActivateSibling={(id) => {
+-                        void onActivate(id);
+-                      }}
+-                      onPin={(pinned) => {
+-                        void onPin(message.id, pinned);
+-                      }}
+-                    />
+-                  ))}
+-                </ol>
+-              )}
+-            </ScrollArea>
+-            <label className="flex flex-col gap-1 border-t px-3 py-2 text-[12px]">
+-              <span className="text-muted-foreground">{t("workspace.extraSystem")}</span>
+-              <textarea
+-                className="min-h-[2.5rem] resize-y rounded-md border bg-background px-2 py-1 text-[13px]"
+-                value={extraSystem}
+-                onChange={(event) => onSelectExtraSystem(event.target.value)}
+-                aria-label={t("workspace.extraSystem")}
+-              />
+-            </label>
+-            <ChatComposer
+-              key={selectedConversationId}
+-              value={draft}
+-              onChange={(value) => {
+-                setDraft(value);
+-                onComposerDraft(value);
+-              }}
+-              streaming={streaming}
+-              sending={sending}
+-              disabled={!hasKey || editing}
+-              onSend={() => {
+-                const next = draft.trim();
+-                if (!next) {
+-                  return;
+-                }
+-                void onSend(next).then((ok) => {
+-                  if (ok) {
+-                    setDraft("");
+-                    onComposerDraft("");
+-                  }
+-                });
+-              }}
+-              onAbort={() => {
+-                void onAbort();
+-              }}
+-            />
+-            </div>
+-            {treeOpen ? (
+-              <ConversationTree
+-                messages={messages}
+-                activeIds={activeIds}
+-                labels={branchLabels}
+-                activeBranchId={leaf?.branchId ?? null}
+-                busy={busy}
+-                onJump={(id) => {
+-                  void onActivate(id);
+-                }}
+-                onRename={onRenameBranch}
+-              />
+-            ) : null}
++              <div className="flex min-w-0 flex-1 flex-col">
++                <ScrollArea className="flex-1 p-4">
++                  {path.length === 0 ? (
++                    <p className="text-muted-foreground">{t("workspace.noMessages")}</p>
++                  ) : (
++                    <ol className="flex flex-col gap-2" aria-live="polite">
++                      {path.map((message, index) => (
++                        <MessageBubble
++                          key={message.id}
++                          message={message}
++                          messages={messages}
++                          isLast={index === path.length - 1}
++                          busy={busy}
++                          hasKey={hasKey}
++                          onRegenerate={() => {
++                            void onRegenerate(message.id);
++                          }}
++                          onContinue={() => {
++                            void onContinue();
++                          }}
++                          onEdit={async (content) => {
++                            await onEditUser(message.id, content);
++                          }}
++                          onEditingChange={setEditing}
++                          onActivateSibling={(id) => {
++                            void onActivate(id);
++                          }}
++                          onPin={(pinned) => {
++                            void onPin(message.id, pinned);
++                          }}
++                        />
++                      ))}
++                    </ol>
++                  )}
++                </ScrollArea>
++                <label className="flex flex-col gap-1 border-t px-3 py-2 text-[12px]">
++                  <span className="text-muted-foreground">
++                    {t("workspace.extraSystem")}
++                  </span>
++                  <textarea
++                    className="min-h-[2.5rem] resize-y rounded-md border bg-background px-2 py-1 text-[13px]"
++                    value={extraSystem}
++                    onChange={(event) => onSelectExtraSystem(event.target.value)}
++                    aria-label={t("workspace.extraSystem")}
++                  />
++                </label>
++                <ChatComposer
++                  key={selectedConversationId}
++                  value={draft}
++                  onChange={(value) => {
++                    setDraft(value);
++                    onComposerDraft(value);
++                  }}
++                  streaming={streaming}
++                  sending={sending}
++                  disabled={!hasKey || editing}
++                  onSend={() => {
++                    const next = draft.trim();
++                    if (!next) {
++                      return;
++                    }
++                    void onSend(next).then((ok) => {
++                      if (ok) {
++                        setDraft("");
++                        onComposerDraft("");
++                      }
++                    });
++                  }}
++                  onAbort={() => {
++                    void onAbort();
++                  }}
++                  onSlashCommand={runSlashCommand}
++                />
++              </div>
++              {treeOpen ? (
++                <ConversationTree
++                  messages={messages}
++                  activeIds={activeIds}
++                  labels={branchLabels}
++                  activeBranchId={leaf?.branchId ?? null}
++                  busy={busy}
++                  onJump={(id) => {
++                    void onActivate(id);
++                  }}
++                  onRename={onRenameBranch}
++                />
++              ) : null}
+             </div>
+           </>
+         ) : (
+@@ -736,7 +858,13 @@ export function HomeView({
+               {error}
+             </p>
+             {showAllowOnce ? (
+-              <Button type="button" size="sm" data-testid="cap-allow-once" onClick={onAllowOnce} disabled={busy}>
++              <Button
++                type="button"
++                size="sm"
++                data-testid="cap-allow-once"
++                onClick={onAllowOnce}
++                disabled={busy}
++              >
+                 {t("workspace.cap.allowOnce")}
+               </Button>
+             ) : null}
+diff --git a/apps/desktop/src/renderer/src/components/layout/keyboard-shortcuts.tsx b/apps/desktop/src/renderer/src/components/layout/keyboard-shortcuts.tsx
+new file mode 100644
+index 0000000..43876d0
+--- /dev/null
++++ b/apps/desktop/src/renderer/src/components/layout/keyboard-shortcuts.tsx
+@@ -0,0 +1,57 @@
++import { type JSX } from "react";
++import { useTranslation } from "react-i18next";
++import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
++
++export function KeyboardShortcutsDialog({
++  open,
++  onOpenChange,
++}: {
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
++}): JSX.Element {
++  const { t } = useTranslation();
++  const modifier = window.hub.platform === "darwin" ? "Ôîÿ" : "Ctrl";
++  const rows = [
++    [`${modifier}+K`, t("shortcuts.palette")],
++    [`${modifier}+N`, t("shortcuts.newChat")],
++    [`${modifier}+Shift+N`, t("shortcuts.newProject")],
++    [`${modifier}+/`, t("shortcuts.cheatsheet")],
++    ["Enter", t("shortcuts.send")],
++    ["Shift+Enter", t("shortcuts.newline")],
++    ["Esc", t("shortcuts.stop")],
++  ] as const;
++  const slashCommands = ["model", "clear", "compact", "packet", "cap"] as const;
++
++  return (
++    <Dialog open={open} onOpenChange={onOpenChange}>
++      <DialogContent data-testid="shortcuts-dialog">
++        <DialogHeader>
++          <DialogTitle>{t("shortcuts.title")}</DialogTitle>
++        </DialogHeader>
++        <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-[13px]">
++          {rows.map(([keys, label]) => (
++            <div key={keys} className="contents">
++              <kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-[11px]">
++                {keys}
++              </kbd>
++              <span>{label}</span>
++            </div>
++          ))}
++        </div>
++        <section className="border-t pt-3">
++          <h3 className="mb-2 text-[12px] font-medium">{t("shortcuts.slashTitle")}</h3>
++          <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-[13px]">
++            {slashCommands.map((command) => (
++              <div key={command} className="contents">
++                <kbd className="rounded border bg-muted px-1.5 py-0.5 font-mono text-[11px]">
++                  /{command}
++                </kbd>
++                <span>{t(`slash.${command}.description`)}</span>
++              </div>
++            ))}
++          </div>
++        </section>
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+index 073ccf2..ab32457 100644
+--- a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+@@ -1,4 +1,4 @@
+-import { type FormEvent, type JSX, useEffect, useState } from "react";
++import { type FormEvent, type JSX, useEffect, useRef, useState } from "react";
+ import { useTranslation } from "react-i18next";
+ import type {
+   AppLocale,
+@@ -14,8 +14,13 @@ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import { persistLocale } from "@/lib/i18n";
+ import { useTheme } from "@/lib/theme";
++import type { SettingsSection } from "./types";
+ 
+-export function SettingsView(): JSX.Element {
++export function SettingsView({
++  focusSection = "general",
++}: {
++  focusSection?: SettingsSection;
++}): JSX.Element {
+   const { t, i18n } = useTranslation();
+   const { theme, setTheme } = useTheme();
+   const [providers, setProviders] = useState<ProviderDto[]>([]);
+@@ -36,6 +41,23 @@ export function SettingsView(): JSX.Element {
+   const [prefs, setPrefs] = useState<AppPrefs | null>(null);
+   const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null);
+   const [checkingUpdate, setCheckingUpdate] = useState(false);
++  const generalRef = useRef<HTMLHeadingElement>(null);
++  const providerRef = useRef<HTMLSelectElement>(null);
++  const capRef = useRef<HTMLInputElement>(null);
++
++  useEffect(() => {
++    const handle = window.setTimeout(() => {
++      const target =
++        focusSection === "providers"
++          ? providerRef.current
++          : focusSection === "caps"
++            ? capRef.current
++            : generalRef.current;
++      target?.scrollIntoView({ block: "center" });
++      target?.focus();
++    }, 0);
++    return () => window.clearTimeout(handle);
++  }, [focusSection]);
+ 
+   const reloadKeys = (): void => {
+     void window.hub.secrets
+@@ -135,7 +157,9 @@ export function SettingsView(): JSX.Element {
+   return (
+     <div className="mx-auto flex w-full max-w-lg flex-col gap-6 p-6">
+       <div>
+-        <h1 className="text-base font-semibold">{t("settings.title")}</h1>
++        <h1 ref={generalRef} tabIndex={-1} className="text-base font-semibold">
++          {t("settings.title")}
++        </h1>
+         <p className="mt-1 text-muted-foreground">{t("settings.hint")}</p>
+       </div>
+       <section className="flex flex-col gap-2">
+@@ -179,6 +203,7 @@ export function SettingsView(): JSX.Element {
+           <label className="flex flex-col gap-1 text-[12px]">
+             {t("secrets.provider")}
+             <select
++              ref={providerRef}
+               className="h-8 rounded-md border border-input bg-background px-2 text-[13px]"
+               value={providerSlug}
+               onChange={(event) => setProviderSlug(event.target.value)}
+@@ -222,7 +247,10 @@ export function SettingsView(): JSX.Element {
+           {keys.map((key) => {
+             const result = testResults[key.id];
+             return (
+-              <li key={key.id} className="flex flex-col gap-1 rounded-md border px-2 py-1">
++              <li
++                key={key.id}
++                className="flex flex-col gap-1 rounded-md border px-2 py-1"
++              >
+                 <div className="flex items-center justify-between gap-2">
+                   <span>
+                     {key.providerSlug} ┬À {key.label} ┬À {key.maskedKey}
+@@ -268,7 +296,10 @@ export function SettingsView(): JSX.Element {
+                   <p className="text-[11px] text-muted-foreground" role="status">
+                     {result.ok
+                       ? t("secrets.testOk", { ms: result.latencyMs })
+-                      : t("secrets.testFail", { code: result.errorCode ?? "unknown", ms: result.latencyMs })}
++                      : t("secrets.testFail", {
++                          code: result.errorCode ?? "unknown",
++                          ms: result.latencyMs,
++                        })}
+                   </p>
+                 ) : null}
+               </li>
+@@ -294,7 +325,8 @@ export function SettingsView(): JSX.Element {
+             });
+             if (
+               nextCaps.some(
+-                (item) => item.limitUsd !== null && !/^\d+(\.\d{1,6})?$/.test(item.limitUsd),
++                (item) =>
++                  item.limitUsd !== null && !/^\d+(\.\d{1,6})?$/.test(item.limitUsd),
+               )
+             ) {
+               setError(t("workspace.error.generic"));
+@@ -320,9 +352,12 @@ export function SettingsView(): JSX.Element {
+             <label key={scope} className="flex flex-col gap-1 text-[12px]">
+               {t(`caps.scope.${scope}`)}
+               <Input
++                ref={scope === "request" ? capRef : undefined}
+                 value={caps[scope]}
+                 placeholder={t("caps.unlimited")}
+-                onChange={(event) => setCaps((current) => ({ ...current, [scope]: event.target.value }))}
++                onChange={(event) =>
++                  setCaps((current) => ({ ...current, [scope]: event.target.value }))
++                }
+                 data-testid={`spend-cap-${scope}`}
+                 inputMode="decimal"
+               />
+@@ -388,7 +423,9 @@ export function SettingsView(): JSX.Element {
+             data-testid="updates-status"
+             data-status={updateResult.status}
+           >
+-            {t(`updates.status.${updateResult.status}`, { version: updateResult.version ?? "ÔÇö" })}
++            {t(`updates.status.${updateResult.status}`, {
++              version: updateResult.version ?? "ÔÇö",
++            })}
+           </p>
+         ) : prefs?.lastUpdateStatus && prefs.lastUpdateStatus !== "idle" ? (
+           <p
+diff --git a/apps/desktop/src/renderer/src/components/layout/sidebar.tsx b/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
+index 2cec7c8..e10f73d 100644
+--- a/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/sidebar.tsx
+@@ -94,7 +94,9 @@ export function Sidebar({
+           {searchQuery.trim().length >= 2 ? (
+             <ul className="mt-1 flex flex-col gap-0.5">
+               {searchHits.length === 0 ? (
+-                <li className="px-1 py-1 text-[11px] text-muted-foreground">{t("workspace.searchEmpty")}</li>
++                <li className="px-1 py-1 text-[11px] text-muted-foreground">
++                  {t("workspace.searchEmpty")}
++                </li>
+               ) : (
+                 searchHits.map((hit) => (
+                   <li key={`${hit.conversationId}:${hit.messageId ?? "title"}`}>
+@@ -106,7 +108,9 @@ export function Sidebar({
+                       onClick={() => onOpenSearchHit(hit)}
+                     >
+                       <span className="font-medium">{hit.conversationTitle}</span>
+-                      <span className="mt-0.5 block text-muted-foreground">{hit.snippet}</span>
++                      <span className="mt-0.5 block text-muted-foreground">
++                        {hit.snippet}
++                      </span>
+                     </Button>
+                   </li>
+                 ))
+@@ -120,9 +124,18 @@ export function Sidebar({
+         <div className="mt-1 flex flex-col gap-0.5">
+           <Button
+             type="button"
+-            variant={view === "home" && selectedProjectId === null && !importedInbox ? "secondary" : "ghost"}
++            variant={
++              view === "home" && selectedProjectId === null && !importedInbox
++                ? "secondary"
++                : "ghost"
++            }
+             className="h-8 w-full justify-start gap-2 truncate"
+             data-testid="inbox-avulsas"
++            aria-current={
++              view === "home" && selectedProjectId === null && !importedInbox
++                ? "page"
++                : undefined
++            }
+             onClick={() => {
+               onSelectProject(null);
+               onChange("home");
+@@ -133,9 +146,18 @@ export function Sidebar({
+           </Button>
+           <Button
+             type="button"
+-            variant={view === "home" && selectedProjectId === null && importedInbox ? "secondary" : "ghost"}
++            variant={
++              view === "home" && selectedProjectId === null && importedInbox
++                ? "secondary"
++                : "ghost"
++            }
+             className="h-8 w-full justify-start gap-2 truncate"
+             data-testid="inbox-imported"
++            aria-current={
++              view === "home" && selectedProjectId === null && importedInbox
++                ? "page"
++                : undefined
++            }
+             onClick={() => {
+               onSelectImportedInbox();
+               onChange("home");
+@@ -145,7 +167,9 @@ export function Sidebar({
+             {t("workspace.importedInbox")}
+           </Button>
+           {projects.length === 0 ? (
+-            <p className="px-2 py-1 text-[11px] text-muted-foreground">{t("empty.body")}</p>
++            <p className="px-2 py-1 text-[11px] text-muted-foreground">
++              {t("empty.body")}
++            </p>
+           ) : null}
+           {projects.map((project) => (
+             <Button
+@@ -154,6 +178,9 @@ export function Sidebar({
+               variant={selectedProjectId === project.id ? "secondary" : "ghost"}
+               className="h-8 w-full justify-start gap-2 truncate"
+               data-testid="project-item"
++              aria-current={
++                view === "home" && selectedProjectId === project.id ? "page" : undefined
++              }
+               onClick={() => {
+                 onSelectProject(project.id);
+                 onChange("home");
+@@ -184,7 +211,12 @@ export function Sidebar({
+           aria-label={t("workspace.projectPlaceholder")}
+           data-testid="workspace-new-project-name"
+         />
+-        <Button type="submit" size="sm" className="h-7 gap-1" data-testid="workspace-new-project">
++        <Button
++          type="submit"
++          size="sm"
++          className="h-7 gap-1"
++          data-testid="workspace-new-project"
++        >
+           <Plus className="h-3 w-3" />
+           {t("workspace.newProject")}
+         </Button>
+diff --git a/apps/desktop/src/renderer/src/components/layout/status-bar.tsx b/apps/desktop/src/renderer/src/components/layout/status-bar.tsx
+index 80de5b9..ad25369 100644
+--- a/apps/desktop/src/renderer/src/components/layout/status-bar.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/status-bar.tsx
+@@ -13,9 +13,16 @@ function healthState(summary: HealthSummaryDto): "ok" | "down" | "unknown" {
+   return "unknown";
+ }
+ 
+-export function StatusBar({ health }: { health: HealthSummaryDto[] }): JSX.Element {
++export function StatusBar({
++  health,
++  onOpenShortcuts,
++}: {
++  health: HealthSummaryDto[];
++  onOpenShortcuts: () => void;
++}): JSX.Element {
+   const { t } = useTranslation();
+   const { theme } = useTheme();
++  const modifier = window.hub.platform === "darwin" ? "Ôîÿ" : "Ctrl";
+ 
+   return (
+     <footer className="flex h-6 shrink-0 items-center justify-between gap-3 border-t bg-background px-3 text-[11px] text-muted-foreground">
+@@ -29,16 +36,30 @@ export function StatusBar({ health }: { health: HealthSummaryDto[] }): JSX.Eleme
+                   provider: item.providerSlug,
+                   state: t(`status.health.${state}`),
+                   latency:
+-                    item.lastLatencyMs === null ? "" : t("status.health.latency", { ms: item.lastLatencyMs }),
++                    item.lastLatencyMs === null
++                      ? ""
++                      : t("status.health.latency", { ms: item.lastLatencyMs }),
+                   errors:
+                     item.sampleCount === 0
+                       ? ""
+-                      : t("status.health.errors", { pct: Math.round(item.errorRate * 100) }),
++                      : t("status.health.errors", {
++                          pct: Math.round(item.errorRate * 100),
++                        }),
+                 });
+               })
+               .join(" ┬À ")}
+       </span>
+-      <span>{t("status.theme", { theme: t(`theme.${theme}`) })}</span>
++      <span className="flex shrink-0 items-center gap-3">
++        <button
++          type="button"
++          className="rounded px-1 hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
++          data-testid="shortcuts-open"
++          onClick={onOpenShortcuts}
++        >
++          {t("shortcuts.status", { modifier })}
++        </button>
++        <span>{t("status.theme", { theme: t(`theme.${theme}`) })}</span>
++      </span>
+     </footer>
+   );
+ }
+diff --git a/apps/desktop/src/renderer/src/components/layout/types.ts b/apps/desktop/src/renderer/src/components/layout/types.ts
+index 4a0e23c..892ea55 100644
+--- a/apps/desktop/src/renderer/src/components/layout/types.ts
++++ b/apps/desktop/src/renderer/src/components/layout/types.ts
+@@ -1 +1,3 @@
+ export type AppView = "home" | "settings" | "debug" | "import";
++
++export type SettingsSection = "general" | "providers" | "caps";
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 11f016e..c950365 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -190,6 +190,32 @@
+   "fallback.estimate": "Estimated ${{usd}} on {{suggested}}",
+   "command.debug": "Open debug",
+   "command.import": "Open Import Hub",
++  "command.exportActive": "Export active branch",
++  "command.exportTree": "Export tree JSON",
++  "command.providers": "Manage providers",
++  "command.settings": "Open settings",
++  "command.shortcuts": "View keyboard shortcuts",
++  "command.unavailable": "unavailable now",
++  "command.searching": "Searching conversationsÔÇª",
++  "command.group.actions": "Actions",
++  "command.group.projects": "Projects",
++  "command.group.models": "Models",
++  "command.group.conversations": "Conversations and messages",
++  "shortcuts.title": "Keyboard shortcuts",
++  "shortcuts.status": "Shortcuts ┬À {{modifier}}+/",
++  "shortcuts.palette": "Open the Command Palette",
++  "shortcuts.newChat": "Create a conversation",
++  "shortcuts.newProject": "Focus project creation",
++  "shortcuts.cheatsheet": "Open this guide",
++  "shortcuts.send": "Send a message or run a slash command",
++  "shortcuts.newline": "Insert a new line",
++  "shortcuts.stop": "Stop the stream or close a dialog",
++  "shortcuts.slashTitle": "Composer slash commands",
++  "slash.model.description": "Focus the model selector",
++  "slash.clear.description": "Open a clean conversation without deleting this one",
++  "slash.compact.description": "Toggle compaction for the next send",
++  "slash.packet.description": "Open the context packet",
++  "slash.cap.description": "Open spend caps",
+   "workspace.sibling.prev": "Previous alternative",
+   "workspace.sibling.next": "Next alternative",
+   "workspace.sibling.count": "{{current}} / {{total}}",
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index 5bd49ac..84859ab 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -190,6 +190,32 @@
+   "fallback.estimate": "Estimado ${{usd}} em {{suggested}}",
+   "command.debug": "Abrir debug",
+   "command.import": "Abrir Import Hub",
++  "command.exportActive": "Exportar ramo ativo",
++  "command.exportTree": "Exportar ├írvore JSON",
++  "command.providers": "Gerenciar providers",
++  "command.settings": "Abrir configura├º├Áes",
++  "command.shortcuts": "Ver atalhos de teclado",
++  "command.unavailable": "indispon├¡vel agora",
++  "command.searching": "Buscando conversasÔÇª",
++  "command.group.actions": "A├º├Áes",
++  "command.group.projects": "Projetos",
++  "command.group.models": "Modelos",
++  "command.group.conversations": "Conversas e mensagens",
++  "shortcuts.title": "Atalhos de teclado",
++  "shortcuts.status": "Atalhos ┬À {{modifier}}+/",
++  "shortcuts.palette": "Abrir a Command Palette",
++  "shortcuts.newChat": "Criar uma conversa",
++  "shortcuts.newProject": "Focar a cria├º├úo de projeto",
++  "shortcuts.cheatsheet": "Abrir este guia",
++  "shortcuts.send": "Enviar mensagem ou executar slash command",
++  "shortcuts.newline": "Inserir nova linha",
++  "shortcuts.stop": "Interromper o stream ou fechar di├ílogo",
++  "shortcuts.slashTitle": "Slash commands do composer",
++  "slash.model.description": "Focar o seletor de modelo",
++  "slash.clear.description": "Abrir uma conversa limpa sem apagar esta",
++  "slash.compact.description": "Alternar compacta├º├úo no pr├│ximo envio",
++  "slash.packet.description": "Abrir o packet de contexto",
++  "slash.cap.description": "Abrir os tetos de gasto",
+   "workspace.sibling.prev": "Alternativa anterior",
+   "workspace.sibling.next": "Pr├│xima alternativa",
+   "workspace.sibling.count": "{{current}} / {{total}}",
+diff --git a/docs/ADR/ADR-W11-001-slash-commands-local-ui.md b/docs/ADR/ADR-W11-001-slash-commands-local-ui.md
+new file mode 100644
+index 0000000..eb4e363
+--- /dev/null
++++ b/docs/ADR/ADR-W11-001-slash-commands-local-ui.md
+@@ -0,0 +1,35 @@
++# ADR-W11-001-slash-commands-local-ui
++
++- **Status:** accepted
++- **Onda:** W11
++- **Data:** 2026-09-18
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++A Wave 11 pede slash commands no composer (`/model`, `/clear`, `/compact`, `/packet`, `/cap`). Se o Enter enviasse o texto ao modelo, o utilizador pagaria tokens e vazar├¡a inten├º├úo de UI para o provider.
++
++## Decis├úo
++
++Slash commands reconhecidos s├úo **a├º├Áes locais**. O composer intercepta `/` + id conhecido (sem espa├ºos) e chama um handler no renderer. O texto **n├úo** entra em `chat:send`.
++
++`/unknown` ou `/foo bar` continuam mensagem normal. `/clear` cria uma conversa nova; n├úo apaga o grafo.
++
++## Alternativas consideradas
++
++- **Enviar o slash ao modelo e interpretar a resposta:** custo oculto e sem determinismo.
++- **Palette-only, sem slash:** falha o sub-task do plano.
++
++## Consequ├¬ncias
++
++- Positivas: teclado-primeiro sem spend; e2e pode afirmar zero `message-user` ap├│s `/compact`.
++- Negativas: lista fechada nesta onda; skills/mentions (ondas posteriores) n├úo entram aqui.
++- Riscos aceitos: um slash com espa├ºo (`/model gpt`) vai para o modelo.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 11
++- `docs/reviews/W11/REVIEW.md`
++- `docs/ADR/ADR-W07-001-spend-caps-hard-stop.md`
+diff --git a/docs/ADR/ADR-W11-002-palette-reuses-w6-search.md b/docs/ADR/ADR-W11-002-palette-reuses-w6-search.md
+new file mode 100644
+index 0000000..3634d65
+--- /dev/null
++++ b/docs/ADR/ADR-W11-002-palette-reuses-w6-search.md
+@@ -0,0 +1,33 @@
++# ADR-W11-002-palette-reuses-w6-search
++
++- **Status:** accepted
++- **Onda:** W11
++- **Data:** 2026-09-18
++- **Deciders:** agent / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++O plano da W11 pede ÔÇ£paleta busca conversas/projetos (FTS)ÔÇØ. O ├¡ndice FTS5 continua vazio (ADR-W06-001). Implementar FTS agora seria popular plaintext no SQLite ou mudar a decis├úo de busca.
++
++## Decis├úo
++
++A Command Palette **reusa** `search:query` da W6 (decripta no main, O(n) local). Projetos filtrados no renderer pelo nome j├í vis├¡vel. Sem canal IPC novo. Sem popular `messages_fts`.
++
++## Alternativas consideradas
++
++- **Popular FTS5 com plaintext:** rejeitado (ADR-W06-001).
++- **Paleta sem busca de conversas:** falha o sub-task.
++
++## Consequ├¬ncias
++
++- Positivas: um caminho de busca; trust boundary intacto.
++- Negativas: a paleta herda a lat├¬ncia O(n) da W6.
++- Riscos aceitos: o texto ÔÇ£(FTS)ÔÇØ do plano fica como inten├º├úo futura; o DoD ├® teclado, n├úo o motor de ├¡ndice.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` Wave 11
++- `docs/ADR/ADR-W06-001-search-decrypt-not-plaintext-fts.md`
++- `docs/reviews/W11/REVIEW.md`
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index 7b8d04b..93dfbe9 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -80,3 +80,5 @@ N├úo escrever ADR de detalhe cosm├®tica. Se mexe em seguran├ºa, custo, provider
+ | [ADR-W10-001](./ADR-W10-001-portable-packet-json-v1.md) | W10 | Envelope `.aihub-packet.json` v1 | accepted |
+ | [ADR-W10-002](./ADR-W10-002-context-packets-apply.md) | W10 | Persist├¬ncia, apply no chat, ticket de ficheiro | accepted |
+ | [ADR-W10-003](./ADR-W10-003-deterministic-inactive-summary-and-pins.md) | W10 | Resumo de ramos inativos sem LLM; pins no compact | accepted |
++| [ADR-W11-001](./ADR-W11-001-slash-commands-local-ui.md) | W11 | Slash commands s├úo a├º├Áes locais, n├úo send | accepted |
++| [ADR-W11-002](./ADR-W11-002-palette-reuses-w6-search.md) | W11 | Paleta reusa busca W6; FTS5 continua vazio | accepted |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 7b7053b..d23b196 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave
+ |---|---|
+ | Wave | **W11** |
+ | Marco | C ÔÇö V1 |
+-| State | `pending` |
++| State | `review` |
+ | Last completed | **W10** |
+-| Next action | Teclado-primeiro: Command Palette + cheatsheet + slash commands |
++| Next action | Wave-close gate W11 (review independente + REVIEW.md) |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
