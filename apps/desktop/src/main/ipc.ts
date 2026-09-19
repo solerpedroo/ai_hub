@@ -75,6 +75,13 @@ import {
   promptResolveResultSchema,
   playgroundRunInputSchema,
   playgroundRunResultSchema,
+  artifactDtoSchema,
+  artifactListResultSchema,
+  artifactsListInputSchema,
+  artifactSaveVersionInputSchema,
+  artifactPinInputSchema,
+  artifactExportInputSchema,
+  artifactExportResultSchema,
   contextPacketDtoSchema,
   contextPacketListResultSchema,
   projectCreateInputSchema,
@@ -96,7 +103,7 @@ import {
   windowIsMaximizedResultSchema,
   workspaceSessionSchema,
 } from "@ai-hub/shared";
-import { safeErrorMessage } from "@ai-hub/security";
+import { redactSecrets, safeErrorMessage } from "@ai-hub/security";
 import { abortChat, sendChat } from "./chat-session";
 import { exportConversation } from "./conversation-export";
 import { applyCrashReporterOptIn } from "./crash-reporter";
@@ -116,6 +123,7 @@ import { previewPacket } from "./packet-preview";
 import { getConversationWorkspaceDto, refreshConversationWorkspace } from "./workspace";
 import { getHubDatabase } from "./persistence";
 import { listPromptDtos, resolvePromptDto, runPlayground } from "./playground";
+import { exportArtifact, toArtifactDto } from "./artifacts";
 import { testProviderKey } from "./provider-health";
 import { localDayStartMs } from "./spend-guard";
 import { checkForAppUpdates } from "./updater";
@@ -555,6 +563,65 @@ export function registerWorkspaceIpc(): void {
     playgroundRunInputSchema,
     playgroundRunResultSchema,
     (input, event) => runPlayground(input, event.sender),
+  );
+
+  registerHandler(
+    IpcChannel.artifactsList,
+    artifactsListInputSchema,
+    artifactListResultSchema,
+    (input) =>
+      getHubDatabase()
+        .repos.listArtifacts(input.conversationId)
+        .slice(0, 100)
+        .map((row) => artifactDtoSchema.parse(toArtifactDto(row))),
+  );
+
+  registerHandler(IpcChannel.artifactsGet, idInputSchema, artifactDtoSchema, (input) => {
+    const row = getHubDatabase().repos.getArtifact(input.id);
+    if (!row) {
+      throw new Error("Artifact not found");
+    }
+    return artifactDtoSchema.parse(toArtifactDto(row));
+  });
+
+  registerHandler(IpcChannel.artifactsSaveVersion, artifactSaveVersionInputSchema, artifactDtoSchema, (input) => {
+    const current = getHubDatabase().repos.getArtifact(input.id);
+    if (!current) {
+      throw new Error("Artifact not found");
+    }
+    return artifactDtoSchema.parse(
+      toArtifactDto(
+        getHubDatabase().repos.createArtifact({
+          conversationId: current.conversationId,
+          familyId: current.familyId,
+          sourceMessageId: current.sourceMessageId,
+          kind: current.kind,
+          title: redactSecrets(input.title ?? current.title),
+          body: redactSecrets(input.body),
+          language: current.language,
+        }),
+      ),
+    );
+  });
+
+  registerHandler(IpcChannel.artifactsSetPinned, artifactPinInputSchema, artifactDtoSchema, (input) => {
+    const current = getHubDatabase().repos.getArtifact(input.id);
+    if (!current) {
+      throw new Error("Artifact not found");
+    }
+    getHubDatabase().repos.setArtifactFamilyPinned(current.familyId, input.pinned);
+    const updated = getHubDatabase().repos.getArtifact(input.id);
+    if (!updated) {
+      throw new Error("Artifact not found");
+    }
+    return artifactDtoSchema.parse(toArtifactDto(updated));
+  });
+
+  registerHandler(
+    IpcChannel.artifactsExport,
+    artifactExportInputSchema,
+    artifactExportResultSchema,
+    (input, event) => exportArtifact(input, event.sender),
   );
 
   registerHandler(IpcChannel.spendCapsGet, emptyIpcPayloadSchema, spendCapListResultSchema, () => {
