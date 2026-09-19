@@ -15,6 +15,8 @@ export const packetSliceKindSchema = z.enum([
   "file",
   "conversation",
   "packet",
+  "memory",
+  "rag",
 ]);
 
 export type PacketSliceKind = z.infer<typeof packetSliceKindSchema>;
