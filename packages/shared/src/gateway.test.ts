@@ -69,6 +69,21 @@ describe("chat contracts", () => {
     ).toThrow();
   });
 
+  it("accepts fileIds on send without extra keys", () => {
+    const parsed = chatSendInputSchema.parse({
+      mode: "send",
+      conversationId: "11111111-1111-4111-8111-111111111111",
+      providerKeyId: "22222222-2222-4222-8222-222222222222",
+      model: "gpt-4o-mini",
+      content: "resuma a seção 3",
+      fileIds: ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"],
+    });
+    expect(parsed.mode).toBe("send");
+    if (parsed.mode === "send") {
+      expect(parsed.fileIds).toEqual(["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]);
+    }
+  });
+
   it("accepts a continue send without content", () => {
     const parsed = chatSendInputSchema.parse({
       mode: "continue",
