@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { basename } from "node:path";
 import { BrowserWindow, dialog, type OpenDialogOptions, type WebContents } from "electron";
-import { compileActivePathDetailed } from "@ai-hub/ai-gateway";
+import { appendMentionsToPacket, compileActivePathDetailed } from "@ai-hub/ai-gateway";
 import { redactSecrets } from "@ai-hub/security";
 import {
   contextPacketDtoSchema,
@@ -20,6 +20,7 @@ import {
 } from "@ai-hub/shared";
 import { isE2eMode } from "./e2e-mode";
 import { getHubDatabase } from "./persistence";
+import { loadAutoProjectContext } from "./project-context";
 
 const tickets = new Map<string, { path: string; fileName: string }>();
 const MAX_PACKET_BYTES = 2_000_000;
@@ -91,6 +92,15 @@ export function compileAndSavePacket(input: PacketsCompileInput): ContextPacketD
   const detailed = compileActivePathDetailed(
     input.compact === true ? { ...compiled, maxTokenBudget: catalog?.contextWindow ?? 128_000 } : compiled,
   );
+  const lastUser = [...compiled.messages].reverse().find((item) => item.role === "user")?.content ?? "";
+  const autoContext = loadAutoProjectContext(
+    repos,
+    conversation.projectId,
+    lastUser,
+    privacyMode,
+    new Set(),
+  );
+  const withContext = appendMentionsToPacket(detailed.packet, autoContext);
   const envelope = portablePacketFromCompile({
     privacyMode,
     origin: {
@@ -98,9 +108,9 @@ export function compileAndSavePacket(input: PacketsCompileInput): ContextPacketD
       projectLabel: (project?.name ?? "").slice(0, 200),
       conversationLabel: conversation.title.slice(0, 200),
     },
-    included: detailed.included,
+    included: [...detailed.included, ...withContext.included],
     omitted: detailed.omitted,
-    payload: detailed.packet,
+    payload: withContext.packet,
   });
   const payloadJson = redactSecrets(JSON.stringify(envelope));
   const stored = repos.createContextPacket({
