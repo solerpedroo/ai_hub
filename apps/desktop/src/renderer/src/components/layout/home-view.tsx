@@ -24,6 +24,7 @@ import {
   type ProjectUpdateInput,
   type ProjectFileDto,
   type PromptDto,
+  type ArtifactDto,
   type ProviderKeyDto,
 } from "@ai-hub/shared";
 import {
@@ -33,6 +34,7 @@ import {
 } from "@/components/chat/chat-composer";
 import { ConversationTree } from "@/components/chat/conversation-tree";
 import { MessageBubble } from "@/components/chat/message-bubble";
+import { ArtifactCanvas } from "@/components/chat/artifact-canvas";
 import { PacketPanel } from "@/components/chat/packet-panel";
 import { ConversationWorkspacePanel } from "@/components/workspace/conversation-workspace-panel";
 import { MemoryPanel } from "@/components/workspace/memory-panel";
@@ -210,6 +212,10 @@ export function HomeView({
   const [packetOpen, setPacketOpen] = useState(false);
   const [memoryOpen, setMemoryOpen] = useState(false);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [artifacts, setArtifacts] = useState<ArtifactDto[]>([]);
+  const [canvasId, setCanvasId] = useState<string | null>(null);
+  const [canvasError, setCanvasError] = useState<string | null>(null);
+  const autoOpenedArtifactRef = useRef<string | null>(null);
   const [projectMemories, setProjectMemories] = useState<ProjectMemoryDto[]>([]);
   const [libraryPrompts, setLibraryPrompts] = useState<PromptDto[]>([]);
   const [memoryOptedOut, setMemoryOptedOut] = useState(false);
@@ -243,6 +249,7 @@ export function HomeView({
   const leaf = path[path.length - 1] ?? null;
   const selectedConversation =
     conversations.find((item) => item.id === selectedConversationId) ?? null;
+  const canvasArtifact = artifacts.find((item) => item.id === canvasId) ?? null;
   const providerSlugs = [...new Set(providerKeys.map((item) => item.providerSlug))];
   const preferredModels = preferredProvider
     ? catalogModelsForProvider(preferredProvider)
@@ -397,6 +404,9 @@ export function HomeView({
   useEffect(() => {
     if (!selectedConversationId) {
       setConversationWorkspace(null);
+      setArtifacts([]);
+      setCanvasId(null);
+      autoOpenedArtifactRef.current = null;
       return;
     }
     const last = messages.at(-1);
@@ -405,6 +415,19 @@ export function HomeView({
         ? window.hub.workspace.refresh({ conversationId: selectedConversationId })
         : window.hub.workspace.get({ conversationId: selectedConversationId });
     void op.then(setConversationWorkspace).catch(() => setConversationWorkspace(null));
+    void window.hub.artifacts
+      .list({ conversationId: selectedConversationId })
+      .then((rows) => {
+        setArtifacts(rows);
+        if (last?.role === "assistant" && last.status === "complete" && autoOpenedArtifactRef.current !== last.id) {
+          const mermaid = rows.find((row) => row.sourceMessageId === last.id && row.kind === "mermaid");
+          if (mermaid) {
+            autoOpenedArtifactRef.current = last.id;
+            setCanvasId(mermaid.id);
+          }
+        }
+      })
+      .catch(() => setArtifacts([]));
   }, [messages, selectedConversationId]);
 
   useEffect(() => {
@@ -898,6 +921,26 @@ export function HomeView({
                   type="button"
                   size="sm"
                   variant="outline"
+                  data-testid="canvas-toggle"
+                  aria-pressed={canvasId !== null}
+                  disabled={!selectedConversationId}
+                  onClick={() => {
+                    if (canvasId) {
+                      setCanvasId(null);
+                      return;
+                    }
+                    const latest = artifacts[0];
+                    if (latest) {
+                      setCanvasId(latest.id);
+                    }
+                  }}
+                >
+                  {t("artifacts.canvas")}
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
                   data-testid="conversation-duplicate"
                   disabled={!selectedConversationId || busy}
                   onClick={() => {
@@ -1071,6 +1114,15 @@ export function HomeView({
                           }}
                           onPin={(pinned) => {
                             void onPin(message.id, pinned);
+                          }}
+                          onOpenArtifact={(messageId) => {
+                            const match =
+                              artifacts.find(
+                                (item) => item.sourceMessageId === messageId && item.kind === "mermaid",
+                              ) ?? artifacts.find((item) => item.sourceMessageId === messageId);
+                            if (match) {
+                              setCanvasId(match.id);
+                            }
                           }}
                         />
                       ))}
@@ -1446,6 +1498,53 @@ export function HomeView({
                   }}
                 />
               </div>
+              {canvasArtifact ? (
+                <ArtifactCanvas
+                  artifact={canvasArtifact}
+                  versions={artifacts}
+                  busy={busy}
+                  onClose={() => setCanvasId(null)}
+                  onSelectVersion={setCanvasId}
+                  onSaveVersion={async (body) => {
+                    setCanvasError(null);
+                    try {
+                      const next = await window.hub.artifacts.saveVersion({ id: canvasArtifact.id, body });
+                      const rows = selectedConversationId
+                        ? await window.hub.artifacts.list({ conversationId: selectedConversationId })
+                        : [next];
+                      setArtifacts(rows);
+                      setCanvasId(next.id);
+                    } catch {
+                      setCanvasError(t("artifacts.error"));
+                    }
+                  }}
+                  onPin={async (pinned) => {
+                    setCanvasError(null);
+                    try {
+                      const next = await window.hub.artifacts.setPinned({ id: canvasArtifact.id, pinned });
+                      setArtifacts((current) =>
+                        current.map((item) =>
+                          item.familyId === next.familyId ? { ...item, pinned: next.pinned } : item,
+                        ),
+                      );
+                    } catch {
+                      setCanvasError(t("artifacts.error"));
+                    }
+                  }}
+                  onExport={async (format, svg) => {
+                    setCanvasError(null);
+                    try {
+                      await window.hub.artifacts.exportFile({
+                        id: canvasArtifact.id,
+                        format,
+                        ...(svg !== undefined ? { svg } : {}),
+                      });
+                    } catch {
+                      setCanvasError(t("artifacts.error"));
+                    }
+                  }}
+                />
+              ) : null}
               {memoryOpen && project ? (
                 <MemoryPanel
                   memories={projectMemories}
@@ -1494,6 +1593,7 @@ export function HomeView({
               {workspaceOpen ? (
                 <ConversationWorkspacePanel
                   workspace={conversationWorkspace}
+                  artifacts={artifacts}
                   busy={busy}
                   onRefresh={async () => {
                     if (!selectedConversationId) {
@@ -1502,7 +1602,9 @@ export function HomeView({
                     setConversationWorkspace(
                       await window.hub.workspace.refresh({ conversationId: selectedConversationId }),
                     );
+                    setArtifacts(await window.hub.artifacts.list({ conversationId: selectedConversationId }));
                   }}
+                  onOpenArtifact={(id) => setCanvasId(id)}
                   onAddTask={async (title) => {
                     if (!selectedConversationId) {
                       return;
@@ -1581,6 +1683,11 @@ export function HomeView({
               </Button>
             ) : null}
           </div>
+        ) : null}
+        {canvasError ? (
+          <p className="border-t px-3 py-2 text-destructive" role="alert" data-testid="artifact-error">
+            {canvasError}
+          </p>
         ) : null}
       </section>
     </div>
