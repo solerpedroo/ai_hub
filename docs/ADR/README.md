@@ -82,3 +82,7 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W10-003](./ADR-W10-003-deterministic-inactive-summary-and-pins.md) | W10 | Resumo de ramos inativos sem LLM; pins no compact | accepted |
 | [ADR-W11-001](./ADR-W11-001-slash-commands-local-ui.md) | W11 | Slash commands são ações locais, não send | accepted |
 | [ADR-W11-002](./ADR-W11-002-palette-reuses-w6-search.md) | W11 | Paleta reusa busca W6; FTS5 continua vazio | accepted |
+| [ADR-W12-001](./ADR-W12-001-files-package-and-encrypted-extract.md) | W12 | Pacote `files` + extract cifrado | accepted |
+| [ADR-W12-002](./ADR-W12-002-files-inject-as-compiler-slices.md) | W12 | Anexos entram como fatias do compiler, não no packet v1 | accepted |
+| [ADR-W12-003](./ADR-W12-003-vision-images-on-stream-not-packet.md) | W12 | Imagens no stream, não no packet; gate `vision` | accepted |
+| [ADR-W12-004](./ADR-W12-004-pdf-flatedecode-inflate.md) | W12 | PDF: inflate FlateDecode + literais Tj | accepted |
