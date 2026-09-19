@@ -179,6 +179,45 @@ CREATE TABLE project_files (
 CREATE INDEX project_files_project_idx ON project_files(project_id);
 `;
 
+export const MIGRATION_0009_SQL = `
+CREATE TABLE project_memories (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  title_cipher TEXT NOT NULL,
+  body_cipher TEXT NOT NULL,
+  source TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX project_memories_project_idx ON project_memories(project_id);
+CREATE TABLE file_chunks (
+  id TEXT PRIMARY KEY,
+  file_id TEXT NOT NULL REFERENCES project_files(id) ON DELETE CASCADE,
+  project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+  chunk_index INTEGER NOT NULL,
+  text_cipher TEXT NOT NULL,
+  embedding_cipher TEXT NOT NULL,
+  token_estimate INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX file_chunks_project_idx ON file_chunks(project_id);
+CREATE INDEX file_chunks_file_idx ON file_chunks(file_id);
+CREATE TABLE conversation_workspace (
+  conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+  summary_cipher TEXT NOT NULL,
+  decisions_cipher TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE conversation_tasks (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  title_cipher TEXT NOT NULL,
+  done INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX conversation_tasks_conversation_idx ON conversation_tasks(conversation_id);
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
@@ -188,4 +227,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 6, sql: MIGRATION_0006_SQL },
   { version: 7, sql: MIGRATION_0007_SQL },
   { version: 8, sql: MIGRATION_0008_SQL },
+  { version: 9, sql: MIGRATION_0009_SQL },
 ];
