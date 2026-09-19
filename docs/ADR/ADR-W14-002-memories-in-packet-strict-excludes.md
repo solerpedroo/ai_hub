@@ -14,7 +14,7 @@ Memórias de projeto devem reaparecer na conversa seguinte e entrar no packet. O
 ## Decisão
 
 - Tabela `project_memories` (título/corpo cifrados). CRUD + opt-out por projeto (`settings` `memory-opt-out:{projectId}`).
-- `@memory` usa o mesmo `MentionRef` da W13; sai de `MENTION_STUB_TYPES`. `@prompt`/`@skill` continuam stub.
+- `@memory` usa o mesmo `MentionRef` da W13; sai de `MENTION_STUB_TYPES`. `@prompt` liga na W15 (ADR-W15-002); `@skill` continua stub até W17.
 - Memórias ativas entram no `system` como `Project memory:` via compiler. Opt-out desliga só a injeção **automática** e o banner de sugerir; `@memory` explícito ainda resolve em `standard`.
 - `privacyMode: strict` **exclui** memórias automáticas, `@memory` e fatias RAG. W18 não precisa de outro gancho para isto.
 
