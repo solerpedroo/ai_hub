@@ -12,7 +12,8 @@
       "@ai-hub/ai-gateway": ["../../packages/ai-gateway/src/index.ts"],
       "@ai-hub/security/keytar": ["../../packages/security/src/keytar-store.ts"],
       "@ai-hub/security": ["../../packages/security/src/index.ts"],
-      "@ai-hub/files": ["../../packages/files/src/index.ts"]
+      "@ai-hub/files": ["../../packages/files/src/index.ts"],
+      "@ai-hub/memory": ["../../packages/memory/src/index.ts"]
     }
   },
   "include": [
@@ -24,7 +25,8 @@
     "../../packages/db/src/**/*.ts",
     "../../packages/ai-gateway/src/**/*.ts",
     "../../packages/security/src/**/*.ts",
-    "../../packages/files/src/**/*.ts"
+    "../../packages/files/src/**/*.ts",
+    "../../packages/memory/src/**/*.ts"
   ],
   "exclude": ["../../packages/**/*.test.ts"]
 }
