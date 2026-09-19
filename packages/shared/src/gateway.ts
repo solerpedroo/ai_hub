@@ -58,6 +58,30 @@ export const receiptDtoSchema = z.object({
 
 export type ReceiptDto = z.infer<typeof receiptDtoSchema>;
 
+export const mentionTypeSchema = z.enum([
+  "file",
+  "conversation",
+  "memory",
+  "prompt",
+  "skill",
+  "packet",
+]);
+
+export const mentionRefSchema = z
+  .object({
+    type: mentionTypeSchema,
+    id: z.string().uuid().optional(),
+    query: z.string().min(1).max(260).optional(),
+  })
+  .strict()
+  .refine((value) => value.id !== undefined || value.query !== undefined, {
+    message: "mention needs id or query",
+  });
+
+export const mentionRefListSchema = z.array(mentionRefSchema).max(8);
+
+export type MentionRef = z.infer<typeof mentionRefSchema>;
+
 const chatSendBaseSchema = z.object({
   conversationId: z.string().uuid(),
   providerKeyId: z.string().uuid(),
@@ -69,6 +93,7 @@ const chatSendBaseSchema = z.object({
   allowOnce: z.boolean().optional(),
   privacyMode: z.enum(["standard", "strict"]).optional(),
   fileIds: z.array(z.string().uuid()).max(8).optional(),
+  mentions: mentionRefListSchema.optional(),
 });
 
 export const chatSendInputSchema = z.discriminatedUnion("mode", [
