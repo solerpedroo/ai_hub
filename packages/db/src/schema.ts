@@ -142,6 +142,42 @@ export const projectFiles = sqliteTable("project_files", {
   createdAt: integer("created_at", { mode: "number" }).notNull(),
 });
 
+export const projectMemories = sqliteTable("project_memories", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id").notNull(),
+  titleCipher: text("title_cipher").notNull(),
+  bodyCipher: text("body_cipher").notNull(),
+  source: text("source").notNull(),
+  createdAt: integer("created_at", { mode: "number" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "number" }).notNull(),
+});
+
+export const fileChunks = sqliteTable("file_chunks", {
+  id: text("id").primaryKey(),
+  fileId: text("file_id").notNull(),
+  projectId: text("project_id"),
+  chunkIndex: integer("chunk_index", { mode: "number" }).notNull(),
+  textCipher: text("text_cipher").notNull(),
+  embeddingCipher: text("embedding_cipher").notNull(),
+  tokenEstimate: integer("token_estimate", { mode: "number" }).notNull(),
+  createdAt: integer("created_at", { mode: "number" }).notNull(),
+});
+
+export const conversationWorkspace = sqliteTable("conversation_workspace", {
+  conversationId: text("conversation_id").primaryKey(),
+  summaryCipher: text("summary_cipher").notNull(),
+  decisionsCipher: text("decisions_cipher").notNull(),
+  updatedAt: integer("updated_at", { mode: "number" }).notNull(),
+});
+
+export const conversationTasks = sqliteTable("conversation_tasks", {
+  id: text("id").primaryKey(),
+  conversationId: text("conversation_id").notNull(),
+  titleCipher: text("title_cipher").notNull(),
+  done: integer("done", { mode: "number" }).notNull().default(0),
+  createdAt: integer("created_at", { mode: "number" }).notNull(),
+});
+
 export const schema = {
   projects,
   conversations,
@@ -157,4 +193,8 @@ export const schema = {
   importJobs,
   contextPackets,
   projectFiles,
+  projectMemories,
+  fileChunks,
+  conversationWorkspace,
+  conversationTasks,
 };
