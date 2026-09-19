@@ -77,6 +77,11 @@ export const IpcChannel = {
   promptsRemove: "prompts:remove",
   promptsResolve: "prompts:resolve",
   playgroundRun: "playground:run",
+  artifactsList: "artifacts:list",
+  artifactsGet: "artifacts:get",
+  artifactsSaveVersion: "artifacts:saveVersion",
+  artifactsSetPinned: "artifacts:setPinned",
+  artifactsExport: "artifacts:export",
 } as const;
 
 export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
