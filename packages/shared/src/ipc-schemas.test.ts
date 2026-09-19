@@ -29,6 +29,8 @@ import {
   playgroundRunInputSchema,
   artifactDtoSchema,
   artifactExportInputSchema,
+  skillCreateInputSchema,
+  skillDtoSchema,
   conversationWorkspaceDtoSchema,
 } from "./ipc-schemas";
 
@@ -480,5 +482,37 @@ describe("wave 16 artifact contracts", () => {
         extra: true,
       }),
     ).toThrow();
+  });
+});
+
+describe("wave 17 skill contracts", () => {
+  it("accepts a skill dto and rejects tools on create", () => {
+    const dto = {
+      id: "11111111-1111-4111-8111-111111111111",
+      folder: "development",
+      title: "Code Review",
+      description: "Review a diff",
+      prompt: "Review {{project}}",
+      preferredModel: null,
+      defaultMentions: [],
+      steps: [{ id: "summary", title: "Summary", section: "Summarize." }],
+      factoryId: "code-review",
+      contractVersion: 1,
+      createdAt: "2026-09-19T00:00:00.000Z",
+      updatedAt: "2026-09-19T00:00:00.000Z",
+    };
+    expect(skillDtoSchema.parse(dto).title).toBe("Code Review");
+    expect(() => skillDtoSchema.parse({ ...dto, extra: true })).toThrow();
+    expect(
+      skillCreateInputSchema.parse({
+        folder: "development",
+        title: "Custom",
+        description: "A custom skill",
+        prompt: "Do the work",
+        preferredModel: null,
+        defaultMentions: [{ type: "file", query: "diff" }],
+        steps: [{ id: "one", title: "One", section: "First section." }],
+      }).steps,
+    ).toHaveLength(1);
   });
 });
