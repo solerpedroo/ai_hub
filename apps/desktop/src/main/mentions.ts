@@ -4,6 +4,7 @@ import { allowsProjectContext } from "@ai-hub/memory";
 import { redactSecrets } from "@ai-hub/security";
 import {
   composeSkillPrompt,
+  effectivePrivacyMode,
   MAX_MENTION_TOKENS,
   MAX_MENTIONS_PER_SEND,
   isMentionStubType,
@@ -22,9 +23,12 @@ export function resolveSendMentions(
   projectId: string | null,
   currentConversationId: string,
   mode: "preview" | "send" = "send",
-  privacyMode: PacketPrivacyMode = "standard",
+  privacyMode: PacketPrivacyMode = "normal",
 ): { fileIds: string[]; mentions: CompilerMention[] } {
   if (!refs || refs.length === 0) {
+    return { fileIds: [], mentions: [] };
+  }
+  if (effectivePrivacyMode(privacyMode) === "private") {
     return { fileIds: [], mentions: [] };
   }
   if (refs.length > MAX_MENTIONS_PER_SEND) {
