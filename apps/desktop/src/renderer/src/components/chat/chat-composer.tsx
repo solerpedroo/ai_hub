@@ -29,6 +29,7 @@ export function ChatComposer({
   onSend,
   onAbort,
   onSlashCommand,
+  onFilesDrop,
   streaming,
   sending,
   disabled,
@@ -38,6 +39,7 @@ export function ChatComposer({
   onSend: () => void;
   onAbort: () => void;
   onSlashCommand: (command: SlashCommandId) => void;
+  onFilesDrop: (files: File[]) => void;
   streaming: boolean;
   sending: boolean;
   disabled: boolean;
@@ -108,6 +110,18 @@ export function ChatComposer({
             ? `slash-command-${slashCommands[selectedSlashIndex] ?? slashCommands[0]}`
             : undefined
         }
+        onDragOver={(event) => {
+          if (event.dataTransfer.types.includes("Files")) {
+            event.preventDefault();
+          }
+        }}
+        onDrop={(event) => {
+          if (event.dataTransfer.files.length === 0) {
+            return;
+          }
+          event.preventDefault();
+          onFilesDrop([...event.dataTransfer.files]);
+        }}
         onChange={(event) => onChange(event.target.value)}
         onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
           if (event.key === "Escape" && streaming) {
