@@ -71,6 +71,12 @@ export const IpcChannel = {
   workspaceRemoveTask: "workspace:removeTask",
   conversationsDuplicate: "conversations:duplicate",
   conversationsToProject: "conversations:toProject",
+  promptsList: "prompts:list",
+  promptsCreate: "prompts:create",
+  promptsUpdate: "prompts:update",
+  promptsRemove: "prompts:remove",
+  promptsResolve: "prompts:resolve",
+  playgroundRun: "playground:run",
 } as const;
 
 export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
