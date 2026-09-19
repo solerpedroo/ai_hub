@@ -12,6 +12,7 @@ export const packetSliceKindSchema = z.enum([
   "message",
   "old-message",
   "privacy",
+  "file",
 ]);
 
 export type PacketSliceKind = z.infer<typeof packetSliceKindSchema>;
