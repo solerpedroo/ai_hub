@@ -85,6 +85,12 @@ import {
   artifactPinInputSchema,
   artifactExportInputSchema,
   artifactExportResultSchema,
+  skillCreateInputSchema,
+  skillDtoSchema,
+  skillListResultSchema,
+  skillResolveInputSchema,
+  skillResolveResultSchema,
+  skillUpdateInputSchema,
   contextPacketDtoSchema,
   contextPacketListResultSchema,
   projectCreateInputSchema,
@@ -436,6 +442,14 @@ const hub: HubApi = {
       invokeParsed(IpcChannel.artifactsSetPinned, input, artifactPinInputSchema, artifactDtoSchema),
     exportFile: (input) =>
       invokeParsed(IpcChannel.artifactsExport, input, artifactExportInputSchema, artifactExportResultSchema),
+  },
+  skills: {
+    list: () => invokeParsed(IpcChannel.skillsList, empty, emptyIpcPayloadSchema, skillListResultSchema),
+    create: (input) => invokeParsed(IpcChannel.skillsCreate, input, skillCreateInputSchema, skillDtoSchema),
+    update: (input) => invokeParsed(IpcChannel.skillsUpdate, input, skillUpdateInputSchema, skillDtoSchema),
+    remove: (input) => invokeAckWith(IpcChannel.skillsRemove, input, idInputSchema),
+    resolve: (input) =>
+      invokeParsed(IpcChannel.skillsResolve, input, skillResolveInputSchema, skillResolveResultSchema),
   },
 };
 
