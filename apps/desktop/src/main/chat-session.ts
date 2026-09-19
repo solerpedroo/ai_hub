@@ -21,12 +21,13 @@ import {
 } from "@ai-hub/ai-gateway";
 import type { ConversationRecord, MessageRecord } from "@ai-hub/db";
 import { stripAttachedFileBodiesForRenderer } from "@ai-hub/files";
-import { redactSecrets } from "@ai-hub/security";
+import { applyContextFirewall, redactSecrets } from "@ai-hub/security";
 import {
   activePath,
   ancestorsOf,
   chatEventSchema,
   findCatalogModel,
+  effectivePrivacyMode,
   IpcChannel,
   mentionVisibleContent,
   packetV0Schema,
@@ -49,7 +50,7 @@ import { loadSendAttachments } from "./files";
 import { resolveSendMentions } from "./mentions";
 import { getHubDatabase } from "./persistence";
 import { loadAutoProjectContext } from "./project-context";
-import { estimateOutgoingCostUsd, evaluateOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
+import { estimateOutgoingCostUsd, evaluateOutgoingCaps, evaluateScopedOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
 
 interface ActiveRun {
   runId: string;
@@ -85,6 +86,21 @@ function inspectablePacket(packet: ProviderAgnosticPacket): ProviderAgnosticPack
     system: stripAttachedFileBodiesForRenderer(packet.system),
   };
   return packetV0Schema.parse(JSON.parse(redactSecrets(JSON.stringify(stripped))) as unknown);
+}
+
+function enforcePacketFirewall(packet: ProviderAgnosticPacket, policy: import("@ai-hub/security").FirewallPolicy): ProviderAgnosticPacket {
+  const system = applyContextFirewall(packet.system, policy);
+  const messages = packet.messages.map((message) => ({ ...message, outcome: applyContextFirewall(message.content, policy) }));
+  const blocked = [...system.blocked, ...messages.flatMap((message) => message.outcome.blocked)];
+  if (blocked.length > 0) throw new Error(`firewall:blocked:${[...new Set(blocked)].join(",")}`);
+  const safeSystem = system.maskedText;
+  const safeMessages = messages.map(({ role, outcome }) => ({ role, content: outcome.maskedText }));
+  return packetV0Schema.parse({
+    ...packet,
+    system: safeSystem,
+    messages: safeMessages,
+    tokenEstimate: Math.ceil((safeSystem.length + safeMessages.reduce((sum, message) => sum + message.content.length, 0)) / 4),
+  });
 }
 
 function emit(sender: WebContents, event: ChatEvent): void {
@@ -175,7 +191,11 @@ function compileOutgoing(
   const privacyMode = input.privacyMode ?? "standard";
   if (conversation.activePacketId) {
     const stored = getHubDatabase().repos.getContextPacket(conversation.activePacketId);
-    if (stored && stored.projectId === conversation.projectId) {
+    if (
+      stored &&
+      stored.projectId === conversation.projectId &&
+      effectivePrivacyMode(stored.privacyMode) === effectivePrivacyMode(input.privacyMode)
+    ) {
       const envelope = portablePacketV1Schema.parse(JSON.parse(stored.payloadJson) as unknown);
       const appliedAt = conversation.packetAppliedAt;
       const tail = activePath(compileRows).filter(
@@ -242,6 +262,17 @@ function snapshotDecision(blocked: string | null, warnings: string[], allowOnce:
 
 export async function sendChat(input: ChatSendInput, sender: WebContents): Promise<ChatSendResult> {
   const repos = getHubDatabase().repos;
+  const prefs = repos.getAppPrefs();
+  if (input.mode === "send" || input.mode === "edit") {
+    const firewall = applyContextFirewall(input.content, prefs.firewallPolicy);
+    if (firewall.blocked.length > 0) {
+      throw new Error(`firewall:blocked:${firewall.blocked.join(",")}`);
+    }
+    if (firewall.maskedText !== input.content) {
+      input = { ...input, content: firewall.maskedText };
+    }
+  }
+  input = { ...input, privacyMode: prefs.privacyMode };
   if (runByConversation.has(input.conversationId)) {
     throw new Error("A stream is already running in this conversation");
   }
@@ -353,7 +384,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
 
   const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
   const catalogForVision = findCatalogModel(input.model, key.providerSlug);
-  const privacyMode = input.privacyMode ?? "standard";
+  const privacyMode = effectivePrivacyMode(prefs.privacyMode);
   const resolvedMentions = resolveSendMentions(
     repos,
     input.mentions,
@@ -362,7 +393,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     "send",
     privacyMode,
   );
-  const fileIds = [...new Set([...(input.fileIds ?? []), ...resolvedMentions.fileIds])];
+  const fileIds = privacyMode === "private" ? [] : [...new Set([...(input.fileIds ?? []), ...resolvedMentions.fileIds])];
   const attachments = loadSendAttachments(
     fileIds,
     conversation.projectId,
@@ -391,10 +422,10 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     skipMemoryIds,
   );
   const withFiles = appendFilesToPacket(compiled, attachments.files);
-  const packet = appendMentionsToPacket(withFiles.packet, [
+  const packet = enforcePacketFirewall(appendMentionsToPacket(withFiles.packet, [
     ...resolvedMentions.mentions,
     ...autoContext,
-  ]).packet;
+  ]).packet, prefs.firewallPolicy);
   if (packet.messages.length === 0) {
     throw new Error("Add a user message before sending");
   }
@@ -415,12 +446,34 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
   const limits = spendCapLimitsFromRows(repos.listSpendCaps());
   const daySpentUsd = repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() });
   const globalSpentUsd = repos.sumReceiptCostUsd({});
-  const cap = evaluateOutgoingCaps({
+  const baseCap = evaluateOutgoingCaps({
     estimatedRequestUsd: estimatedCostUsd,
     daySpentUsd,
     globalSpentUsd,
     limits,
   });
+  const scoped = repos.listScopedSpendCaps();
+  const projectCapLimit = conversation.projectId
+    ? (scoped.find((item) => item.dimension === "project" && item.subjectId === conversation.projectId)?.limitUsd ?? null)
+    : null;
+  const providerCapLimit =
+    scoped.find((item) => item.dimension === "provider" && item.subjectId === key.providerSlug)?.limitUsd ?? null;
+  const projectCap = evaluateScopedOutgoingCaps({
+    estimatedRequestUsd: estimatedCostUsd,
+    spentUsd: conversation.projectId ? repos.sumReceiptCostUsd({ projectId: conversation.projectId }) : "0.000000",
+    limitUsd: projectCapLimit,
+    scope: "project",
+  });
+  const providerCap = evaluateScopedOutgoingCaps({
+    estimatedRequestUsd: estimatedCostUsd,
+    spentUsd: repos.sumReceiptCostUsd({ providerSlug: key.providerSlug }),
+    limitUsd: providerCapLimit,
+    scope: "provider",
+  });
+  const cap = {
+    blocked: baseCap.blocked ?? projectCap.blocked ?? providerCap.blocked,
+    warnings: [...new Set([...baseCap.warnings, ...projectCap.warnings, ...providerCap.warnings])],
+  };
   const allowOnce = input.allowOnce === true;
   recordDebugSnapshot({
     at: new Date().toISOString(),
@@ -438,10 +491,16 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     throw new SpendCapError(cap.blocked);
   }
   if (cap.blocked && allowOnce) {
+    const overriddenLimit =
+      cap.blocked === "project"
+        ? projectCapLimit
+        : cap.blocked === "provider"
+          ? providerCapLimit
+          : limits[cap.blocked];
     repos.appendSpendCapOverride({
       at: new Date().toISOString(),
       scope: cap.blocked,
-      limitUsd: limits[cap.blocked] ?? "0",
+      limitUsd: overriddenLimit ?? "0",
       estimatedUsd: estimatedCostUsd,
       conversationId: input.conversationId,
       model: input.model,
