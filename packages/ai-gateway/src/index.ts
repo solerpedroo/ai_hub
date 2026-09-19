@@ -1,4 +1,5 @@
 export type {
+  ChatImagePart,
   ChatStreamEvent,
   ChatStreamRequest,
   ModelRef,
@@ -10,10 +11,12 @@ export {
   compileActivePathDetailed,
   compilePacket,
   compilePacketDetailed,
+  appendFilesToPacket,
   mergePacketWithTail,
   summarizeInactiveBranches,
   type CompileDetailedResult,
   type CompileInput,
+  type CompilerFile,
   type CompilerGraphMessage,
   type CompilerMessage,
   type InactiveBranchSummaries,
