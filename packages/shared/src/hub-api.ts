@@ -82,6 +82,11 @@ import type {
   ArtifactPinInput,
   ArtifactExportInput,
   ArtifactExportResult,
+  SkillDto,
+  SkillCreateInput,
+  SkillUpdateInput,
+  SkillResolveInput,
+  SkillResolveResult,
   ProviderKeyDto,
   SecretsSaveInput,
   SecretsTestInput,
@@ -234,6 +239,14 @@ export interface HubArtifactsApi {
   exportFile: (input: ArtifactExportInput) => Promise<ArtifactExportResult>;
 }
 
+export interface HubSkillsApi {
+  list: () => Promise<SkillDto[]>;
+  create: (input: SkillCreateInput) => Promise<SkillDto>;
+  update: (input: SkillUpdateInput) => Promise<SkillDto>;
+  remove: (input: IdInput) => Promise<void>;
+  resolve: (input: SkillResolveInput) => Promise<SkillResolveResult>;
+}
+
 export interface HubChatApi {
   send: (input: ChatSendInput) => Promise<ChatSendResult>;
   abort: (input: ChatAbortInput) => Promise<void>;
@@ -266,6 +279,7 @@ export interface HubApi {
   prompts: HubPromptsApi;
   playground: HubPlaygroundApi;
   artifacts: HubArtifactsApi;
+  skills: HubSkillsApi;
 }
 
 export type { AppLocale, ThemeMode };
