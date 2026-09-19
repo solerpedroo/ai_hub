@@ -16,11 +16,12 @@ export function KeyboardShortcutsDialog({
     [`${modifier}+N`, t("shortcuts.newChat")],
     [`${modifier}+Shift+N`, t("shortcuts.newProject")],
     [`${modifier}+/`, t("shortcuts.cheatsheet")],
+    [`${modifier}+Shift+S`, t("shortcuts.skills")],
     ["Enter", t("shortcuts.send")],
     ["Shift+Enter", t("shortcuts.newline")],
     ["Esc", t("shortcuts.stop")],
   ] as const;
-  const slashCommands = ["model", "clear", "compact", "packet", "cap"] as const;
+  const slashCommands = ["model", "clear", "compact", "packet", "cap", "skill"] as const;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
