@@ -2,7 +2,7 @@ export const MENTION_TYPES = ["file", "conversation", "memory", "prompt", "skill
 
 export type MentionType = (typeof MENTION_TYPES)[number];
 
-export const MENTION_STUB_TYPES = ["skill"] as const;
+export const MENTION_STUB_TYPES = [] as const;
 
 export type MentionStubType = (typeof MENTION_STUB_TYPES)[number];
 
@@ -89,4 +89,12 @@ export function mentionQueryParts(typed: string):
     return { kind: "types", prefix: raw.toLowerCase() };
   }
   return { kind: "items", type, query: raw.slice(colon + 1) };
+}
+
+export function projectFileNameMatches(name: string, query: string): boolean {
+  const needle = query.toLowerCase();
+  const lower = name.toLowerCase().replace(/\\/g, "/");
+  const base = lower.split("/").pop() ?? lower;
+  const stem = base.includes(".") ? base.slice(0, base.lastIndexOf(".")) : base;
+  return lower === needle || base === needle || stem === needle || lower.endsWith(`/${needle}`);
 }
