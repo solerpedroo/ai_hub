@@ -35,6 +35,7 @@ import { HomeView } from "@/components/layout/home-view";
 import { SettingsView } from "@/components/layout/settings-view";
 import { DebugView } from "@/components/layout/debug-view";
 import { ImportView } from "@/components/layout/import-view";
+import { PromptsView } from "@/components/layout/prompts-view";
 import { OnboardingView } from "@/components/layout/onboarding-view";
 import {
   ChromeCommandPalette,
@@ -165,6 +166,7 @@ export function App(): JSX.Element {
   const [costs, setCosts] = useState<CostsAggregateResult | null>(null);
   const [showAllowOnce, setShowAllowOnce] = useState(false);
   const [composerDraft, setComposerDraft] = useState("");
+  const [composerInsert, setComposerInsert] = useState<string | null>(null);
   const [attachedFiles, setAttachedFiles] = useState<ProjectFileDto[]>([]);
   const [mentionRefs, setMentionRefs] = useState<MentionRef[]>([]);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -399,7 +401,7 @@ export function App(): JSX.Element {
   ]);
 
   useEffect(() => {
-    if (view !== "home") {
+    if (view !== "home" && view !== "prompts") {
       return;
     }
     void loadKeys()
@@ -1190,6 +1192,8 @@ export function App(): JSX.Element {
                 void sendToModel({ ...pending, allowOnce: true });
               }}
               onComposerDraft={reportComposerDraft}
+              composerInsert={composerInsert}
+              onComposerInsertConsumed={() => setComposerInsert(null)}
               onPin={async (id, pinned) => {
                 try {
                   const updated = await window.hub.messages.pin({ id, pinned });
@@ -1352,6 +1356,16 @@ export function App(): JSX.Element {
             />
           ) : view === "debug" ? (
             <DebugView />
+          ) : view === "prompts" ? (
+            <PromptsView
+              project={selectedProject}
+              providerKeys={providerKeys}
+              privacyMode={privacyMode}
+              onInsertIntoComposer={(text) => {
+                setComposerInsert(text);
+                setView("home");
+              }}
+            />
           ) : view === "import" ? (
             <ImportView
               projects={projects}
@@ -1487,6 +1501,7 @@ export function App(): JSX.Element {
         onSettings={() => openSettings("general")}
         onDebug={() => navigateToView("debug")}
         onImport={() => navigateToView("import")}
+        onPrompts={() => navigateToView("prompts")}
         onShortcuts={() => setShortcutsOpen(true)}
       />
     </div>
