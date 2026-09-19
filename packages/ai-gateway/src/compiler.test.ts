@@ -133,6 +133,32 @@ describe("compilePacket", () => {
     expect(withContext.included[1]?.label).not.toContain("Section 3");
   });
 
+  it("appends a library prompt slice without putting the body in the label", () => {
+    const compiled = compilePacket({
+      projectInstructions: null,
+      extraSystem: null,
+      messages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          role: "user",
+          content: "review this",
+          status: "complete",
+        },
+      ],
+    });
+    const withPrompt = appendMentionsToPacket(compiled, [
+      {
+        kind: "prompt",
+        id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        name: "Code review",
+        text: "You are a senior code reviewer for E2E.",
+      },
+    ]);
+    expect(withPrompt.packet.system).toContain("Library prompt: Code review");
+    expect(withPrompt.included[0]?.label).toBe("Library prompt: Code review");
+    expect(withPrompt.included[0]?.label).not.toContain("senior");
+  });
+
   it("never puts an apiKey field on the packet", () => {
     const packet = compilePacket({
       projectInstructions: null,
