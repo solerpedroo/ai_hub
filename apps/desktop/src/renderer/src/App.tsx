@@ -34,8 +34,12 @@ import { SettingsView } from "@/components/layout/settings-view";
 import { DebugView } from "@/components/layout/debug-view";
 import { ImportView } from "@/components/layout/import-view";
 import { OnboardingView } from "@/components/layout/onboarding-view";
-import { ChromeCommandPalette } from "@/components/layout/command-palette";
-import type { AppView } from "@/components/layout/types";
+import {
+  ChromeCommandPalette,
+  type PaletteModelOption,
+} from "@/components/layout/command-palette";
+import { KeyboardShortcutsDialog } from "@/components/layout/keyboard-shortcuts";
+import type { AppView, SettingsSection } from "@/components/layout/types";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
@@ -57,16 +61,26 @@ const GATEWAY_ERROR_KEYS = new Set<GatewayErrorCode>([
   "unknown",
 ]);
 
-function workspaceErrorText(t: TFunction, error: unknown): { text: string; cap: boolean } {
+function workspaceErrorText(
+  t: TFunction,
+  error: unknown,
+): { text: string; cap: boolean } {
   const message = error instanceof Error ? error.message : String(error);
   const classified = classifyHubIpcError(message);
   if (classified.kind === "cap" && classified.scope) {
-    return { text: t("workspace.error.cap", { scope: t(`caps.scope.${classified.scope}`) }), cap: true };
+    return {
+      text: t("workspace.error.cap", { scope: t(`caps.scope.${classified.scope}`) }),
+      cap: true,
+    };
   }
   if (classified.kind === "unknown_model") {
     return { text: t("workspace.error.unknownModel"), cap: false };
   }
-  if (classified.kind === "gateway" && classified.code && GATEWAY_ERROR_KEYS.has(classified.code)) {
+  if (
+    classified.kind === "gateway" &&
+    classified.code &&
+    GATEWAY_ERROR_KEYS.has(classified.code)
+  ) {
     return { text: t(`workspace.error.${classified.code}`), cap: false };
   }
   return { text: t("workspace.error.generic"), cap: false };
@@ -86,7 +100,9 @@ export function App(): JSX.Element {
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [importedInbox, setImportedInbox] = useState(false);
   const [conversations, setConversations] = useState<ConversationDto[]>([]);
-  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
+  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(
+    null,
+  );
   const [messages, setMessages] = useState<MessageDto[]>([]);
   const [providerKeys, setProviderKeys] = useState<ProviderKeyDto[]>([]);
   const [selectedKeyId, setSelectedKeyId] = useState<string | null>(null);
@@ -113,6 +129,8 @@ export function App(): JSX.Element {
   const [costs, setCosts] = useState<CostsAggregateResult | null>(null);
   const [showAllowOnce, setShowAllowOnce] = useState(false);
   const [composerDraft, setComposerDraft] = useState("");
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
   const [fallback, setFallback] = useState<{
     messageId: string;
     code: GatewayErrorCode;
@@ -121,7 +139,9 @@ export function App(): JSX.Element {
     suggestKeyId: string;
     suggestModel: string;
   } | null>(null);
-  const [fallbackPreview, setFallbackPreview] = useState<PacketPreviewResult | null>(null);
+  const [fallbackPreview, setFallbackPreview] = useState<PacketPreviewResult | null>(
+    null,
+  );
   const projectInputRef = useRef<HTMLInputElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const selectedModelRef = useRef(selectedModel);
@@ -144,7 +164,10 @@ export function App(): JSX.Element {
   }, []);
 
   const loadConversations = useCallback(
-    async (projectId: string | null, inboxImported = false): Promise<ConversationDto[]> => {
+    async (
+      projectId: string | null,
+      inboxImported = false,
+    ): Promise<ConversationDto[]> => {
       const list = await window.hub.conversations.list(
         projectId === null
           ? { projectId: null, inbox: inboxImported ? "imported" : "avulsas" }
@@ -156,13 +179,16 @@ export function App(): JSX.Element {
     [],
   );
 
-  const loadMessages = useCallback(async (conversationId: string): Promise<MessageDto[]> => {
-    const list = await window.hub.messages.list({ conversationId });
-    setMessages(list);
-    const labels = await window.hub.conversations.getBranchLabels({ conversationId });
-    setBranchLabels(labels);
-    return list;
-  }, []);
+  const loadMessages = useCallback(
+    async (conversationId: string): Promise<MessageDto[]> => {
+      const list = await window.hub.messages.list({ conversationId });
+      setMessages(list);
+      const labels = await window.hub.conversations.getBranchLabels({ conversationId });
+      setBranchLabels(labels);
+      return list;
+    },
+    [],
+  );
 
   const loadPackets = useCallback(async (projectId: string | null): Promise<void> => {
     try {
@@ -197,17 +223,24 @@ export function App(): JSX.Element {
         ]);
         const matchingKey =
           keys.find(
-            (item) => item.status === "active" && findCatalogModel(session.model, item.providerSlug) !== null,
+            (item) =>
+              item.status === "active" &&
+              findCatalogModel(session.model, item.providerSlug) !== null,
           ) ??
           keys.find((item) => item.status === "active") ??
           null;
         setSelectedKeyId(matchingKey?.id ?? null);
         if (matchingKey?.providerSlug === "custom") {
           setSelectedModel(session.model);
-        } else if (matchingKey && findCatalogModel(session.model, matchingKey.providerSlug)) {
+        } else if (
+          matchingKey &&
+          findCatalogModel(session.model, matchingKey.providerSlug)
+        ) {
           setSelectedModel(session.model);
         } else if (matchingKey) {
-          setSelectedModel(catalogModelsForProvider(matchingKey.providerSlug)[0]?.id ?? session.model);
+          setSelectedModel(
+            catalogModelsForProvider(matchingKey.providerSlug)[0]?.id ?? session.model,
+          );
         }
         if (session.temperature !== undefined) {
           setTemperature(session.temperature);
@@ -227,13 +260,16 @@ export function App(): JSX.Element {
           wizardStartedAt.current = Date.now();
         }
         if (session.projectId) {
-          const project = projectList.find((item) => item.id === session.projectId) ?? null;
+          const project =
+            projectList.find((item) => item.id === session.projectId) ?? null;
           if (!project) {
             setSelectedProjectId(null);
             setImportedInbox(false);
             const convos = await loadConversations(null, false);
             const conversation =
-              convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
+              convos.find((item) => item.id === session.conversationId) ??
+              convos[0] ??
+              null;
             if (conversation) {
               setSelectedConversationId(conversation.id);
               await loadMessages(conversation.id);
@@ -245,7 +281,9 @@ export function App(): JSX.Element {
           setImportedInbox(false);
           const convos = await loadConversations(project.id, false);
           const conversation =
-            convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
+            convos.find((item) => item.id === session.conversationId) ??
+            convos[0] ??
+            null;
           if (conversation) {
             setSelectedConversationId(conversation.id);
             await loadMessages(conversation.id);
@@ -256,7 +294,9 @@ export function App(): JSX.Element {
           setImportedInbox(imported);
           const convos = await loadConversations(null, imported);
           const conversation =
-            convos.find((item) => item.id === session.conversationId) ?? convos[0] ?? null;
+            convos.find((item) => item.id === session.conversationId) ??
+            convos[0] ??
+            null;
           if (conversation) {
             setSelectedConversationId(conversation.id);
             await loadMessages(conversation.id);
@@ -379,6 +419,10 @@ export function App(): JSX.Element {
     return () => window.clearTimeout(handle);
   }, [fail, searchQuery]);
 
+  const activePacketId =
+    conversations.find((item) => item.id === selectedConversationId)?.activePacketId ??
+    null;
+
   useEffect(() => {
     if (!selectedConversationId) {
       setPacketPreview(null);
@@ -419,7 +463,7 @@ export function App(): JSX.Element {
     selectedKeyId,
     selectedModel,
     privacyMode,
-    conversations.find((item) => item.id === selectedConversationId)?.activePacketId,
+    activePacketId,
   ]);
 
   useEffect(() => {
@@ -448,7 +492,9 @@ export function App(): JSX.Element {
       }
       if (event.type === "done") {
         setMessages((current) =>
-          current.map((message) => (message.id === event.message.id ? event.message : message)),
+          current.map((message) =>
+            message.id === event.message.id ? event.message : message,
+          ),
         );
         setRun((current) => (current?.runId === event.runId ? null : current));
         void loadHealth();
@@ -460,7 +506,8 @@ export function App(): JSX.Element {
         setShowAllowOnce(false);
         if (event.suggestKeyId && event.suggestProviderSlug && event.suggestModel) {
           const failed =
-            providerKeys.find((item) => item.id === selectedKeyId)?.providerSlug ?? event.suggestProviderSlug;
+            providerKeys.find((item) => item.id === selectedKeyId)?.providerSlug ??
+            event.suggestProviderSlug;
           setFallback({
             messageId: event.messageId,
             code: event.code,
@@ -500,13 +547,21 @@ export function App(): JSX.Element {
       })
       .then(setFallbackPreview)
       .catch(() => setFallbackPreview(null));
-  }, [compactHistory, extraSystem, fallback, maxTokens, privacyMode, selectedConversationId]);
+  }, [
+    compactHistory,
+    extraSystem,
+    fallback,
+    maxTokens,
+    privacyMode,
+    selectedConversationId,
+  ]);
 
   const applyProjectPreferences = useCallback(
     (project: ProjectDto, keys: ProviderKeyDto[]): void => {
       if (project.preferredProvider) {
         const key = keys.find(
-          (item) => item.status === "active" && item.providerSlug === project.preferredProvider,
+          (item) =>
+            item.status === "active" && item.providerSlug === project.preferredProvider,
         );
         if (!key) {
           return;
@@ -552,7 +607,11 @@ export function App(): JSX.Element {
     lastSendRef.current = input;
     setSending(true);
     try {
-      const result = await window.hub.chat.send({ ...input, compactHistory, privacyMode });
+      const result = await window.hub.chat.send({
+        ...input,
+        compactHistory,
+        privacyMode,
+      });
       setError(null);
       setShowAllowOnce(false);
       setFallback(null);
@@ -569,18 +628,133 @@ export function App(): JSX.Element {
     }
   };
 
-  const abortIfLeaving = (nextConversationId: string | null): void => {
-    if (run && run.conversationId !== nextConversationId) {
-      void window.hub.chat.abort({ runId: run.runId }).catch(fail);
-    }
-  };
+  const abortIfLeaving = useCallback(
+    (nextConversationId: string | null): void => {
+      if (run && run.conversationId !== nextConversationId) {
+        void window.hub.chat.abort({ runId: run.runId }).catch(fail);
+      }
+    },
+    [fail, run],
+  );
 
-  const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
+  const navigateToView = useCallback(
+    (next: AppView): void => {
+      if (next !== "home") {
+        abortIfLeaving(null);
+      }
+      setView(next);
+    },
+    [abortIfLeaving],
+  );
+
+  const openSettings = useCallback(
+    (section: SettingsSection): void => {
+      setSettingsSection(section);
+      navigateToView("settings");
+    },
+    [navigateToView],
+  );
+
+  const selectProject = useCallback(
+    (id: string | null): void => {
+      abortIfLeaving(null);
+      setSelectedProjectId(id);
+      setImportedInbox(false);
+      setSelectedConversationId(null);
+      setMessages([]);
+      setBranchLabels({});
+      if (id) {
+        const next = projects.find((item) => item.id === id);
+        if (next) {
+          applyProjectPreferences(next, providerKeys);
+        }
+      }
+      void loadConversations(id, false).catch(fail);
+      setView("home");
+    },
+    [
+      abortIfLeaving,
+      applyProjectPreferences,
+      fail,
+      loadConversations,
+      projects,
+      providerKeys,
+    ],
+  );
+
+  const openSearchHit = useCallback(
+    (hit: SearchHit): void => {
+      abortIfLeaving(hit.conversationId);
+      setSelectedProjectId(hit.projectId);
+      setView("home");
+      void (async () => {
+        try {
+          let convos = await loadConversations(hit.projectId, false);
+          let imported = false;
+          if (
+            hit.projectId === null &&
+            !convos.some((item) => item.id === hit.conversationId)
+          ) {
+            convos = await loadConversations(null, true);
+            imported = true;
+          }
+          setImportedInbox(imported);
+          setSelectedConversationId(hit.conversationId);
+          await loadMessages(hit.conversationId);
+          if (hit.messageId) {
+            await window.hub.messages.activate({ id: hit.messageId });
+            await loadMessages(hit.conversationId);
+          }
+          setSearchQuery("");
+          setSearchHits([]);
+        } catch {
+          fail();
+        }
+      })();
+    },
+    [abortIfLeaving, fail, loadConversations, loadMessages],
+  );
+
+  const exportConversation = useCallback(
+    async (mode: "active" | "tree"): Promise<void> => {
+      if (!selectedConversationId) {
+        return;
+      }
+      try {
+        const result = await window.hub.conversations.export({
+          conversationId: selectedConversationId,
+          mode,
+        });
+        if (result.status === "saved") {
+          const parts = result.path.split(/[/\\]/);
+          const name = parts[parts.length - 1] ?? result.path;
+          setExportNotice(t("workspace.export.saved", { path: name }));
+        } else {
+          setExportNotice(null);
+        }
+      } catch {
+        fail();
+      }
+    },
+    [fail, selectedConversationId, t],
+  );
+
+  const searchWorkspace = useCallback((query: string): Promise<SearchHit[]> => {
+    return window.hub.search.query({ query });
+  }, []);
+
+  const selectedProject =
+    projects.find((project) => project.id === selectedProjectId) ?? null;
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent): void => {
       const modifier = event.ctrlKey || event.metaKey;
       if (!modifier) {
+        return;
+      }
+      if (event.key === "/") {
+        event.preventDefault();
+        setShortcutsOpen(true);
         return;
       }
       if (event.shiftKey && event.key.toLowerCase() === "n") {
@@ -636,30 +810,11 @@ export function App(): JSX.Element {
       <div className="flex min-h-0 flex-1">
         <Sidebar
           view={view}
-          onChange={(next) => {
-            if (next !== "home" && run) {
-              void window.hub.chat.abort({ runId: run.runId }).catch(fail);
-            }
-            setView(next);
-          }}
+          onChange={navigateToView}
           projects={projects}
           selectedProjectId={selectedProjectId}
           importedInbox={importedInbox}
-          onSelectProject={(id) => {
-            abortIfLeaving(null);
-            setSelectedProjectId(id);
-            setImportedInbox(false);
-            setSelectedConversationId(null);
-            setMessages([]);
-            setBranchLabels({});
-            if (id) {
-              const next = projects.find((item) => item.id === id);
-              if (next) {
-                applyProjectPreferences(next, providerKeys);
-              }
-            }
-            void loadConversations(id, false).catch(fail);
-          }}
+          onSelectProject={selectProject}
           onSelectImportedInbox={() => {
             abortIfLeaving(null);
             setSelectedProjectId(null);
@@ -692,32 +847,7 @@ export function App(): JSX.Element {
           searchHits={searchHits}
           onSearchQuery={setSearchQuery}
           searchInputRef={searchInputRef}
-          onOpenSearchHit={(hit) => {
-            abortIfLeaving(hit.conversationId);
-            setSelectedProjectId(hit.projectId);
-            setView("home");
-            void (async () => {
-              try {
-                let convos = await loadConversations(hit.projectId, false);
-                let imported = false;
-                if (hit.projectId === null && !convos.some((item) => item.id === hit.conversationId)) {
-                  convos = await loadConversations(null, true);
-                  imported = true;
-                }
-                setImportedInbox(imported);
-                setSelectedConversationId(hit.conversationId);
-                await loadMessages(hit.conversationId);
-                if (hit.messageId) {
-                  await window.hub.messages.activate({ id: hit.messageId });
-                  await loadMessages(hit.conversationId);
-                }
-                setSearchQuery("");
-                setSearchHits([]);
-              } catch {
-                fail();
-              }
-            })();
-          }}
+          onOpenSearchHit={openSearchHit}
         />
         <main className="min-w-0 flex-1 bg-background">
           {view === "home" ? (
@@ -868,26 +998,7 @@ export function App(): JSX.Element {
                   fail();
                 }
               }}
-              onExport={async (mode) => {
-                if (!selectedConversationId) {
-                  return;
-                }
-                try {
-                  const result = await window.hub.conversations.export({
-                    conversationId: selectedConversationId,
-                    mode,
-                  });
-                  if (result.status === "saved") {
-                    const parts = result.path.split(/[/\\]/);
-                    const name = parts[parts.length - 1] ?? result.path;
-                    setExportNotice(t("workspace.export.saved", { path: name }));
-                  } else {
-                    setExportNotice(null);
-                  }
-                } catch {
-                  fail();
-                }
-              }}
+              onExport={exportConversation}
               onMoveConversation={async (projectId) => {
                 if (!selectedConversationId) {
                   return;
@@ -922,7 +1033,10 @@ export function App(): JSX.Element {
                   return;
                 }
                 try {
-                  const updated = await window.hub.projects.update({ id: selectedProjectId, ...input });
+                  const updated = await window.hub.projects.update({
+                    id: selectedProjectId,
+                    ...input,
+                  });
                   setError(null);
                   await loadProjects();
                   applyProjectPreferences(updated, providerKeys);
@@ -934,7 +1048,9 @@ export function App(): JSX.Element {
                 if (!selectedProjectId) {
                   return;
                 }
-                const leaving = conversations.find((item) => item.id === selectedConversationId);
+                const leaving = conversations.find(
+                  (item) => item.id === selectedConversationId,
+                );
                 const imported = leaving?.importSource != null;
                 try {
                   abortIfLeaving(null);
@@ -1010,7 +1126,9 @@ export function App(): JSX.Element {
                     conversationId: selectedConversationId,
                     compact: compactHistory,
                     privacyMode,
-                    ...(key ? { model: selectedModel, providerSlug: key.providerSlug } : {}),
+                    ...(key
+                      ? { model: selectedModel, providerSlug: key.providerSlug }
+                      : {}),
                     ...(extra !== undefined ? { extraSystem: extra } : {}),
                   });
                   await loadPackets(selectedProjectId);
@@ -1041,7 +1159,10 @@ export function App(): JSX.Element {
                     setExportNotice(t("workspace.packet.cancelled"));
                     return;
                   }
-                  await window.hub.packets.import({ ticket: picked.ticket, projectId: selectedProjectId });
+                  await window.hub.packets.import({
+                    ticket: picked.ticket,
+                    projectId: selectedProjectId,
+                  });
                   await loadPackets(selectedProjectId);
                   setExportNotice(t("workspace.packet.imported"));
                 } catch {
@@ -1070,7 +1191,9 @@ export function App(): JSX.Element {
                   return;
                 }
                 try {
-                  const updated = await window.hub.packets.clear({ conversationId: selectedConversationId });
+                  const updated = await window.hub.packets.clear({
+                    conversationId: selectedConversationId,
+                  });
                   setConversations((current) =>
                     current.map((item) => (item.id === updated.id ? updated : item)),
                   );
@@ -1079,6 +1202,7 @@ export function App(): JSX.Element {
                   fail();
                 }
               }}
+              onOpenCaps={() => openSettings("caps")}
             />
           ) : view === "debug" ? (
             <DebugView />
@@ -1104,17 +1228,20 @@ export function App(): JSX.Element {
               }}
             />
           ) : (
-            <SettingsView />
+            <SettingsView focusSection={settingsSection} />
           )}
         </main>
       </div>
-      <StatusBar health={health} />
-      <Dialog open={fallback !== null} onOpenChange={(open) => {
-        if (!open) {
-          setFallback(null);
-          setFallbackPreview(null);
-        }
-      }}>
+      <StatusBar health={health} onOpenShortcuts={() => setShortcutsOpen(true)} />
+      <Dialog
+        open={fallback !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setFallback(null);
+            setFallbackPreview(null);
+          }
+        }}
+      >
         <DialogContent data-testid="fallback-dialog">
           <DialogHeader>
             <DialogTitle>{t("fallback.title")}</DialogTitle>
@@ -1129,7 +1256,10 @@ export function App(): JSX.Element {
                 })}
               </p>
               {fallbackPreview?.estimatedCostUsd ? (
-                <p className="text-[12px] text-muted-foreground" data-testid="fallback-estimate">
+                <p
+                  className="text-[12px] text-muted-foreground"
+                  data-testid="fallback-estimate"
+                >
                   {t("fallback.estimate", {
                     usd: fallbackPreview.estimatedCostUsd,
                     suggested: fallback.suggestProviderSlug,
@@ -1170,20 +1300,47 @@ export function App(): JSX.Element {
           ) : null}
         </DialogContent>
       </Dialog>
+      <KeyboardShortcutsDialog open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
       <ChromeCommandPalette
+        projects={projects}
+        providerKeys={providerKeys}
+        selectedModel={selectedModel}
+        selectedConversationId={selectedConversationId}
+        busy={sending || run !== null}
         onNewProject={() => {
-          setView("home");
+          navigateToView("home");
           window.setTimeout(() => projectInputRef.current?.focus(), 0);
         }}
         onNewChat={() => {
           void createUntitledChat();
         }}
-        onSearch={() => {
+        onOpenInbox={() => selectProject(null)}
+        onOpenImportedInbox={() => {
+          abortIfLeaving(null);
+          setSelectedProjectId(null);
+          setImportedInbox(true);
+          setSelectedConversationId(null);
+          setMessages([]);
+          setBranchLabels({});
+          void loadConversations(null, true).catch(fail);
           setView("home");
-          window.setTimeout(() => searchInputRef.current?.focus(), 0);
         }}
-        onDebug={() => setView("debug")}
-        onImport={() => setView("import")}
+        onOpenProject={(projectId) => selectProject(projectId)}
+        onOpenSearchHit={openSearchHit}
+        onSearchWorkspace={searchWorkspace}
+        onSelectModel={(option: PaletteModelOption) => {
+          setSelectedKeyId(option.keyId);
+          setSelectedModel(option.modelId);
+          navigateToView("home");
+        }}
+        onExport={(mode) => {
+          void exportConversation(mode);
+        }}
+        onProviders={() => openSettings("providers")}
+        onSettings={() => openSettings("general")}
+        onDebug={() => navigateToView("debug")}
+        onImport={() => navigateToView("import")}
+        onShortcuts={() => setShortcutsOpen(true)}
       />
     </div>
   );
