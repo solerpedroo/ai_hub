@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { siblingsOf, type MessageDto } from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { messageHasArtifacts } from "@/components/chat/artifact-canvas";
 import { CopyResponseButton, MessageMarkdown } from "@/components/chat/message-markdown";
 
 export function MessageBubble({
@@ -17,6 +18,7 @@ export function MessageBubble({
   onEditingChange,
   onActivateSibling,
   onPin,
+  onOpenArtifact,
 }: {
   message: MessageDto;
   messages: MessageDto[];
@@ -29,6 +31,7 @@ export function MessageBubble({
   onEditingChange?: (editing: boolean) => void;
   onActivateSibling: (id: string) => void;
   onPin: (pinned: boolean) => void;
+  onOpenArtifact?: (messageId: string) => void;
 }): JSX.Element {
   const { t } = useTranslation();
   const [editing, setEditing] = useState(false);
@@ -102,6 +105,20 @@ export function MessageBubble({
           ) : null}
           {message.role === "assistant" && message.content.length > 0 ? (
             <CopyResponseButton text={message.content} />
+          ) : null}
+          {message.role === "assistant" &&
+          message.status === "complete" &&
+          onOpenArtifact &&
+          messageHasArtifacts(message.content) ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              data-testid="artifact-open-from-message"
+              onClick={() => onOpenArtifact(message.id)}
+            >
+              {t("artifacts.open")}
+            </Button>
           ) : null}
           {message.role !== "system" && message.status !== "streaming" ? (
             <Button
