@@ -87,7 +87,7 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W12-003](./ADR-W12-003-vision-images-on-stream-not-packet.md) | W12 | Imagens no stream, não no packet; gate `vision` | accepted |
 | [ADR-W12-004](./ADR-W12-004-pdf-flatedecode-inflate.md) | W12 | PDF: inflate FlateDecode + literais Tj | accepted |
 | [ADR-W13-001](./ADR-W13-001-mentions-structured-not-in-user-text.md) | W13 | Menções estruturadas, não no texto do user | accepted |
-| [ADR-W13-002](./ADR-W13-002-mention-stubs-until-later-waves.md) | W13 | `@skill` stub; `@prompt` superseded by W15-002 | accepted |
+| [ADR-W13-002](./ADR-W13-002-mention-stubs-until-later-waves.md) | W13 | stubs; `@skill` superseded by W17-003 | accepted |
 | [ADR-W13-003](./ADR-W13-003-mention-token-cap-excludes-files.md) | W13 | Cap de menção não inclui `@file` | accepted |
 | [ADR-W14-001](./ADR-W14-001-local-hashed-embeddings.md) | W14 | Embeddings locais hashed; pacote `memory` | accepted |
 | [ADR-W14-002](./ADR-W14-002-memories-in-packet-strict-excludes.md) | W14 | Memórias no packet; `strict` exclui | accepted |
@@ -98,3 +98,6 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W16-001](./ADR-W16-001-artifacts-versioned-encrypted.md) | W16 | Artifacts versionados e cifrados | accepted |
 | [ADR-W16-002](./ADR-W16-002-html-sandbox-custom-protocol.md) | W16 | HTML sandbox via `ai-hub-artifact:` | accepted |
 | [ADR-W16-003](./ADR-W16-003-artifact-detector-thresholds.md) | W16 | Limiares do detector de artifacts | accepted |
+| [ADR-W17-001](./ADR-W17-001-skill-contract-json.md) | W17 | Contrato JSON v1; steps = secções; tools `[]` | accepted |
+| [ADR-W17-002](./ADR-W17-002-skill-slash-arguments.md) | W17 | `/skill Nome` parse-on-send local | accepted |
+| [ADR-W17-003](./ADR-W17-003-skills-encrypted-library.md) | W17 | Library de skills cifrada; `@skill` no compiler | accepted |
