@@ -159,7 +159,7 @@ export function App(): JSX.Element {
   const [compactHistory, setCompactHistory] = useState(false);
   const [packetPreview, setPacketPreview] = useState<PacketPreviewResult | null>(null);
   const [packets, setPackets] = useState<ContextPacketDto[]>([]);
-  const [privacyMode, setPrivacyMode] = useState<PacketPrivacyMode>("standard");
+  const [privacyMode, setPrivacyMode] = useState<PacketPrivacyMode>("normal");
   const [searchQuery, setSearchQuery] = useState("");
   const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
   const [threadStartModel, setThreadStartModel] = useState<string | null>(null);
@@ -293,6 +293,7 @@ export function App(): JSX.Element {
         if (session.extraSystem !== undefined) {
           setExtraSystem(session.extraSystem);
         }
+        setPrivacyMode(prefs.privacyMode);
         const showWizard = shouldShowOnboarding({
           hasProviderKey: keys.length > 0,
           onboardingComplete: prefs.onboardingComplete,
@@ -960,7 +961,7 @@ export function App(): JSX.Element {
                 }
                 let nextMentions = mentions;
                 let model = selectedModel;
-                let providerKeyId = selectedKeyId;
+                const providerKeyId = selectedKeyId;
                 const skillRef = mentions.find((item) => item.type === "skill");
                 if (skillRef) {
                   try {
@@ -1252,7 +1253,12 @@ export function App(): JSX.Element {
               }}
               packets={packets}
               privacyMode={privacyMode}
-              onPrivacyMode={setPrivacyMode}
+              onPrivacyMode={(value) => {
+                setPrivacyMode(value);
+                if (value === "private" || value === "normal" || value === "maximum") {
+                  void window.hub.prefs.set({ privacyMode: value });
+                }
+              }}
               onCompilePacket={async () => {
                 if (!selectedConversationId) {
                   return;
