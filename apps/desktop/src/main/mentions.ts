@@ -1,5 +1,6 @@
 import type { CompilerMention } from "@ai-hub/ai-gateway";
 import type { HubRepos } from "@ai-hub/db";
+import { allowsProjectContext } from "@ai-hub/memory";
 import { redactSecrets } from "@ai-hub/security";
 import {
   MAX_MENTION_TOKENS,
@@ -8,6 +9,7 @@ import {
   mentionTokenEstimate,
   portablePacketV1Schema,
   type MentionRef,
+  type PacketPrivacyMode,
 } from "@ai-hub/shared";
 
 export function resolveSendMentions(
@@ -16,6 +18,7 @@ export function resolveSendMentions(
   projectId: string | null,
   currentConversationId: string,
   mode: "preview" | "send" = "send",
+  privacyMode: PacketPrivacyMode = "standard",
 ): { fileIds: string[]; mentions: CompilerMention[] } {
   if (!refs || refs.length === 0) {
     return { fileIds: [], mentions: [] };
@@ -56,6 +59,19 @@ export function resolveSendMentions(
         continue;
       }
       const remaining = MAX_MENTION_TOKENS - usedTokens;
+      if (ref.type === "memory") {
+        if (!allowsProjectContext(privacyMode)) {
+          continue;
+        }
+        const mention = resolveMemoryMention(repos, projectId, ref, remaining);
+        if (seen.has(`memory:${mention.id}`)) {
+          continue;
+        }
+        seen.add(`memory:${mention.id}`);
+        usedTokens += mentionTokenEstimate(mention.text.length);
+        mentions.push(mention);
+        continue;
+      }
       if (ref.type === "conversation") {
         const mention = resolveConversationMention(repos, projectId, currentConversationId, ref, remaining);
         if (mention) {
@@ -83,6 +99,35 @@ export function resolveSendMentions(
     }
   }
   return { fileIds, mentions };
+}
+
+function resolveMemoryMention(
+  repos: HubRepos,
+  projectId: string | null,
+  ref: MentionRef,
+  remainingTokens: number,
+): CompilerMention {
+  if (!projectId) {
+    throw new Error("mentions:not_found");
+  }
+  const memories = repos.listProjectMemories(projectId);
+  const match = ref.id
+    ? memories.find((item) => item.id === ref.id)
+    : memories.find((item) => {
+        const query = (ref.query ?? "").toLowerCase();
+        return item.title.toLowerCase().includes(query) || item.body.toLowerCase().includes(query);
+      });
+  if (!match) {
+    throw new Error("mentions:not_found");
+  }
+  const text = redactSecrets(match.body);
+  const maxChars = Math.max(4, remainingTokens * 4);
+  return {
+    kind: "memory",
+    id: match.id,
+    name: match.title,
+    text: text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text,
+  };
 }
 
 function resolveProjectFile(
