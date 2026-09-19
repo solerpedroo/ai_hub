@@ -39,6 +39,23 @@ export { suggestFallbackProvider, type FallbackKeyLike, type FallbackSuggestion 
 export { classifyHubIpcError, type HubIpcError, type HubIpcErrorKind } from "./hub-error";
 export { looksLikePastedSecret, redactPastedSecrets } from "./secret-paste";
 export {
+  MAX_MENTIONS_PER_SEND,
+  MAX_MENTION_TOKENS,
+  MENTION_STUB_TYPES,
+  MENTION_TYPES,
+  isMentionStubType,
+  isMentionType,
+  mentionTokenEstimate,
+  mentionQueryParts,
+  mentionTriggerIn,
+  mentionVisibleContent,
+  parseMentionTokens,
+  type MentionParseResult,
+  type MentionStubType,
+  type MentionType,
+  type ParsedMention,
+} from "./mentions";
+export {
   shouldShowOnboarding,
   sortProvidersForWizard,
   WIZARD_PROVIDER_ORDER,
@@ -215,6 +232,9 @@ export {
 export {
   chatAbortInputSchema,
   chatSendInputSchema,
+  mentionRefListSchema,
+  mentionRefSchema,
+  mentionTypeSchema,
   catalogModelsForProvider,
   estimateCostUsd,
   findCatalogModel,
@@ -226,6 +246,7 @@ export {
   type CatalogModel,
   type ChatAbortInput,
   type ChatSendInput,
+  type MentionRef,
   type GatewayErrorCode,
   type ModelCatalog,
   type PacketMessage,
