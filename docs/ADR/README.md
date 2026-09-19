@@ -80,3 +80,5 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W10-001](./ADR-W10-001-portable-packet-json-v1.md) | W10 | Envelope `.aihub-packet.json` v1 | accepted |
 | [ADR-W10-002](./ADR-W10-002-context-packets-apply.md) | W10 | Persistência, apply no chat, ticket de ficheiro | accepted |
 | [ADR-W10-003](./ADR-W10-003-deterministic-inactive-summary-and-pins.md) | W10 | Resumo de ramos inativos sem LLM; pins no compact | accepted |
+| [ADR-W11-001](./ADR-W11-001-slash-commands-local-ui.md) | W11 | Slash commands são ações locais, não send | accepted |
+| [ADR-W11-002](./ADR-W11-002-palette-reuses-w6-search.md) | W11 | Paleta reusa busca W6; FTS5 continua vazio | accepted |
