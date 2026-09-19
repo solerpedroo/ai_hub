@@ -53,6 +53,10 @@ export const IpcChannel = {
   packetsImport: "packets:import",
   packetsApply: "packets:apply",
   packetsClear: "packets:clear",
+  filesList: "files:list",
+  filesAttach: "files:attach",
+  filesIngestPaths: "files:ingestPaths",
+  filesRemove: "files:remove",
 } as const;
 
 export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
