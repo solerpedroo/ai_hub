@@ -56,6 +56,7 @@ export function ChromeCommandPalette({
   onSettings,
   onDebug,
   onImport,
+  onPrompts,
   onShortcuts,
 }: {
   projects: ProjectDto[];
@@ -76,6 +77,7 @@ export function ChromeCommandPalette({
   onSettings: () => void;
   onDebug: () => void;
   onImport: () => void;
+  onPrompts: () => void;
   onShortcuts: () => void;
 }): JSX.Element {
   const { t } = useTranslation();
@@ -160,6 +162,12 @@ export function ChromeCommandPalette({
       label: t("command.import"),
       keywords: "import chatgpt claude gemini importar",
       run: onImport,
+    },
+    {
+      id: "prompts",
+      label: t("command.prompts"),
+      keywords: "prompt library playground prompts biblioteca",
+      run: onPrompts,
     },
     {
       id: "imported",
