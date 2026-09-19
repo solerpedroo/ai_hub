@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { app } from "electron";
 import { openHubDatabase, type HubDatabase } from "@ai-hub/db";
+import { FACTORY_PROMPTS } from "@ai-hub/shared";
 import { loadOrCreateMasterKey, MemorySecretStore } from "@ai-hub/security";
 import { KeytarSecretStore } from "@ai-hub/security/keytar";
 import { isE2eMode } from "./e2e-mode";
@@ -39,6 +40,7 @@ export async function bootPersistence(): Promise<HubDatabase> {
   const masterKey = await loadOrCreateMasterKey(store);
   const dbPath = join(app.getPath("userData"), "ai-hub.sqlite");
   hub = openHubDatabase({ path: dbPath, masterKey, secretStore: store });
+  hub.repos.ensureFactoryPrompts(FACTORY_PROMPTS);
   if (isE2eMode() && process.env.AI_HUB_E2E_EMPTY !== "1") {
     await seedE2eWorkspace(hub);
   }
