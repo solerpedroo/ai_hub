@@ -391,6 +391,14 @@ describe("wave 8 contracts", () => {
       lastUpdateCheckAt: null,
       lastUpdateStatus: "idle" as const,
       lastWizardTtftMs: null,
+      privacyMode: "normal",
+      firewallPolicy: {
+        secret: "mask",
+        token: "mask",
+        email: "mask",
+        cpf: "mask",
+        prompt_injection: "block",
+      },
     };
     expect(appPrefsSchema.parse(prefs).crashReporterOptIn).toBe(false);
     expect(() => appPrefsSchema.parse({ ...prefs, apiKey: "sk-test" })).toThrow();
