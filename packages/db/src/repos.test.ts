@@ -125,7 +125,7 @@ describe("hub database", () => {
       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
       applyMigrations(second.sqlite);
-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(9);
+      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(10);
       second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -685,6 +685,39 @@ describe("hub database", () => {
     expect(promoted.conversation.projectId).toBe(promoted.project.id);
     hub.repos.removeProjectMemory(memory.id);
     expect(hub.repos.getProjectMemory(memory.id)).toBeNull();
+    hub.close();
+  });
+
+  it("stores prompts encrypted, seeds factory once, and hides playground chats", () => {
+    const { hub } = openTestDb();
+    hub.repos.ensureFactoryPrompts([
+      {
+        factoryId: "code-review",
+        folder: "development",
+        title: "Code review",
+        body: "Review {{project}}",
+      },
+    ]);
+    hub.repos.ensureFactoryPrompts([
+      {
+        factoryId: "code-review",
+        folder: "development",
+        title: "Code review",
+        body: "Review {{project}}",
+      },
+    ]);
+    expect(hub.repos.listPrompts()).toHaveLength(1);
+    const custom = hub.repos.createPrompt({
+      folder: "work",
+      title: "Winner",
+      body: "Best of two models for Alpha",
+    });
+    expect(dumpAllText(hub.sqlite)).not.toContain("Best of two models");
+    expect(hub.repos.getPrompt(custom.id)?.body).toBe("Best of two models for Alpha");
+    const project = hub.repos.createProject("Alpha");
+    hub.repos.createConversation(project.id, "Chat");
+    hub.repos.createConversation(project.id, "Playground · gpt-4o-mini", "playground");
+    expect(hub.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Chat"]);
     hub.close();
   });
 });
