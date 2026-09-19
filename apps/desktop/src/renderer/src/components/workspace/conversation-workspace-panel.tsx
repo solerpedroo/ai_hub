@@ -1,23 +1,38 @@
 import { type JSX, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { ConversationWorkspaceDto } from "@ai-hub/shared";
+import type { ArtifactDto, ConversationWorkspaceDto } from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
+function latestArtifacts(items: ArtifactDto[]): ArtifactDto[] {
+  const latest = new Map<string, ArtifactDto>();
+  for (const item of items) {
+    const current = latest.get(item.familyId);
+    if (!current || item.version > current.version) {
+      latest.set(item.familyId, item);
+    }
+  }
+  return [...latest.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
 export function ConversationWorkspacePanel({
   workspace,
+  artifacts,
   busy,
   onRefresh,
   onAddTask,
   onSetTaskDone,
   onRemoveTask,
+  onOpenArtifact,
 }: {
   workspace: ConversationWorkspaceDto | null;
+  artifacts: ArtifactDto[];
   busy: boolean;
   onRefresh: () => Promise<void>;
   onAddTask: (title: string) => Promise<void>;
   onSetTaskDone: (id: string, done: boolean) => Promise<void>;
   onRemoveTask: (id: string) => Promise<void>;
+  onOpenArtifact: (id: string) => void;
 }): JSX.Element {
   const { t } = useTranslation();
   const [taskTitle, setTaskTitle] = useState("");
@@ -56,6 +71,29 @@ export function ConversationWorkspacePanel({
           <p className="text-[12px] text-muted-foreground" data-testid="workspace-pins">
             {t("workspace.panel.pinCount", { n: workspace?.pins.length ?? 0 })}
           </p>
+        </section>
+        <section>
+          <p className="text-[11px] font-medium">{t("workspace.panel.artifacts")}</p>
+          {(artifacts ?? []).length === 0 ? (
+            <p className="text-[12px] text-muted-foreground">{t("workspace.panel.empty")}</p>
+          ) : (
+            <ul>
+              {latestArtifacts(artifacts).map((item) => (
+                <li key={item.familyId}>
+                  <button
+                    type="button"
+                    className="w-full truncate text-left text-[12px] underline-offset-2 hover:underline"
+                    data-testid="artifact-workspace-item"
+                    onClick={() => onOpenArtifact(item.id)}
+                  >
+                    {item.title}
+                    {item.pinned ? ` · ${t("artifacts.pinned")}` : ""}
+                    {` · ${t("artifacts.version", { n: item.version })}`}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </section>
         <section>
           <p className="text-[11px] font-medium">{t("workspace.panel.tasks")}</p>
