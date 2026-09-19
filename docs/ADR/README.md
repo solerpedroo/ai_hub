@@ -101,3 +101,4 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W17-001](./ADR-W17-001-skill-contract-json.md) | W17 | Contrato JSON v1; steps = secções; tools `[]` | accepted |
 | [ADR-W17-002](./ADR-W17-002-skill-slash-arguments.md) | W17 | `/skill Nome` parse-on-send local | accepted |
 | [ADR-W17-003](./ADR-W17-003-skills-encrypted-library.md) | W17 | Library de skills cifrada; `@skill` no compiler | accepted |
+| [ADR-W18-001](./ADR-W18-001-effective-privacy-policy.md) | W18 | Política efetiva de privacidade no main | accepted |
