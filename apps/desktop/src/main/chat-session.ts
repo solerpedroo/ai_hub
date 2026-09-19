@@ -3,6 +3,7 @@ import type { WebContents } from "electron";
 import {
   composeReceipt,
   appendFilesToPacket,
+  appendMentionsToPacket,
   compileActivePath,
   compilePacket,
   consumeCrashSafeStream,
@@ -27,6 +28,7 @@ import {
   chatEventSchema,
   findCatalogModel,
   IpcChannel,
+  mentionVisibleContent,
   packetV0Schema,
   portablePacketV1Schema,
   SpendCapError,
@@ -43,6 +45,7 @@ import { recordDebugSnapshot } from "./debug-snapshot";
 import { isE2eMode } from "./e2e-mode";
 import { toMessageDto } from "./message-dto";
 import { loadSendAttachments } from "./files";
+import { resolveSendMentions } from "./mentions";
 import { getHubDatabase } from "./persistence";
 import { estimateOutgoingCostUsd, evaluateOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
 
@@ -268,13 +271,14 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     case "send": {
       const leaf = activePath(existing).at(-1);
       const branchId = leaf?.branchId ?? randomUUID();
-      const draft = pendingUser(input.conversationId, input.content, leaf?.id ?? null, branchId);
+      const content = mentionVisibleContent(input.content) || input.content;
+      const draft = pendingUser(input.conversationId, content, leaf?.id ?? null, branchId);
       compileRows = [...existing, draft];
       persistUser = () =>
         repos.createMessage({
           conversationId: input.conversationId,
           role: "user",
-          content: input.content,
+          content,
           parentId: leaf?.id ?? null,
           branchId: leaf?.branchId ?? null,
         });
@@ -316,7 +320,8 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
         throw new Error("User message not found");
       }
       const branchId = randomUUID();
-      const draft = pendingUser(input.conversationId, input.content, target.parentId, branchId);
+      const content = mentionVisibleContent(input.content) || input.content;
+      const draft = pendingUser(input.conversationId, content, target.parentId, branchId);
       compileRows = existing
         .map((item) => (item.id === target.id ? { ...item, isActiveBranch: false } : item))
         .concat(draft);
@@ -324,7 +329,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
         repos.createMessage({
           conversationId: input.conversationId,
           role: "user",
-          content: input.content,
+          content,
           parentId: target.parentId,
           branchId,
         });
@@ -340,8 +345,16 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
 
   const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
   const catalogForVision = findCatalogModel(input.model, key.providerSlug);
+  const resolvedMentions = resolveSendMentions(
+    repos,
+    input.mentions,
+    conversation.projectId,
+    input.conversationId,
+    "send",
+  );
+  const fileIds = [...new Set([...(input.fileIds ?? []), ...resolvedMentions.fileIds])];
   const attachments = loadSendAttachments(
-    input.fileIds,
+    fileIds,
     conversation.projectId,
     catalogForVision?.vision === true,
     "send",
@@ -353,7 +366,8 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     key.providerSlug,
     conversation,
   );
-  const packet = appendFilesToPacket(compiled, attachments.files).packet;
+  const withFiles = appendFilesToPacket(compiled, attachments.files);
+  const packet = appendMentionsToPacket(withFiles.packet, resolvedMentions.mentions).packet;
   if (packet.messages.length === 0) {
     throw new Error("Add a user message before sending");
   }
