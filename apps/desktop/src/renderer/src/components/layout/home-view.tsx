@@ -13,6 +13,7 @@ import {
   type PacketPrivacyMode,
   type ProjectDto,
   type ProjectUpdateInput,
+  type ProjectFileDto,
   type ProviderKeyDto,
 } from "@ai-hub/shared";
 import { ChatComposer, type SlashCommandId } from "@/components/chat/chat-composer";
@@ -90,6 +91,11 @@ export function HomeView({
   onApplyPacket,
   onClearPacket,
   onOpenCaps,
+  attachedFiles,
+  onAttachFile,
+  onAttachFolder,
+  onRemoveFile,
+  onDropFiles,
 }: {
   project: ProjectDto | null;
   importedInbox: boolean;
@@ -146,6 +152,11 @@ export function HomeView({
   onApplyPacket: (packetId: string) => Promise<void>;
   onClearPacket: () => Promise<void>;
   onOpenCaps: () => void;
+  attachedFiles: ProjectFileDto[];
+  onAttachFile: () => Promise<void>;
+  onAttachFolder: () => Promise<void>;
+  onRemoveFile: (id: string) => Promise<void>;
+  onDropFiles: (files: File[]) => Promise<void>;
 }): JSX.Element {
   const { t } = useTranslation();
   const modifier = window.hub.platform === "darwin" ? "⌘" : "Ctrl";
@@ -805,6 +816,81 @@ export function HomeView({
                     aria-label={t("workspace.extraSystem")}
                   />
                 </label>
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      data-testid="files-attach"
+                      disabled={busy || editing}
+                      onClick={() => {
+                        void onAttachFile();
+                      }}
+                    >
+                      {t("files.attach")}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      data-testid="files-attach-folder"
+                      disabled={busy || editing}
+                      onClick={() => {
+                        void onAttachFolder();
+                      }}
+                    >
+                      {t("files.attachFolder")}
+                    </Button>
+                  </div>
+                  {attachedFiles.length > 0 ? (
+                    <ul className="flex flex-col gap-1" data-testid="files-attached">
+                      {attachedFiles.map((file) => (
+                        <li
+                          key={file.id}
+                          className="flex items-center justify-between gap-2 rounded-md border px-2 py-1 text-[12px]"
+                          data-testid="files-chip"
+                        >
+                          <span className="min-w-0 truncate">
+                            {file.name}
+                            <span className="ml-2 text-muted-foreground">
+                              {t("files.tokens", { n: file.tokenEstimate })}
+                            </span>
+                            {file.truncated ? (
+                              <span className="ml-2 text-muted-foreground">{t("files.truncated")}</span>
+                            ) : null}
+                            {file.visionRequired ? (
+                              <span className="ml-2 text-muted-foreground">
+                                {t("files.visionHint")}
+                              </span>
+                            ) : null}
+                            {file.excerpt ? (
+                              <span className="ml-2 text-muted-foreground">{file.excerpt}</span>
+                            ) : null}
+                          </span>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            data-testid="files-remove"
+                            onClick={() => {
+                              void onRemoveFile(file.id);
+                            }}
+                          >
+                            {t("files.remove")}
+                          </Button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                  {attachedFiles.length > 0 ? (
+                    <p className="text-[11px] text-muted-foreground" data-testid="files-token-warning">
+                      {t("files.tokenWarning", {
+                        n: attachedFiles.reduce((sum, file) => sum + file.tokenEstimate, 0),
+                      })}
+                    </p>
+                  ) : null}
+                </div>
                 <ChatComposer
                   key={selectedConversationId}
                   value={draft}
@@ -831,6 +917,9 @@ export function HomeView({
                     void onAbort();
                   }}
                   onSlashCommand={runSlashCommand}
+                  onFilesDrop={(files) => {
+                    void onDropFiles(files);
+                  }}
                 />
               </div>
               {treeOpen ? (
