@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { localeSchema, themeModeSchema } from "./appearance";
-import { gatewayErrorCodeSchema, packetV0Schema, receiptDtoSchema } from "./gateway";
+import {
+  gatewayErrorCodeSchema,
+  mentionRefListSchema,
+  packetV0Schema,
+  receiptDtoSchema,
+} from "./gateway";
 import {
   packetPrivacyModeSchema,
   packetSliceSchema,
@@ -181,6 +186,7 @@ export const packetPreviewInputSchema = z
     maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
     privacyMode: packetPrivacyModeSchema.optional(),
     fileIds: z.array(z.string().uuid()).max(8).optional(),
+    mentions: mentionRefListSchema.optional(),
   })
   .strict();
 
