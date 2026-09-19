@@ -38,6 +38,7 @@
     "i18next": "^25.4.2",
     "keytar": "^7.9.0",
     "lucide-react": "^0.542.0",
+    "mermaid": "^11.6.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "react-i18next": "^15.7.3",
