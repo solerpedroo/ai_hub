@@ -22,6 +22,7 @@ import {
   importJobs,
   projectFiles,
   projectMemories,
+  prompts,
   messageReceipts,
   messages,
   projects,
@@ -63,6 +64,7 @@ export interface ConversationRecord {
   importSource: "chatgpt" | "claude" | "gemini" | null;
   activePacketId: string | null;
   packetAppliedAt: string | null;
+  kind: "chat" | "playground";
 }
 
 export interface SearchHitRecord {
@@ -204,6 +206,18 @@ export interface ConversationTaskRecord {
   createdAt: string;
 }
 
+export type PromptFolder = "development" | "studies" | "work";
+
+export interface PromptRecord {
+  id: string;
+  folder: PromptFolder;
+  title: string;
+  body: string;
+  factoryId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface SpendCapOverrideRecord {
   at: string;
   scope: string;
@@ -266,6 +280,7 @@ const BRANCH_LABELS_PREFIX = "branch-labels:";
 const CUSTOM_BASE_URL_PREFIX = "custom-base-url:";
 const SPEND_CAP_OVERRIDES_KEY = "spend-cap-overrides";
 const MEMORY_OPT_OUT_PREFIX = "memory-opt-out:";
+const PROMPT_FACTORY_SEEDED_KEY = "prompt-factory-seeded";
 const DEFAULT_SESSION: WorkspaceSessionRecord = {
   projectId: null,
   conversationId: null,
@@ -467,6 +482,7 @@ export class HubRepos {
           : null,
       activePacketId: row.activePacketId ?? null,
       packetAppliedAt: row.packetAppliedAt !== null && row.packetAppliedAt !== undefined ? iso(row.packetAppliedAt) : null,
+      kind: row.kind === "playground" ? "playground" : "chat",
     };
   }
 
@@ -605,6 +621,7 @@ export class HubRepos {
         : this.db.select().from(conversations).where(eq(conversations.projectId, projectId)).all();
     return rows
       .map((row) => this.toConversation(row))
+      .filter((item) => item.kind !== "playground")
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
@@ -613,7 +630,11 @@ export class HubRepos {
     return row ? this.toConversation(row) : null;
   }
 
-  createConversation(projectId: string | null, title: string): ConversationRecord {
+  createConversation(
+    projectId: string | null,
+    title: string,
+    kind: "chat" | "playground" = "chat",
+  ): ConversationRecord {
     const now = Date.now();
     const id = randomUUID();
     this.db
@@ -626,6 +647,7 @@ export class HubRepos {
         updatedAt: now,
         importSource: null,
         externalId: null,
+        kind,
       })
       .run();
     return {
@@ -638,6 +660,7 @@ export class HubRepos {
       importSource: null,
       activePacketId: null,
       packetAppliedAt: null,
+      kind,
     };
   }
 
@@ -836,6 +859,9 @@ export class HubRepos {
     for (const row of rows) {
       if (hits.length >= limit) {
         break;
+      }
+      if (row.kind === "playground") {
+        continue;
       }
       const title = decryptUtf8(row.titleCipher, this.masterKey);
       const titleMatched = matchesAllTokens(title, tokens);
@@ -2024,6 +2050,106 @@ export class HubRepos {
       .run();
   }
 
+  ensureFactoryPrompts(
+    items: readonly { factoryId: string; folder: PromptFolder; title: string; body: string }[],
+  ): void {
+    const seeded = this.db.select().from(settings).where(eq(settings.key, PROMPT_FACTORY_SEEDED_KEY)).get();
+    if (seeded?.value === "1") {
+      return;
+    }
+    for (const item of items) {
+      const existing = this.db.select().from(prompts).where(eq(prompts.factoryId, item.factoryId)).get();
+      if (existing) {
+        continue;
+      }
+      this.createPrompt({
+        folder: item.folder,
+        title: item.title,
+        body: item.body,
+        factoryId: item.factoryId,
+      });
+    }
+    const now = Date.now();
+    this.db
+      .insert(settings)
+      .values({ key: PROMPT_FACTORY_SEEDED_KEY, value: "1", updatedAt: now })
+      .onConflictDoUpdate({
+        target: settings.key,
+        set: { value: "1", updatedAt: now },
+      })
+      .run();
+  }
+
+  createPrompt(input: {
+    folder: PromptFolder;
+    title: string;
+    body: string;
+    factoryId?: string | null;
+  }): PromptRecord {
+    const id = randomUUID();
+    const now = Date.now();
+    this.db
+      .insert(prompts)
+      .values({
+        id,
+        folder: input.folder,
+        titleCipher: encryptUtf8(input.title.slice(0, 120), this.masterKey),
+        bodyCipher: encryptUtf8(input.body.slice(0, 16_000), this.masterKey),
+        factoryId: input.factoryId ?? null,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+    const created = this.getPrompt(id);
+    if (!created) {
+      throw new Error("Prompt not found");
+    }
+    return created;
+  }
+
+  getPrompt(id: string): PromptRecord | null {
+    const row = this.db.select().from(prompts).where(eq(prompts.id, id)).get();
+    return row ? this.toPrompt(row) : null;
+  }
+
+  listPrompts(): PromptRecord[] {
+    return this.db
+      .select()
+      .from(prompts)
+      .all()
+      .map((row) => this.toPrompt(row))
+      .sort((a, b) => a.folder.localeCompare(b.folder) || a.title.localeCompare(b.title));
+  }
+
+  updatePrompt(
+    id: string,
+    patch: { folder?: PromptFolder; title?: string; body?: string },
+  ): PromptRecord {
+    const existing = this.getPrompt(id);
+    if (!existing) {
+      throw new Error("Prompt not found");
+    }
+    this.db
+      .update(prompts)
+      .set({
+        folder: patch.folder ?? existing.folder,
+        titleCipher: encryptUtf8((patch.title ?? existing.title).slice(0, 120), this.masterKey),
+        bodyCipher: encryptUtf8((patch.body ?? existing.body).slice(0, 16_000), this.masterKey),
+        updatedAt: Date.now(),
+      })
+      .where(eq(prompts.id, id))
+      .run();
+    const updated = this.getPrompt(id);
+    if (!updated) {
+      throw new Error("Prompt not found");
+    }
+    return updated;
+  }
+
+  removePrompt(id: string): void {
+    this.db.delete(prompts).where(eq(prompts.id, id)).run();
+  }
+
   replaceFileChunks(
     fileId: string,
     projectId: string | null,
@@ -2269,6 +2395,22 @@ export class HubRepos {
       title: decryptUtf8(row.titleCipher, this.masterKey),
       done: row.done === 1,
       createdAt: iso(row.createdAt),
+    };
+  }
+
+  private toPrompt(row: typeof prompts.$inferSelect): PromptRecord {
+    const folder =
+      row.folder === "development" || row.folder === "studies" || row.folder === "work"
+        ? row.folder
+        : "work";
+    return {
+      id: row.id,
+      folder,
+      title: decryptUtf8(row.titleCipher, this.masterKey),
+      body: decryptUtf8(row.bodyCipher, this.masterKey),
+      factoryId: row.factoryId ?? null,
+      createdAt: iso(row.createdAt),
+      updatedAt: iso(row.updatedAt),
     };
   }
 
