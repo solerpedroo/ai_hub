@@ -10,6 +10,7 @@ import type {
   CostsAggregateResult,
   GatewayErrorCode,
   HealthSummaryDto,
+  MentionRef,
   MessageDto,
   PacketPreviewResult,
   PacketPrivacyMode,
@@ -92,6 +93,15 @@ function workspaceErrorText(
   if (message.includes("files:limit")) {
     return { text: t("files.error.limit"), cap: false };
   }
+  if (message.includes("mentions:unavailable")) {
+    return { text: t("mentions.error.unavailable"), cap: false };
+  }
+  if (message.includes("mentions:not_found")) {
+    return { text: t("mentions.error.notFound"), cap: false };
+  }
+  if (message.includes("mentions:limit")) {
+    return { text: t("mentions.error.limit"), cap: false };
+  }
   if (
     classified.kind === "gateway" &&
     classified.code &&
@@ -104,6 +114,12 @@ function workspaceErrorText(
 
 function fileIdsPayload(files: ProjectFileDto[]): { fileIds: string[] } | Record<string, never> {
   return files.length > 0 ? { fileIds: files.map((file) => file.id) } : {};
+}
+
+function mentionsPayload(
+  mentions: MentionRef[],
+): { mentions: MentionRef[] } | Record<string, never> {
+  return mentions.length > 0 ? { mentions } : {};
 }
 
 function chatEventErrorText(t: TFunction, code: GatewayErrorCode): string {
@@ -150,6 +166,7 @@ export function App(): JSX.Element {
   const [showAllowOnce, setShowAllowOnce] = useState(false);
   const [composerDraft, setComposerDraft] = useState("");
   const [attachedFiles, setAttachedFiles] = useState<ProjectFileDto[]>([]);
+  const [mentionRefs, setMentionRefs] = useState<MentionRef[]>([]);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
   const [fallback, setFallback] = useState<{
@@ -468,6 +485,7 @@ export function App(): JSX.Element {
           ...(pending !== undefined ? { pendingContent: pending } : {}),
           ...(maxTokens !== null ? { maxTokens } : {}),
           ...fileIdsPayload(attachedFiles),
+          ...mentionsPayload(mentionRefs),
         })
         .then(setPacketPreview)
         .catch(fail);
@@ -487,6 +505,7 @@ export function App(): JSX.Element {
     privacyMode,
     activePacketId,
     attachedFiles,
+    mentionRefs,
   ]);
 
   useEffect(() => {
@@ -568,6 +587,7 @@ export function App(): JSX.Element {
         ...(extra !== undefined ? { extraSystem: extra } : {}),
         ...(maxTokens !== null ? { maxTokens } : {}),
         ...fileIdsPayload(attachedFiles),
+        ...mentionsPayload(mentionRefs),
       })
       .then(setFallbackPreview)
       .catch(() => setFallbackPreview(null));
@@ -577,6 +597,7 @@ export function App(): JSX.Element {
     extraSystem,
     fallback,
     maxTokens,
+    mentionRefs,
     privacyMode,
     selectedConversationId,
   ]);
@@ -686,6 +707,7 @@ export function App(): JSX.Element {
       setSelectedProjectId(id);
       setImportedInbox(false);
       setAttachedFiles([]);
+      setMentionRefs([]);
       setSelectedConversationId(null);
       setMessages([]);
       setBranchLabels({});
@@ -845,6 +867,7 @@ export function App(): JSX.Element {
             abortIfLeaving(null);
             setSelectedProjectId(null);
             setAttachedFiles([]);
+      setMentionRefs([]);
             setImportedInbox(true);
             setSelectedConversationId(null);
             setMessages([]);
@@ -922,10 +945,11 @@ export function App(): JSX.Element {
               onSelectTemperature={setTemperature}
               onSelectMaxTokens={setMaxTokens}
               onSelectExtraSystem={setExtraSystem}
-              onSend={(content) => {
+              onSend={(content, mentions) => {
                 if (!selectedConversationId || !selectedKeyId) {
                   return Promise.resolve(false);
                 }
+                setMentionRefs(mentions);
                 return sendToModel({
                   mode: "send",
                   conversationId: selectedConversationId,
@@ -937,8 +961,10 @@ export function App(): JSX.Element {
                   extraSystem,
                   compactHistory,
                   ...fileIdsPayload(attachedFiles),
+                  ...mentionsPayload(mentions),
                 });
               }}
+              onMentionsChange={setMentionRefs}
               onAbort={async () => {
                 if (!run || run.conversationId !== selectedConversationId) {
                   return;
@@ -1272,14 +1298,7 @@ export function App(): JSX.Element {
                 }
               }}
               onRemoveFile={async (id) => {
-                try {
-                  await window.hub.files.remove({ id, projectId: selectedProjectId });
-                  setAttachedFiles((current) => current.filter((item) => item.id !== id));
-                  setError(null);
-                } catch (error) {
-                  const mapped = workspaceErrorText(t, error);
-                  setError(mapped.text);
-                }
+                setAttachedFiles((current) => current.filter((item) => item.id !== id));
               }}
               onDropFiles={async (files) => {
                 try {
