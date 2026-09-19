@@ -29,4 +29,11 @@ describe("stripAttachedFileBodiesForRenderer", () => {
     expect(stripped).not.toContain("PostgreSQL");
     expect(stripped).not.toContain("secret-doc");
   });
+
+  it("omits library prompt bodies", () => {
+    const system = "Be brief.\n\nLibrary prompt: Code review\nYou are a senior code reviewer for E2E.";
+    const stripped = stripAttachedFileBodiesForRenderer(system);
+    expect(stripped).toContain("Library prompt: Code review");
+    expect(stripped).not.toContain("senior");
+  });
 });
