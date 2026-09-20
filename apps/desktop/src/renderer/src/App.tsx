@@ -920,6 +920,7 @@ export function App(): JSX.Element {
               messages={messages}
               error={error}
               providerKeys={providerKeys}
+              health={health}
               selectedKeyId={selectedKeyId}
               selectedModel={selectedModel}
               temperature={temperature}
@@ -955,13 +956,14 @@ export function App(): JSX.Element {
               onSelectTemperature={setTemperature}
               onSelectMaxTokens={setMaxTokens}
               onSelectExtraSystem={setExtraSystem}
-              onSend={async (content, mentions) => {
-                if (!selectedConversationId || !selectedKeyId) {
+              onSend={async (content, mentions, route) => {
+                const routeKeyId = route?.keyId ?? selectedKeyId;
+                if (!selectedConversationId || !routeKeyId) {
                   return false;
                 }
                 let nextMentions = mentions;
-                let model = selectedModel;
-                const providerKeyId = selectedKeyId;
+                let model = route?.model ?? selectedModel;
+                const providerKeyId = routeKeyId;
                 const skillRef = mentions.find((item) => item.type === "skill");
                 if (skillRef) {
                   try {
@@ -1414,6 +1416,7 @@ export function App(): JSX.Element {
               providerKeys={providerKeys}
               privacyMode={privacyMode}
               conversationId={selectedConversationId}
+              health={health}
               onInsertIntoComposer={(text) => {
                 setComposerInsert(text);
                 setView("home");
