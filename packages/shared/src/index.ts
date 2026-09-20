@@ -25,6 +25,7 @@ export {
   type HubArtifactsApi,
   type HubSkillsApi,
   type HubWindowApi,
+  type HubQuickAiApi,
 } from "./hub-api";
 export {
   evaluateSpendCaps,
@@ -46,6 +47,12 @@ export { summarizeProviderHealth, HEALTH_WINDOW, type HealthSampleLike, type Hea
 export { suggestFallbackProvider, type FallbackKeyLike, type FallbackSuggestion } from "./fallback";
 export { classifyHubIpcError, type HubIpcError, type HubIpcErrorKind } from "./hub-error";
 export { looksLikePastedSecret, redactPastedSecrets } from "./secret-paste";
+export {
+  inspectClipboardText,
+  typescriptInterfaceFromJson,
+  type ClipboardInsight,
+  type ClipboardInsightKind,
+} from "./clipboard-intelligence";
 export {
   MAX_MENTIONS_PER_SEND,
   MAX_MENTION_TOKENS,
@@ -255,6 +262,7 @@ export {
   secretsTestInputSchema,
   secretsTestResultSchema,
   windowIsMaximizedResultSchema,
+  clipboardTextSchema,
   workspaceSessionSchema,
   type AppearanceSettings,
   type BranchLabelSetInput,
