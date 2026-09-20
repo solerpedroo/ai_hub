@@ -12,6 +12,8 @@ import {
   type PromptDto,
   type PromptFolder,
   type ProviderKeyDto,
+  COUNCIL_ROLES,
+  recommendModelRoute,
 } from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -52,11 +54,13 @@ export function PromptsView({
   providerKeys,
   privacyMode,
   onInsertIntoComposer,
+  conversationId,
 }: {
   project: ProjectDto | null;
   providerKeys: ProviderKeyDto[];
   privacyMode: PacketPrivacyMode;
   onInsertIntoComposer: (text: string) => void;
+  conversationId: string | null;
 }): JSX.Element {
   const { t } = useTranslation();
   const [prompts, setPrompts] = useState<PromptDto[]>([]);
@@ -69,6 +73,9 @@ export function PromptsView({
   const [slots, setSlots] = useState<PlaygroundColumn[]>(() => defaultSlots(providerKeys));
   const [running, setRunning] = useState(false);
   const [winnerTitle, setWinnerTitle] = useState("");
+  const [councilDraft, setCouncilDraft] = useState("");
+  const [councilRunning, setCouncilRunning] = useState(false);
+  const [councilResult, setCouncilResult] = useState<{ divergences: string[]; synthesis: MessageDto | null } | null>(null);
   const slotsRef = useRef(slots);
   slotsRef.current = slots;
 
@@ -273,6 +280,27 @@ export function PromptsView({
     }
   };
 
+  const runCouncil = async (): Promise<void> => {
+    if (!conversationId || councilDraft.trim().length === 0 || keyOptions.length < 2) {
+      setError(t("council.error.setup")); return;
+    }
+    const selected = keyOptions.slice(0, Math.min(4, keyOptions.length));
+    const roles = COUNCIL_ROLES.slice(0, selected.length);
+    const synth = selected[0];
+    if (!synth) return;
+    setCouncilRunning(true); setError(null); setCouncilResult(null);
+    try {
+      const result = await window.hub.council.run({
+        projectId: project?.id ?? null,
+        content: councilDraft.trim(),
+        slots: selected.map((slot, index) => ({ providerKeyId: slot.providerKeyId, model: slot.model, role: roles[index] ?? "reviewer" })),
+        synthesis: { providerKeyId: synth.providerKeyId, model: synth.model }, privacyMode,
+      });
+      const synthesis = await window.hub.messages.list({ conversationId: result.synthesis.send.assistant.conversationId });
+      setCouncilResult({ divergences: result.divergences, synthesis: synthesis.at(-1) ?? null });
+    } catch { setError(t("council.error.run")); } finally { setCouncilRunning(false); }
+  };
+
   return (
     <div className="flex h-full min-h-0" data-testid="prompts-view">
       <aside className="flex w-64 shrink-0 flex-col border-r">
@@ -414,6 +442,13 @@ export function PromptsView({
               >
                 {running ? t("prompts.running") : t("prompts.run")}
               </Button>
+            </div>
+            <div className="mt-3 border-t pt-2" data-testid="council-panel">
+              <p className="mb-1 text-[12px] font-medium">{t("council.title")}</p>
+              <textarea className="mb-1 h-16 w-full resize-none rounded border bg-background p-2 text-[12px]" value={councilDraft} onChange={(event) => setCouncilDraft(event.target.value)} placeholder={t("council.placeholder")} data-testid="council-input" />
+              <p className="mb-1 text-[11px] text-muted-foreground">{t(`council.router.${recommendModelRoute(councilDraft).reason}`)}</p>
+              <Button size="sm" type="button" disabled={councilRunning || !conversationId} onClick={() => void runCouncil()} data-testid="council-run">{councilRunning ? t("council.running") : t("council.run")}</Button>
+              {councilResult ? <div className="mt-2 rounded border p-2 text-[11px]"><p>{t("council.divergences")}: {councilResult.divergences.join(", ") || t("council.none")}</p><p className="mt-1 font-medium">{t("council.synthesis")}</p><p className="whitespace-pre-wrap">{councilResult.synthesis?.content}</p></div> : null}
             </div>
             <Input
               className="mb-2"
