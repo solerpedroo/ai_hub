@@ -33,6 +33,7 @@ import {
   settings,
   spendCaps,
   scopedSpendCaps,
+  spendReservations,
   tags,
   type schema,
 } from "./schema";
@@ -1688,6 +1689,29 @@ export class HubRepos {
     for (const row of rows) {
       micros += parseUsdMicros(row.costUsd);
     }
+    return microsToUsdText(micros);
+  }
+
+  reserveSpend(input: { projectId: string | null; providerSlug: string; amountUsd: string; expiresAt: number }): string {
+    const id = randomUUID();
+    this.sqlite.prepare("DELETE FROM spend_reservations WHERE expires_at <= ?").run(Date.now());
+    this.db.insert(spendReservations).values({ id, projectId: input.projectId, providerSlug: input.providerSlug, amountUsd: input.amountUsd, expiresAt: input.expiresAt, createdAt: Date.now() }).run();
+    return id;
+  }
+
+  releaseSpendReservation(id: string): void {
+    this.db.delete(spendReservations).where(eq(spendReservations.id, id)).run();
+  }
+
+  sumReservedSpendUsd(filter: { projectId?: string | null; providerSlug?: string; sinceMs?: number } = {}): string {
+    this.sqlite.prepare("DELETE FROM spend_reservations WHERE expires_at <= ?").run(Date.now());
+    const clauses = [gte(spendReservations.expiresAt, Date.now())];
+    if (filter.projectId) clauses.push(eq(spendReservations.projectId, filter.projectId));
+    if (filter.providerSlug) clauses.push(eq(spendReservations.providerSlug, filter.providerSlug));
+    if (filter.sinceMs !== undefined) clauses.push(gte(spendReservations.createdAt, filter.sinceMs));
+    const rows = this.db.select({ amountUsd: spendReservations.amountUsd }).from(spendReservations).where(and(...clauses)).all();
+    let micros = 0;
+    for (const row of rows) micros += parseUsdMicros(row.amountUsd);
     return microsToUsdText(micros);
   }
 
