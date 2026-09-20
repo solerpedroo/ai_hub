@@ -1,11 +1,12 @@
 import { redactSecrets } from "@ai-hub/security";
 import { catalogModelsForProvider, type ProviderAgnosticPacket } from "@ai-hub/shared";
-import type {
-  ChatStreamEvent,
-  ChatStreamRequest,
-  ModelRef,
-  ProviderAdapter,
-  ProviderCapabilities,
+import {
+  packetForDispatch,
+  type ChatStreamEvent,
+  type ChatStreamRequest,
+  type ModelRef,
+  type ProviderAdapter,
+  type ProviderCapabilities,
 } from "./adapter";
 import { GatewayError } from "./errors";
 import { iterateSseData } from "./sse";
@@ -208,7 +209,7 @@ export function createOpenAICompatibleAdapter(
         model: input.model,
         stream: true,
         stream_options: { include_usage: true },
-        messages: packetMessages(input.packet, input.images),
+        messages: packetMessages(packetForDispatch(input), input.images),
         temperature: input.temperature ?? 1,
       };
       if (input.maxTokens !== undefined && input.maxTokens !== null) {
