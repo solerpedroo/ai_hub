@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ThemeProvider } from "@/lib/theme";
 import { App } from "./App";
+import { QuickAiOverlay } from "./components/quick-ai/quick-ai-overlay";
 import "./lib/i18n";
 import "./index.css";
 import "highlight.js/styles/github-dark.min.css";
@@ -16,7 +17,7 @@ createRoot(root).render(
   <StrictMode>
     <ThemeProvider>
       <TooltipProvider delayDuration={200}>
-        <App />
+        {window.location.hash === "#quick-ai" ? <QuickAiOverlay /> : <App />}
       </TooltipProvider>
     </ThemeProvider>
   </StrictMode>,
