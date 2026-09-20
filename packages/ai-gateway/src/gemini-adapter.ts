@@ -1,11 +1,12 @@
 import { redactSecrets } from "@ai-hub/security";
 import { catalogModelsForProvider, type ProviderAgnosticPacket } from "@ai-hub/shared";
-import type {
-  ChatStreamEvent,
-  ChatStreamRequest,
-  ModelRef,
-  ProviderAdapter,
-  ProviderCapabilities,
+import {
+  packetForDispatch,
+  type ChatStreamEvent,
+  type ChatStreamRequest,
+  type ModelRef,
+  type ProviderAdapter,
+  type ProviderCapabilities,
 } from "./adapter";
 import { GatewayError } from "./errors";
 import { iterateSseData } from "./sse";
@@ -165,7 +166,7 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): Provide
       }
     },
     async *chatStream(input: ChatStreamRequest): AsyncIterable<ChatStreamEvent> {
-      const converted = packetToGemini(input.packet, input.images);
+      const converted = packetToGemini(packetForDispatch(input), input.images);
       const generationConfig: Record<string, unknown> = {
         temperature: input.temperature ?? 1,
       };
