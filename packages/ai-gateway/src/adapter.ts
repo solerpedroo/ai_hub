@@ -1,4 +1,5 @@
 import type { ProviderAgnosticPacket } from "@ai-hub/shared";
+import type { CouncilRole } from "@ai-hub/shared";
 
 export interface ModelRef {
   id: string;
@@ -23,6 +24,24 @@ export interface ChatStreamRequest {
   temperature?: number;
   maxTokens?: number | null;
   images?: ChatImagePart[];
+  /** Dispatch-only metadata. It is never persisted in or merged into the context packet. */
+  councilRole?: CouncilRole;
+}
+
+const COUNCIL_ROLE_INSTRUCTIONS: Record<CouncilRole, string> = {
+  architect: "Analyze structure, trade-offs, and a concrete recommendation.",
+  reviewer: "Find assumptions, gaps, and testable objections.",
+  security: "Identify risks, abuse paths, and mitigations.",
+  ux: "Identify user impact, clarity, and accessible next steps.",
+};
+
+export function packetForDispatch(input: Pick<ChatStreamRequest, "packet" | "councilRole">): ProviderAgnosticPacket {
+  if (!input.councilRole) return input.packet;
+  return {
+    ...input.packet,
+    system: `${input.packet.system}\n\nCouncil role: ${input.councilRole}. ${COUNCIL_ROLE_INSTRUCTIONS[input.councilRole]}`,
+    tokenEstimate: input.packet.tokenEstimate + Math.ceil(COUNCIL_ROLE_INSTRUCTIONS[input.councilRole].length / 4),
+  };
 }
 
 export type ChatStreamEvent =
