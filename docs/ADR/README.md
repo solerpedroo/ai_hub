@@ -102,3 +102,4 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W17-002](./ADR-W17-002-skill-slash-arguments.md) | W17 | `/skill Nome` parse-on-send local | accepted |
 | [ADR-W17-003](./ADR-W17-003-skills-encrypted-library.md) | W17 | Library de skills cifrada; `@skill` no compiler | accepted |
 | [ADR-W18-001](./ADR-W18-001-effective-privacy-policy.md) | W18 | Política efetiva de privacidade no main | accepted |
+| [ADR-W19-001](./ADR-W19-001-shared-renderer-quick-ai-overlay.md) | W19 | Overlay Quick AI no renderer compartilhado | accepted |
