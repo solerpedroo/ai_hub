@@ -24,6 +24,7 @@ import { stripAttachedFileBodiesForRenderer } from "@ai-hub/files";
 import { applyContextFirewall, redactSecrets } from "@ai-hub/security";
 import {
   activePath,
+  addUsd,
   ancestorsOf,
   chatEventSchema,
   findCatalogModel,
@@ -62,10 +63,18 @@ interface ActiveRun {
   startedAt: number;
   model: string;
   provider: string;
+  reservationId: string | null;
 }
 
 const runs = new Map<string, ActiveRun>();
 const runByConversation = new Map<string, string>();
+
+/** Main-process-only Council hook. It is deliberately not part of the IPC schema. */
+type PreparedChatSendInput = ChatSendInput & {
+  __preparedPacket?: ProviderAgnosticPacket;
+  __skipCaps?: boolean;
+  __councilRole?: import("@ai-hub/shared").CouncilRole;
+};
 
 function adapterFor(slug: string, baseUrl: string | null): ProviderAdapter {
   if (isE2eMode()) {
@@ -260,7 +269,7 @@ function snapshotDecision(blocked: string | null, warnings: string[], allowOnce:
   return "ok";
 }
 
-export async function sendChat(input: ChatSendInput, sender: WebContents): Promise<ChatSendResult> {
+export async function sendChat(input: PreparedChatSendInput, sender: WebContents): Promise<ChatSendResult> {
   const repos = getHubDatabase().repos;
   const prefs = repos.getAppPrefs();
   if (input.mode === "send" || input.mode === "edit") {
@@ -422,10 +431,13 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     skipMemoryIds,
   );
   const withFiles = appendFilesToPacket(compiled, attachments.files);
-  const packet = enforcePacketFirewall(appendMentionsToPacket(withFiles.packet, [
+  const compiledPacket = enforcePacketFirewall(appendMentionsToPacket(withFiles.packet, [
     ...resolvedMentions.mentions,
     ...autoContext,
   ]).packet, prefs.firewallPolicy);
+  const packet = input.__preparedPacket
+    ? input.__preparedPacket
+    : compiledPacket;
   if (packet.messages.length === 0) {
     throw new Error("Add a user message before sending");
   }
@@ -444,8 +456,8 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     input.maxTokens ?? null,
   );
   const limits = spendCapLimitsFromRows(repos.listSpendCaps());
-  const daySpentUsd = repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() });
-  const globalSpentUsd = repos.sumReceiptCostUsd({});
+  const daySpentUsd = addUsd(repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() }), repos.sumReservedSpendUsd({ sinceMs: localDayStartMs() }));
+  const globalSpentUsd = addUsd(repos.sumReceiptCostUsd({}), repos.sumReservedSpendUsd({}));
   const baseCap = evaluateOutgoingCaps({
     estimatedRequestUsd: estimatedCostUsd,
     daySpentUsd,
@@ -460,13 +472,13 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     scoped.find((item) => item.dimension === "provider" && item.subjectId === key.providerSlug)?.limitUsd ?? null;
   const projectCap = evaluateScopedOutgoingCaps({
     estimatedRequestUsd: estimatedCostUsd,
-    spentUsd: conversation.projectId ? repos.sumReceiptCostUsd({ projectId: conversation.projectId }) : "0.000000",
+    spentUsd: conversation.projectId ? addUsd(repos.sumReceiptCostUsd({ projectId: conversation.projectId }), repos.sumReservedSpendUsd({ projectId: conversation.projectId })) : "0.000000",
     limitUsd: projectCapLimit,
     scope: "project",
   });
   const providerCap = evaluateScopedOutgoingCaps({
     estimatedRequestUsd: estimatedCostUsd,
-    spentUsd: repos.sumReceiptCostUsd({ providerSlug: key.providerSlug }),
+    spentUsd: addUsd(repos.sumReceiptCostUsd({ providerSlug: key.providerSlug }), repos.sumReservedSpendUsd({ providerSlug: key.providerSlug })),
     limitUsd: providerCapLimit,
     scope: "provider",
   });
@@ -487,10 +499,10 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     capScope: cap.blocked,
     overflow,
   });
-  if (cap.blocked && !allowOnce) {
+  if (cap.blocked && !allowOnce && !input.__skipCaps) {
     throw new SpendCapError(cap.blocked);
   }
-  if (cap.blocked && allowOnce) {
+  if (cap.blocked && allowOnce && !input.__skipCaps) {
     const overriddenLimit =
       cap.blocked === "project"
         ? projectCapLimit
@@ -507,6 +519,9 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
       provider: key.providerSlug,
     });
   }
+  const reservationId = !input.__skipCaps && estimatedCostUsd !== null
+    ? repos.reserveSpend({ projectId: conversation.projectId, providerSlug: key.providerSlug, amountUsd: estimatedCostUsd, expiresAt: Date.now() + 15 * 60_000 })
+    : null;
 
   console.info("[hub:packet]", {
     tokens: packet.tokenEstimate,
@@ -555,6 +570,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
     startedAt: Date.now(),
     model: input.model,
     provider: key.providerSlug,
+    reservationId,
   };
   runs.set(runId, run);
   runByConversation.set(input.conversationId, runId);
@@ -594,6 +610,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
               temperature: input.temperature ?? 1,
               maxTokens: input.maxTokens ?? null,
               ...(attachments.images.length > 0 ? { images: attachments.images } : {}),
+              ...(input.__councilRole ? { councilRole: input.__councilRole } : {}),
             }),
             onDelta: (text) => {
               streamed = true;
@@ -700,6 +717,9 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
         suggestModel: suggestion?.model ?? null,
       });
     } finally {
+      if (run.reservationId) {
+        repos.releaseSpendReservation(run.reservationId);
+      }
       runs.delete(runId);
       runByConversation.delete(input.conversationId);
     }
