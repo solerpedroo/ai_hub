@@ -1110,6 +1110,7 @@ export type PlaygroundRunResult = z.infer<typeof playgroundRunResultSchema>;
 
 export const councilRoleSchema = z.enum(["architect", "reviewer", "security", "ux"]);
 export const councilRunInputSchema = z.object({
+  conversationId: z.string().uuid(),
   projectId: z.string().uuid().nullable(),
   content: z.string().trim().min(1).max(100_000),
   slots: z.array(playgroundSlotInputSchema.extend({ role: councilRoleSchema })).min(2).max(4),
