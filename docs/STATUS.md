@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave 
 
 | Field | Value |
 |---|---|
-| Wave | **W19** |
+| Wave | **W20** |
 | Marco | C — V1 |
 | State | `complete` |
-| Last completed | **W18** |
-| Next action | Start Wave 19 (Desktop superpowers) |
+| Last completed | **W19** |
+| Next action | Start Wave 20 (Council) |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
@@ -46,11 +46,11 @@ None.
 
 - W17 fechada. Skills cifradas; `/skill` + `@skill`; contrato `tools: []` para W23.
 - W18 fechada: Privacy Center, Context Firewall, Cost Tracker e caps por projeto/provider.
-- Não implementar MCP, agentes, Council, Quick AI overlay.
+- W19 fechada: Quick AI, clipboard intelligence, seleção via copy + atalho e tray/background.
 
 ## Last review / ADR
 
 | Kind | Path |
 |---|---|
-| Review | `docs/reviews/W18/REVIEW.md` |
-| Latest ADR | `docs/ADR/ADR-W18-001-effective-privacy-policy.md` |
+| Review | `docs/reviews/W19/REVIEW.md` |
+| Latest ADR | `docs/ADR/ADR-W19-001-shared-renderer-quick-ai-overlay.md` |
