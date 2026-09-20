@@ -12,8 +12,12 @@ import {
   type PromptDto,
   type PromptFolder,
   type ProviderKeyDto,
+  type HealthSummaryDto,
   COUNCIL_ROLES,
   recommendModelRoute,
+  estimateCostUsd,
+  findCatalogModel,
+  DEFAULT_ESTIMATED_OUTPUT_TOKENS,
 } from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -55,12 +59,14 @@ export function PromptsView({
   privacyMode,
   onInsertIntoComposer,
   conversationId,
+  health,
 }: {
   project: ProjectDto | null;
   providerKeys: ProviderKeyDto[];
   privacyMode: PacketPrivacyMode;
   onInsertIntoComposer: (text: string) => void;
   conversationId: string | null;
+  health: HealthSummaryDto[];
 }): JSX.Element {
   const { t } = useTranslation();
   const [prompts, setPrompts] = useState<PromptDto[]>([]);
@@ -75,7 +81,9 @@ export function PromptsView({
   const [winnerTitle, setWinnerTitle] = useState("");
   const [councilDraft, setCouncilDraft] = useState("");
   const [councilRunning, setCouncilRunning] = useState(false);
-  const [councilResult, setCouncilResult] = useState<{ divergences: string[]; synthesis: MessageDto | null } | null>(null);
+  const [routerConfirmed, setRouterConfirmed] = useState(false);
+  const [routerChoice, setRouterChoice] = useState("");
+  const [councilResult, setCouncilResult] = useState<{ divergences: string[]; synthesis: MessageDto | null; debate: MessageDto[] } | null>(null);
   const slotsRef = useRef(slots);
   slotsRef.current = slots;
 
@@ -94,6 +102,25 @@ export function PromptsView({
       ),
     [providerKeys],
   );
+  const routerRecommendation = recommendModelRoute(councilDraft);
+  const recommendedRouterOption = useMemo(() => {
+    const candidates = keyOptions.map((option) => {
+      const provider = providerKeys.find((key) => key.id === option.providerKeyId)?.providerSlug ?? "";
+      const model = findCatalogModel(option.model, provider);
+      const cost = model ? model.inputUsdPerMillion + model.outputUsdPerMillion : Number.POSITIVE_INFINITY;
+      const latency = health.find((item) => item.providerSlug === provider)?.lastLatencyMs ?? Number.POSITIVE_INFINITY;
+      return { option, cost, latency };
+    });
+    if (routerRecommendation.tier === "frontier") return candidates.sort((a, b) => b.cost - a.cost || a.latency - b.latency)[0]?.option;
+    if (routerRecommendation.tier === "fast") return candidates.sort((a, b) => a.latency - b.latency || a.cost - b.cost)[0]?.option;
+    return candidates.sort((a, b) => a.cost - b.cost || a.latency - b.latency)[0]?.option;
+  }, [health, keyOptions, providerKeys, routerRecommendation.tier]);
+  const routerOption = keyOptions.find((item) => item.value === (routerChoice || recommendedRouterOption?.value));
+  const routerEstimate = routerOption
+    ? findCatalogModel(routerOption.model, providerKeys.find((key) => key.id === routerOption.providerKeyId)?.providerSlug ?? "")
+    : undefined;
+  const routerCost = routerEstimate ? estimateCostUsd(routerEstimate, Math.ceil(councilDraft.length / 4), DEFAULT_ESTIMATED_OUTPUT_TOKENS) : null;
+  const routerLatency = routerOption ? health.find((item) => item.providerSlug === providerKeys.find((key) => key.id === routerOption.providerKeyId)?.providerSlug)?.lastLatencyMs ?? null : null;
 
   const reload = async (): Promise<void> => {
     const list = await window.hub.prompts.list();
@@ -281,23 +308,25 @@ export function PromptsView({
   };
 
   const runCouncil = async (): Promise<void> => {
-    if (!conversationId || councilDraft.trim().length === 0 || keyOptions.length < 2) {
+    if (!routerConfirmed || !conversationId || councilDraft.trim().length === 0 || keyOptions.length < 2) {
       setError(t("council.error.setup")); return;
     }
-    const selected = keyOptions.slice(0, Math.min(4, keyOptions.length));
+    const preferred = keyOptions.find((item) => item.value === routerChoice) ?? recommendedRouterOption ?? keyOptions[0];
+    const selected = [preferred, ...keyOptions.filter((item) => item.value !== preferred?.value)].filter((item): item is NonNullable<typeof item> => item !== undefined).slice(0, Math.min(4, keyOptions.length));
     const roles = COUNCIL_ROLES.slice(0, selected.length);
     const synth = selected[0];
     if (!synth) return;
     setCouncilRunning(true); setError(null); setCouncilResult(null);
     try {
       const result = await window.hub.council.run({
+        conversationId,
         projectId: project?.id ?? null,
         content: councilDraft.trim(),
         slots: selected.map((slot, index) => ({ providerKeyId: slot.providerKeyId, model: slot.model, role: roles[index] ?? "reviewer" })),
         synthesis: { providerKeyId: synth.providerKeyId, model: synth.model }, privacyMode,
       });
-      const synthesis = await window.hub.messages.list({ conversationId: result.synthesis.send.assistant.conversationId });
-      setCouncilResult({ divergences: result.divergences, synthesis: synthesis.at(-1) ?? null });
+      const messages = await window.hub.messages.list({ conversationId });
+      setCouncilResult({ divergences: result.divergences, synthesis: messages.find((item) => item.id === result.synthesis.send.messageId) ?? null, debate: result.slots.map((slot) => messages.find((item) => item.id === slot.send.messageId)).filter((item): item is MessageDto => item !== undefined) });
     } catch { setError(t("council.error.run")); } finally { setCouncilRunning(false); }
   };
 
@@ -446,9 +475,11 @@ export function PromptsView({
             <div className="mt-3 border-t pt-2" data-testid="council-panel">
               <p className="mb-1 text-[12px] font-medium">{t("council.title")}</p>
               <textarea className="mb-1 h-16 w-full resize-none rounded border bg-background p-2 text-[12px]" value={councilDraft} onChange={(event) => setCouncilDraft(event.target.value)} placeholder={t("council.placeholder")} data-testid="council-input" />
-              <p className="mb-1 text-[11px] text-muted-foreground">{t(`council.router.${recommendModelRoute(councilDraft).reason}`)}</p>
-              <Button size="sm" type="button" disabled={councilRunning || !conversationId} onClick={() => void runCouncil()} data-testid="council-run">{councilRunning ? t("council.running") : t("council.run")}</Button>
-              {councilResult ? <div className="mt-2 rounded border p-2 text-[11px]"><p>{t("council.divergences")}: {councilResult.divergences.join(", ") || t("council.none")}</p><p className="mt-1 font-medium">{t("council.synthesis")}</p><p className="whitespace-pre-wrap">{councilResult.synthesis?.content}</p></div> : null}
+              <p className="mb-1 text-[11px] text-muted-foreground">{t(`council.router.${routerRecommendation.reason}`)}</p>
+              <select aria-label={t("council.router.model")} className="mb-1 h-8 w-full rounded border bg-background px-1 text-[11px]" value={routerChoice || recommendedRouterOption?.value || ""} onChange={(event) => { setRouterChoice(event.target.value); setRouterConfirmed(false); }} data-testid="router-choice">{keyOptions.map((item) => <option key={item.value} value={item.value}>{item.label}{item.value === recommendedRouterOption?.value ? ` · ${t("council.router.recommended")}` : ""}</option>)}</select>
+              <p className="mb-1 text-[11px] text-muted-foreground">{t("council.router.cost", { usd: routerCost ?? "—" })} · {routerLatency === null ? t(`council.router.speed.${routerRecommendation.tier}`) : t("council.router.latency", { ms: routerLatency })}</p>
+              <div className="flex gap-1"><Button size="sm" type="button" variant="outline" onClick={() => setRouterConfirmed(false)}>{t("council.router.reject")}</Button><Button size="sm" type="button" variant="secondary" onClick={() => setRouterConfirmed(true)}>{t("council.router.confirm")}</Button><Button size="sm" type="button" disabled={councilRunning || !conversationId || !routerConfirmed} onClick={() => void runCouncil()} data-testid="council-run">{councilRunning ? t("council.running") : t("council.run")}</Button></div>
+              {councilResult ? <div className="mt-2 rounded border p-2 text-[11px]"><p>{t("council.divergences")}: {councilResult.divergences.join(", ") || t("council.none")}</p><div className="mt-2 grid grid-cols-2 gap-2">{councilResult.debate.map((message, index) => <div key={message.id} className="min-w-0 rounded border p-1"><p className="font-medium">{COUNCIL_ROLES[index] ?? t("prompts.slot", { n: index + 1 })}</p><p className="whitespace-pre-wrap">{message.content}</p></div>)}</div><p className="mt-2 font-medium">{t("council.synthesis")}</p><p className="whitespace-pre-wrap">{councilResult.synthesis?.content}</p></div> : null}
             </div>
             <Input
               className="mb-2"
