@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave 
 |---|---|
 | Wave | **W20** |
 | Marco | C — V1 |
-| State | `complete` |
+| State | `review` |
 | Last completed | **W19** |
-| Next action | Start Wave 20 (Council) |
+| Next action | Map Council, comparison and explicit router contracts |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
