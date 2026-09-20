@@ -1,4 +1,4 @@
-import { ipcMain } from "electron";
+import { clipboard, ipcMain } from "electron";
 import { ZodError, type ZodType } from "zod";
 import {
   IpcChannel,
@@ -111,6 +111,7 @@ import {
   SPEND_CAP_SCOPES,
   summarizeProviderHealth,
   windowIsMaximizedResultSchema,
+  clipboardTextSchema,
   workspaceSessionSchema,
 } from "@ai-hub/shared";
 import { redactSecrets, safeErrorMessage } from "@ai-hub/security";
@@ -790,7 +791,12 @@ export function registerWorkspaceIpc(): void {
 
 export function registerWindowIpc(
   targetWindow: (event: Electron.IpcMainInvokeEvent) => Electron.BrowserWindow | null,
+  isQuickAiSender: (event: Electron.IpcMainInvokeEvent) => boolean = () => false,
 ): void {
+  registerHandler(IpcChannel.quickAiReadClipboard, emptyIpcPayloadSchema, clipboardTextSchema, (_input, event) => {
+    if (!isQuickAiSender(event)) throw new Error("quickAi:forbidden");
+    return redactSecrets(clipboard.readText()).slice(0, 100_000);
+  });
   registerHandler(IpcChannel.windowMinimize, emptyIpcPayloadSchema, ipcAckResultSchema, (_input, event) => {
     targetWindow(event)?.minimize();
   });
