@@ -80,6 +80,8 @@ import type {
   PromptResolveResult,
   PlaygroundRunInput,
   PlaygroundRunResult,
+  CouncilRunInput,
+  CouncilRunResult,
   ArtifactDto,
   ArtifactsListInput,
   ArtifactSaveVersionInput,
@@ -244,6 +246,7 @@ export interface HubPromptsApi {
 export interface HubPlaygroundApi {
   run: (input: PlaygroundRunInput) => Promise<PlaygroundRunResult>;
 }
+export interface HubCouncilApi { run: (input: CouncilRunInput) => Promise<CouncilRunResult>; }
 
 export interface HubArtifactsApi {
   list: (input: ArtifactsListInput) => Promise<ArtifactDto[]>;
@@ -294,6 +297,7 @@ export interface HubApi {
   workspace: HubWorkspaceApi;
   prompts: HubPromptsApi;
   playground: HubPlaygroundApi;
+  council: HubCouncilApi;
   artifacts: HubArtifactsApi;
   skills: HubSkillsApi;
 }
