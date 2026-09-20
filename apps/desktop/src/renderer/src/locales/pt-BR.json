@@ -475,5 +475,6 @@
   "skills.factory.explain-error": "Explicar erro",
   "skills.factory.write-rfc": "Escrever RFC",
   "skills.error.generic": "Não foi possível carregar a biblioteca de skills.",
-  "skills.error.save": "Não foi possível guardar essa skill."
+  "skills.error.save": "Não foi possível guardar essa skill.",
+  "quickAi.title": "Quick AI", "quickAi.close": "Fechar", "quickAi.placeholder": "Pergunte algo ou cole conteúdo…", "quickAi.clipboard": "Ler clipboard", "quickAi.formatJson": "Formatar JSON", "quickAi.toInterface": "Interface TS", "quickAi.explainJson": "Explicar JSON", "quickAi.diagnoseStack": "Diagnosticar stack", "quickAi.sendToProject": "Mandar ao projeto atual", "quickAi.model": "Modelo", "quickAi.estimate": "Estimativa: US$ {{usd}}", "quickAi.estimateUnavailable": "Estimativa disponível ao enviar", "quickAi.send": "Enviar", "quickAi.cancel": "Cancelar", "quickAi.sending": "Enviando…", "quickAi.error.setup": "Configure uma chave de provider antes de enviar.", "quickAi.error.send": "Não foi possível enviar a pergunta.", "quickAi.conversationTitle": "Quick AI", "quickAi.explainPrefix": "Explique este JSON de forma clara:", "quickAi.diagnosePrefix": "Diagnostique este stack trace e sugira uma correção:"
 }
