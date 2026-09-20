@@ -112,6 +112,7 @@ import {
   monthlyCostsInputSchema,
   monthlyCostsResultSchema,
   windowIsMaximizedResultSchema,
+  clipboardTextSchema,
   workspaceSessionSchema,
 } from "@ai-hub/shared";
 
@@ -176,6 +177,21 @@ const hub: HubApi = {
       } catch (error) {
         rethrowIpcError(error);
       }
+    },
+  },
+  quickAi: {
+    readClipboard: () =>
+      invokeParsed(IpcChannel.quickAiReadClipboard, empty, emptyIpcPayloadSchema, clipboardTextSchema),
+    onPrefill: (listener) => {
+      const wrapped = (_event: unknown, payload: unknown): void => {
+        try {
+          listener(clipboardTextSchema.parse(payload));
+        } catch (error) {
+          rethrowIpcError(error);
+        }
+      };
+      ipcRenderer.on(IpcChannel.quickAiPrefill, wrapped);
+      return () => ipcRenderer.removeListener(IpcChannel.quickAiPrefill, wrapped);
     },
   },
   projects: {
