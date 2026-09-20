@@ -4,6 +4,7 @@ import {
   activePath,
   catalogModelsForProvider,
   findCatalogModel,
+  recommendModelRoute,
   isMentionStubType,
   MAX_MENTION_TOKENS,
   mentionQueryParts,
@@ -27,6 +28,7 @@ import {
   type SkillDto,
   type ArtifactDto,
   type ProviderKeyDto,
+  type HealthSummaryDto,
 } from "@ai-hub/shared";
 import {
   ChatComposer,
@@ -76,6 +78,7 @@ export function HomeView({
   messages,
   error,
   providerKeys,
+  health,
   selectedKeyId,
   selectedModel,
   temperature,
@@ -145,6 +148,7 @@ export function HomeView({
   messages: MessageDto[];
   error: string | null;
   providerKeys: ProviderKeyDto[];
+  health: HealthSummaryDto[];
   selectedKeyId: string | null;
   selectedModel: string;
   temperature: number;
@@ -161,7 +165,7 @@ export function HomeView({
   onSelectTemperature: (value: number) => void;
   onSelectMaxTokens: (value: number | null) => void;
   onSelectExtraSystem: (value: string) => void;
-  onSend: (content: string, mentions: MentionRef[]) => Promise<boolean>;
+  onSend: (content: string, mentions: MentionRef[], route?: { keyId: string; model: string }) => Promise<boolean>;
   onMentionsChange: (mentions: MentionRef[]) => void;
   onAbort: () => Promise<void>;
   onRegenerate: (messageId: string) => Promise<void>;
@@ -210,6 +214,8 @@ export function HomeView({
   const modifier = window.hub.platform === "darwin" ? "⌘" : "Ctrl";
   const [title, setTitle] = useState("");
   const [draft, setDraft] = useState("");
+  const [autoRouter, setAutoRouter] = useState(false);
+  const [autoRouteConfirmed, setAutoRouteConfirmed] = useState(false);
   const [mentionChips, setMentionChips] = useState<MentionSuggestion[]>([]);
   const [mentionSuggestions, setMentionSuggestions] = useState<MentionSuggestion[]>([]);
   const [projectFiles, setProjectFiles] = useState<ProjectFileDto[]>([]);
@@ -254,6 +260,8 @@ export function HomeView({
   const models = providerSlug ? catalogModelsForProvider(providerSlug) : [];
   const selectedCatalog: CatalogModel | null =
     providerSlug && selectedModel ? findCatalogModel(selectedModel, providerSlug) : null;
+  const routerRecommendation = recommendModelRoute(draft);
+  const routedModel = providerKeys.flatMap((key) => catalogModelsForProvider(key.providerSlug).map((model) => ({ key, model, cost: model.inputUsdPerMillion + model.outputUsdPerMillion, latency: health.find((sample) => sample.providerSlug === key.providerSlug)?.lastLatencyMs ?? Number.MAX_SAFE_INTEGER }))).sort((left, right) => routerRecommendation.tier === "frontier" ? right.cost - left.cost || left.latency - right.latency : left.cost - right.cost || left.latency - right.latency)[0] ?? null;
   const hasKey =
     selectedKeyId !== null && providerKeys.some((key) => key.id === selectedKeyId);
   const busy = streaming || sending;
@@ -551,6 +559,7 @@ export function HomeView({
   };
 
   const sendDraft = (content: string, mentions: MentionRef[]): void => {
+    if (autoRouter && !autoRouteConfirmed) return;
     const skillMention = mentions.find((item) => item.type === "skill");
     if (skillMention) {
       const skill = librarySkills.find((row) => {
@@ -571,7 +580,7 @@ export function HomeView({
         });
       }
     }
-    void onSend(content, mentions).then((ok) => {
+    void onSend(content, mentions, autoRouter && routedModel ? { keyId: routedModel.key.id, model: routedModel.model.id } : undefined).then((ok) => {
       if (ok) {
         setDraft("");
         setMentionChips([]);
@@ -865,7 +874,7 @@ export function HomeView({
                         ref={customModelRef}
                         className="h-8 w-52"
                         value={selectedModel}
-                        onChange={(event) => onSelectModel(event.target.value)}
+                      onChange={(event) => onSelectModel(event.target.value)}
                         aria-label={t("workspace.customModel")}
                         data-testid="workspace-custom-model"
                       />
@@ -888,6 +897,10 @@ export function HomeView({
                         ))}
                       </select>
                     )}
+                  </label>
+                  <label className="flex items-center gap-1 text-[11px]">
+                    <input type="checkbox" checked={autoRouter} onChange={(event) => { setAutoRouter(event.target.checked); setAutoRouteConfirmed(false); }} />
+                    {t("council.router.auto")}
                   </label>
                   {selectedCatalog ? (
                     <span className="text-[11px] text-muted-foreground">
@@ -1433,6 +1446,7 @@ export function HomeView({
                   value={draft}
                   onChange={(value) => {
                     setDraft(value);
+                    setAutoRouteConfirmed(false);
                     onComposerDraft(value);
                   }}
                   streaming={streaming}
@@ -1643,6 +1657,7 @@ export function HomeView({
                     void onDropFiles(files);
                   }}
                 />
+                {autoRouter && routedModel ? <div className="flex items-center gap-2 border-t px-2 py-1 text-[11px] text-muted-foreground" data-testid="chat-router"><span>{t(`council.router.${routerRecommendation.reason}`)} · {routedModel.key.label} · {routedModel.model.label}</span><span>{t("council.router.cost", { usd: (routedModel.cost / 1_000_000 * (Math.ceil(draft.length / 4) + 1024)).toFixed(6) })} · {routedModel.latency === Number.MAX_SAFE_INTEGER ? t(`council.router.speed.${routerRecommendation.tier}`) : t("council.router.latency", { ms: routedModel.latency })}</span><Button type="button" size="sm" variant={autoRouteConfirmed ? "secondary" : "outline"} onClick={() => setAutoRouteConfirmed(true)}>{autoRouteConfirmed ? t("council.router.confirmed") : t("council.router.confirm")}</Button></div> : null}
               </div>
               {canvasArtifact ? (
                 <ArtifactCanvas
