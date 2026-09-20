@@ -1,0 +1,372 @@
+diff --git a/apps/desktop/src/main/index.ts b/apps/desktop/src/main/index.ts
+index ada84b2..fcd177a 100644
+--- a/apps/desktop/src/main/index.ts
++++ b/apps/desktop/src/main/index.ts
+@@ -1,10 +1,10 @@
+ import { join } from "node:path";
+ import { existsSync, mkdtempSync } from "node:fs";
+ import { tmpdir } from "node:os";
+-import { BrowserWindow, app, dialog, protocol, session, shell } from "electron";
++import { BrowserWindow, Menu, Tray, app, clipboard, dialog, globalShortcut, nativeImage, protocol, session, shell } from "electron";
+ import { electronApp, is, optimizer } from "@electron-toolkit/utils";
+ import { ARTIFACT_PROTOCOL } from "@ai-hub/shared";
+-import { safeErrorMessage } from "@ai-hub/security";
++import { redactSecrets, safeErrorMessage } from "@ai-hub/security";
+ import { registerWindowIpc, registerWorkspaceIpc } from "./ipc";
+ import { ARTIFACT_HTML_CSP, registerArtifactProtocol } from "./artifacts";
+ import { applyCrashReporterOptIn } from "./crash-reporter";
+@@ -161,7 +161,21 @@ function preloadScript(): string {
+   return js;
+ }
+ 
+-function createWindow(): void {
++let mainWindow: BrowserWindow | null = null;
++let quickAiWindow: BrowserWindow | null = null;
++let tray: Tray | null = null;
++let isQuitting = false;
++
++function loadRenderer(window: BrowserWindow, quickAi = false): void {
++  const hash = quickAi ? "quick-ai" : undefined;
++  if ((is.dev && !isE2eMode()) && process.env["ELECTRON_RENDERER_URL"]) {
++    void window.loadURL(`${process.env["ELECTRON_RENDERER_URL"]}${hash ? `#${hash}` : ""}`);
++  } else {
++    void window.loadFile(join(__dirname, "../renderer/index.html"), hash ? { hash } : undefined);
++  }
++}
++
++function createWindow(): BrowserWindow {
+   const window = new BrowserWindow({
+     width: 1280,
+     height: 800,
+@@ -189,18 +203,71 @@ function createWindow(): void {
+   window.on("ready-to-show", () => {
+     window.show();
+   });
++  window.on("close", (event) => {
++    if (!isQuitting) {
++      event.preventDefault();
++      window.hide();
++    }
++  });
++  window.on("closed", () => { if (mainWindow === window) mainWindow = null; });
++  loadRenderer(window);
++  return window;
++}
+ 
+-  if ((is.dev && !isE2eMode()) && process.env["ELECTRON_RENDERER_URL"]) {
+-    void window.loadURL(process.env["ELECTRON_RENDERER_URL"]);
+-  } else {
+-    void window.loadFile(join(__dirname, "../renderer/index.html"));
++function showQuickAi(prefill = ""): void {
++  const safePrefill = redactSecrets(prefill).slice(0, 100_000);
++  if (!quickAiWindow || quickAiWindow.isDestroyed()) {
++    quickAiWindow = new BrowserWindow({
++      width: 680, height: 460, minWidth: 560, minHeight: 360, show: false, frame: false,
++      alwaysOnTop: true, skipTaskbar: true, resizable: true, backgroundColor: "#0c0c0e",
++      webPreferences: { preload: preloadScript(), sandbox: true, contextIsolation: true, nodeIntegration: false, spellcheck: false },
++    });
++    attachNavigationLocks(quickAiWindow);
++    attachQuickAiContext(quickAiWindow);
++    quickAiWindow.on("blur", () => quickAiWindow?.hide());
++    quickAiWindow.on("closed", () => { quickAiWindow = null; });
++    loadRenderer(quickAiWindow, true);
++    quickAiWindow.webContents.once("did-finish-load", () => {
++      if (safePrefill) quickAiWindow?.webContents.send("quickAi:prefill", safePrefill);
++    });
++  } else if (safePrefill) {
++    quickAiWindow.webContents.send("quickAi:prefill", safePrefill);
+   }
++  quickAiWindow.show();
++  quickAiWindow.focus();
++}
++
++function showMainWindow(): void {
++  if (!mainWindow || mainWindow.isDestroyed()) mainWindow = createWindow();
++  mainWindow.show();
++  mainWindow.focus();
++}
++
++function attachQuickAiContext(window: BrowserWindow): void {
++  window.webContents.on("context-menu", (_event, params) => {
++    const selection = params.selectionText.trim();
++    if (!selection) return;
++    Menu.buildFromTemplate([{ label: "Perguntar à IA / Ask AI", click: () => showQuickAi(selection) }]).popup({ window });
++  });
++}
++
++function createTray(): void {
++  const icon = nativeImage.createFromPath(join(__dirname, "../../resources/icon.png"));
++  tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon);
++  tray.setToolTip("AI Hub Desktop");
++  tray.setContextMenu(Menu.buildFromTemplate([
++    { label: "Mostrar AI Hub / Show AI Hub", click: showMainWindow },
++    { label: "Quick AI", click: () => showQuickAi() },
++    { type: "separator" },
++    { label: "Sair / Quit", click: () => { isQuitting = true; app.quit(); } },
++  ]));
++  tray.on("double-click", showMainWindow);
+ }
+ 
+ app.whenReady().then(async () => {
+   electronApp.setAppUserModelId("com.aihub.desktop");
+   applyContentSecurityPolicy();
+-  registerWindowIpc(targetWindow);
++  registerWindowIpc(targetWindow, (event) => BrowserWindow.fromWebContents(event.sender) === quickAiWindow);
+   try {
+     await bootPersistence();
+   } catch (error) {
+@@ -226,17 +293,21 @@ app.whenReady().then(async () => {
+     optimizer.watchWindowShortcuts(window);
+   });
+ 
+-  createWindow();
++  mainWindow = createWindow();
++  attachQuickAiContext(mainWindow);
++  createTray();
++  const quickShortcutRegistered = globalShortcut.register("CommandOrControl+Shift+Space", () =>
++    showQuickAi(clipboard.readText()),
++  );
++  if (!quickShortcutRegistered) console.warn("[hub:quick-ai] global shortcut unavailable");
+ 
+   app.on("activate", () => {
+-    if (BrowserWindow.getAllWindows().length === 0) {
+-      createWindow();
+-    }
++    showMainWindow();
+   });
+ });
+ 
+ app.on("window-all-closed", () => {
+-  if (process.platform !== "darwin") {
+-    app.quit();
+-  }
++  // Tray keeps the application available in the background on every platform.
+ });
++
++app.on("before-quit", () => { isQuitting = true; globalShortcut.unregisterAll(); tray?.destroy(); tray = null; });
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index 2652de2..e7545bc 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -1,4 +1,4 @@
+-import { ipcMain } from "electron";
++import { clipboard, ipcMain } from "electron";
+ import { ZodError, type ZodType } from "zod";
+ import {
+   IpcChannel,
+@@ -111,6 +111,7 @@ import {
+   SPEND_CAP_SCOPES,
+   summarizeProviderHealth,
+   windowIsMaximizedResultSchema,
++  clipboardTextSchema,
+   workspaceSessionSchema,
+ } from "@ai-hub/shared";
+ import { redactSecrets, safeErrorMessage } from "@ai-hub/security";
+@@ -790,7 +791,12 @@ export function registerWorkspaceIpc(): void {
+ 
+ export function registerWindowIpc(
+   targetWindow: (event: Electron.IpcMainInvokeEvent) => Electron.BrowserWindow | null,
++  isQuickAiSender: (event: Electron.IpcMainInvokeEvent) => boolean = () => false,
+ ): void {
++  registerHandler(IpcChannel.quickAiReadClipboard, emptyIpcPayloadSchema, clipboardTextSchema, (_input, event) => {
++    if (!isQuickAiSender(event)) throw new Error("quickAi:forbidden");
++    return redactSecrets(clipboard.readText()).slice(0, 100_000);
++  });
+   registerHandler(IpcChannel.windowMinimize, emptyIpcPayloadSchema, ipcAckResultSchema, (_input, event) => {
+     targetWindow(event)?.minimize();
+   });
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index 7d0c615..da593ec 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -112,6 +112,7 @@ import {
+   monthlyCostsInputSchema,
+   monthlyCostsResultSchema,
+   windowIsMaximizedResultSchema,
++  clipboardTextSchema,
+   workspaceSessionSchema,
+ } from "@ai-hub/shared";
+ 
+@@ -178,6 +179,21 @@ const hub: HubApi = {
+       }
+     },
+   },
++  quickAi: {
++    readClipboard: () =>
++      invokeParsed(IpcChannel.quickAiReadClipboard, empty, emptyIpcPayloadSchema, clipboardTextSchema),
++    onPrefill: (listener) => {
++      const wrapped = (_event: unknown, payload: unknown): void => {
++        try {
++          listener(clipboardTextSchema.parse(payload));
++        } catch (error) {
++          rethrowIpcError(error);
++        }
++      };
++      ipcRenderer.on(IpcChannel.quickAiPrefill, wrapped);
++      return () => ipcRenderer.removeListener(IpcChannel.quickAiPrefill, wrapped);
++    },
++  },
+   projects: {
+     list: () => invokeParsed(IpcChannel.projectsList, empty, emptyIpcPayloadSchema, projectListResultSchema),
+     create: (input) =>
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 44398c8..c1e3076 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -475,5 +475,6 @@
+   "skills.factory.explain-error": "Explain error",
+   "skills.factory.write-rfc": "Write RFC",
+   "skills.error.generic": "Could not load the skill library.",
+-  "skills.error.save": "Could not save that skill."
++  "skills.error.save": "Could not save that skill.",
++  "quickAi.title": "Quick AI", "quickAi.close": "Close", "quickAi.placeholder": "Ask something or paste content…", "quickAi.clipboard": "Read clipboard", "quickAi.formatJson": "Format JSON", "quickAi.toInterface": "TS interface", "quickAi.explainJson": "Explain JSON", "quickAi.diagnoseStack": "Diagnose stack", "quickAi.sendToProject": "Send to current project", "quickAi.model": "Model", "quickAi.estimate": "Estimate: ${{usd}}", "quickAi.estimateUnavailable": "Estimate available on send", "quickAi.send": "Send", "quickAi.cancel": "Cancel", "quickAi.sending": "Sending…", "quickAi.error.setup": "Configure a provider key before sending.", "quickAi.error.send": "Could not send the question.", "quickAi.conversationTitle": "Quick AI", "quickAi.explainPrefix": "Explain this JSON clearly:", "quickAi.diagnosePrefix": "Diagnose this stack trace and suggest a fix:"
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index 3fd56ec..db2f09a 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -475,5 +475,6 @@
+   "skills.factory.explain-error": "Explicar erro",
+   "skills.factory.write-rfc": "Escrever RFC",
+   "skills.error.generic": "Não foi possível carregar a biblioteca de skills.",
+-  "skills.error.save": "Não foi possível guardar essa skill."
++  "skills.error.save": "Não foi possível guardar essa skill.",
++  "quickAi.title": "Quick AI", "quickAi.close": "Fechar", "quickAi.placeholder": "Pergunte algo ou cole conteúdo…", "quickAi.clipboard": "Ler clipboard", "quickAi.formatJson": "Formatar JSON", "quickAi.toInterface": "Interface TS", "quickAi.explainJson": "Explicar JSON", "quickAi.diagnoseStack": "Diagnosticar stack", "quickAi.sendToProject": "Mandar ao projeto atual", "quickAi.model": "Modelo", "quickAi.estimate": "Estimativa: US$ {{usd}}", "quickAi.estimateUnavailable": "Estimativa disponível ao enviar", "quickAi.send": "Enviar", "quickAi.cancel": "Cancelar", "quickAi.sending": "Enviando…", "quickAi.error.setup": "Configure uma chave de provider antes de enviar.", "quickAi.error.send": "Não foi possível enviar a pergunta.", "quickAi.conversationTitle": "Quick AI", "quickAi.explainPrefix": "Explique este JSON de forma clara:", "quickAi.diagnosePrefix": "Diagnostique este stack trace e sugira uma correção:"
+ }
+diff --git a/apps/desktop/src/renderer/src/main.tsx b/apps/desktop/src/renderer/src/main.tsx
+index bcca33d..9b6ab27 100644
+--- a/apps/desktop/src/renderer/src/main.tsx
++++ b/apps/desktop/src/renderer/src/main.tsx
+@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
+ import { TooltipProvider } from "@/components/ui/tooltip";
+ import { ThemeProvider } from "@/lib/theme";
+ import { App } from "./App";
++import { QuickAiOverlay } from "./components/quick-ai/quick-ai-overlay";
+ import "./lib/i18n";
+ import "./index.css";
+ import "highlight.js/styles/github-dark.min.css";
+@@ -16,7 +17,7 @@ createRoot(root).render(
+   <StrictMode>
+     <ThemeProvider>
+       <TooltipProvider delayDuration={200}>
+-        <App />
++        {window.location.hash === "#quick-ai" ? <QuickAiOverlay /> : <App />}
+       </TooltipProvider>
+     </ThemeProvider>
+   </StrictMode>,
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index f0edddb..232019b 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -102,3 +102,4 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider
+ | [ADR-W17-002](./ADR-W17-002-skill-slash-arguments.md) | W17 | `/skill Nome` parse-on-send local | accepted |
+ | [ADR-W17-003](./ADR-W17-003-skills-encrypted-library.md) | W17 | Library de skills cifrada; `@skill` no compiler | accepted |
+ | [ADR-W18-001](./ADR-W18-001-effective-privacy-policy.md) | W18 | Política efetiva de privacidade no main | accepted |
++| [ADR-W19-001](./ADR-W19-001-shared-renderer-quick-ai-overlay.md) | W19 | Overlay Quick AI no renderer compartilhado | accepted |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 33c0af5..3f4ae0d 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave
+ |---|---|
+ | Wave | **W19** |
+ | Marco | C — V1 |
+-| State | `complete` |
++| State | `review` |
+ | Last completed | **W18** |
+-| Next action | Start Wave 19 (Desktop superpowers) |
++| Next action | Implement global Quick AI overlay and desktop lifecycle contracts |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -46,7 +46,7 @@ None.
+ 
+ - W17 fechada. Skills cifradas; `/skill` + `@skill`; contrato `tools: []` para W23.
+ - W18 fechada: Privacy Center, Context Firewall, Cost Tracker e caps por projeto/provider.
+-- Não implementar MCP, agentes, Council, Quick AI overlay.
++- Não implementar MCP, agentes, Council ou run modes nesta onda.
+ 
+ ## Last review / ADR
+ 
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index 6801c8b..05752a6 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -98,6 +98,11 @@ import type {
+   WorkspaceSession,
+ } from "./ipc-schemas";
+ 
++export interface HubQuickAiApi {
++  readClipboard: () => Promise<string>;
++  onPrefill: (listener: (text: string) => void) => () => void;
++}
++
+ export interface HubWindowApi {
+   minimize: () => Promise<void>;
+   maximize: () => Promise<void>;
+@@ -266,6 +271,7 @@ export interface HubChatApi {
+ export interface HubApi {
+   platform: "win32" | "darwin" | "linux";
+   window: HubWindowApi;
++  quickAi: HubQuickAiApi;
+   projects: HubProjectsApi;
+   conversations: HubConversationsApi;
+   messages: HubMessagesApi;
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index a19de30..e4d7683 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -25,6 +25,7 @@ export {
+   type HubArtifactsApi,
+   type HubSkillsApi,
+   type HubWindowApi,
++  type HubQuickAiApi,
+ } from "./hub-api";
+ export {
+   evaluateSpendCaps,
+@@ -46,6 +47,12 @@ export { summarizeProviderHealth, HEALTH_WINDOW, type HealthSampleLike, type Hea
+ export { suggestFallbackProvider, type FallbackKeyLike, type FallbackSuggestion } from "./fallback";
+ export { classifyHubIpcError, type HubIpcError, type HubIpcErrorKind } from "./hub-error";
+ export { looksLikePastedSecret, redactPastedSecrets } from "./secret-paste";
++export {
++  inspectClipboardText,
++  typescriptInterfaceFromJson,
++  type ClipboardInsight,
++  type ClipboardInsightKind,
++} from "./clipboard-intelligence";
+ export {
+   MAX_MENTIONS_PER_SEND,
+   MAX_MENTION_TOKENS,
+@@ -255,6 +262,7 @@ export {
+   secretsTestInputSchema,
+   secretsTestResultSchema,
+   windowIsMaximizedResultSchema,
++  clipboardTextSchema,
+   workspaceSessionSchema,
+   type AppearanceSettings,
+   type BranchLabelSetInput,
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index 33b8f1e..6057b45 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -3,6 +3,8 @@ export const IpcChannel = {
+   windowMaximize: "window:maximize",
+   windowClose: "window:close",
+   windowIsMaximized: "window:isMaximized",
++  quickAiReadClipboard: "quickAi:readClipboard",
++  quickAiPrefill: "quickAi:prefill",
+   projectsList: "projects:list",
+   projectsCreate: "projects:create",
+   projectsUpdate: "projects:update",
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index 845b027..a1e1b13 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -21,6 +21,7 @@ export const emptyIpcPayloadSchema = z.object({}).strict();
+ export type EmptyIpcPayload = z.infer<typeof emptyIpcPayloadSchema>;
+ 
+ export const windowIsMaximizedResultSchema = z.boolean();
++export const clipboardTextSchema = z.string().max(100_000);
+ 
+ export const ipcAckResultSchema = z.union([z.void(), z.undefined(), z.null()]);
+ 
