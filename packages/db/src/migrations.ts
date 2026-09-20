@@ -278,6 +278,18 @@ CREATE UNIQUE INDEX scoped_spend_caps_dimension_subject_idx
   ON scoped_spend_caps(dimension, subject_id);
 `;
 
+export const MIGRATION_0014_SQL = `
+CREATE TABLE spend_reservations (
+  id TEXT PRIMARY KEY,
+  project_id TEXT,
+  provider_slug TEXT NOT NULL,
+  amount_usd TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX spend_reservations_expires_idx ON spend_reservations(expires_at);
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
@@ -292,4 +304,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 11, sql: MIGRATION_0011_SQL },
   { version: 12, sql: MIGRATION_0012_SQL },
   { version: 13, sql: MIGRATION_0013_SQL },
+  { version: 14, sql: MIGRATION_0014_SQL },
 ];
