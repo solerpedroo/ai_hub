@@ -82,6 +82,7 @@ export const IpcChannel = {
   promptsRemove: "prompts:remove",
   promptsResolve: "prompts:resolve",
   playgroundRun: "playground:run",
+  councilRun: "council:run",
   artifactsList: "artifacts:list",
   artifactsGet: "artifacts:get",
   artifactsSaveVersion: "artifacts:saveVersion",
