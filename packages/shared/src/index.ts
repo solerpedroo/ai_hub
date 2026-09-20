@@ -47,6 +47,7 @@ export { summarizeProviderHealth, HEALTH_WINDOW, type HealthSampleLike, type Hea
 export { suggestFallbackProvider, type FallbackKeyLike, type FallbackSuggestion } from "./fallback";
 export { classifyHubIpcError, type HubIpcError, type HubIpcErrorKind } from "./hub-error";
 export { looksLikePastedSecret, redactPastedSecrets } from "./secret-paste";
+export { COUNCIL_ROLES, divergenceTerms, recommendModelRoute, type CouncilRole, type RouterRecommendation } from "./council";
 export {
   inspectClipboardText,
   typescriptInterfaceFromJson,
@@ -156,6 +157,9 @@ export {
   promptResolveResultSchema,
   playgroundRunInputSchema,
   playgroundRunResultSchema,
+  councilRoleSchema,
+  councilRunInputSchema,
+  councilRunResultSchema,
   playgroundSlotInputSchema,
   artifactKindSchema,
   artifactDtoSchema,
@@ -288,6 +292,8 @@ export {
   type PromptResolveResult,
   type PlaygroundRunInput,
   type PlaygroundRunResult,
+  type CouncilRunInput,
+  type CouncilRunResult,
   type SkillDto,
   type SkillFolderDto,
   type SkillCreateInput,
