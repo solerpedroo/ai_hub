@@ -98,6 +98,11 @@ import type {
   WorkspaceSession,
 } from "./ipc-schemas";
 
+export interface HubQuickAiApi {
+  readClipboard: () => Promise<string>;
+  onPrefill: (listener: (text: string) => void) => () => void;
+}
+
 export interface HubWindowApi {
   minimize: () => Promise<void>;
   maximize: () => Promise<void>;
@@ -266,6 +271,7 @@ export interface HubChatApi {
 export interface HubApi {
   platform: "win32" | "darwin" | "linux";
   window: HubWindowApi;
+  quickAi: HubQuickAiApi;
   projects: HubProjectsApi;
   conversations: HubConversationsApi;
   messages: HubMessagesApi;
