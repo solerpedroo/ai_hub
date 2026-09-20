@@ -114,6 +114,15 @@ export const scopedSpendCaps = sqliteTable(
   (table) => [uniqueIndex("scoped_spend_caps_dimension_subject_idx").on(table.dimension, table.subjectId)],
 );
 
+export const spendReservations = sqliteTable("spend_reservations", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id"),
+  providerSlug: text("provider_slug").notNull(),
+  amountUsd: text("amount_usd").notNull(),
+  expiresAt: integer("expires_at", { mode: "number" }).notNull(),
+  createdAt: integer("created_at", { mode: "number" }).notNull(),
+});
+
 export const healthSamples = sqliteTable("health_samples", {
   id: text("id").primaryKey(),
   providerSlug: text("provider_slug").notNull(),
