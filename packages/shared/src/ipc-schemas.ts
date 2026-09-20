@@ -1108,6 +1108,22 @@ export const playgroundRunResultSchema = z
 
 export type PlaygroundRunResult = z.infer<typeof playgroundRunResultSchema>;
 
+export const councilRoleSchema = z.enum(["architect", "reviewer", "security", "ux"]);
+export const councilRunInputSchema = z.object({
+  projectId: z.string().uuid().nullable(),
+  content: z.string().trim().min(1).max(100_000),
+  slots: z.array(playgroundSlotInputSchema.extend({ role: councilRoleSchema })).min(2).max(4),
+  synthesis: playgroundSlotInputSchema,
+  privacyMode: packetPrivacyModeSchema.optional(),
+}).strict();
+export type CouncilRunInput = z.infer<typeof councilRunInputSchema>;
+export const councilRunResultSchema = z.object({
+  slots: z.array(playgroundRunSlotSchema.extend({ role: councilRoleSchema })).min(2).max(4),
+  synthesis: playgroundRunSlotSchema,
+  divergences: z.array(z.string()).max(12),
+}).strict();
+export type CouncilRunResult = z.infer<typeof councilRunResultSchema>;
+
 export const artifactKindSchema = z.enum(["mermaid", "html", "markdown", "code"]);
 
 export type ArtifactKindDto = z.infer<typeof artifactKindSchema>;
