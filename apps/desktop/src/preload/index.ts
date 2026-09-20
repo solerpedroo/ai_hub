@@ -78,6 +78,8 @@ import {
   promptUpdateInputSchema,
   playgroundRunInputSchema,
   playgroundRunResultSchema,
+  councilRunInputSchema,
+  councilRunResultSchema,
   artifactDtoSchema,
   artifactListResultSchema,
   artifactsListInputSchema,
@@ -459,6 +461,9 @@ const hub: HubApi = {
   playground: {
     run: (input) =>
       invokeParsed(IpcChannel.playgroundRun, input, playgroundRunInputSchema, playgroundRunResultSchema),
+  },
+  council: {
+    run: (input) => invokeParsed(IpcChannel.councilRun, input, councilRunInputSchema, councilRunResultSchema),
   },
   artifacts: {
     list: (input) =>
