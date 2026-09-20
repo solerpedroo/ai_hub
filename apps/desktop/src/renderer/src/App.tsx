@@ -1413,6 +1413,7 @@ export function App(): JSX.Element {
               project={selectedProject}
               providerKeys={providerKeys}
               privacyMode={privacyMode}
+              conversationId={selectedConversationId}
               onInsertIntoComposer={(text) => {
                 setComposerInsert(text);
                 setView("home");
