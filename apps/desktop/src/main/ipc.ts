@@ -77,6 +77,8 @@ import {
   promptResolveResultSchema,
   playgroundRunInputSchema,
   playgroundRunResultSchema,
+  councilRunInputSchema,
+  councilRunResultSchema,
   artifactDtoSchema,
   artifactListResultSchema,
   artifactsListInputSchema,
@@ -134,6 +136,7 @@ import { previewPacket } from "./packet-preview";
 import { getConversationWorkspaceDto, refreshConversationWorkspace } from "./workspace";
 import { getHubDatabase } from "./persistence";
 import { listPromptDtos, resolvePromptDto, runPlayground } from "./playground";
+import { runCouncil } from "./council";
 import { listSkillDtos, resolveSkillDto } from "./skills";
 import { exportArtifact, toArtifactDto } from "./artifacts";
 import { testProviderKey } from "./provider-health";
@@ -199,6 +202,9 @@ export function registerWorkspaceIpc(): void {
       getHubDatabase()
         .repos.listConversations(input.projectId, input.inbox ?? "avulsas")
         .map((row) => conversationDtoSchema.parse(row)),
+  );
+  registerHandler(IpcChannel.councilRun, councilRunInputSchema, councilRunResultSchema, (input, event) =>
+    runCouncil(input, event.sender),
   );
 
   registerHandler(
