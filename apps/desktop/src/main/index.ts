@@ -1,10 +1,10 @@
 import { join } from "node:path";
 import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { BrowserWindow, app, dialog, protocol, session, shell } from "electron";
+import { BrowserWindow, Menu, Tray, app, clipboard, dialog, globalShortcut, nativeImage, protocol, session, shell } from "electron";
 import { electronApp, is, optimizer } from "@electron-toolkit/utils";
 import { ARTIFACT_PROTOCOL } from "@ai-hub/shared";
-import { safeErrorMessage } from "@ai-hub/security";
+import { redactSecrets, safeErrorMessage } from "@ai-hub/security";
 import { registerWindowIpc, registerWorkspaceIpc } from "./ipc";
 import { ARTIFACT_HTML_CSP, registerArtifactProtocol } from "./artifacts";
 import { applyCrashReporterOptIn } from "./crash-reporter";
@@ -161,7 +161,21 @@ function preloadScript(): string {
   return js;
 }
 
-function createWindow(): void {
+let mainWindow: BrowserWindow | null = null;
+let quickAiWindow: BrowserWindow | null = null;
+let tray: Tray | null = null;
+let isQuitting = false;
+
+function loadRenderer(window: BrowserWindow, quickAi = false): void {
+  const hash = quickAi ? "quick-ai" : undefined;
+  if ((is.dev && !isE2eMode()) && process.env["ELECTRON_RENDERER_URL"]) {
+    void window.loadURL(`${process.env["ELECTRON_RENDERER_URL"]}${hash ? `#${hash}` : ""}`);
+  } else {
+    void window.loadFile(join(__dirname, "../renderer/index.html"), hash ? { hash } : undefined);
+  }
+}
+
+function createWindow(): BrowserWindow {
   const window = new BrowserWindow({
     width: 1280,
     height: 800,
@@ -189,18 +203,71 @@ function createWindow(): void {
   window.on("ready-to-show", () => {
     window.show();
   });
+  window.on("close", (event) => {
+    if (!isQuitting) {
+      event.preventDefault();
+      window.hide();
+    }
+  });
+  window.on("closed", () => { if (mainWindow === window) mainWindow = null; });
+  loadRenderer(window);
+  return window;
+}
 
-  if ((is.dev && !isE2eMode()) && process.env["ELECTRON_RENDERER_URL"]) {
-    void window.loadURL(process.env["ELECTRON_RENDERER_URL"]);
-  } else {
-    void window.loadFile(join(__dirname, "../renderer/index.html"));
+function showQuickAi(prefill = ""): void {
+  const safePrefill = redactSecrets(prefill).slice(0, 100_000);
+  if (!quickAiWindow || quickAiWindow.isDestroyed()) {
+    quickAiWindow = new BrowserWindow({
+      width: 680, height: 460, minWidth: 560, minHeight: 360, show: false, frame: false,
+      alwaysOnTop: true, skipTaskbar: true, resizable: true, backgroundColor: "#0c0c0e",
+      webPreferences: { preload: preloadScript(), sandbox: true, contextIsolation: true, nodeIntegration: false, spellcheck: false },
+    });
+    attachNavigationLocks(quickAiWindow);
+    attachQuickAiContext(quickAiWindow);
+    quickAiWindow.on("blur", () => quickAiWindow?.hide());
+    quickAiWindow.on("closed", () => { quickAiWindow = null; });
+    loadRenderer(quickAiWindow, true);
+    quickAiWindow.webContents.once("did-finish-load", () => {
+      if (safePrefill) quickAiWindow?.webContents.send("quickAi:prefill", safePrefill);
+    });
+  } else if (safePrefill) {
+    quickAiWindow.webContents.send("quickAi:prefill", safePrefill);
   }
+  quickAiWindow.show();
+  quickAiWindow.focus();
+}
+
+function showMainWindow(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) mainWindow = createWindow();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function attachQuickAiContext(window: BrowserWindow): void {
+  window.webContents.on("context-menu", (_event, params) => {
+    const selection = params.selectionText.trim();
+    if (!selection) return;
+    Menu.buildFromTemplate([{ label: "Perguntar à IA / Ask AI", click: () => showQuickAi(selection) }]).popup({ window });
+  });
+}
+
+function createTray(): void {
+  const icon = nativeImage.createFromPath(join(__dirname, "../../resources/icon.png"));
+  tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon);
+  tray.setToolTip("AI Hub Desktop");
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: "Mostrar AI Hub / Show AI Hub", click: showMainWindow },
+    { label: "Quick AI", click: () => showQuickAi() },
+    { type: "separator" },
+    { label: "Sair / Quit", click: () => { isQuitting = true; app.quit(); } },
+  ]));
+  tray.on("double-click", showMainWindow);
 }
 
 app.whenReady().then(async () => {
   electronApp.setAppUserModelId("com.aihub.desktop");
   applyContentSecurityPolicy();
-  registerWindowIpc(targetWindow);
+  registerWindowIpc(targetWindow, (event) => BrowserWindow.fromWebContents(event.sender) === quickAiWindow);
   try {
     await bootPersistence();
   } catch (error) {
@@ -226,17 +293,21 @@ app.whenReady().then(async () => {
     optimizer.watchWindowShortcuts(window);
   });
 
-  createWindow();
+  mainWindow = createWindow();
+  attachQuickAiContext(mainWindow);
+  createTray();
+  const quickShortcutRegistered = globalShortcut.register("CommandOrControl+Shift+Space", () =>
+    showQuickAi(clipboard.readText()),
+  );
+  if (!quickShortcutRegistered) console.warn("[hub:quick-ai] global shortcut unavailable");
 
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
-    }
+    showMainWindow();
   });
 });
 
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") {
-    app.quit();
-  }
+  // Tray keeps the application available in the background on every platform.
 });
+
+app.on("before-quit", () => { isQuitting = true; globalShortcut.unregisterAll(); tray?.destroy(); tray = null; });
