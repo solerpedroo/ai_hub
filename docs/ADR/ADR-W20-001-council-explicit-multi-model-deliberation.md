@@ -1,6 +1,6 @@
 # ADR-W20-001-council-explicit-multi-model-deliberation
 
-- **Status:** proposed
+- **Status:** accepted
 - **Onda:** W20
 - **Data:** 2026-09-20
 - **Deciders:** agent / Pedro
@@ -13,7 +13,7 @@ Council compara respostas de múltiplos modelos sem se tornar um agente, sem too
 
 ## Decisão
 
-Council recebe slots e papéis explícitos, estima debate mais síntese antes de enviar e usa o caminho normal de `chat:send` para cada resposta. A síntese é solicitada a um modelo escolhido explicitamente. Divergência e Router são heurísticas locais e explicáveis; uma sugestão nunca troca o modelo sozinha.
+Council recebe slots e papéis explícitos, estima debate mais síntese antes de enviar e usa o caminho normal de `chat:send` para cada resposta. O packet compilado é congelado e persistido antes do primeiro despacho; o papel é metadata de dispatch tipada, traduzida pelo adapter sem alterar o packet auditável. A síntese é solicitada a um modelo escolhido explicitamente. Divergência e Router são heurísticas locais e explicáveis; uma sugestão nunca troca o modelo sem confirmação.
 
 ## Alternativas consideradas
 
