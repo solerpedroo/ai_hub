@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave 
 
 | Field | Value |
 |---|---|
-| Wave | **W20** |
+| Wave | **W21** |
 | Marco | C — V1 |
-| State | `review` |
-| Last completed | **W19** |
-| Next action | Map Council, comparison and explicit router contracts |
+| State | `pending` |
+| Last completed | **W20** |
+| Next action | Start W21: Run modes + HUD de tokens |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
@@ -52,5 +52,5 @@ None.
 
 | Kind | Path |
 |---|---|
-| Review | `docs/reviews/W19/REVIEW.md` |
-| Latest ADR | `docs/ADR/ADR-W19-001-shared-renderer-quick-ai-overlay.md` |
+| Review | `docs/reviews/W20/REVIEW.md` |
+| Latest ADR | `docs/ADR/ADR-W20-001-council-explicit-multi-model-deliberation.md` |
