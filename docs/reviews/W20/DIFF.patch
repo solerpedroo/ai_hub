@@ -1,0 +1,818 @@
+diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts
+index ae7f16f..2bea1c8 100644
+--- a/apps/desktop/src/main/chat-session.ts
++++ b/apps/desktop/src/main/chat-session.ts
+@@ -24,6 +24,7 @@ import { stripAttachedFileBodiesForRenderer } from "@ai-hub/files";
+ import { applyContextFirewall, redactSecrets } from "@ai-hub/security";
+ import {
+   activePath,
++  addUsd,
+   ancestorsOf,
+   chatEventSchema,
+   findCatalogModel,
+@@ -67,6 +68,13 @@ interface ActiveRun {
+ const runs = new Map<string, ActiveRun>();
+ const runByConversation = new Map<string, string>();
+ 
++/** Main-process-only Council hook. It is deliberately not part of the IPC schema. */
++type PreparedChatSendInput = ChatSendInput & {
++  __preparedPacket?: ProviderAgnosticPacket;
++  __skipCaps?: boolean;
++  __roleInstruction?: string;
++};
++
+ function adapterFor(slug: string, baseUrl: string | null): ProviderAdapter {
+   if (isE2eMode()) {
+     return createMockOpenAIAdapter();
+@@ -260,7 +268,7 @@ function snapshotDecision(blocked: string | null, warnings: string[], allowOnce:
+   return "ok";
+ }
+ 
+-export async function sendChat(input: ChatSendInput, sender: WebContents): Promise<ChatSendResult> {
++export async function sendChat(input: PreparedChatSendInput, sender: WebContents): Promise<ChatSendResult> {
+   const repos = getHubDatabase().repos;
+   const prefs = repos.getAppPrefs();
+   if (input.mode === "send" || input.mode === "edit") {
+@@ -422,10 +430,13 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+     skipMemoryIds,
+   );
+   const withFiles = appendFilesToPacket(compiled, attachments.files);
+-  const packet = enforcePacketFirewall(appendMentionsToPacket(withFiles.packet, [
++  const compiledPacket = enforcePacketFirewall(appendMentionsToPacket(withFiles.packet, [
+     ...resolvedMentions.mentions,
+     ...autoContext,
+   ]).packet, prefs.firewallPolicy);
++  const packet = input.__preparedPacket
++    ? input.__preparedPacket
++    : compiledPacket;
+   if (packet.messages.length === 0) {
+     throw new Error("Add a user message before sending");
+   }
+@@ -444,8 +455,8 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+     input.maxTokens ?? null,
+   );
+   const limits = spendCapLimitsFromRows(repos.listSpendCaps());
+-  const daySpentUsd = repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() });
+-  const globalSpentUsd = repos.sumReceiptCostUsd({});
++  const daySpentUsd = addUsd(repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() }), repos.sumReservedSpendUsd({ sinceMs: localDayStartMs() }));
++  const globalSpentUsd = addUsd(repos.sumReceiptCostUsd({}), repos.sumReservedSpendUsd({}));
+   const baseCap = evaluateOutgoingCaps({
+     estimatedRequestUsd: estimatedCostUsd,
+     daySpentUsd,
+@@ -460,13 +471,13 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+     scoped.find((item) => item.dimension === "provider" && item.subjectId === key.providerSlug)?.limitUsd ?? null;
+   const projectCap = evaluateScopedOutgoingCaps({
+     estimatedRequestUsd: estimatedCostUsd,
+-    spentUsd: conversation.projectId ? repos.sumReceiptCostUsd({ projectId: conversation.projectId }) : "0.000000",
++    spentUsd: conversation.projectId ? addUsd(repos.sumReceiptCostUsd({ projectId: conversation.projectId }), repos.sumReservedSpendUsd({ projectId: conversation.projectId })) : "0.000000",
+     limitUsd: projectCapLimit,
+     scope: "project",
+   });
+   const providerCap = evaluateScopedOutgoingCaps({
+     estimatedRequestUsd: estimatedCostUsd,
+-    spentUsd: repos.sumReceiptCostUsd({ providerSlug: key.providerSlug }),
++    spentUsd: addUsd(repos.sumReceiptCostUsd({ providerSlug: key.providerSlug }), repos.sumReservedSpendUsd({ providerSlug: key.providerSlug })),
+     limitUsd: providerCapLimit,
+     scope: "provider",
+   });
+@@ -487,10 +498,10 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+     capScope: cap.blocked,
+     overflow,
+   });
+-  if (cap.blocked && !allowOnce) {
++  if (cap.blocked && !allowOnce && !input.__skipCaps) {
+     throw new SpendCapError(cap.blocked);
+   }
+-  if (cap.blocked && allowOnce) {
++  if (cap.blocked && allowOnce && !input.__skipCaps) {
+     const overriddenLimit =
+       cap.blocked === "project"
+         ? projectCapLimit
+@@ -507,6 +518,9 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+       provider: key.providerSlug,
+     });
+   }
++  if (!input.__skipCaps && estimatedCostUsd !== null) {
++    repos.reserveSpend({ projectId: conversation.projectId, providerSlug: key.providerSlug, amountUsd: estimatedCostUsd, expiresAt: Date.now() + 15 * 60_000 });
++  }
+ 
+   console.info("[hub:packet]", {
+     tokens: packet.tokenEstimate,
+@@ -594,6 +608,7 @@ export async function sendChat(input: ChatSendInput, sender: WebContents): Promi
+               temperature: input.temperature ?? 1,
+               maxTokens: input.maxTokens ?? null,
+               ...(attachments.images.length > 0 ? { images: attachments.images } : {}),
++              ...(input.__roleInstruction ? { roleInstruction: input.__roleInstruction } : {}),
+             }),
+             onDelta: (text) => {
+               streamed = true;
+diff --git a/apps/desktop/src/main/council.ts b/apps/desktop/src/main/council.ts
+index 0621274..2716b17 100644
+--- a/apps/desktop/src/main/council.ts
++++ b/apps/desktop/src/main/council.ts
+@@ -1,37 +1,87 @@
+-import { SpendCapError, divergenceTerms, evaluatePlaygroundCaps, type CouncilRunInput, type CouncilRunResult } from "@ai-hub/shared";
++import { DEFAULT_ESTIMATED_OUTPUT_TOKENS, SpendCapError, divergenceTerms, effectivePrivacyMode, packetV0Schema, portablePacketFromCompile, type CouncilRunInput, type CouncilRunResult } from "@ai-hub/shared";
+ import type { WebContents } from "electron";
++import { compileActivePathDetailed } from "@ai-hub/ai-gateway";
++import { applyContextFirewall } from "@ai-hub/security";
+ import { sendChat, waitForChatRun } from "./chat-session";
+ import { getHubDatabase } from "./persistence";
+-import { localDayStartMs, estimateOutgoingCostUsd, spendCapLimitsFromRows } from "./spend-guard";
++import { estimateOutgoingCostUsd, evaluateBatchScopedCaps } from "./spend-guard";
+ 
+ const ROLE_PROMPTS = {
+-  architect: "You are the Architect. Analyze structure, trade-offs, and a concrete recommendation.",
+-  reviewer: "You are the Reviewer. Find assumptions, gaps, and testable objections.",
+-  security: "You are the Security reviewer. Identify risks, abuse paths, and mitigations.",
+-  ux: "You are the UX reviewer. Identify user impact, clarity, and accessible next steps.",
++  architect: "Council role: Architect. Analyze structure, trade-offs, and a concrete recommendation.",
++  reviewer: "Council role: Reviewer. Find assumptions, gaps, and testable objections.",
++  security: "Council role: Security. Identify risks, abuse paths, and mitigations.",
++  ux: "Council role: UX. Identify user impact, clarity, and accessible next steps.",
+ } as const;
+ 
++function prepareCouncilPacket(input: CouncilRunInput) {
++  const repos = getHubDatabase().repos;
++  const conversation = repos.getConversation(input.conversationId);
++  if (!conversation) throw new Error("council:conversation");
++  const prefs = repos.getAppPrefs();
++  const privacyMode = effectivePrivacyMode(prefs.privacyMode);
++  const safe = (text: string): string => {
++    const result = applyContextFirewall(text, prefs.firewallPolicy);
++    if (result.blocked.length > 0) throw new Error(`firewall:blocked:${result.blocked.join(",")}`);
++    return result.maskedText;
++  };
++  const project = conversation.projectId ? repos.getProject(conversation.projectId) : null;
++  const rows = repos.listMessages(input.conversationId).map((item) => ({ id: item.id, parentId: item.parentId, isActiveBranch: item.isActiveBranch, createdAt: item.createdAt, role: item.role, content: item.content, status: item.status, branchId: item.branchId, ...(item.pinned ? { pinned: true } : {}) }));
++  const leaf = rows.filter((item) => item.isActiveBranch).at(-1);
++  rows.push({ id: "council-pending", parentId: leaf?.id ?? null, isActiveBranch: true, createdAt: new Date().toISOString(), role: "user", content: safe(input.content), status: "complete", branchId: leaf?.branchId ?? "council" });
++  const detailed = compileActivePathDetailed({ projectInstructions: project?.instructions ?? null, extraSystem: null, privacyMode, messages: rows });
++  const packet = packetV0Schema.parse({ ...detailed.packet, system: safe(detailed.packet.system), messages: detailed.packet.messages.map((message) => ({ ...message, content: safe(message.content) })), tokenEstimate: Math.ceil((safe(detailed.packet.system).length + detailed.packet.messages.reduce((sum, message) => sum + safe(message.content).length, 0)) / 4) });
++  return { packet, privacyMode };
++}
++
+ export async function runCouncil(input: CouncilRunInput, sender: WebContents): Promise<CouncilRunResult> {
+   const repos = getHubDatabase().repos;
+-  const configured = [...input.slots, input.synthesis];
+-  const estimates: Array<string | null> = [];
+-  for (const slot of configured) {
++  const conversation = repos.getConversation(input.conversationId);
++  if (!conversation || conversation.projectId !== input.projectId) throw new Error("council:conversation");
++  const prepared = prepareCouncilPacket(input);
++  const estimates: Array<{ usd: string | null; projectId: string | null; providerSlug: string }> = [];
++  // Reserve every branch plus the synthesis before the first provider call. The
++  // synthesis receives all branch output, hence its input reservation is N outputs.
++  const synthesisInputTokens = prepared.packet.tokenEstimate + input.slots.length * DEFAULT_ESTIMATED_OUTPUT_TOKENS;
++  for (const slot of input.slots) {
+     const key = await repos.getProviderSecret(slot.providerKeyId);
+     if (!key) throw new Error("gateway:auth");
+-    estimates.push(estimateOutgoingCostUsd(slot.model, key.providerSlug, Math.ceil(input.content.length / 4), null));
++    estimates.push({ usd: estimateOutgoingCostUsd(slot.model, key.providerSlug, prepared.packet.tokenEstimate + Math.ceil(ROLE_PROMPTS[slot.role].length / 4), DEFAULT_ESTIMATED_OUTPUT_TOKENS), projectId: conversation.projectId, providerSlug: key.providerSlug });
+   }
+-  const cap = evaluatePlaygroundCaps({ estimates, daySpentUsd: repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() }), globalSpentUsd: repos.sumReceiptCostUsd({}), limits: spendCapLimitsFromRows(repos.listSpendCaps()) });
++  const synthesisKey = await repos.getProviderSecret(input.synthesis.providerKeyId);
++  if (!synthesisKey) throw new Error("gateway:auth");
++  estimates.push({ usd: estimateOutgoingCostUsd(input.synthesis.model, synthesisKey.providerSlug, synthesisInputTokens, DEFAULT_ESTIMATED_OUTPUT_TOKENS), projectId: conversation.projectId, providerSlug: synthesisKey.providerSlug });
++  const cap = evaluateBatchScopedCaps({ estimates, repos });
+   if (cap.blocked) throw new SpendCapError(cap.blocked);
+-
+-  const deliberations = await Promise.all(input.slots.map(async (slot) => {
+-    const conversation = repos.createConversation(input.projectId, `Council · ${slot.role} · ${slot.model}`, "playground");
+-    const send = await sendChat({ mode: "send", conversationId: conversation.id, providerKeyId: slot.providerKeyId, model: slot.model, content: input.content, extraSystem: ROLE_PROMPTS[slot.role], ...(input.privacyMode ? { privacyMode: input.privacyMode } : {}) }, sender);
+-    await waitForChatRun(send.runId);
+-    const answer = repos.getMessage(send.messageId)?.content ?? "";
+-    return { ...slot, send, answer };
+-  }));
+-  const debate = deliberations.map((item) => `## ${item.role}\n${item.answer}`).join("\n\n");
+-  const synthesisConversation = repos.createConversation(input.projectId, `Council synthesis · ${input.synthesis.model}`, "playground");
+-  const synthesis = await sendChat({ mode: "send", conversationId: synthesisConversation.id, providerKeyId: input.synthesis.providerKeyId, model: input.synthesis.model, content: `Question:\n${input.content}\n\nCouncil deliberation:\n${debate}\n\nSynthesize the disagreements, recommendation, and risks.`, ...(input.privacyMode ? { privacyMode: input.privacyMode } : {}) }, sender);
+-  return { slots: deliberations.map(({ role, providerKeyId, model, send }) => ({ role, providerKeyId, model, send })), synthesis: { providerKeyId: input.synthesis.providerKeyId, model: input.synthesis.model, send: synthesis }, divergences: divergenceTerms(deliberations.map((item) => item.answer)) };
++  // Persist the whole batch before dispatch so a concurrent chat sees this budget.
++  for (const estimate of estimates) {
++    if (estimate.usd !== null) repos.reserveSpend({ projectId: estimate.projectId, providerSlug: estimate.providerSlug, amountUsd: estimate.usd, expiresAt: Date.now() + 15 * 60_000 });
++  }
++  const first = input.slots[0];
++  if (!first) throw new Error("council:slots");
++  // Freeze the compiler result before any provider request. Role instructions are a
++  // dispatch layer; the context packet itself is identical for every council slot.
++  const storedPacket = repos.createContextPacket({
++    projectId: conversation.projectId,
++    privacyMode: prepared.privacyMode,
++    origin: { source: "compile", projectLabel: (repos.getProject(conversation.projectId ?? "")?.name ?? "").slice(0, 200), conversationLabel: conversation.title.slice(0, 200) },
++    tokenEstimate: prepared.packet.tokenEstimate,
++    payloadJson: JSON.stringify(portablePacketFromCompile({ privacyMode: prepared.privacyMode, origin: { source: "compile", projectLabel: (repos.getProject(conversation.projectId ?? "")?.name ?? "").slice(0, 200), conversationLabel: conversation.title.slice(0, 200) }, included: [], omitted: [], payload: prepared.packet })),
++  });
++  repos.applyContextPacket(input.conversationId, storedPacket.id);
++  const primary = await sendChat({ mode: "send", conversationId: input.conversationId, providerKeyId: first.providerKeyId, model: first.model, content: input.content, __preparedPacket: prepared.packet, __roleInstruction: ROLE_PROMPTS[first.role], __skipCaps: true, ...(input.privacyMode ? { privacyMode: input.privacyMode } : {}) }, sender);
++  await waitForChatRun(primary.runId);
++  const slots: CouncilRunResult["slots"] = [{ role: first.role, providerKeyId: first.providerKeyId, model: first.model, send: primary }];
++  const answers = [repos.getMessage(primary.messageId)?.content ?? ""];
++  for (const slot of input.slots.slice(1)) {
++    const branch = await sendChat({ mode: "regenerate", conversationId: input.conversationId, providerKeyId: slot.providerKeyId, model: slot.model, messageId: primary.messageId, __preparedPacket: prepared.packet, __roleInstruction: ROLE_PROMPTS[slot.role], __skipCaps: true, ...(input.privacyMode ? { privacyMode: input.privacyMode } : {}) }, sender);
++    await waitForChatRun(branch.runId);
++    slots.push({ role: slot.role, providerKeyId: slot.providerKeyId, model: slot.model, send: branch });
++    answers.push(repos.getMessage(branch.messageId)?.content ?? "");
++  }
++  const debate = slots.map((slot, index) => `## ${slot.role}\n${answers[index] ?? ""}`).join("\n\n");
++  const synthesisContent = `Council debate for: ${input.content}\n\n${debate}\n\nSynthesize agreements, disagreements, recommendation and risks.`;
++  const synthesisPacket = packetV0Schema.parse({ ...prepared.packet, messages: [...prepared.packet.messages, { role: "user", content: synthesisContent }], tokenEstimate: prepared.packet.tokenEstimate + Math.ceil(synthesisContent.length / 4) });
++  const synthesis = await sendChat({ mode: "send", conversationId: input.conversationId, providerKeyId: input.synthesis.providerKeyId, model: input.synthesis.model, content: synthesisContent, __preparedPacket: synthesisPacket, __skipCaps: true, ...(input.privacyMode ? { privacyMode: input.privacyMode } : {}) }, sender);
++  await waitForChatRun(synthesis.runId);
++  return { slots, synthesis: { providerKeyId: input.synthesis.providerKeyId, model: input.synthesis.model, send: synthesis }, divergences: divergenceTerms(answers) };
+ }
+diff --git a/apps/desktop/src/main/spend-guard.ts b/apps/desktop/src/main/spend-guard.ts
+index 0f26bab..47fcaea 100644
+--- a/apps/desktop/src/main/spend-guard.ts
++++ b/apps/desktop/src/main/spend-guard.ts
+@@ -1,5 +1,7 @@
+ import {
+   DEFAULT_ESTIMATED_OUTPUT_TOKENS,
++  addUsd,
++  evaluatePlaygroundCaps,
+   evaluateSpendCaps,
+   estimateCostUsd,
+   findCatalogModel,
+@@ -7,7 +9,7 @@ import {
+   type SpendCapLimits,
+   type SpendCapScope,
+ } from "@ai-hub/shared";
+-import type { SpendCapRecord } from "@ai-hub/db";
++import type { HubRepos, SpendCapRecord } from "@ai-hub/db";
+ 
+ export function localDayStartMs(now = Date.now()): number {
+   const date = new Date(now);
+@@ -64,3 +66,34 @@ export function evaluateScopedOutgoingCaps(input: {
+   });
+   return { blocked: result.blocked ? input.scope : null, warnings: result.warnings.length > 0 ? [input.scope] : [] };
+ }
++
++export function evaluateBatchScopedCaps(input: {
++  estimates: readonly { usd: string | null; projectId: string | null; providerSlug: string }[];
++  repos: HubRepos;
++}): { blocked: "request" | "day" | "global" | "project" | "provider" | null } {
++  const base = evaluatePlaygroundCaps({
++    estimates: input.estimates.map((item) => item.usd),
++    daySpentUsd: addUsd(input.repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() }), input.repos.sumReservedSpendUsd({ sinceMs: localDayStartMs() })),
++    globalSpentUsd: addUsd(input.repos.sumReceiptCostUsd({}), input.repos.sumReservedSpendUsd({})),
++    limits: spendCapLimitsFromRows(input.repos.listSpendCaps()),
++  });
++  if (base.blocked) return { blocked: base.blocked };
++  const scoped = input.repos.listScopedSpendCaps();
++  for (const [dimension, subjectId] of [["project", input.estimates[0]?.projectId], ["provider", null]] as const) {
++    if (dimension === "project" && subjectId) {
++      const limit = scoped.find((row) => row.dimension === "project" && row.subjectId === subjectId)?.limitUsd ?? null;
++      const projectEstimates = input.estimates.filter((item) => item.projectId === subjectId).map((item) => item.usd);
++      if (limit !== null && projectEstimates.some((item) => item === null)) return { blocked: "project" };
++      const usd = projectEstimates.reduce<string>((sum, item) => item === null ? sum : addUsd(sum, item), "0.000000");
++      if (evaluateScopedOutgoingCaps({ estimatedRequestUsd: usd, spentUsd: addUsd(input.repos.sumReceiptCostUsd({ projectId: subjectId }), input.repos.sumReservedSpendUsd({ projectId: subjectId })), limitUsd: limit, scope: "project" }).blocked) return { blocked: "project" };
++    }
++  }
++  for (const providerSlug of new Set(input.estimates.map((item) => item.providerSlug))) {
++    const limit = scoped.find((row) => row.dimension === "provider" && row.subjectId === providerSlug)?.limitUsd ?? null;
++    const providerEstimates = input.estimates.filter((item) => item.providerSlug === providerSlug).map((item) => item.usd);
++    if (limit !== null && providerEstimates.some((item) => item === null)) return { blocked: "provider" };
++    const usd = providerEstimates.reduce<string>((sum, item) => item === null ? sum : addUsd(sum, item), "0.000000");
++    if (evaluateScopedOutgoingCaps({ estimatedRequestUsd: usd, spentUsd: addUsd(input.repos.sumReceiptCostUsd({ providerSlug }), input.repos.sumReservedSpendUsd({ providerSlug })), limitUsd: limit, scope: "provider" }).blocked) return { blocked: "provider" };
++  }
++  return { blocked: null };
++}
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index 7442b3d..80a2cf6 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -920,6 +920,7 @@ export function App(): JSX.Element {
+               messages={messages}
+               error={error}
+               providerKeys={providerKeys}
++              health={health}
+               selectedKeyId={selectedKeyId}
+               selectedModel={selectedModel}
+               temperature={temperature}
+@@ -955,13 +956,14 @@ export function App(): JSX.Element {
+               onSelectTemperature={setTemperature}
+               onSelectMaxTokens={setMaxTokens}
+               onSelectExtraSystem={setExtraSystem}
+-              onSend={async (content, mentions) => {
+-                if (!selectedConversationId || !selectedKeyId) {
++              onSend={async (content, mentions, route) => {
++                const routeKeyId = route?.keyId ?? selectedKeyId;
++                if (!selectedConversationId || !routeKeyId) {
+                   return false;
+                 }
+                 let nextMentions = mentions;
+-                let model = selectedModel;
+-                const providerKeyId = selectedKeyId;
++                let model = route?.model ?? selectedModel;
++                const providerKeyId = routeKeyId;
+                 const skillRef = mentions.find((item) => item.type === "skill");
+                 if (skillRef) {
+                   try {
+@@ -1414,6 +1416,7 @@ export function App(): JSX.Element {
+               providerKeys={providerKeys}
+               privacyMode={privacyMode}
+               conversationId={selectedConversationId}
++              health={health}
+               onInsertIntoComposer={(text) => {
+                 setComposerInsert(text);
+                 setView("home");
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index 03a8443..6b5ace3 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -4,6 +4,7 @@ import {
+   activePath,
+   catalogModelsForProvider,
+   findCatalogModel,
++  recommendModelRoute,
+   isMentionStubType,
+   MAX_MENTION_TOKENS,
+   mentionQueryParts,
+@@ -27,6 +28,7 @@ import {
+   type SkillDto,
+   type ArtifactDto,
+   type ProviderKeyDto,
++  type HealthSummaryDto,
+ } from "@ai-hub/shared";
+ import {
+   ChatComposer,
+@@ -76,6 +78,7 @@ export function HomeView({
+   messages,
+   error,
+   providerKeys,
++  health,
+   selectedKeyId,
+   selectedModel,
+   temperature,
+@@ -145,6 +148,7 @@ export function HomeView({
+   messages: MessageDto[];
+   error: string | null;
+   providerKeys: ProviderKeyDto[];
++  health: HealthSummaryDto[];
+   selectedKeyId: string | null;
+   selectedModel: string;
+   temperature: number;
+@@ -161,7 +165,7 @@ export function HomeView({
+   onSelectTemperature: (value: number) => void;
+   onSelectMaxTokens: (value: number | null) => void;
+   onSelectExtraSystem: (value: string) => void;
+-  onSend: (content: string, mentions: MentionRef[]) => Promise<boolean>;
++  onSend: (content: string, mentions: MentionRef[], route?: { keyId: string; model: string }) => Promise<boolean>;
+   onMentionsChange: (mentions: MentionRef[]) => void;
+   onAbort: () => Promise<void>;
+   onRegenerate: (messageId: string) => Promise<void>;
+@@ -210,6 +214,8 @@ export function HomeView({
+   const modifier = window.hub.platform === "darwin" ? "⌘" : "Ctrl";
+   const [title, setTitle] = useState("");
+   const [draft, setDraft] = useState("");
++  const [autoRouter, setAutoRouter] = useState(false);
++  const [autoRouteConfirmed, setAutoRouteConfirmed] = useState(false);
+   const [mentionChips, setMentionChips] = useState<MentionSuggestion[]>([]);
+   const [mentionSuggestions, setMentionSuggestions] = useState<MentionSuggestion[]>([]);
+   const [projectFiles, setProjectFiles] = useState<ProjectFileDto[]>([]);
+@@ -254,6 +260,8 @@ export function HomeView({
+   const models = providerSlug ? catalogModelsForProvider(providerSlug) : [];
+   const selectedCatalog: CatalogModel | null =
+     providerSlug && selectedModel ? findCatalogModel(selectedModel, providerSlug) : null;
++  const routerRecommendation = recommendModelRoute(draft);
++  const routedModel = providerKeys.flatMap((key) => catalogModelsForProvider(key.providerSlug).map((model) => ({ key, model, cost: model.inputUsdPerMillion + model.outputUsdPerMillion, latency: health.find((sample) => sample.providerSlug === key.providerSlug)?.lastLatencyMs ?? Number.MAX_SAFE_INTEGER }))).sort((left, right) => routerRecommendation.tier === "frontier" ? right.cost - left.cost || left.latency - right.latency : left.cost - right.cost || left.latency - right.latency)[0] ?? null;
+   const hasKey =
+     selectedKeyId !== null && providerKeys.some((key) => key.id === selectedKeyId);
+   const busy = streaming || sending;
+@@ -551,6 +559,7 @@ export function HomeView({
+   };
+ 
+   const sendDraft = (content: string, mentions: MentionRef[]): void => {
++    if (autoRouter && !autoRouteConfirmed) return;
+     const skillMention = mentions.find((item) => item.type === "skill");
+     if (skillMention) {
+       const skill = librarySkills.find((row) => {
+@@ -571,7 +580,7 @@ export function HomeView({
+         });
+       }
+     }
+-    void onSend(content, mentions).then((ok) => {
++    void onSend(content, mentions, autoRouter && routedModel ? { keyId: routedModel.key.id, model: routedModel.model.id } : undefined).then((ok) => {
+       if (ok) {
+         setDraft("");
+         setMentionChips([]);
+@@ -865,7 +874,7 @@ export function HomeView({
+                         ref={customModelRef}
+                         className="h-8 w-52"
+                         value={selectedModel}
+-                        onChange={(event) => onSelectModel(event.target.value)}
++                      onChange={(event) => onSelectModel(event.target.value)}
+                         aria-label={t("workspace.customModel")}
+                         data-testid="workspace-custom-model"
+                       />
+@@ -889,6 +898,10 @@ export function HomeView({
+                       </select>
+                     )}
+                   </label>
++                  <label className="flex items-center gap-1 text-[11px]">
++                    <input type="checkbox" checked={autoRouter} onChange={(event) => { setAutoRouter(event.target.checked); setAutoRouteConfirmed(false); }} />
++                    {t("council.router.auto")}
++                  </label>
+                   {selectedCatalog ? (
+                     <span className="text-[11px] text-muted-foreground">
+                       {t("workspace.model.price", {
+@@ -1433,6 +1446,7 @@ export function HomeView({
+                   value={draft}
+                   onChange={(value) => {
+                     setDraft(value);
++                    setAutoRouteConfirmed(false);
+                     onComposerDraft(value);
+                   }}
+                   streaming={streaming}
+@@ -1643,6 +1657,7 @@ export function HomeView({
+                     void onDropFiles(files);
+                   }}
+                 />
++                {autoRouter && routedModel ? <div className="flex items-center gap-2 border-t px-2 py-1 text-[11px] text-muted-foreground" data-testid="chat-router"><span>{t(`council.router.${routerRecommendation.reason}`)} · {routedModel.key.label} · {routedModel.model.label}</span><span>{t("council.router.cost", { usd: (routedModel.cost / 1_000_000 * (Math.ceil(draft.length / 4) + 1024)).toFixed(6) })} · {routedModel.latency === Number.MAX_SAFE_INTEGER ? t(`council.router.speed.${routerRecommendation.tier}`) : t("council.router.latency", { ms: routedModel.latency })}</span><Button type="button" size="sm" variant={autoRouteConfirmed ? "secondary" : "outline"} onClick={() => setAutoRouteConfirmed(true)}>{autoRouteConfirmed ? t("council.router.confirmed") : t("council.router.confirm")}</Button></div> : null}
+               </div>
+               {canvasArtifact ? (
+                 <ArtifactCanvas
+diff --git a/apps/desktop/src/renderer/src/components/layout/prompts-view.tsx b/apps/desktop/src/renderer/src/components/layout/prompts-view.tsx
+index 854a679..e783408 100644
+--- a/apps/desktop/src/renderer/src/components/layout/prompts-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/prompts-view.tsx
+@@ -12,8 +12,12 @@ import {
+   type PromptDto,
+   type PromptFolder,
+   type ProviderKeyDto,
++  type HealthSummaryDto,
+   COUNCIL_ROLES,
+   recommendModelRoute,
++  estimateCostUsd,
++  findCatalogModel,
++  DEFAULT_ESTIMATED_OUTPUT_TOKENS,
+ } from "@ai-hub/shared";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+@@ -55,12 +59,14 @@ export function PromptsView({
+   privacyMode,
+   onInsertIntoComposer,
+   conversationId,
++  health,
+ }: {
+   project: ProjectDto | null;
+   providerKeys: ProviderKeyDto[];
+   privacyMode: PacketPrivacyMode;
+   onInsertIntoComposer: (text: string) => void;
+   conversationId: string | null;
++  health: HealthSummaryDto[];
+ }): JSX.Element {
+   const { t } = useTranslation();
+   const [prompts, setPrompts] = useState<PromptDto[]>([]);
+@@ -75,7 +81,9 @@ export function PromptsView({
+   const [winnerTitle, setWinnerTitle] = useState("");
+   const [councilDraft, setCouncilDraft] = useState("");
+   const [councilRunning, setCouncilRunning] = useState(false);
+-  const [councilResult, setCouncilResult] = useState<{ divergences: string[]; synthesis: MessageDto | null } | null>(null);
++  const [routerConfirmed, setRouterConfirmed] = useState(false);
++  const [routerChoice, setRouterChoice] = useState("");
++  const [councilResult, setCouncilResult] = useState<{ divergences: string[]; synthesis: MessageDto | null; debate: MessageDto[] } | null>(null);
+   const slotsRef = useRef(slots);
+   slotsRef.current = slots;
+ 
+@@ -94,6 +102,25 @@ export function PromptsView({
+       ),
+     [providerKeys],
+   );
++  const routerRecommendation = recommendModelRoute(councilDraft);
++  const recommendedRouterOption = useMemo(() => {
++    const candidates = keyOptions.map((option) => {
++      const provider = providerKeys.find((key) => key.id === option.providerKeyId)?.providerSlug ?? "";
++      const model = findCatalogModel(option.model, provider);
++      const cost = model ? model.inputUsdPerMillion + model.outputUsdPerMillion : Number.POSITIVE_INFINITY;
++      const latency = health.find((item) => item.providerSlug === provider)?.lastLatencyMs ?? Number.POSITIVE_INFINITY;
++      return { option, cost, latency };
++    });
++    if (routerRecommendation.tier === "frontier") return candidates.sort((a, b) => b.cost - a.cost || a.latency - b.latency)[0]?.option;
++    if (routerRecommendation.tier === "fast") return candidates.sort((a, b) => a.latency - b.latency || a.cost - b.cost)[0]?.option;
++    return candidates.sort((a, b) => a.cost - b.cost || a.latency - b.latency)[0]?.option;
++  }, [health, keyOptions, providerKeys, routerRecommendation.tier]);
++  const routerOption = keyOptions.find((item) => item.value === (routerChoice || recommendedRouterOption?.value));
++  const routerEstimate = routerOption
++    ? findCatalogModel(routerOption.model, providerKeys.find((key) => key.id === routerOption.providerKeyId)?.providerSlug ?? "")
++    : undefined;
++  const routerCost = routerEstimate ? estimateCostUsd(routerEstimate, Math.ceil(councilDraft.length / 4), DEFAULT_ESTIMATED_OUTPUT_TOKENS) : null;
++  const routerLatency = routerOption ? health.find((item) => item.providerSlug === providerKeys.find((key) => key.id === routerOption.providerKeyId)?.providerSlug)?.lastLatencyMs ?? null : null;
+ 
+   const reload = async (): Promise<void> => {
+     const list = await window.hub.prompts.list();
+@@ -281,23 +308,25 @@ export function PromptsView({
+   };
+ 
+   const runCouncil = async (): Promise<void> => {
+-    if (!conversationId || councilDraft.trim().length === 0 || keyOptions.length < 2) {
++    if (!routerConfirmed || !conversationId || councilDraft.trim().length === 0 || keyOptions.length < 2) {
+       setError(t("council.error.setup")); return;
+     }
+-    const selected = keyOptions.slice(0, Math.min(4, keyOptions.length));
++    const preferred = keyOptions.find((item) => item.value === routerChoice) ?? recommendedRouterOption ?? keyOptions[0];
++    const selected = [preferred, ...keyOptions.filter((item) => item.value !== preferred?.value)].filter((item): item is NonNullable<typeof item> => item !== undefined).slice(0, Math.min(4, keyOptions.length));
+     const roles = COUNCIL_ROLES.slice(0, selected.length);
+     const synth = selected[0];
+     if (!synth) return;
+     setCouncilRunning(true); setError(null); setCouncilResult(null);
+     try {
+       const result = await window.hub.council.run({
++        conversationId,
+         projectId: project?.id ?? null,
+         content: councilDraft.trim(),
+         slots: selected.map((slot, index) => ({ providerKeyId: slot.providerKeyId, model: slot.model, role: roles[index] ?? "reviewer" })),
+         synthesis: { providerKeyId: synth.providerKeyId, model: synth.model }, privacyMode,
+       });
+-      const synthesis = await window.hub.messages.list({ conversationId: result.synthesis.send.assistant.conversationId });
+-      setCouncilResult({ divergences: result.divergences, synthesis: synthesis.at(-1) ?? null });
++      const messages = await window.hub.messages.list({ conversationId });
++      setCouncilResult({ divergences: result.divergences, synthesis: messages.find((item) => item.id === result.synthesis.send.messageId) ?? null, debate: result.slots.map((slot) => messages.find((item) => item.id === slot.send.messageId)).filter((item): item is MessageDto => item !== undefined) });
+     } catch { setError(t("council.error.run")); } finally { setCouncilRunning(false); }
+   };
+ 
+@@ -446,9 +475,11 @@ export function PromptsView({
+             <div className="mt-3 border-t pt-2" data-testid="council-panel">
+               <p className="mb-1 text-[12px] font-medium">{t("council.title")}</p>
+               <textarea className="mb-1 h-16 w-full resize-none rounded border bg-background p-2 text-[12px]" value={councilDraft} onChange={(event) => setCouncilDraft(event.target.value)} placeholder={t("council.placeholder")} data-testid="council-input" />
+-              <p className="mb-1 text-[11px] text-muted-foreground">{t(`council.router.${recommendModelRoute(councilDraft).reason}`)}</p>
+-              <Button size="sm" type="button" disabled={councilRunning || !conversationId} onClick={() => void runCouncil()} data-testid="council-run">{councilRunning ? t("council.running") : t("council.run")}</Button>
+-              {councilResult ? <div className="mt-2 rounded border p-2 text-[11px]"><p>{t("council.divergences")}: {councilResult.divergences.join(", ") || t("council.none")}</p><p className="mt-1 font-medium">{t("council.synthesis")}</p><p className="whitespace-pre-wrap">{councilResult.synthesis?.content}</p></div> : null}
++              <p className="mb-1 text-[11px] text-muted-foreground">{t(`council.router.${routerRecommendation.reason}`)}</p>
++              <select aria-label={t("council.router.model")} className="mb-1 h-8 w-full rounded border bg-background px-1 text-[11px]" value={routerChoice || recommendedRouterOption?.value || ""} onChange={(event) => { setRouterChoice(event.target.value); setRouterConfirmed(false); }} data-testid="router-choice">{keyOptions.map((item) => <option key={item.value} value={item.value}>{item.label}{item.value === recommendedRouterOption?.value ? ` · ${t("council.router.recommended")}` : ""}</option>)}</select>
++              <p className="mb-1 text-[11px] text-muted-foreground">{t("council.router.cost", { usd: routerCost ?? "—" })} · {routerLatency === null ? t(`council.router.speed.${routerRecommendation.tier}`) : t("council.router.latency", { ms: routerLatency })}</p>
++              <div className="flex gap-1"><Button size="sm" type="button" variant="outline" onClick={() => setRouterConfirmed(false)}>{t("council.router.reject")}</Button><Button size="sm" type="button" variant="secondary" onClick={() => setRouterConfirmed(true)}>{t("council.router.confirm")}</Button><Button size="sm" type="button" disabled={councilRunning || !conversationId || !routerConfirmed} onClick={() => void runCouncil()} data-testid="council-run">{councilRunning ? t("council.running") : t("council.run")}</Button></div>
++              {councilResult ? <div className="mt-2 rounded border p-2 text-[11px]"><p>{t("council.divergences")}: {councilResult.divergences.join(", ") || t("council.none")}</p><div className="mt-2 grid grid-cols-2 gap-2">{councilResult.debate.map((message, index) => <div key={message.id} className="min-w-0 rounded border p-1"><p className="font-medium">{COUNCIL_ROLES[index] ?? t("prompts.slot", { n: index + 1 })}</p><p className="whitespace-pre-wrap">{message.content}</p></div>)}</div><p className="mt-2 font-medium">{t("council.synthesis")}</p><p className="whitespace-pre-wrap">{councilResult.synthesis?.content}</p></div> : null}
+             </div>
+             <Input
+               className="mb-2"
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 5720426..dec32c7 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -476,5 +476,6 @@
+   "skills.factory.write-rfc": "Write RFC",
+   "skills.error.generic": "Could not load the skill library.",
+   "skills.error.save": "Could not save that skill.",
++  "council.router.model": "Recommended model", "council.router.auto": "Automatic", "council.router.confirmed": "Route confirmed", "council.router.recommended": "recommended", "council.router.cost": "Estimated first-model cost: ${{usd}}", "council.router.latency": "Latency: {{ms}} ms", "council.router.speed.fast": "Speed: fast", "council.router.speed.balanced": "Speed: balanced", "council.router.speed.frontier": "Speed: frontier", "council.router.confirm": "Confirm route", "council.router.reject": "Reject route",
+   "quickAi.title": "Quick AI", "quickAi.close": "Close", "quickAi.placeholder": "Ask something or paste content…", "quickAi.clipboard": "Read clipboard", "quickAi.formatJson": "Format JSON", "quickAi.toInterface": "TS interface", "quickAi.explainJson": "Explain JSON", "quickAi.diagnoseStack": "Diagnose stack", "quickAi.sendToProject": "Send to current project", "quickAi.model": "Model", "quickAi.estimate": "Estimate: ${{usd}}", "quickAi.estimateUnavailable": "Estimate available on send", "quickAi.send": "Send", "quickAi.cancel": "Cancel", "quickAi.sending": "Sending…", "quickAi.error.setup": "Configure a provider key before sending.", "quickAi.error.send": "Could not send the question.", "quickAi.conversationTitle": "Quick AI", "quickAi.explainPrefix": "Explain this JSON clearly:", "quickAi.diagnosePrefix": "Diagnose this stack trace and suggest a fix:", "council.title": "AI Council", "council.placeholder": "Question for the council…", "council.run": "Start debate", "council.running": "Debating…", "council.synthesis": "Synthesis", "council.divergences": "Divergences (heuristic)", "council.none": "None highlighted", "council.error.setup": "Open a conversation and configure at least two models.", "council.error.run": "Could not complete the Council.", "council.router.simple": "Router: simple question → fast route; confirm before sending.", "council.router.code": "Router: code → balanced route; confirm before sending.", "council.router.complex": "Router: complex task → frontier route; confirm before sending."
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index c514737..81cefd3 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -476,5 +476,6 @@
+   "skills.factory.write-rfc": "Escrever RFC",
+   "skills.error.generic": "Não foi possível carregar a biblioteca de skills.",
+   "skills.error.save": "Não foi possível guardar essa skill.",
++  "council.router.model": "Modelo recomendado", "council.router.auto": "Automático", "council.router.confirmed": "Rota confirmada", "council.router.recommended": "recomendado", "council.router.cost": "Custo estimado do primeiro modelo: US$ {{usd}}", "council.router.latency": "Latência: {{ms}} ms", "council.router.speed.fast": "Velocidade: rápida", "council.router.speed.balanced": "Velocidade: equilibrada", "council.router.speed.frontier": "Velocidade: frontier", "council.router.confirm": "Confirmar rota", "council.router.reject": "Recusar rota",
+   "quickAi.title": "Quick AI", "quickAi.close": "Fechar", "quickAi.placeholder": "Pergunte algo ou cole conteúdo…", "quickAi.clipboard": "Ler clipboard", "quickAi.formatJson": "Formatar JSON", "quickAi.toInterface": "Interface TS", "quickAi.explainJson": "Explicar JSON", "quickAi.diagnoseStack": "Diagnosticar stack", "quickAi.sendToProject": "Mandar ao projeto atual", "quickAi.model": "Modelo", "quickAi.estimate": "Estimativa: US$ {{usd}}", "quickAi.estimateUnavailable": "Estimativa disponível ao enviar", "quickAi.send": "Enviar", "quickAi.cancel": "Cancelar", "quickAi.sending": "Enviando…", "quickAi.error.setup": "Configure uma chave de provider antes de enviar.", "quickAi.error.send": "Não foi possível enviar a pergunta.", "quickAi.conversationTitle": "Quick AI", "quickAi.explainPrefix": "Explique este JSON de forma clara:", "quickAi.diagnosePrefix": "Diagnostique este stack trace e sugira uma correção:", "council.title": "AI Council", "council.placeholder": "Pergunta para o conselho…", "council.run": "Iniciar debate", "council.running": "Debatendo…", "council.synthesis": "Síntese", "council.divergences": "Divergências (heurística)", "council.none": "Nenhuma destacada", "council.error.setup": "Abra uma conversa e configure ao menos dois modelos.", "council.error.run": "Não foi possível concluir o Council.", "council.router.simple": "Router: pergunta simples → rota rápida; confirme antes de enviar.", "council.router.code": "Router: código → rota equilibrada; confirme antes de enviar.", "council.router.complex": "Router: tarefa complexa → rota frontier; confirme antes de enviar."
+ }
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 70d52f0..f8b17ec 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave
+ |---|---|
+ | Wave | **W20** |
+ | Marco | C — V1 |
+-| State | `review` |
++| State | `in_progress` |
+ | Last completed | **W19** |
+-| Next action | Map Council, comparison and explicit router contracts |
++| Next action | Refactor Council dispatcher: freeze packet before dispatch, role-specific sibling branches, exact packet/debate preflight, side-by-side comparison and concrete Router. |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+diff --git a/packages/ai-gateway/src/adapter.ts b/packages/ai-gateway/src/adapter.ts
+index 3d977ad..c02f059 100644
+--- a/packages/ai-gateway/src/adapter.ts
++++ b/packages/ai-gateway/src/adapter.ts
+@@ -23,6 +23,17 @@ export interface ChatStreamRequest {
+   temperature?: number;
+   maxTokens?: number | null;
+   images?: ChatImagePart[];
++  /** Dispatch-only Council lens. The immutable packet remains shared and auditable. */
++  roleInstruction?: string;
++}
++
++export function packetForDispatch(input: Pick<ChatStreamRequest, "packet" | "roleInstruction">): ProviderAgnosticPacket {
++  if (!input.roleInstruction) return input.packet;
++  return {
++    ...input.packet,
++    system: `${input.packet.system}\n\n${input.roleInstruction}`,
++    tokenEstimate: input.packet.tokenEstimate + Math.ceil(input.roleInstruction.length / 4),
++  };
+ }
+ 
+ export type ChatStreamEvent =
+diff --git a/packages/ai-gateway/src/anthropic-adapter.ts b/packages/ai-gateway/src/anthropic-adapter.ts
+index 6a63eb4..ece379a 100644
+--- a/packages/ai-gateway/src/anthropic-adapter.ts
++++ b/packages/ai-gateway/src/anthropic-adapter.ts
+@@ -1,11 +1,12 @@
+ import { redactSecrets } from "@ai-hub/security";
+ import { catalogModelsForProvider, type ProviderAgnosticPacket } from "@ai-hub/shared";
+-import type {
+-  ChatStreamEvent,
+-  ChatStreamRequest,
+-  ModelRef,
+-  ProviderAdapter,
+-  ProviderCapabilities,
++import {
++  packetForDispatch,
++  type ChatStreamEvent,
++  type ChatStreamRequest,
++  type ModelRef,
++  type ProviderAdapter,
++  type ProviderCapabilities,
+ } from "./adapter";
+ import { GatewayError } from "./errors";
+ import { iterateSseData } from "./sse";
+@@ -164,7 +165,7 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): P
+       }
+     },
+     async *chatStream(input: ChatStreamRequest): AsyncIterable<ChatStreamEvent> {
+-      const converted = packetToAnthropic(input.packet, input.images);
++      const converted = packetToAnthropic(packetForDispatch(input), input.images);
+       const body: Record<string, unknown> = {
+         model: input.model,
+         stream: true,
+diff --git a/packages/ai-gateway/src/gemini-adapter.ts b/packages/ai-gateway/src/gemini-adapter.ts
+index b4ba4ff..dbf9ed9 100644
+--- a/packages/ai-gateway/src/gemini-adapter.ts
++++ b/packages/ai-gateway/src/gemini-adapter.ts
+@@ -1,11 +1,12 @@
+ import { redactSecrets } from "@ai-hub/security";
+ import { catalogModelsForProvider, type ProviderAgnosticPacket } from "@ai-hub/shared";
+-import type {
+-  ChatStreamEvent,
+-  ChatStreamRequest,
+-  ModelRef,
+-  ProviderAdapter,
+-  ProviderCapabilities,
++import {
++  packetForDispatch,
++  type ChatStreamEvent,
++  type ChatStreamRequest,
++  type ModelRef,
++  type ProviderAdapter,
++  type ProviderCapabilities,
+ } from "./adapter";
+ import { GatewayError } from "./errors";
+ import { iterateSseData } from "./sse";
+@@ -165,7 +166,7 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): Provide
+       }
+     },
+     async *chatStream(input: ChatStreamRequest): AsyncIterable<ChatStreamEvent> {
+-      const converted = packetToGemini(input.packet, input.images);
++      const converted = packetToGemini(packetForDispatch(input), input.images);
+       const generationConfig: Record<string, unknown> = {
+         temperature: input.temperature ?? 1,
+       };
+diff --git a/packages/ai-gateway/src/openai-adapter.ts b/packages/ai-gateway/src/openai-adapter.ts
+index 4f5650a..de4be04 100644
+--- a/packages/ai-gateway/src/openai-adapter.ts
++++ b/packages/ai-gateway/src/openai-adapter.ts
+@@ -1,11 +1,12 @@
+ import { redactSecrets } from "@ai-hub/security";
+ import { catalogModelsForProvider, type ProviderAgnosticPacket } from "@ai-hub/shared";
+-import type {
+-  ChatStreamEvent,
+-  ChatStreamRequest,
+-  ModelRef,
+-  ProviderAdapter,
+-  ProviderCapabilities,
++import {
++  packetForDispatch,
++  type ChatStreamEvent,
++  type ChatStreamRequest,
++  type ModelRef,
++  type ProviderAdapter,
++  type ProviderCapabilities,
+ } from "./adapter";
+ import { GatewayError } from "./errors";
+ import { iterateSseData } from "./sse";
+@@ -208,7 +209,7 @@ export function createOpenAICompatibleAdapter(
+         model: input.model,
+         stream: true,
+         stream_options: { include_usage: true },
+-        messages: packetMessages(input.packet, input.images),
++        messages: packetMessages(packetForDispatch(input), input.images),
+         temperature: input.temperature ?? 1,
+       };
+       if (input.maxTokens !== undefined && input.maxTokens !== null) {
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index d285595..a88e29a 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -1,5 +1,5 @@
+ export { applyMigrations } from "./migrate";
+-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL } from "./migrations";
++export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL, MIGRATION_0013_SQL, MIGRATION_0014_SQL } from "./migrations";
+ export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
+ export {
+   HubRepos,
+diff --git a/packages/db/src/migrations.ts b/packages/db/src/migrations.ts
+index ebe55c0..989c6d3 100644
+--- a/packages/db/src/migrations.ts
++++ b/packages/db/src/migrations.ts
+@@ -278,6 +278,18 @@ CREATE UNIQUE INDEX scoped_spend_caps_dimension_subject_idx
+   ON scoped_spend_caps(dimension, subject_id);
+ `;
+ 
++export const MIGRATION_0014_SQL = `
++CREATE TABLE spend_reservations (
++  id TEXT PRIMARY KEY,
++  project_id TEXT,
++  provider_slug TEXT NOT NULL,
++  amount_usd TEXT NOT NULL,
++  expires_at INTEGER NOT NULL,
++  created_at INTEGER NOT NULL
++);
++CREATE INDEX spend_reservations_expires_idx ON spend_reservations(expires_at);
++`;
++
+ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 1, sql: MIGRATION_0001_SQL },
+   { version: 2, sql: MIGRATION_0002_SQL },
+@@ -292,4 +304,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 11, sql: MIGRATION_0011_SQL },
+   { version: 12, sql: MIGRATION_0012_SQL },
+   { version: 13, sql: MIGRATION_0013_SQL },
++  { version: 14, sql: MIGRATION_0014_SQL },
+ ];
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 30eaf9b..573c029 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -33,6 +33,7 @@ import {
+   settings,
+   spendCaps,
+   scopedSpendCaps,
++  spendReservations,
+   tags,
+   type schema,
+ } from "./schema";
+@@ -1691,6 +1692,29 @@ export class HubRepos {
+     return microsToUsdText(micros);
+   }
+ 
++  reserveSpend(input: { projectId: string | null; providerSlug: string; amountUsd: string; expiresAt: number }): string {
++    const id = randomUUID();
++    this.sqlite.prepare("DELETE FROM spend_reservations WHERE expires_at <= ?").run(Date.now());
++    this.db.insert(spendReservations).values({ id, projectId: input.projectId, providerSlug: input.providerSlug, amountUsd: input.amountUsd, expiresAt: input.expiresAt, createdAt: Date.now() }).run();
++    return id;
++  }
++
++  releaseSpendReservation(id: string): void {
++    this.db.delete(spendReservations).where(eq(spendReservations.id, id)).run();
++  }
++
++  sumReservedSpendUsd(filter: { projectId?: string | null; providerSlug?: string; sinceMs?: number } = {}): string {
++    this.sqlite.prepare("DELETE FROM spend_reservations WHERE expires_at <= ?").run(Date.now());
++    const clauses = [gte(spendReservations.expiresAt, Date.now())];
++    if (filter.projectId) clauses.push(eq(spendReservations.projectId, filter.projectId));
++    if (filter.providerSlug) clauses.push(eq(spendReservations.providerSlug, filter.providerSlug));
++    if (filter.sinceMs !== undefined) clauses.push(gte(spendReservations.createdAt, filter.sinceMs));
++    const rows = this.db.select({ amountUsd: spendReservations.amountUsd }).from(spendReservations).where(and(...clauses)).all();
++    let micros = 0;
++    for (const row of rows) micros += parseUsdMicros(row.amountUsd);
++    return microsToUsdText(micros);
++  }
++
+   summarizeReceipts(fromMs: number, toMs: number): {
+     tokens: number;
+     requests: number;
+diff --git a/packages/db/src/schema.ts b/packages/db/src/schema.ts
+index 03bdd4a..759566d 100644
+--- a/packages/db/src/schema.ts
++++ b/packages/db/src/schema.ts
+@@ -114,6 +114,15 @@ export const scopedSpendCaps = sqliteTable(
+   (table) => [uniqueIndex("scoped_spend_caps_dimension_subject_idx").on(table.dimension, table.subjectId)],
+ );
+ 
++export const spendReservations = sqliteTable("spend_reservations", {
++  id: text("id").primaryKey(),
++  projectId: text("project_id"),
++  providerSlug: text("provider_slug").notNull(),
++  amountUsd: text("amount_usd").notNull(),
++  expiresAt: integer("expires_at", { mode: "number" }).notNull(),
++  createdAt: integer("created_at", { mode: "number" }).notNull(),
++});
++
+ export const healthSamples = sqliteTable("health_samples", {
+   id: text("id").primaryKey(),
+   providerSlug: text("provider_slug").notNull(),
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index 61f91d4..a6d77e3 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -1110,6 +1110,7 @@ export type PlaygroundRunResult = z.infer<typeof playgroundRunResultSchema>;
+ 
+ export const councilRoleSchema = z.enum(["architect", "reviewer", "security", "ux"]);
+ export const councilRunInputSchema = z.object({
++  conversationId: z.string().uuid(),
+   projectId: z.string().uuid().nullable(),
+   content: z.string().trim().min(1).max(100_000),
+   slots: z.array(playgroundSlotInputSchema.extend({ role: councilRoleSchema })).min(2).max(4),
