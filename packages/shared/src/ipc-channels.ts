@@ -3,6 +3,8 @@ export const IpcChannel = {
   windowMaximize: "window:maximize",
   windowClose: "window:close",
   windowIsMaximized: "window:isMaximized",
+  quickAiReadClipboard: "quickAi:readClipboard",
+  quickAiPrefill: "quickAi:prefill",
   projectsList: "projects:list",
   projectsCreate: "projects:create",
   projectsUpdate: "projects:update",
