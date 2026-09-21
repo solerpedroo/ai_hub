@@ -86,6 +86,7 @@ export function HomeView({
   extraSystem,
   streaming,
   sending,
+  runHud,
   branchLabels,
   exportNotice,
   onSelectConversation,
@@ -156,6 +157,7 @@ export function HomeView({
   extraSystem: string;
   streaming: boolean;
   sending: boolean;
+  runHud: { tokensIn: number | null; tokensOut: number | null; tokensThinking: number | null; cacheReadTokens: number | null; cacheWriteTokens: number | null; costUsd: string | null; thinkingSupported: boolean | null } | null;
   branchLabels: BranchLabels;
   exportNotice: string | null;
   onSelectConversation: (id: string) => void;
@@ -165,7 +167,7 @@ export function HomeView({
   onSelectTemperature: (value: number) => void;
   onSelectMaxTokens: (value: number | null) => void;
   onSelectExtraSystem: (value: string) => void;
-  onSend: (content: string, mentions: MentionRef[], route?: { keyId: string; model: string }) => Promise<boolean>;
+  onSend: (content: string, mentions: MentionRef[], route?: { keyId: string; model: string; runMode: "plan" | "assist" | "agent" | "orchestrate"; effortLevel: "low" | "medium" | "high" | "max" }) => Promise<boolean>;
   onMentionsChange: (mentions: MentionRef[]) => void;
   onAbort: () => Promise<void>;
   onRegenerate: (messageId: string) => Promise<void>;
@@ -214,6 +216,8 @@ export function HomeView({
   const modifier = window.hub.platform === "darwin" ? "⌘" : "Ctrl";
   const [title, setTitle] = useState("");
   const [draft, setDraft] = useState("");
+  const [runMode, setRunMode] = useState<"plan" | "assist" | "agent" | "orchestrate">("assist");
+  const [effortLevel, setEffortLevel] = useState<"low" | "medium" | "high" | "max">("medium");
   const [autoRouter, setAutoRouter] = useState(false);
   const [autoRouteConfirmed, setAutoRouteConfirmed] = useState(false);
   const [mentionChips, setMentionChips] = useState<MentionSuggestion[]>([]);
@@ -270,6 +274,18 @@ export function HomeView({
   const leaf = path[path.length - 1] ?? null;
   const selectedConversation =
     conversations.find((item) => item.id === selectedConversationId) ?? null;
+  useEffect(() => {
+    if (selectedConversation) {
+      setRunMode(selectedConversation.runMode);
+      setEffortLevel(selectedConversation.effortLevel);
+    }
+  }, [selectedConversation]);
+  const saveRunSettings = async (nextMode: typeof runMode, nextEffort: typeof effortLevel): Promise<void> => {
+    if (!selectedConversationId) return;
+    if (nextMode === "agent" || nextMode === "orchestrate") return;
+    setRunMode(nextMode); setEffortLevel(nextEffort);
+    await window.hub.conversations.setRunSettings({ conversationId: selectedConversationId, runMode: nextMode, effortLevel: nextEffort });
+  };
   const canvasArtifact = artifacts.find((item) => item.id === canvasId) ?? null;
   const providerSlugs = [...new Set(providerKeys.map((item) => item.providerSlug))];
   const preferredModels = preferredProvider
@@ -580,7 +596,8 @@ export function HomeView({
         });
       }
     }
-    void onSend(content, mentions, autoRouter && routedModel ? { keyId: routedModel.key.id, model: routedModel.model.id } : undefined).then((ok) => {
+    const route = autoRouter && routedModel ? { keyId: routedModel.key.id, model: routedModel.model.id, runMode, effortLevel } : { keyId: selectedKeyId ?? "", model: selectedModel, runMode, effortLevel };
+    void onSend(content, mentions, route).then((ok) => {
       if (ok) {
         setDraft("");
         setMentionChips([]);
@@ -867,6 +884,8 @@ export function HomeView({
                       ))}
                     </select>
                   </label>
+                  <label className="flex items-center gap-1 text-[11px]"><span>{t("runMode.label")}</span><select className="h-8 rounded border bg-background px-1" value={runMode} onChange={(event) => void saveRunSettings(event.target.value as typeof runMode, effortLevel)}><option value="assist">Assist</option><option value="plan">Plan</option><option value="agent" disabled>Agent (W23)</option><option value="orchestrate" disabled>Orchestrate (W24)</option></select></label>
+                  <label className="flex items-center gap-1 text-[11px"><span>{t("effort.label")}</span><select className="h-8 rounded border bg-background px-1" value={effortLevel} onChange={(event) => void saveRunSettings(runMode, event.target.value as typeof effortLevel)}>{["low", "medium", "high", "max"].map((level) => <option key={level} value={level}>{level}</option>)}</select></label>
                   <label className="flex items-center gap-1">
                     <span className="text-muted-foreground">{t("workspace.model")}</span>
                     {providerSlug === "custom" ? (
@@ -1441,6 +1460,13 @@ export function HomeView({
                     </ol>
                   </div>
                 ) : null}
+                <div className="flex flex-wrap gap-2 border-t px-2 py-1 text-[11px] text-muted-foreground" data-testid="run-hud">
+                  <span>{t("hud.mode")}: {runMode}</span><span>{t("hud.effort")}: {effortLevel}</span>
+                  <span>{t("hud.context")}: {packetPreview?.tokenEstimate ?? "—"}/{packetPreview?.contextWindow ?? "—"}</span>
+                  <span>{t("hud.tokens")}: {runHud?.tokensIn ?? "—"}/{runHud?.tokensOut ?? "—"}</span><span>{t("hud.turnCost")}: {runHud?.costUsd ?? conversationCost ?? "—"}</span>
+                  <span>{t("hud.thinking")}: {runHud?.tokensThinking ?? "—"}</span><span>{t("hud.cache")}: {runHud?.cacheReadTokens ?? "—"}/{runHud?.cacheWriteTokens ?? "—"}</span>
+                  {runHud?.thinkingSupported === false ? <span>{t("hud.thinkingUnavailable")}</span> : null}
+                </div>
                 <ChatComposer
                   key={selectedConversationId}
                   value={draft}
