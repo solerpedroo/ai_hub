@@ -289,6 +289,10 @@ CREATE TABLE spend_reservations (
 );
 CREATE INDEX spend_reservations_expires_idx ON spend_reservations(expires_at);
 `;
+export const MIGRATION_0015_SQL = `
+ALTER TABLE conversations ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'assist';
+ALTER TABLE conversations ADD COLUMN effort_level TEXT NOT NULL DEFAULT 'medium';
+`;
 
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
@@ -305,4 +309,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 12, sql: MIGRATION_0012_SQL },
   { version: 13, sql: MIGRATION_0013_SQL },
   { version: 14, sql: MIGRATION_0014_SQL },
+  { version: 15, sql: MIGRATION_0015_SQL },
 ];
