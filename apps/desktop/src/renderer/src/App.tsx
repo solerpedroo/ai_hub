@@ -148,7 +148,7 @@ export function App(): JSX.Element {
   const [temperature, setTemperature] = useState(1);
   const [maxTokens, setMaxTokens] = useState<number | null>(null);
   const [extraSystem, setExtraSystem] = useState("");
-  const [run, setRun] = useState<{ runId: string; conversationId: string } | null>(null);
+  const [run, setRun] = useState<{ runId: string; conversationId: string; tokensIn: number | null; tokensOut: number | null; tokensThinking: number | null; cacheReadTokens: number | null; cacheWriteTokens: number | null; costUsd: string | null; thinkingSupported: boolean | null } | null>(null);
   const [sending, setSending] = useState(false);
   const [activating, setActivating] = useState(false);
   const [sessionReady, setSessionReady] = useState(false);
@@ -537,6 +537,10 @@ export function App(): JSX.Element {
         );
         return;
       }
+      if (event.type === "usage") {
+        setRun((current) => current?.runId === event.runId ? { ...current, tokensIn: event.tokensIn, tokensOut: event.tokensOut, tokensThinking: event.tokensThinking, cacheReadTokens: event.cacheReadTokens, cacheWriteTokens: event.cacheWriteTokens, costUsd: event.costUsd, thinkingSupported: event.thinkingSupported } : current);
+        return;
+      }
       if (event.type === "done") {
         setMessages((current) =>
           current.map((message) =>
@@ -666,7 +670,7 @@ export function App(): JSX.Element {
       setError(null);
       setShowAllowOnce(false);
       setFallback(null);
-      setRun({ runId: result.runId, conversationId: selectedConversationId });
+      setRun({ runId: result.runId, conversationId: selectedConversationId, tokensIn: null, tokensOut: null, tokensThinking: null, cacheReadTokens: null, cacheWriteTokens: null, costUsd: null, thinkingSupported: null });
       setMessages((current) => applySendResult(current, result));
       return true;
     } catch (error) {
@@ -928,6 +932,7 @@ export function App(): JSX.Element {
               extraSystem={extraSystem}
               streaming={run?.conversationId === selectedConversationId}
               sending={sending || activating}
+              runHud={run}
               branchLabels={branchLabels}
               exportNotice={exportNotice}
               onSelectConversation={(id) => {
@@ -1006,6 +1011,7 @@ export function App(): JSX.Element {
                   content,
                   temperature,
                   maxTokens,
+                  ...(route ? { runMode: route.runMode, effortLevel: route.effortLevel } : {}),
                   extraSystem,
                   compactHistory,
                   ...fileIdsPayload(attachedFiles),
@@ -1455,7 +1461,7 @@ export function App(): JSX.Element {
           )}
         </main>
       </div>
-      <StatusBar health={health} onOpenShortcuts={() => setShortcutsOpen(true)} />
+      <StatusBar health={health} runHud={run} onOpenShortcuts={() => setShortcutsOpen(true)} />
       <Dialog
         open={fallback !== null}
         onOpenChange={(open) => {
