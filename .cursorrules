@@ -13,6 +13,7 @@ Canonical docs (read before inventing process):
 - `.cursor/rules/` — focused rules applied by file type (do not contradict this constitution)
 - `.cursor/skills/` — `wave-start`, `wave-close`, `write-adr` (follow; do not reinvent)
 - `.cursor/agents/` — `wave-reviewer`, `trust-auditor` (review only; do not implement)
+- `.codex/` — Codex-native mirror of the rules, skills, agents, and session bootstrap; keep it synchronized with `.cursor/`.
 
 ---
 
@@ -481,4 +482,3 @@ Portuguese (this repo’s product language). Headings in the template. Required 
 - Links: plan section, related review `docs/reviews/WXX/REVIEW.md`, related ADRs
 
 Code identifiers stay English. Do not put secrets, keys, or conversation content in an ADR.
-
