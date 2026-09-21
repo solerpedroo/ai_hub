@@ -2,6 +2,7 @@ import { redactSecrets } from "@ai-hub/security";
 import { catalogModelsForProvider, type ProviderAgnosticPacket } from "@ai-hub/shared";
 import {
   packetForDispatch,
+  councilDispatchInstruction,
   type ChatStreamEvent,
   type ChatStreamRequest,
   type ModelRef,
@@ -148,7 +149,7 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): Provide
       return catalogModelsForProvider("google").map((model) => ({ id: model.id, label: model.label }));
     },
     capabilities(): ProviderCapabilities {
-      return { streaming: true, tools: false };
+      return { streaming: true, tools: false, thinking: false };
     },
     async testConnection(secret: string, signal: AbortSignal): Promise<void> {
       const { response } = await request(
@@ -177,8 +178,9 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): Provide
         contents: converted.contents,
         generationConfig,
       };
-      if (converted.systemInstruction !== undefined) {
-        body.systemInstruction = converted.systemInstruction;
+      const instruction = councilDispatchInstruction(input.councilRole);
+      if (converted.systemInstruction !== undefined || instruction) {
+        body.systemInstruction = { parts: [{ text: [converted.systemInstruction?.parts?.[0]?.text, instruction].filter(Boolean).join("\n\n") }] };
       }
       const { response, timeout } = await request(input.model, input.secret, body, input.signal, true);
       if (!response.ok) {
