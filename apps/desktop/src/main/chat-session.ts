@@ -25,6 +25,7 @@ import { applyContextFirewall, redactSecrets } from "@ai-hub/security";
 import {
   activePath,
   addUsd,
+  effortParams,
   ancestorsOf,
   chatEventSchema,
   findCatalogModel,
@@ -453,7 +454,7 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
     input.model,
     key.providerSlug,
     packet.tokenEstimate,
-    input.maxTokens ?? null,
+    input.maxTokens ?? (input.effortLevel ? effortParams(input.effortLevel).maxTokens : null),
   );
   const limits = spendCapLimitsFromRows(repos.listSpendCaps());
   const daySpentUsd = addUsd(repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() }), repos.sumReservedSpendUsd({ sinceMs: localDayStartMs() }));
@@ -601,25 +602,34 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
         },
         run: async () => {
           streamed = false;
+          let streamedTextLength = 0;
           return consumeCrashSafeStream({
             stream: adapter.chatStream({
               secret,
               model: input.model,
-              packet,
+              packet: input.runMode === "plan"
+                ? { ...packet, system: `${packet.system}\n\nExecution mode: plan. Return an inspectable plan with assumptions, steps, and validation criteria. Do not perform side effects or tool actions.` }
+                : packet,
               signal: run.abort.signal,
-              temperature: input.temperature ?? 1,
-              maxTokens: input.maxTokens ?? null,
+              temperature: input.temperature ?? (input.effortLevel ? effortParams(input.effortLevel).temperature : 1),
+              maxTokens: input.maxTokens ?? (input.effortLevel ? effortParams(input.effortLevel).maxTokens : null),
+              ...(input.effortLevel ? { effortLevel: input.effortLevel } : {}),
+              ...(input.effortLevel && adapter.capabilities().thinking
+                ? { thinkingBudget: effortParams(input.effortLevel).thinkingBudget }
+                : {}),
               ...(attachments.images.length > 0 ? { images: attachments.images } : {}),
               ...(input.__councilRole ? { councilRole: input.__councilRole } : {}),
             }),
             onDelta: (text) => {
               streamed = true;
+              streamedTextLength += text.length;
               emit(run.sender, {
                 type: "chunk",
                 runId,
                 messageId: assistant.id,
                 text,
               });
+              emit(run.sender, { type: "usage", runId, messageId: assistant.id, tokensIn: packet.tokenEstimate, tokensOut: estimateTokensFromChars(streamedTextLength), tokensThinking: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: null, thinkingSupported: adapter.capabilities().thinking });
             },
             onFlush: (content) => {
               repos.updateMessage(assistant.id, content, "streaming");
@@ -628,6 +638,7 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
         },
       });
       repos.updateMessage(assistant.id, result.content, "complete");
+      emit(run.sender, { type: "usage", runId, messageId: assistant.id, tokensIn: result.tokensIn ?? packet.tokenEstimate, tokensOut: result.tokensOut ?? estimateTokensFromChars(result.content.length), tokensThinking: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: result.costUsd, thinkingSupported: adapter.capabilities().thinking });
       try {
         captureMessageArtifacts(repos, assistant.id);
       } catch {
