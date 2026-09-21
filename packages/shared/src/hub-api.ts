@@ -11,6 +11,7 @@ import type {
   ConversationDto,
   ConversationExportInput,
   ConversationTagsSetInput,
+  ConversationRunSettings,
   ConversationExportResult,
   ConversationListInput,
   ConversationMoveInput,
@@ -127,6 +128,7 @@ export interface HubConversationsApi {
   getBranchLabels: (input: BranchLabelsGetInput) => Promise<BranchLabels>;
   setBranchLabel: (input: BranchLabelSetInput) => Promise<void>;
   setTags: (input: ConversationTagsSetInput) => Promise<ConversationDto>;
+  setRunSettings: (input: ConversationRunSettings) => Promise<ConversationDto>;
   move: (input: ConversationMoveInput) => Promise<ConversationDto>;
   duplicate: (input: IdInput) => Promise<ConversationDto>;
   toProject: (input: IdInput) => Promise<ConversationToProjectResult>;
