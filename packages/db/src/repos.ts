@@ -69,6 +69,8 @@ export interface ConversationRecord {
   activePacketId: string | null;
   packetAppliedAt: string | null;
   kind: "chat" | "playground";
+  runMode: "plan" | "assist" | "agent" | "orchestrate";
+  effortLevel: "low" | "medium" | "high" | "max";
 }
 
 export interface SearchHitRecord {
@@ -548,6 +550,8 @@ export class HubRepos {
       activePacketId: row.activePacketId ?? null,
       packetAppliedAt: row.packetAppliedAt !== null && row.packetAppliedAt !== undefined ? iso(row.packetAppliedAt) : null,
       kind: row.kind === "playground" ? "playground" : "chat",
+      runMode: row.runMode === "plan" || row.runMode === "agent" || row.runMode === "orchestrate" ? row.runMode : "assist",
+      effortLevel: row.effortLevel === "low" || row.effortLevel === "high" || row.effortLevel === "max" ? row.effortLevel : "medium",
     };
   }
 
@@ -713,6 +717,8 @@ export class HubRepos {
         importSource: null,
         externalId: null,
         kind,
+        runMode: "assist",
+        effortLevel: "medium",
       })
       .run();
     return {
@@ -726,7 +732,16 @@ export class HubRepos {
       activePacketId: null,
       packetAppliedAt: null,
       kind,
+      runMode: "assist",
+      effortLevel: "medium",
     };
+  }
+
+  updateConversationRunSettings(id: string, runMode: ConversationRecord["runMode"], effortLevel: ConversationRecord["effortLevel"]): ConversationRecord {
+    this.db.update(conversations).set({ runMode, effortLevel, updatedAt: Date.now() }).where(eq(conversations.id, id)).run();
+    const updated = this.getConversation(id);
+    if (!updated) throw new Error("Conversation not found");
+    return updated;
   }
 
   removeConversation(id: string): void {
