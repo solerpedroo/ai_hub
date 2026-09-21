@@ -20,6 +20,7 @@ import {
   conversationExportInputSchema,
   conversationExportResultSchema,
   conversationTagsSetInputSchema,
+  conversationRunSettingsSchema,
   costsAggregateInputSchema,
   costsAggregateResultSchema,
   debugSnapshotResultSchema,
@@ -238,6 +239,7 @@ const hub: HubApi = {
         conversationTagsSetInputSchema,
         conversationDtoSchema,
       ),
+    setRunSettings: (input) => invokeParsed(IpcChannel.conversationsSetRunSettings, input, conversationRunSettingsSchema, conversationDtoSchema),
     move: (input) =>
       invokeParsed(IpcChannel.conversationsMove, input, conversationMoveInputSchema, conversationDtoSchema),
     duplicate: (input) =>
