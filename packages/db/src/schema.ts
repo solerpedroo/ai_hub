@@ -22,6 +22,8 @@ export const conversations = sqliteTable("conversations", {
   activePacketId: text("active_packet_id"),
   packetAppliedAt: integer("packet_applied_at", { mode: "number" }),
   kind: text("kind").notNull().default("chat"),
+  runMode: text("run_mode").notNull().default("assist"),
+  effortLevel: text("effort_level").notNull().default("medium"),
 });
 
 export const messages = sqliteTable("messages", {
