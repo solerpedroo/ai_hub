@@ -31,7 +31,7 @@ describe("createOpenAIAdapter", () => {
       },
     });
     expect(adapter.id).toBe("openai");
-    expect(adapter.capabilities()).toEqual({ streaming: true, tools: false });
+    expect(adapter.capabilities()).toEqual({ streaming: true, tools: false, thinking: false });
     expect(adapter.listModels().some((model) => model.id === "gpt-4o-mini")).toBe(true);
   });
 
