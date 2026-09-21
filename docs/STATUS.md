@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave 
 
 | Field | Value |
 |---|---|
-| Wave | **W21** |
+| Wave | **W22** |
 | Marco | C — V1 |
 | State | `pending` |
-| Last completed | **W20** |
-| Next action | Start W21: Run modes + HUD de tokens |
+| Last completed | **W21** |
+| Next action | Start W22: MCP + Permission Center |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
