@@ -104,3 +104,4 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W18-001](./ADR-W18-001-effective-privacy-policy.md) | W18 | Política efetiva de privacidade no main | accepted |
 | [ADR-W19-001](./ADR-W19-001-shared-renderer-quick-ai-overlay.md) | W19 | Overlay Quick AI no renderer compartilhado | accepted |
 | [ADR-W20-001](./ADR-W20-001-council-explicit-multi-model-deliberation.md) | W20 | Council multi-modelo explícito | accepted |
+| [ADR-W21-001](./ADR-W21-001-run-modes-effort-hud.md) | W21 | Run modes, esforço e HUD de uso | accepted |
