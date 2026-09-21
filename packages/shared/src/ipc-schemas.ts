@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { localeSchema, themeModeSchema } from "./appearance";
+import { effortLevelSchema, runModeSchema } from "./run-modes";
 import {
   gatewayErrorCodeSchema,
   mentionRefListSchema,
@@ -114,6 +115,8 @@ export const conversationDtoSchema = z.object({
   updatedAt: isoTimestampSchema,
   importSource: importSourceSchema.nullable(),
   activePacketId: z.string().uuid().nullable(),
+  runMode: runModeSchema,
+  effortLevel: effortLevelSchema,
 });
 
 export type ConversationDto = z.infer<typeof conversationDtoSchema>;
@@ -146,6 +149,8 @@ export const conversationTagsSetInputSchema = z
   .strict();
 
 export type ConversationTagsSetInput = z.infer<typeof conversationTagsSetInputSchema>;
+export const conversationRunSettingsSchema = z.object({ conversationId: z.string().uuid(), runMode: runModeSchema, effortLevel: effortLevelSchema }).strict();
+export type ConversationRunSettings = z.infer<typeof conversationRunSettingsSchema>;
 
 export const conversationMoveInputSchema = z
   .object({
@@ -382,6 +387,7 @@ export const chatEventSchema = z.discriminatedUnion("type", [
     message: messageDtoSchema,
     packet: packetV0Schema,
   }),
+  z.object({ type: z.literal("usage"), runId: z.string().uuid(), messageId: z.string().uuid(), tokensIn: z.number().int().nonnegative(), tokensOut: z.number().int().nonnegative(), tokensThinking: z.number().int().nonnegative().default(0), cacheReadTokens: z.number().int().nonnegative().default(0), cacheWriteTokens: z.number().int().nonnegative().default(0), costUsd: z.string().nullable(), thinkingSupported: z.boolean() }),
   z.object({
     type: z.literal("error"),
     runId: z.string().uuid(),
