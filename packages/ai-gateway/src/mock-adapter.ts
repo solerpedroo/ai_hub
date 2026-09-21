@@ -77,7 +77,7 @@ export function createMockOpenAIAdapter(): ProviderAdapter {
     id: "mock",
     listModels: (): ModelRef[] =>
       catalogModelsForProvider("openai").map((model) => ({ id: model.id, label: model.label })),
-    capabilities: (): ProviderCapabilities => ({ streaming: true, tools: false }),
+    capabilities: (): ProviderCapabilities => ({ streaming: true, tools: false, thinking: false }),
     testConnection: async (): Promise<void> => {
       return;
     },
