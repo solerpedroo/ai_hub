@@ -1,0 +1,25 @@
+# Codex context policy: keep source and docs; exclude generated, secret, and binary noise.
+node_modules/
+.pnpm-store/
+.turbo/
+dist/
+out/
+release/
+build/
+coverage/
+*.tsbuildinfo
+*.map
+*.min.js
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+.env
+.env.*
+*.sqlite
+*.sqlite3
+*.db
+*.log
+user-data/
+app-data/
+docs/reviews/**/DIFF.patch
+docs/reviews/**/DIFF-post-review.patch
