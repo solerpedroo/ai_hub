@@ -48,6 +48,7 @@ export { suggestFallbackProvider, type FallbackKeyLike, type FallbackSuggestion 
 export { classifyHubIpcError, type HubIpcError, type HubIpcErrorKind } from "./hub-error";
 export { looksLikePastedSecret, redactPastedSecrets } from "./secret-paste";
 export { COUNCIL_ROLES, divergenceTerms, recommendModelRoute, type CouncilRole, type RouterRecommendation } from "./council";
+export { effortLevelSchema, effortParams, runModeSchema, type EffortLevel, type EffortParams, type RunMode } from "./run-modes";
 export {
   inspectClipboardText,
   typescriptInterfaceFromJson,
@@ -140,6 +141,7 @@ export {
   conversationCreateInputSchema,
   conversationDtoSchema,
   conversationTagsSetInputSchema,
+  conversationRunSettingsSchema,
   conversationExportDocumentSchema,
   conversationExportInputSchema,
   conversationExportModeSchema,
