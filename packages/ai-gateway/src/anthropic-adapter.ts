@@ -2,6 +2,7 @@ import { redactSecrets } from "@ai-hub/security";
 import { catalogModelsForProvider, type ProviderAgnosticPacket } from "@ai-hub/shared";
 import {
   packetForDispatch,
+  councilDispatchInstruction,
   type ChatStreamEvent,
   type ChatStreamRequest,
   type ModelRef,
@@ -148,7 +149,7 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): P
       return catalogModelsForProvider("anthropic").map((model) => ({ id: model.id, label: model.label }));
     },
     capabilities(): ProviderCapabilities {
-      return { streaming: true, tools: false };
+      return { streaming: true, tools: false, thinking: false };
     },
     async testConnection(secret: string, signal: AbortSignal): Promise<void> {
       const { response } = await request(
@@ -173,8 +174,9 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): P
         temperature: input.temperature ?? 1,
         messages: converted.messages,
       };
-      if (converted.system !== undefined) {
-        body.system = converted.system;
+      const instruction = councilDispatchInstruction(input.councilRole);
+      if (converted.system !== undefined || instruction) {
+        body.system = [converted.system, instruction].filter(Boolean).join("\n\n");
       }
       const { response, timeout } = await request(input.secret, body, input.signal);
       if (!response.ok) {
