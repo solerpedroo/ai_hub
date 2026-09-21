@@ -15,9 +15,11 @@ function healthState(summary: HealthSummaryDto): "ok" | "down" | "unknown" {
 
 export function StatusBar({
   health,
+  runHud,
   onOpenShortcuts,
 }: {
   health: HealthSummaryDto[];
+  runHud: { tokensIn: number | null; tokensOut: number | null; tokensThinking: number | null; cacheReadTokens: number | null; cacheWriteTokens: number | null; costUsd: string | null; thinkingSupported: boolean | null } | null;
   onOpenShortcuts: () => void;
 }): JSX.Element {
   const { t } = useTranslation();
@@ -48,6 +50,9 @@ export function StatusBar({
                 });
               })
               .join(" · ")}
+      </span>
+      <span className="truncate" data-testid="status-usage">
+        {runHud ? `tokens ${runHud.tokensIn ?? "—"}/${runHud.tokensOut ?? "—"} · thinking ${runHud.tokensThinking ?? "—"} · cache ${runHud.cacheReadTokens ?? "—"}/${runHud.cacheWriteTokens ?? "—"} · $${runHud.costUsd ?? "—"}` : ""}
       </span>
       <span className="flex shrink-0 items-center gap-3">
         <button
