@@ -1,0 +1,757 @@
+diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts
+index 6b80f88..ea214d4 100644
+--- a/apps/desktop/src/main/chat-session.ts
++++ b/apps/desktop/src/main/chat-session.ts
+@@ -25,6 +25,7 @@ import { applyContextFirewall, redactSecrets } from "@ai-hub/security";
+ import {
+   activePath,
+   addUsd,
++  effortParams,
+   ancestorsOf,
+   chatEventSchema,
+   findCatalogModel,
+@@ -453,7 +454,7 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
+     input.model,
+     key.providerSlug,
+     packet.tokenEstimate,
+-    input.maxTokens ?? null,
++    input.maxTokens ?? (input.effortLevel ? effortParams(input.effortLevel).maxTokens : null),
+   );
+   const limits = spendCapLimitsFromRows(repos.listSpendCaps());
+   const daySpentUsd = addUsd(repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() }), repos.sumReservedSpendUsd({ sinceMs: localDayStartMs() }));
+@@ -601,25 +602,34 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
+         },
+         run: async () => {
+           streamed = false;
++          let streamedTextLength = 0;
+           return consumeCrashSafeStream({
+             stream: adapter.chatStream({
+               secret,
+               model: input.model,
+-              packet,
++              packet: input.runMode === "plan"
++                ? { ...packet, system: `${packet.system}\n\nExecution mode: plan. Return an inspectable plan with assumptions, steps, and validation criteria. Do not perform side effects or tool actions.` }
++                : packet,
+               signal: run.abort.signal,
+-              temperature: input.temperature ?? 1,
+-              maxTokens: input.maxTokens ?? null,
++              temperature: input.temperature ?? (input.effortLevel ? effortParams(input.effortLevel).temperature : 1),
++              maxTokens: input.maxTokens ?? (input.effortLevel ? effortParams(input.effortLevel).maxTokens : null),
++              ...(input.effortLevel ? { effortLevel: input.effortLevel } : {}),
++              ...(input.effortLevel && adapter.capabilities().thinking
++                ? { thinkingBudget: effortParams(input.effortLevel).thinkingBudget }
++                : {}),
+               ...(attachments.images.length > 0 ? { images: attachments.images } : {}),
+               ...(input.__councilRole ? { councilRole: input.__councilRole } : {}),
+             }),
+             onDelta: (text) => {
+               streamed = true;
++              streamedTextLength += text.length;
+               emit(run.sender, {
+                 type: "chunk",
+                 runId,
+                 messageId: assistant.id,
+                 text,
+               });
++              emit(run.sender, { type: "usage", runId, messageId: assistant.id, tokensIn: packet.tokenEstimate, tokensOut: estimateTokensFromChars(streamedTextLength), tokensThinking: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: null, thinkingSupported: adapter.capabilities().thinking });
+             },
+             onFlush: (content) => {
+               repos.updateMessage(assistant.id, content, "streaming");
+@@ -628,6 +638,7 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
+         },
+       });
+       repos.updateMessage(assistant.id, result.content, "complete");
++      emit(run.sender, { type: "usage", runId, messageId: assistant.id, tokensIn: result.tokensIn ?? packet.tokenEstimate, tokensOut: result.tokensOut ?? estimateTokensFromChars(result.content.length), tokensThinking: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: result.costUsd, thinkingSupported: adapter.capabilities().thinking });
+       try {
+         captureMessageArtifacts(repos, assistant.id);
+       } catch {
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index 2877739..8d5705f 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -18,6 +18,7 @@ import {
+   conversationMoveInputSchema,
+   conversationToProjectResultSchema,
+   conversationTagsSetInputSchema,
++  conversationRunSettingsSchema,
+   costsAggregateInputSchema,
+   costsAggregateResultSchema,
+   monthlyCostsInputSchema,
+@@ -255,6 +256,7 @@ export function registerWorkspaceIpc(): void {
+         getHubDatabase().repos.setConversationTags(input.conversationId, input.names),
+       ),
+   );
++  registerHandler(IpcChannel.conversationsSetRunSettings, conversationRunSettingsSchema, conversationDtoSchema, (input) => conversationDtoSchema.parse(getHubDatabase().repos.updateConversationRunSettings(input.conversationId, input.runMode, input.effortLevel)));
+ 
+   registerHandler(IpcChannel.conversationsDuplicate, idInputSchema, conversationDtoSchema, (input) =>
+     conversationDtoSchema.parse(getHubDatabase().repos.duplicateConversation(input.id)),
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index 36a780f..ad9a23b 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -20,6 +20,7 @@ import {
+   conversationExportInputSchema,
+   conversationExportResultSchema,
+   conversationTagsSetInputSchema,
++  conversationRunSettingsSchema,
+   costsAggregateInputSchema,
+   costsAggregateResultSchema,
+   debugSnapshotResultSchema,
+@@ -238,6 +239,7 @@ const hub: HubApi = {
+         conversationTagsSetInputSchema,
+         conversationDtoSchema,
+       ),
++    setRunSettings: (input) => invokeParsed(IpcChannel.conversationsSetRunSettings, input, conversationRunSettingsSchema, conversationDtoSchema),
+     move: (input) =>
+       invokeParsed(IpcChannel.conversationsMove, input, conversationMoveInputSchema, conversationDtoSchema),
+     duplicate: (input) =>
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index 80a2cf6..1799c89 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -148,7 +148,7 @@ export function App(): JSX.Element {
+   const [temperature, setTemperature] = useState(1);
+   const [maxTokens, setMaxTokens] = useState<number | null>(null);
+   const [extraSystem, setExtraSystem] = useState("");
+-  const [run, setRun] = useState<{ runId: string; conversationId: string } | null>(null);
++  const [run, setRun] = useState<{ runId: string; conversationId: string; tokensIn: number | null; tokensOut: number | null; tokensThinking: number | null; cacheReadTokens: number | null; cacheWriteTokens: number | null; costUsd: string | null; thinkingSupported: boolean | null } | null>(null);
+   const [sending, setSending] = useState(false);
+   const [activating, setActivating] = useState(false);
+   const [sessionReady, setSessionReady] = useState(false);
+@@ -537,6 +537,10 @@ export function App(): JSX.Element {
+         );
+         return;
+       }
++      if (event.type === "usage") {
++        setRun((current) => current?.runId === event.runId ? { ...current, tokensIn: event.tokensIn, tokensOut: event.tokensOut, tokensThinking: event.tokensThinking, cacheReadTokens: event.cacheReadTokens, cacheWriteTokens: event.cacheWriteTokens, costUsd: event.costUsd, thinkingSupported: event.thinkingSupported } : current);
++        return;
++      }
+       if (event.type === "done") {
+         setMessages((current) =>
+           current.map((message) =>
+@@ -666,7 +670,7 @@ export function App(): JSX.Element {
+       setError(null);
+       setShowAllowOnce(false);
+       setFallback(null);
+-      setRun({ runId: result.runId, conversationId: selectedConversationId });
++      setRun({ runId: result.runId, conversationId: selectedConversationId, tokensIn: null, tokensOut: null, tokensThinking: null, cacheReadTokens: null, cacheWriteTokens: null, costUsd: null, thinkingSupported: null });
+       setMessages((current) => applySendResult(current, result));
+       return true;
+     } catch (error) {
+@@ -928,6 +932,7 @@ export function App(): JSX.Element {
+               extraSystem={extraSystem}
+               streaming={run?.conversationId === selectedConversationId}
+               sending={sending || activating}
++              runHud={run}
+               branchLabels={branchLabels}
+               exportNotice={exportNotice}
+               onSelectConversation={(id) => {
+@@ -1006,6 +1011,7 @@ export function App(): JSX.Element {
+                   content,
+                   temperature,
+                   maxTokens,
++                  ...(route ? { runMode: route.runMode, effortLevel: route.effortLevel } : {}),
+                   extraSystem,
+                   compactHistory,
+                   ...fileIdsPayload(attachedFiles),
+@@ -1455,7 +1461,7 @@ export function App(): JSX.Element {
+           )}
+         </main>
+       </div>
+-      <StatusBar health={health} onOpenShortcuts={() => setShortcutsOpen(true)} />
++      <StatusBar health={health} runHud={run} onOpenShortcuts={() => setShortcutsOpen(true)} />
+       <Dialog
+         open={fallback !== null}
+         onOpenChange={(open) => {
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index 6b5ace3..49922bd 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -86,6 +86,7 @@ export function HomeView({
+   extraSystem,
+   streaming,
+   sending,
++  runHud,
+   branchLabels,
+   exportNotice,
+   onSelectConversation,
+@@ -156,6 +157,7 @@ export function HomeView({
+   extraSystem: string;
+   streaming: boolean;
+   sending: boolean;
++  runHud: { tokensIn: number | null; tokensOut: number | null; tokensThinking: number | null; cacheReadTokens: number | null; cacheWriteTokens: number | null; costUsd: string | null; thinkingSupported: boolean | null } | null;
+   branchLabels: BranchLabels;
+   exportNotice: string | null;
+   onSelectConversation: (id: string) => void;
+@@ -165,7 +167,7 @@ export function HomeView({
+   onSelectTemperature: (value: number) => void;
+   onSelectMaxTokens: (value: number | null) => void;
+   onSelectExtraSystem: (value: string) => void;
+-  onSend: (content: string, mentions: MentionRef[], route?: { keyId: string; model: string }) => Promise<boolean>;
++  onSend: (content: string, mentions: MentionRef[], route?: { keyId: string; model: string; runMode: "plan" | "assist" | "agent" | "orchestrate"; effortLevel: "low" | "medium" | "high" | "max" }) => Promise<boolean>;
+   onMentionsChange: (mentions: MentionRef[]) => void;
+   onAbort: () => Promise<void>;
+   onRegenerate: (messageId: string) => Promise<void>;
+@@ -214,6 +216,8 @@ export function HomeView({
+   const modifier = window.hub.platform === "darwin" ? "⌘" : "Ctrl";
+   const [title, setTitle] = useState("");
+   const [draft, setDraft] = useState("");
++  const [runMode, setRunMode] = useState<"plan" | "assist" | "agent" | "orchestrate">("assist");
++  const [effortLevel, setEffortLevel] = useState<"low" | "medium" | "high" | "max">("medium");
+   const [autoRouter, setAutoRouter] = useState(false);
+   const [autoRouteConfirmed, setAutoRouteConfirmed] = useState(false);
+   const [mentionChips, setMentionChips] = useState<MentionSuggestion[]>([]);
+@@ -270,6 +274,18 @@ export function HomeView({
+   const leaf = path[path.length - 1] ?? null;
+   const selectedConversation =
+     conversations.find((item) => item.id === selectedConversationId) ?? null;
++  useEffect(() => {
++    if (selectedConversation) {
++      setRunMode(selectedConversation.runMode);
++      setEffortLevel(selectedConversation.effortLevel);
++    }
++  }, [selectedConversation]);
++  const saveRunSettings = async (nextMode: typeof runMode, nextEffort: typeof effortLevel): Promise<void> => {
++    if (!selectedConversationId) return;
++    if (nextMode === "agent" || nextMode === "orchestrate") return;
++    setRunMode(nextMode); setEffortLevel(nextEffort);
++    await window.hub.conversations.setRunSettings({ conversationId: selectedConversationId, runMode: nextMode, effortLevel: nextEffort });
++  };
+   const canvasArtifact = artifacts.find((item) => item.id === canvasId) ?? null;
+   const providerSlugs = [...new Set(providerKeys.map((item) => item.providerSlug))];
+   const preferredModels = preferredProvider
+@@ -580,7 +596,8 @@ export function HomeView({
+         });
+       }
+     }
+-    void onSend(content, mentions, autoRouter && routedModel ? { keyId: routedModel.key.id, model: routedModel.model.id } : undefined).then((ok) => {
++    const route = autoRouter && routedModel ? { keyId: routedModel.key.id, model: routedModel.model.id, runMode, effortLevel } : { keyId: selectedKeyId ?? "", model: selectedModel, runMode, effortLevel };
++    void onSend(content, mentions, route).then((ok) => {
+       if (ok) {
+         setDraft("");
+         setMentionChips([]);
+@@ -867,6 +884,8 @@ export function HomeView({
+                       ))}
+                     </select>
+                   </label>
++                  <label className="flex items-center gap-1 text-[11px]"><span>{t("runMode.label")}</span><select className="h-8 rounded border bg-background px-1" value={runMode} onChange={(event) => void saveRunSettings(event.target.value as typeof runMode, effortLevel)}><option value="assist">Assist</option><option value="plan">Plan</option><option value="agent" disabled>Agent (W23)</option><option value="orchestrate" disabled>Orchestrate (W24)</option></select></label>
++                  <label className="flex items-center gap-1 text-[11px"><span>{t("effort.label")}</span><select className="h-8 rounded border bg-background px-1" value={effortLevel} onChange={(event) => void saveRunSettings(runMode, event.target.value as typeof effortLevel)}>{["low", "medium", "high", "max"].map((level) => <option key={level} value={level}>{level}</option>)}</select></label>
+                   <label className="flex items-center gap-1">
+                     <span className="text-muted-foreground">{t("workspace.model")}</span>
+                     {providerSlug === "custom" ? (
+@@ -1441,6 +1460,13 @@ export function HomeView({
+                     </ol>
+                   </div>
+                 ) : null}
++                <div className="flex flex-wrap gap-2 border-t px-2 py-1 text-[11px] text-muted-foreground" data-testid="run-hud">
++                  <span>{t("hud.mode")}: {runMode}</span><span>{t("hud.effort")}: {effortLevel}</span>
++                  <span>{t("hud.context")}: {packetPreview?.tokenEstimate ?? "—"}/{packetPreview?.contextWindow ?? "—"}</span>
++                  <span>{t("hud.tokens")}: {runHud?.tokensIn ?? "—"}/{runHud?.tokensOut ?? "—"}</span><span>{t("hud.turnCost")}: {runHud?.costUsd ?? conversationCost ?? "—"}</span>
++                  <span>{t("hud.thinking")}: {runHud?.tokensThinking ?? "—"}</span><span>{t("hud.cache")}: {runHud?.cacheReadTokens ?? "—"}/{runHud?.cacheWriteTokens ?? "—"}</span>
++                  {runHud?.thinkingSupported === false ? <span>{t("hud.thinkingUnavailable")}</span> : null}
++                </div>
+                 <ChatComposer
+                   key={selectedConversationId}
+                   value={draft}
+diff --git a/apps/desktop/src/renderer/src/components/layout/status-bar.tsx b/apps/desktop/src/renderer/src/components/layout/status-bar.tsx
+index ad25369..754638a 100644
+--- a/apps/desktop/src/renderer/src/components/layout/status-bar.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/status-bar.tsx
+@@ -15,9 +15,11 @@ function healthState(summary: HealthSummaryDto): "ok" | "down" | "unknown" {
+ 
+ export function StatusBar({
+   health,
++  runHud,
+   onOpenShortcuts,
+ }: {
+   health: HealthSummaryDto[];
++  runHud: { tokensIn: number | null; tokensOut: number | null; tokensThinking: number | null; cacheReadTokens: number | null; cacheWriteTokens: number | null; costUsd: string | null; thinkingSupported: boolean | null } | null;
+   onOpenShortcuts: () => void;
+ }): JSX.Element {
+   const { t } = useTranslation();
+@@ -49,6 +51,9 @@ export function StatusBar({
+               })
+               .join(" · ")}
+       </span>
++      <span className="truncate" data-testid="status-usage">
++        {runHud ? `tokens ${runHud.tokensIn ?? "—"}/${runHud.tokensOut ?? "—"} · thinking ${runHud.tokensThinking ?? "—"} · cache ${runHud.cacheReadTokens ?? "—"}/${runHud.cacheWriteTokens ?? "—"} · $${runHud.costUsd ?? "—"}` : ""}
++      </span>
+       <span className="flex shrink-0 items-center gap-3">
+         <button
+           type="button"
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index dec32c7..74f1336 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -476,6 +476,8 @@
+   "skills.factory.write-rfc": "Write RFC",
+   "skills.error.generic": "Could not load the skill library.",
+   "skills.error.save": "Could not save that skill.",
++  "hud.mode": "Mode", "hud.effort": "Effort", "hud.context": "Context tokens/window", "hud.tokens": "Tokens in/out", "hud.thinking": "Thinking", "hud.cache": "Cache read/write", "hud.turnCost": "Turn cost", "hud.thinkingUnavailable": "Thinking unavailable for this provider",
++  "runMode.label": "Mode", "effort.label": "Effort",
+   "council.router.model": "Recommended model", "council.router.auto": "Automatic", "council.router.confirmed": "Route confirmed", "council.router.recommended": "recommended", "council.router.cost": "Estimated first-model cost: ${{usd}}", "council.router.latency": "Latency: {{ms}} ms", "council.router.speed.fast": "Speed: fast", "council.router.speed.balanced": "Speed: balanced", "council.router.speed.frontier": "Speed: frontier", "council.router.confirm": "Confirm route", "council.router.reject": "Reject route",
+   "quickAi.title": "Quick AI", "quickAi.close": "Close", "quickAi.placeholder": "Ask something or paste content…", "quickAi.clipboard": "Read clipboard", "quickAi.formatJson": "Format JSON", "quickAi.toInterface": "TS interface", "quickAi.explainJson": "Explain JSON", "quickAi.diagnoseStack": "Diagnose stack", "quickAi.sendToProject": "Send to current project", "quickAi.model": "Model", "quickAi.estimate": "Estimate: ${{usd}}", "quickAi.estimateUnavailable": "Estimate available on send", "quickAi.send": "Send", "quickAi.cancel": "Cancel", "quickAi.sending": "Sending…", "quickAi.error.setup": "Configure a provider key before sending.", "quickAi.error.send": "Could not send the question.", "quickAi.conversationTitle": "Quick AI", "quickAi.explainPrefix": "Explain this JSON clearly:", "quickAi.diagnosePrefix": "Diagnose this stack trace and suggest a fix:", "council.title": "AI Council", "council.placeholder": "Question for the council…", "council.run": "Start debate", "council.running": "Debating…", "council.synthesis": "Synthesis", "council.divergences": "Divergences (heuristic)", "council.none": "None highlighted", "council.error.setup": "Open a conversation and configure at least two models.", "council.error.run": "Could not complete the Council.", "council.router.simple": "Router: simple question → fast route; confirm before sending.", "council.router.code": "Router: code → balanced route; confirm before sending.", "council.router.complex": "Router: complex task → frontier route; confirm before sending."
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index 81cefd3..0e74525 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -476,6 +476,8 @@
+   "skills.factory.write-rfc": "Escrever RFC",
+   "skills.error.generic": "Não foi possível carregar a biblioteca de skills.",
+   "skills.error.save": "Não foi possível guardar essa skill.",
++  "hud.mode": "Modo", "hud.effort": "Esforço", "hud.context": "Tokens de contexto/janela", "hud.tokens": "Tokens entrada/saída", "hud.thinking": "Thinking", "hud.cache": "Cache leitura/escrita", "hud.turnCost": "Custo do turno", "hud.thinkingUnavailable": "Thinking indisponível neste provedor",
++  "runMode.label": "Modo", "effort.label": "Esforço",
+   "council.router.model": "Modelo recomendado", "council.router.auto": "Automático", "council.router.confirmed": "Rota confirmada", "council.router.recommended": "recomendado", "council.router.cost": "Custo estimado do primeiro modelo: US$ {{usd}}", "council.router.latency": "Latência: {{ms}} ms", "council.router.speed.fast": "Velocidade: rápida", "council.router.speed.balanced": "Velocidade: equilibrada", "council.router.speed.frontier": "Velocidade: frontier", "council.router.confirm": "Confirmar rota", "council.router.reject": "Recusar rota",
+   "quickAi.title": "Quick AI", "quickAi.close": "Fechar", "quickAi.placeholder": "Pergunte algo ou cole conteúdo…", "quickAi.clipboard": "Ler clipboard", "quickAi.formatJson": "Formatar JSON", "quickAi.toInterface": "Interface TS", "quickAi.explainJson": "Explicar JSON", "quickAi.diagnoseStack": "Diagnosticar stack", "quickAi.sendToProject": "Mandar ao projeto atual", "quickAi.model": "Modelo", "quickAi.estimate": "Estimativa: US$ {{usd}}", "quickAi.estimateUnavailable": "Estimativa disponível ao enviar", "quickAi.send": "Enviar", "quickAi.cancel": "Cancelar", "quickAi.sending": "Enviando…", "quickAi.error.setup": "Configure uma chave de provider antes de enviar.", "quickAi.error.send": "Não foi possível enviar a pergunta.", "quickAi.conversationTitle": "Quick AI", "quickAi.explainPrefix": "Explique este JSON de forma clara:", "quickAi.diagnosePrefix": "Diagnostique este stack trace e sugira uma correção:", "council.title": "AI Council", "council.placeholder": "Pergunta para o conselho…", "council.run": "Iniciar debate", "council.running": "Debatendo…", "council.synthesis": "Síntese", "council.divergences": "Divergências (heurística)", "council.none": "Nenhuma destacada", "council.error.setup": "Abra uma conversa e configure ao menos dois modelos.", "council.error.run": "Não foi possível concluir o Council.", "council.router.simple": "Router: pergunta simples → rota rápida; confirme antes de enviar.", "council.router.code": "Router: código → rota equilibrada; confirme antes de enviar.", "council.router.complex": "Router: tarefa complexa → rota frontier; confirme antes de enviar."
+ }
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index 1a0df94..a62a0c8 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -104,3 +104,4 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider
+ | [ADR-W18-001](./ADR-W18-001-effective-privacy-policy.md) | W18 | Política efetiva de privacidade no main | accepted |
+ | [ADR-W19-001](./ADR-W19-001-shared-renderer-quick-ai-overlay.md) | W19 | Overlay Quick AI no renderer compartilhado | accepted |
+ | [ADR-W20-001](./ADR-W20-001-council-explicit-multi-model-deliberation.md) | W20 | Council multi-modelo explícito | accepted |
++| [ADR-W21-001](./ADR-W21-001-run-modes-effort-hud.md) | W21 | Run modes, esforço e HUD de uso | accepted |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 8c82911..19c5b3d 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave
+ 
+ | Field | Value |
+ |---|---|
+-| Wave | **W21** |
++| Wave | **W22** |
+ | Marco | C — V1 |
+ | State | `pending` |
+-| Last completed | **W20** |
+-| Next action | Start W21: Run modes + HUD de tokens |
++| Last completed | **W21** |
++| Next action | Start W22: MCP + Permission Center |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+diff --git a/packages/ai-gateway/src/adapter.test.ts b/packages/ai-gateway/src/adapter.test.ts
+index 198c40e..3334d72 100644
+--- a/packages/ai-gateway/src/adapter.test.ts
++++ b/packages/ai-gateway/src/adapter.test.ts
+@@ -1,12 +1,17 @@
+ import { describe, expect, it } from "vitest";
+-import { packetForDispatch } from "./adapter";
++import { councilDispatchInstruction, packetForDispatch } from "./adapter";
+ 
+ describe("Council dispatch packet", () => {
+-  it("keeps the audited packet immutable while applying a role only at dispatch", () => {
++  it("keeps the audited packet immutable when dispatch metadata is present", () => {
+     const packet = { version: 1 as const, system: "base", messages: [{ role: "user" as const, content: "question" }], tokenEstimate: 3, excluded: [] };
+     const dispatched = packetForDispatch({ packet, councilRole: "security" });
+     expect(packet.system).toBe("base");
+     expect(packet.messages).toEqual(dispatched.messages);
+-    expect(dispatched.system).toContain("Council role: security");
++    expect(dispatched).toBe(packet);
++  });
++
++  it("keeps role lenses out of the persisted packet while producing dispatch metadata", () => {
++    expect(councilDispatchInstruction("security")).toContain("security");
++    expect(councilDispatchInstruction(undefined)).toBeUndefined();
+   });
+ });
+diff --git a/packages/ai-gateway/src/adapter.ts b/packages/ai-gateway/src/adapter.ts
+index 55c1c04..257871f 100644
+--- a/packages/ai-gateway/src/adapter.ts
++++ b/packages/ai-gateway/src/adapter.ts
+@@ -1,5 +1,6 @@
+ import type { ProviderAgnosticPacket } from "@ai-hub/shared";
+ import type { CouncilRole } from "@ai-hub/shared";
++import type { EffortLevel } from "@ai-hub/shared";
+ 
+ export interface ModelRef {
+   id: string;
+@@ -9,6 +10,7 @@ export interface ModelRef {
+ export interface ProviderCapabilities {
+   streaming: boolean;
+   tools: boolean;
++  thinking: boolean;
+ }
+ 
+ export interface ChatImagePart {
+@@ -23,25 +25,27 @@ export interface ChatStreamRequest {
+   signal: AbortSignal;
+   temperature?: number;
+   maxTokens?: number | null;
++  effortLevel?: EffortLevel;
++  thinkingBudget?: number;
+   images?: ChatImagePart[];
+   /** Dispatch-only metadata. It is never persisted in or merged into the context packet. */
+   councilRole?: CouncilRole;
+ }
+ 
+-const COUNCIL_ROLE_INSTRUCTIONS: Record<CouncilRole, string> = {
+-  architect: "Analyze structure, trade-offs, and a concrete recommendation.",
+-  reviewer: "Find assumptions, gaps, and testable objections.",
+-  security: "Identify risks, abuse paths, and mitigations.",
+-  ux: "Identify user impact, clarity, and accessible next steps.",
+-};
+-
+ export function packetForDispatch(input: Pick<ChatStreamRequest, "packet" | "councilRole">): ProviderAgnosticPacket {
+-  if (!input.councilRole) return input.packet;
+-  return {
+-    ...input.packet,
+-    system: `${input.packet.system}\n\nCouncil role: ${input.councilRole}. ${COUNCIL_ROLE_INSTRUCTIONS[input.councilRole]}`,
+-    tokenEstimate: input.packet.tokenEstimate + Math.ceil(COUNCIL_ROLE_INSTRUCTIONS[input.councilRole].length / 4),
++  // Dispatch metadata must never mutate the immutable context packet.
++  return input.packet;
++}
++
++export function councilDispatchInstruction(role: CouncilRole | undefined): string | undefined {
++  if (!role) return undefined;
++  const lens: Record<CouncilRole, string> = {
++    architect: "Analyze structure, trade-offs, and a concrete recommendation.",
++    reviewer: "Find assumptions, gaps, and testable objections.",
++    security: "Identify risks, abuse paths, and mitigations.",
++    ux: "Identify user impact, clarity, and accessible next steps.",
+   };
++  return `Council role: ${role}. ${lens[role]}`;
+ }
+ 
+ export type ChatStreamEvent =
+diff --git a/packages/ai-gateway/src/anthropic-adapter.ts b/packages/ai-gateway/src/anthropic-adapter.ts
+index ece379a..7c4beea 100644
+--- a/packages/ai-gateway/src/anthropic-adapter.ts
++++ b/packages/ai-gateway/src/anthropic-adapter.ts
+@@ -2,6 +2,7 @@ import { redactSecrets } from "@ai-hub/security";
+ import { catalogModelsForProvider, type ProviderAgnosticPacket } from "@ai-hub/shared";
+ import {
+   packetForDispatch,
++  councilDispatchInstruction,
+   type ChatStreamEvent,
+   type ChatStreamRequest,
+   type ModelRef,
+@@ -148,7 +149,7 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): P
+       return catalogModelsForProvider("anthropic").map((model) => ({ id: model.id, label: model.label }));
+     },
+     capabilities(): ProviderCapabilities {
+-      return { streaming: true, tools: false };
++      return { streaming: true, tools: false, thinking: false };
+     },
+     async testConnection(secret: string, signal: AbortSignal): Promise<void> {
+       const { response } = await request(
+@@ -173,8 +174,9 @@ export function createAnthropicAdapter(options: AnthropicAdapterOptions = {}): P
+         temperature: input.temperature ?? 1,
+         messages: converted.messages,
+       };
+-      if (converted.system !== undefined) {
+-        body.system = converted.system;
++      const instruction = councilDispatchInstruction(input.councilRole);
++      if (converted.system !== undefined || instruction) {
++        body.system = [converted.system, instruction].filter(Boolean).join("\n\n");
+       }
+       const { response, timeout } = await request(input.secret, body, input.signal);
+       if (!response.ok) {
+diff --git a/packages/ai-gateway/src/gemini-adapter.ts b/packages/ai-gateway/src/gemini-adapter.ts
+index dbf9ed9..6aab1b5 100644
+--- a/packages/ai-gateway/src/gemini-adapter.ts
++++ b/packages/ai-gateway/src/gemini-adapter.ts
+@@ -2,6 +2,7 @@ import { redactSecrets } from "@ai-hub/security";
+ import { catalogModelsForProvider, type ProviderAgnosticPacket } from "@ai-hub/shared";
+ import {
+   packetForDispatch,
++  councilDispatchInstruction,
+   type ChatStreamEvent,
+   type ChatStreamRequest,
+   type ModelRef,
+@@ -148,7 +149,7 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): Provide
+       return catalogModelsForProvider("google").map((model) => ({ id: model.id, label: model.label }));
+     },
+     capabilities(): ProviderCapabilities {
+-      return { streaming: true, tools: false };
++      return { streaming: true, tools: false, thinking: false };
+     },
+     async testConnection(secret: string, signal: AbortSignal): Promise<void> {
+       const { response } = await request(
+@@ -177,8 +178,9 @@ export function createGeminiAdapter(options: GeminiAdapterOptions = {}): Provide
+         contents: converted.contents,
+         generationConfig,
+       };
+-      if (converted.systemInstruction !== undefined) {
+-        body.systemInstruction = converted.systemInstruction;
++      const instruction = councilDispatchInstruction(input.councilRole);
++      if (converted.systemInstruction !== undefined || instruction) {
++        body.systemInstruction = { parts: [{ text: [converted.systemInstruction?.parts?.[0]?.text, instruction].filter(Boolean).join("\n\n") }] };
+       }
+       const { response, timeout } = await request(input.model, input.secret, body, input.signal, true);
+       if (!response.ok) {
+diff --git a/packages/ai-gateway/src/mock-adapter.ts b/packages/ai-gateway/src/mock-adapter.ts
+index 7b83ea3..5e8742d 100644
+--- a/packages/ai-gateway/src/mock-adapter.ts
++++ b/packages/ai-gateway/src/mock-adapter.ts
+@@ -77,7 +77,7 @@ export function createMockOpenAIAdapter(): ProviderAdapter {
+     id: "mock",
+     listModels: (): ModelRef[] =>
+       catalogModelsForProvider("openai").map((model) => ({ id: model.id, label: model.label })),
+-    capabilities: (): ProviderCapabilities => ({ streaming: true, tools: false }),
++    capabilities: (): ProviderCapabilities => ({ streaming: true, tools: false, thinking: false }),
+     testConnection: async (): Promise<void> => {
+       return;
+     },
+diff --git a/packages/ai-gateway/src/openai-adapter.test.ts b/packages/ai-gateway/src/openai-adapter.test.ts
+index c6287d9..e572f97 100644
+--- a/packages/ai-gateway/src/openai-adapter.test.ts
++++ b/packages/ai-gateway/src/openai-adapter.test.ts
+@@ -31,7 +31,7 @@ describe("createOpenAIAdapter", () => {
+       },
+     });
+     expect(adapter.id).toBe("openai");
+-    expect(adapter.capabilities()).toEqual({ streaming: true, tools: false });
++    expect(adapter.capabilities()).toEqual({ streaming: true, tools: false, thinking: false });
+     expect(adapter.listModels().some((model) => model.id === "gpt-4o-mini")).toBe(true);
+   });
+ 
+diff --git a/packages/ai-gateway/src/openai-adapter.ts b/packages/ai-gateway/src/openai-adapter.ts
+index de4be04..49510b5 100644
+--- a/packages/ai-gateway/src/openai-adapter.ts
++++ b/packages/ai-gateway/src/openai-adapter.ts
+@@ -2,6 +2,7 @@ import { redactSecrets } from "@ai-hub/security";
+ import { catalogModelsForProvider, type ProviderAgnosticPacket } from "@ai-hub/shared";
+ import {
+   packetForDispatch,
++  councilDispatchInstruction,
+   type ChatStreamEvent,
+   type ChatStreamRequest,
+   type ModelRef,
+@@ -180,7 +181,7 @@ export function createOpenAICompatibleAdapter(
+       return catalogModelsForProvider(options.id).map((model) => ({ id: model.id, label: model.label }));
+     },
+     capabilities(): ProviderCapabilities {
+-      return { streaming: true, tools: false };
++      return { streaming: true, tools: false, thinking: false };
+     },
+     async testConnection(secret: string, signal: AbortSignal): Promise<void> {
+       if (options.id === "custom") {
+@@ -209,7 +210,7 @@ export function createOpenAICompatibleAdapter(
+         model: input.model,
+         stream: true,
+         stream_options: { include_usage: true },
+-        messages: packetMessages(packetForDispatch(input), input.images),
++        messages: (() => { const messages = packetMessages(packetForDispatch(input), input.images); const instruction = councilDispatchInstruction(input.councilRole); return instruction ? [{ role: "system" as const, content: instruction }, ...messages] : messages; })(),
+         temperature: input.temperature ?? 1,
+       };
+       if (input.maxTokens !== undefined && input.maxTokens !== null) {
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index a88e29a..ce7ea2d 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -1,5 +1,5 @@
+ export { applyMigrations } from "./migrate";
+-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL, MIGRATION_0013_SQL, MIGRATION_0014_SQL } from "./migrations";
++export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL, MIGRATION_0013_SQL, MIGRATION_0014_SQL, MIGRATION_0015_SQL } from "./migrations";
+ export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
+ export {
+   HubRepos,
+diff --git a/packages/db/src/migrations.ts b/packages/db/src/migrations.ts
+index 989c6d3..76f41e4 100644
+--- a/packages/db/src/migrations.ts
++++ b/packages/db/src/migrations.ts
+@@ -289,6 +289,10 @@ CREATE TABLE spend_reservations (
+ );
+ CREATE INDEX spend_reservations_expires_idx ON spend_reservations(expires_at);
+ `;
++export const MIGRATION_0015_SQL = `
++ALTER TABLE conversations ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'assist';
++ALTER TABLE conversations ADD COLUMN effort_level TEXT NOT NULL DEFAULT 'medium';
++`;
+ 
+ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 1, sql: MIGRATION_0001_SQL },
+@@ -305,4 +309,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 12, sql: MIGRATION_0012_SQL },
+   { version: 13, sql: MIGRATION_0013_SQL },
+   { version: 14, sql: MIGRATION_0014_SQL },
++  { version: 15, sql: MIGRATION_0015_SQL },
+ ];
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index 689968f..a0e5c21 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -139,7 +139,7 @@ describe("hub database", () => {
+       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
+       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
+       applyMigrations(second.sqlite);
+-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(14);
++      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(15);
+       second.close();
+     } finally {
+       rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 573c029..5145918 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -69,6 +69,8 @@ export interface ConversationRecord {
+   activePacketId: string | null;
+   packetAppliedAt: string | null;
+   kind: "chat" | "playground";
++  runMode: "plan" | "assist" | "agent" | "orchestrate";
++  effortLevel: "low" | "medium" | "high" | "max";
+ }
+ 
+ export interface SearchHitRecord {
+@@ -548,6 +550,8 @@ export class HubRepos {
+       activePacketId: row.activePacketId ?? null,
+       packetAppliedAt: row.packetAppliedAt !== null && row.packetAppliedAt !== undefined ? iso(row.packetAppliedAt) : null,
+       kind: row.kind === "playground" ? "playground" : "chat",
++      runMode: row.runMode === "plan" || row.runMode === "agent" || row.runMode === "orchestrate" ? row.runMode : "assist",
++      effortLevel: row.effortLevel === "low" || row.effortLevel === "high" || row.effortLevel === "max" ? row.effortLevel : "medium",
+     };
+   }
+ 
+@@ -713,6 +717,8 @@ export class HubRepos {
+         importSource: null,
+         externalId: null,
+         kind,
++        runMode: "assist",
++        effortLevel: "medium",
+       })
+       .run();
+     return {
+@@ -726,9 +732,18 @@ export class HubRepos {
+       activePacketId: null,
+       packetAppliedAt: null,
+       kind,
++      runMode: "assist",
++      effortLevel: "medium",
+     };
+   }
+ 
++  updateConversationRunSettings(id: string, runMode: ConversationRecord["runMode"], effortLevel: ConversationRecord["effortLevel"]): ConversationRecord {
++    this.db.update(conversations).set({ runMode, effortLevel, updatedAt: Date.now() }).where(eq(conversations.id, id)).run();
++    const updated = this.getConversation(id);
++    if (!updated) throw new Error("Conversation not found");
++    return updated;
++  }
++
+   removeConversation(id: string): void {
+     this.db.delete(artifacts).where(eq(artifacts.conversationId, id)).run();
+     this.db.delete(conversationTags).where(eq(conversationTags.conversationId, id)).run();
+diff --git a/packages/db/src/schema.ts b/packages/db/src/schema.ts
+index 759566d..ffc854f 100644
+--- a/packages/db/src/schema.ts
++++ b/packages/db/src/schema.ts
+@@ -22,6 +22,8 @@ export const conversations = sqliteTable("conversations", {
+   activePacketId: text("active_packet_id"),
+   packetAppliedAt: integer("packet_applied_at", { mode: "number" }),
+   kind: text("kind").notNull().default("chat"),
++  runMode: text("run_mode").notNull().default("assist"),
++  effortLevel: text("effort_level").notNull().default("medium"),
+ });
+ 
+ export const messages = sqliteTable("messages", {
+diff --git a/packages/shared/src/gateway.ts b/packages/shared/src/gateway.ts
+index 916f922..d636cd9 100644
+--- a/packages/shared/src/gateway.ts
++++ b/packages/shared/src/gateway.ts
+@@ -1,4 +1,5 @@
+ import { z } from "zod";
++import { effortLevelSchema, runModeSchema } from "./run-modes";
+ 
+ export {
+   catalogModelsForProvider,
+@@ -88,6 +89,8 @@ const chatSendBaseSchema = z.object({
+   model: z.string().min(1).max(128),
+   temperature: z.number().min(0).max(2).optional(),
+   maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
++  runMode: runModeSchema.optional(),
++  effortLevel: effortLevelSchema.optional(),
+   extraSystem: z.string().max(20_000).optional(),
+   compactHistory: z.boolean().optional(),
+   allowOnce: z.boolean().optional(),
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index 1a9a0cf..ebd1c35 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -11,6 +11,7 @@ import type {
+   ConversationDto,
+   ConversationExportInput,
+   ConversationTagsSetInput,
++  ConversationRunSettings,
+   ConversationExportResult,
+   ConversationListInput,
+   ConversationMoveInput,
+@@ -127,6 +128,7 @@ export interface HubConversationsApi {
+   getBranchLabels: (input: BranchLabelsGetInput) => Promise<BranchLabels>;
+   setBranchLabel: (input: BranchLabelSetInput) => Promise<void>;
+   setTags: (input: ConversationTagsSetInput) => Promise<ConversationDto>;
++  setRunSettings: (input: ConversationRunSettings) => Promise<ConversationDto>;
+   move: (input: ConversationMoveInput) => Promise<ConversationDto>;
+   duplicate: (input: IdInput) => Promise<ConversationDto>;
+   toProject: (input: IdInput) => Promise<ConversationToProjectResult>;
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 1c0cce2..f2e0d90 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -48,6 +48,7 @@ export { suggestFallbackProvider, type FallbackKeyLike, type FallbackSuggestion
+ export { classifyHubIpcError, type HubIpcError, type HubIpcErrorKind } from "./hub-error";
+ export { looksLikePastedSecret, redactPastedSecrets } from "./secret-paste";
+ export { COUNCIL_ROLES, divergenceTerms, recommendModelRoute, type CouncilRole, type RouterRecommendation } from "./council";
++export { effortLevelSchema, effortParams, runModeSchema, type EffortLevel, type EffortParams, type RunMode } from "./run-modes";
+ export {
+   inspectClipboardText,
+   typescriptInterfaceFromJson,
+@@ -140,6 +141,7 @@ export {
+   conversationCreateInputSchema,
+   conversationDtoSchema,
+   conversationTagsSetInputSchema,
++  conversationRunSettingsSchema,
+   conversationExportDocumentSchema,
+   conversationExportInputSchema,
+   conversationExportModeSchema,
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index b9e4fbb..e68efdd 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -16,6 +16,7 @@ export const IpcChannel = {
+   conversationsGetBranchLabels: "conversations:getBranchLabels",
+   conversationsSetBranchLabel: "conversations:setBranchLabel",
+   conversationsSetTags: "conversations:setTags",
++  conversationsSetRunSettings: "conversations:setRunSettings",
+   conversationsMove: "conversations:move",
+   importPickFile: "import:pickFile",
+   importStart: "import:start",
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index a6d77e3..91447e3 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -1,5 +1,6 @@
+ import { z } from "zod";
+ import { localeSchema, themeModeSchema } from "./appearance";
++import { effortLevelSchema, runModeSchema } from "./run-modes";
+ import {
+   gatewayErrorCodeSchema,
+   mentionRefListSchema,
+@@ -114,6 +115,8 @@ export const conversationDtoSchema = z.object({
+   updatedAt: isoTimestampSchema,
+   importSource: importSourceSchema.nullable(),
+   activePacketId: z.string().uuid().nullable(),
++  runMode: runModeSchema,
++  effortLevel: effortLevelSchema,
+ });
+ 
+ export type ConversationDto = z.infer<typeof conversationDtoSchema>;
+@@ -146,6 +149,8 @@ export const conversationTagsSetInputSchema = z
+   .strict();
+ 
+ export type ConversationTagsSetInput = z.infer<typeof conversationTagsSetInputSchema>;
++export const conversationRunSettingsSchema = z.object({ conversationId: z.string().uuid(), runMode: runModeSchema, effortLevel: effortLevelSchema }).strict();
++export type ConversationRunSettings = z.infer<typeof conversationRunSettingsSchema>;
+ 
+ export const conversationMoveInputSchema = z
+   .object({
+@@ -382,6 +387,7 @@ export const chatEventSchema = z.discriminatedUnion("type", [
+     message: messageDtoSchema,
+     packet: packetV0Schema,
+   }),
++  z.object({ type: z.literal("usage"), runId: z.string().uuid(), messageId: z.string().uuid(), tokensIn: z.number().int().nonnegative(), tokensOut: z.number().int().nonnegative(), tokensThinking: z.number().int().nonnegative().default(0), cacheReadTokens: z.number().int().nonnegative().default(0), cacheWriteTokens: z.number().int().nonnegative().default(0), costUsd: z.string().nullable(), thinkingSupported: z.boolean() }),
+   z.object({
+     type: z.literal("error"),
+     runId: z.string().uuid(),
