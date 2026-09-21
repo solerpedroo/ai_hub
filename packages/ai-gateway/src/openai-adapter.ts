@@ -2,6 +2,7 @@ import { redactSecrets } from "@ai-hub/security";
 import { catalogModelsForProvider, type ProviderAgnosticPacket } from "@ai-hub/shared";
 import {
   packetForDispatch,
+  councilDispatchInstruction,
   type ChatStreamEvent,
   type ChatStreamRequest,
   type ModelRef,
@@ -180,7 +181,7 @@ export function createOpenAICompatibleAdapter(
       return catalogModelsForProvider(options.id).map((model) => ({ id: model.id, label: model.label }));
     },
     capabilities(): ProviderCapabilities {
-      return { streaming: true, tools: false };
+      return { streaming: true, tools: false, thinking: false };
     },
     async testConnection(secret: string, signal: AbortSignal): Promise<void> {
       if (options.id === "custom") {
@@ -209,7 +210,7 @@ export function createOpenAICompatibleAdapter(
         model: input.model,
         stream: true,
         stream_options: { include_usage: true },
-        messages: packetMessages(packetForDispatch(input), input.images),
+        messages: (() => { const messages = packetMessages(packetForDispatch(input), input.images); const instruction = councilDispatchInstruction(input.councilRole); return instruction ? [{ role: "system" as const, content: instruction }, ...messages] : messages; })(),
         temperature: input.temperature ?? 1,
       };
       if (input.maxTokens !== undefined && input.maxTokens !== null) {
