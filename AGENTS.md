@@ -27,6 +27,10 @@ Staff engineer. Portuguese to the user. English in code, commits, identifiers. U
 | Skills | `.cursor/skills/` |
 | Reviewer subagents | `.cursor/agents/` |
 
+## Codex mirror
+
+For Codex sessions, use the versioned mirror in `.codex/`: `.codex/README.md`, `.codex/rules/`, `.codex/skills/`, and `.codex/agents/`. The Cursor and Codex layouts are intentionally kept equivalent; `.cursorrules` remains the constitution for both.
+
 ## Skills (follow them, do not reinvent)
 
 - Starting or resuming a wave → `.cursor/skills/wave-start/SKILL.md`
