@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { effortLevelSchema, runModeSchema } from "./run-modes";
 
 export {
   catalogModelsForProvider,
@@ -88,6 +89,8 @@ const chatSendBaseSchema = z.object({
   model: z.string().min(1).max(128),
   temperature: z.number().min(0).max(2).optional(),
   maxTokens: z.number().int().min(1).max(128_000).nullable().optional(),
+  runMode: runModeSchema.optional(),
+  effortLevel: effortLevelSchema.optional(),
   extraSystem: z.string().max(20_000).optional(),
   compactHistory: z.boolean().optional(),
   allowOnce: z.boolean().optional(),
