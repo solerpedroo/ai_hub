@@ -18,6 +18,7 @@ import {
   conversationMoveInputSchema,
   conversationToProjectResultSchema,
   conversationTagsSetInputSchema,
+  conversationRunSettingsSchema,
   costsAggregateInputSchema,
   costsAggregateResultSchema,
   monthlyCostsInputSchema,
@@ -255,6 +256,7 @@ export function registerWorkspaceIpc(): void {
         getHubDatabase().repos.setConversationTags(input.conversationId, input.names),
       ),
   );
+  registerHandler(IpcChannel.conversationsSetRunSettings, conversationRunSettingsSchema, conversationDtoSchema, (input) => conversationDtoSchema.parse(getHubDatabase().repos.updateConversationRunSettings(input.conversationId, input.runMode, input.effortLevel)));
 
   registerHandler(IpcChannel.conversationsDuplicate, idInputSchema, conversationDtoSchema, (input) =>
     conversationDtoSchema.parse(getHubDatabase().repos.duplicateConversation(input.id)),
