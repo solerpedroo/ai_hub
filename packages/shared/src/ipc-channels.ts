@@ -16,6 +16,7 @@ export const IpcChannel = {
   conversationsGetBranchLabels: "conversations:getBranchLabels",
   conversationsSetBranchLabel: "conversations:setBranchLabel",
   conversationsSetTags: "conversations:setTags",
+  conversationsSetRunSettings: "conversations:setRunSettings",
   conversationsMove: "conversations:move",
   importPickFile: "import:pickFile",
   importStart: "import:start",
