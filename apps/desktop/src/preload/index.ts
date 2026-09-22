@@ -123,6 +123,11 @@ import {
   toolReadRequestInputSchema,
   toolReadRequestResultSchema,
   toolActivityResultSchema,
+  agentPrepareInputSchema,
+  agentIdInputSchema,
+  agentListInputSchema,
+  agentListResultSchema,
+  agentRunDetailSchema,
 } from "@ai-hub/shared";
 
 const empty = emptyIpcPayloadSchema.parse({});
@@ -497,6 +502,15 @@ const hub: HubApi = {
     pickProjectRoot: (input) => invokeParsed(IpcChannel.toolsPickProjectRoot, input, toolProjectGetInputSchema, toolProjectRootPickResultSchema),
     requestRead: (input) => invokeParsed(IpcChannel.toolsRequestRead, input, toolReadRequestInputSchema, toolReadRequestResultSchema),
     getLatestActivity: () => invokeParsed(IpcChannel.toolsGetLatestActivity, empty, emptyIpcPayloadSchema, toolActivityResultSchema),
+  },
+  agents: {
+    prepare: (input) => invokeParsed(IpcChannel.agentsPrepare, input, agentPrepareInputSchema, agentRunDetailSchema),
+    get: (input) => invokeParsed(IpcChannel.agentsGet, input, agentIdInputSchema, agentRunDetailSchema),
+    list: (input) => invokeParsed(IpcChannel.agentsList, input, agentListInputSchema, agentListResultSchema),
+    start: (input) => invokeParsed(IpcChannel.agentsStart, input, agentIdInputSchema, agentRunDetailSchema),
+    pause: (input) => invokeParsed(IpcChannel.agentsPause, input, agentIdInputSchema, agentRunDetailSchema),
+    resume: (input) => invokeParsed(IpcChannel.agentsResume, input, agentIdInputSchema, agentRunDetailSchema),
+    cancel: (input) => invokeParsed(IpcChannel.agentsCancel, input, agentIdInputSchema, agentRunDetailSchema),
   },
 };
 
