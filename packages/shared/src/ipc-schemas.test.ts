@@ -32,6 +32,8 @@ import {
   skillCreateInputSchema,
   skillDtoSchema,
   conversationWorkspaceDtoSchema,
+  toolReadRequestInputSchema,
+  toolReadRequestResultSchema,
 } from "./ipc-schemas";
 
 describe("emptyIpcPayloadSchema", () => {
@@ -493,8 +495,8 @@ describe("wave 16 artifact contracts", () => {
   });
 });
 
-describe("wave 17 skill contracts", () => {
-  it("accepts a skill dto and rejects tools on create", () => {
+describe("wave 17/22 skill contracts", () => {
+  it("keeps v1 DTOs readable and permits only allowlisted tools on create", () => {
     const dto = {
       id: "11111111-1111-4111-8111-111111111111",
       folder: "development",
@@ -522,5 +524,34 @@ describe("wave 17 skill contracts", () => {
         steps: [{ id: "one", title: "One", section: "First section." }],
       }).steps,
     ).toHaveLength(1);
+    expect(() => skillCreateInputSchema.parse({ folder: "development", title: "Custom", description: "A custom skill", prompt: "Do the work", preferredModel: null, defaultMentions: [], steps: [], allowedTools: [{ toolId: "shell", operation: "read" }] })).toThrow();
+  });
+});
+
+describe("wave 22 tool IPC contracts", () => {
+  it("accepts only a bounded relative project path and a redacted completed activity", () => {
+    const input = {
+      projectId: "11111111-1111-4111-8111-111111111111",
+      relativePath: "docs/README.md",
+    };
+    expect(toolReadRequestInputSchema.parse(input)).toEqual(input);
+    expect(() => toolReadRequestInputSchema.parse({ ...input, extra: "secret" })).toThrow();
+    expect(
+      toolReadRequestResultSchema.parse({
+        kind: "completed",
+        content: "safe output",
+        activity: {
+          id: "22222222-2222-4222-8222-222222222222",
+          projectId: input.projectId,
+          toolId: "project-filesystem.read-file",
+          operation: "read",
+          effect: "read",
+          status: "completed",
+          argsSummary: "path: docs/README.md",
+          resultSummary: "README.md",
+          createdAt: "2026-09-21T00:00:00.000Z",
+        },
+      }).kind,
+    ).toBe("completed");
   });
 });
