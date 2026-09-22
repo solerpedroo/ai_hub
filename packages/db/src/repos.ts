@@ -83,6 +83,7 @@ export interface AgentRunRecord {
   kind: "single";
   status: AgentRunStatus;
   provider: string;
+  providerKeyId: string;
   model: string;
   goal: string;
   plan: string;
@@ -2668,6 +2669,7 @@ export class HubRepos {
     projectId: string;
     conversationId: string;
     provider: string;
+    providerKeyId: string;
     model: string;
     goal: string;
     plan: string;
@@ -2688,6 +2690,7 @@ export class HubRepos {
         kind: "single",
         status: "awaiting_confirmation",
         provider: input.provider,
+        providerKeyId: input.providerKeyId,
         model: input.model,
         goalCipher: encryptUtf8(input.goal.slice(0, 4_000), this.masterKey),
         planCipher: encryptUtf8(input.plan.slice(0, 8_000), this.masterKey),
@@ -3255,6 +3258,49 @@ export class HubRepos {
       factoryId: row.factoryId ?? null,
       createdAt: iso(row.createdAt),
       updatedAt: iso(row.updatedAt),
+    };
+  }
+
+  private toAgentRun(row: typeof agentRuns.$inferSelect): AgentRunRecord {
+    return {
+      id: row.id,
+      projectId: row.projectId,
+      conversationId: row.conversationId,
+      parentRunId: row.parentRunId ?? null,
+      kind: "single",
+      status: asAgentRunStatus(row.status),
+      provider: row.provider,
+      providerKeyId: row.providerKeyId,
+      model: row.model,
+      goal: decryptUtf8(row.goalCipher, this.masterKey),
+      plan: decryptUtf8(row.planCipher, this.masterKey),
+      sourceSkillId: row.sourceSkillId ?? null,
+      maxSteps: row.maxSteps,
+      budgetUsd: row.budgetUsd,
+      timeoutSeconds: row.timeoutSeconds,
+      reportArtifactId: row.reportArtifactId ?? null,
+      createdAt: iso(row.createdAt),
+      startedAt: row.startedAt === null || row.startedAt === undefined ? null : iso(row.startedAt),
+      finishedAt: row.finishedAt === null || row.finishedAt === undefined ? null : iso(row.finishedAt),
+    };
+  }
+
+  private toAgentStep(row: typeof agentSteps.$inferSelect): AgentStepRecord {
+    return {
+      id: row.id,
+      runId: row.runId,
+      ordinal: row.ordinal,
+      kind: asAgentStepKind(row.kind),
+      title: decryptUtf8(row.titleCipher, this.masterKey),
+      status: asAgentStepStatus(row.status),
+      toolId: row.toolId ?? null,
+      summary: row.summaryCipher ? decryptUtf8(row.summaryCipher, this.masterKey) : null,
+      detail: row.detailCipher ? decryptUtf8(row.detailCipher, this.masterKey) : null,
+      tokensIn: row.tokensIn ?? null,
+      tokensOut: row.tokensOut ?? null,
+      costUsd: row.costUsd ?? null,
+      startedAt: row.startedAt === null || row.startedAt === undefined ? null : iso(row.startedAt),
+      finishedAt: row.finishedAt === null || row.finishedAt === undefined ? null : iso(row.finishedAt),
     };
   }
 
