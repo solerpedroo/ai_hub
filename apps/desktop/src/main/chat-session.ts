@@ -156,8 +156,14 @@ export function abortChat(runId: string): void {
   runs.get(runId)?.abort.abort();
 }
 
-export async function waitForChatRun(runId: string): Promise<void> {
+export async function waitForChatRun(
+  runId: string,
+  options: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<void> {
+  const deadline = options.timeoutMs === undefined ? null : Date.now() + options.timeoutMs;
   while (runs.has(runId)) {
+    if (options.signal?.aborted) throw new Error("gateway:aborted");
+    if (deadline !== null && Date.now() >= deadline) throw new Error("gateway:timeout");
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
 }
