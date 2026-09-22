@@ -1,0 +1,1365 @@
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index 8d5705f..bf146ba 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -116,6 +116,12 @@ import {
+   windowIsMaximizedResultSchema,
+   clipboardTextSchema,
+   workspaceSessionSchema,
++  toolProjectGetInputSchema,
++  toolProjectStateSchema,
++  toolProjectRootPickResultSchema,
++  toolReadRequestInputSchema,
++  toolReadRequestResultSchema,
++  toolActivityResultSchema,
+ } from "@ai-hub/shared";
+ import { redactSecrets, safeErrorMessage } from "@ai-hub/security";
+ import { abortChat, sendChat } from "./chat-session";
+@@ -143,6 +149,7 @@ import { exportArtifact, toArtifactDto } from "./artifacts";
+ import { testProviderKey } from "./provider-health";
+ import { localDayStartMs } from "./spend-guard";
+ import { checkForAppUpdates } from "./updater";
++import { getLatestToolActivity, getToolProjectState, pickProjectToolRoot, requestToolRead } from "./tools";
+ 
+ function registerHandler<TIn, TOut>(
+   channel: string,
+@@ -195,6 +202,19 @@ export function registerWorkspaceIpc(): void {
+     getHubDatabase().repos.removeProject(input.id);
+   });
+ 
++  registerHandler(IpcChannel.toolsGetProject, toolProjectGetInputSchema, toolProjectStateSchema, (input) =>
++    getToolProjectState(input.projectId),
++  );
++  registerHandler(IpcChannel.toolsPickProjectRoot, toolProjectGetInputSchema, toolProjectRootPickResultSchema, (input, event) =>
++    pickProjectToolRoot(input.projectId, event.sender),
++  );
++  registerHandler(IpcChannel.toolsRequestRead, toolReadRequestInputSchema, toolReadRequestResultSchema, (input, event) =>
++    requestToolRead(input, event.sender),
++  );
++  registerHandler(IpcChannel.toolsGetLatestActivity, emptyIpcPayloadSchema, toolActivityResultSchema, () =>
++    getLatestToolActivity(),
++  );
++
+   registerHandler(
+     IpcChannel.conversationsList,
+     conversationListInputSchema,
+@@ -658,8 +678,8 @@ export function registerWorkspaceIpc(): void {
+         preferredModel: input.preferredModel,
+         defaultMentions: input.defaultMentions,
+         steps: input.steps,
++        ...(input.allowedTools !== undefined ? { allowedTools: input.allowedTools } : {}),
+       }),
+-      contractVersion: 1 as const,
+     }),
+   );
+ 
+@@ -673,8 +693,8 @@ export function registerWorkspaceIpc(): void {
+         ...(input.preferredModel !== undefined ? { preferredModel: input.preferredModel } : {}),
+         ...(input.defaultMentions !== undefined ? { defaultMentions: input.defaultMentions } : {}),
+         ...(input.steps !== undefined ? { steps: input.steps } : {}),
++        ...(input.allowedTools !== undefined ? { allowedTools: input.allowedTools } : {}),
+       }),
+-      contractVersion: 1 as const,
+     }),
+   );
+ 
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index ad9a23b..53cd16a 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -117,6 +117,12 @@ import {
+   windowIsMaximizedResultSchema,
+   clipboardTextSchema,
+   workspaceSessionSchema,
++  toolProjectGetInputSchema,
++  toolProjectStateSchema,
++  toolProjectRootPickResultSchema,
++  toolReadRequestInputSchema,
++  toolReadRequestResultSchema,
++  toolActivityResultSchema,
+ } from "@ai-hub/shared";
+ 
+ const empty = emptyIpcPayloadSchema.parse({});
+@@ -486,6 +492,12 @@ const hub: HubApi = {
+     resolve: (input) =>
+       invokeParsed(IpcChannel.skillsResolve, input, skillResolveInputSchema, skillResolveResultSchema),
+   },
++  tools: {
++    getProject: (input) => invokeParsed(IpcChannel.toolsGetProject, input, toolProjectGetInputSchema, toolProjectStateSchema),
++    pickProjectRoot: (input) => invokeParsed(IpcChannel.toolsPickProjectRoot, input, toolProjectGetInputSchema, toolProjectRootPickResultSchema),
++    requestRead: (input) => invokeParsed(IpcChannel.toolsRequestRead, input, toolReadRequestInputSchema, toolReadRequestResultSchema),
++    getLatestActivity: () => invokeParsed(IpcChannel.toolsGetLatestActivity, empty, emptyIpcPayloadSchema, toolActivityResultSchema),
++  },
+ };
+ 
+ contextBridge.exposeInMainWorld("hub", hub);
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index 49922bd..1638950 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -29,6 +29,7 @@ import {
+   type ArtifactDto,
+   type ProviderKeyDto,
+   type HealthSummaryDto,
++  type ToolActivityDto,
+ } from "@ai-hub/shared";
+ import {
+   ChatComposer,
+@@ -247,6 +248,10 @@ export function HomeView({
+     null,
+   );
+   const [tagDraft, setTagDraft] = useState("");
++  const [toolPath, setToolPath] = useState("");
++  const [toolActivity, setToolActivity] = useState<ToolActivityDto | null>(null);
++  const [toolBusy, setToolBusy] = useState(false);
++  const [toolError, setToolError] = useState<string | null>(null);
+   const [projectName, setProjectName] = useState(project?.name ?? "");
+   const [projectColor, setProjectColor] = useState<string | null>(project?.color ?? null);
+   const [projectInstructions, setProjectInstructions] = useState(
+@@ -280,6 +285,12 @@ export function HomeView({
+       setEffortLevel(selectedConversation.effortLevel);
+     }
+   }, [selectedConversation]);
++  useEffect(() => {
++    if (!project) { setToolActivity(null); return; }
++    void window.hub.tools.getLatestActivity().then((activity) => {
++      setToolActivity(activity?.projectId === project.id ? activity : null);
++    }).catch(() => setToolActivity(null));
++  }, [project]);
+   const saveRunSettings = async (nextMode: typeof runMode, nextEffort: typeof effortLevel): Promise<void> => {
+     if (!selectedConversationId) return;
+     if (nextMode === "agent" || nextMode === "orchestrate") return;
+@@ -609,6 +620,24 @@ export function HomeView({
+     });
+   };
+ 
++  const appendToolOutput = (content: string, activity: ToolActivityDto): void => {
++    setToolActivity(activity);
++    setDraft((current) => `${current}${current.trim().length > 0 ? "\n\n" : ""}[${t("tools.untrustedContext")}: ${activity.resultSummary ?? activity.toolId}]\n\`\`\`text\n${content}\n\`\`\``);
++  };
++
++  const requestProjectFile = async (): Promise<void> => {
++    if (!project || toolPath.trim().length === 0) return;
++    setToolError(null);
++    setToolBusy(true);
++    try {
++      const result = await window.hub.tools.requestRead({ projectId: project.id, relativePath: toolPath.trim() });
++      setToolActivity(result.activity);
++      if (result.kind === "completed") { appendToolOutput(result.content, result.activity); setToolPath(""); }
++      if (result.kind === "denied") setToolError(t("tools.error.denied"));
++    } catch { setToolError(t("tools.error.read")); }
++    finally { setToolBusy(false); }
++  };
++
+   return (
+     <div className="flex h-full min-h-0">
+       <section className="flex w-64 shrink-0 flex-col border-r">
+@@ -1466,7 +1495,16 @@ export function HomeView({
+                   <span>{t("hud.tokens")}: {runHud?.tokensIn ?? "—"}/{runHud?.tokensOut ?? "—"}</span><span>{t("hud.turnCost")}: {runHud?.costUsd ?? conversationCost ?? "—"}</span>
+                   <span>{t("hud.thinking")}: {runHud?.tokensThinking ?? "—"}</span><span>{t("hud.cache")}: {runHud?.cacheReadTokens ?? "—"}/{runHud?.cacheWriteTokens ?? "—"}</span>
+                   {runHud?.thinkingSupported === false ? <span>{t("hud.thinkingUnavailable")}</span> : null}
++                  {toolActivity ? <span data-testid="tool-activity">{t("tools.activity")}: {toolActivity.toolId} · {toolActivity.argsSummary} · {toolActivity.resultSummary ?? t(`tools.status.${toolActivity.status}`)}</span> : null}
+                 </div>
++                {project ? (
++                  <div className="flex flex-wrap items-center gap-2 border-t px-2 py-1.5" data-testid="permission-center">
++                    <Input className="h-7 max-w-64" value={toolPath} onChange={(event) => setToolPath(event.target.value)} placeholder={t("tools.pathPlaceholder")} aria-label={t("tools.pathPlaceholder")} />
++                    <Button type="button" size="sm" variant="outline" disabled={toolBusy || toolPath.trim().length === 0} onClick={() => void requestProjectFile()} data-testid="tools-read-file">{t("tools.readFile")}</Button>
++                    <Button type="button" size="sm" variant="ghost" disabled={toolBusy} onClick={() => void window.hub.tools.pickProjectRoot({ projectId: project.id })}>{t("tools.chooseRoot")}</Button>
++                    {toolError ? <span role="alert" className="text-destructive">{toolError}</span> : null}
++                  </div>
++                ) : null}
+                 <ChatComposer
+                   key={selectedConversationId}
+                   value={draft}
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index a0e5c21..4db3af7 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -59,6 +59,24 @@ describe("hub database", () => {
+     hub.close();
+   });
+ 
++  it("encrypts project roots and isolates persistent tool permissions by project", () => {
++    const { hub } = openTestDb();
++    const first = hub.repos.createProject("First");
++    const second = hub.repos.createProject("Second");
++    hub.repos.setProjectToolRoot(first.id, "C:\\private-project");
++    expect(hub.repos.getProjectToolRoot(first.id)?.rootPath).toBe("C:\\private-project");
++    expect(dumpAllText(hub.sqlite)).not.toContain("C:\\private-project");
++    hub.repos.grantProjectToolPermission(first.id, "project-filesystem.read-file", "read");
++    expect(hub.repos.hasProjectToolPermission(first.id, "project-filesystem.read-file", "read")).toBe(true);
++    expect(hub.repos.hasProjectToolPermission(second.id, "project-filesystem.read-file", "read")).toBe(false);
++    hub.repos.setProjectToolRoot(first.id, "C:\\another-project");
++    expect(hub.repos.hasProjectToolPermission(first.id, "project-filesystem.read-file", "read")).toBe(false);
++    hub.repos.clearProjectToolRoot(first.id);
++    expect(hub.repos.getProjectToolRoot(first.id)).toBeNull();
++    expect(hub.repos.hasProjectToolPermission(first.id, "project-filesystem.read-file", "read")).toBe(false);
++    hub.close();
++  });
++
+   it("accepts linear messages (null parent) and a branch (parent set)", () => {
+     const { hub } = openTestDb();
+     const project = hub.repos.createProject("Graph");
+@@ -139,10 +157,10 @@ describe("hub database", () => {
+       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
+       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
+       applyMigrations(second.sqlite);
+-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(15);
++      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(16);
+       second.close();
+     } finally {
+-      rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
++      rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 });
+     }
+   });
+ 
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 5145918..dcaff98 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -22,6 +22,8 @@ import {
+   importJobs,
+   projectFiles,
+   projectMemories,
++  projectToolPermissions,
++  projectToolRoots,
+   prompts,
+   skills,
+   artifacts,
+@@ -51,6 +53,22 @@ export interface ProjectRecord {
+   updatedAt: string;
+ }
+ 
++export interface ProjectToolRootRecord {
++  projectId: string;
++  rootPath: string;
++  createdAt: string;
++  updatedAt: string;
++}
++
++export interface ProjectToolPermissionRecord {
++  id: string;
++  projectId: string;
++  toolId: string;
++  operation: string;
++  createdAt: string;
++  updatedAt: string;
++}
++
+ export interface ProjectWriteFields {
+   color?: string | null;
+   instructions?: string | null;
+@@ -243,8 +261,9 @@ export interface SkillRecord {
+   preferredModel: string | null;
+   defaultMentions: Array<{ type: "file" | "conversation" | "memory" | "prompt" | "skill" | "packet"; query: string }>;
+   steps: Array<{ id: string; title: string; section: string }>;
++  allowedTools: Array<{ toolId: "project-filesystem.read-file"; operation: "read" }>;
+   factoryId: string | null;
+-  contractVersion: 1;
++  contractVersion: 1 | 2;
+   createdAt: string;
+   updatedAt: string;
+ }
+@@ -673,6 +692,92 @@ export class HubRepos {
+     this.db.delete(projects).where(eq(projects.id, id)).run();
+   }
+ 
++  getProjectToolRoot(projectId: string): ProjectToolRootRecord | null {
++    const row = this.db.select().from(projectToolRoots).where(eq(projectToolRoots.projectId, projectId)).get();
++    if (!row) return null;
++    return {
++      projectId: row.projectId,
++      rootPath: decryptUtf8(row.rootCipher, this.masterKey),
++      createdAt: iso(row.createdAt),
++      updatedAt: iso(row.updatedAt),
++    };
++  }
++
++  setProjectToolRoot(projectId: string, rootPath: string): ProjectToolRootRecord {
++    if (!this.getProject(projectId)) throw new Error("Project not found");
++    const now = Date.now();
++    this.db.transaction((tx) => {
++      tx.delete(projectToolPermissions).where(eq(projectToolPermissions.projectId, projectId)).run();
++      tx
++        .insert(projectToolRoots)
++        .values({ projectId, rootCipher: encryptUtf8(rootPath, this.masterKey), createdAt: now, updatedAt: now })
++        .onConflictDoUpdate({
++          target: projectToolRoots.projectId,
++          set: { rootCipher: encryptUtf8(rootPath, this.masterKey), updatedAt: now },
++        })
++        .run();
++    });
++    const saved = this.getProjectToolRoot(projectId);
++    if (!saved) throw new Error("Project tool root not found");
++    return saved;
++  }
++
++  clearProjectToolRoot(projectId: string): void {
++    this.db.delete(projectToolRoots).where(eq(projectToolRoots.projectId, projectId)).run();
++    this.db.delete(projectToolPermissions).where(eq(projectToolPermissions.projectId, projectId)).run();
++  }
++
++  listProjectToolPermissions(projectId: string): ProjectToolPermissionRecord[] {
++    return this.db
++      .select()
++      .from(projectToolPermissions)
++      .where(eq(projectToolPermissions.projectId, projectId))
++      .all()
++      .map((row) => ({
++        id: row.id,
++        projectId: row.projectId,
++        toolId: row.toolId,
++        operation: row.operation,
++        createdAt: iso(row.createdAt),
++        updatedAt: iso(row.updatedAt),
++      }));
++  }
++
++  hasProjectToolPermission(projectId: string, toolId: string, operation: string): boolean {
++    return this.db
++      .select()
++      .from(projectToolPermissions)
++      .where(and(eq(projectToolPermissions.projectId, projectId), eq(projectToolPermissions.toolId, toolId), eq(projectToolPermissions.operation, operation)))
++      .get() !== undefined;
++  }
++
++  grantProjectToolPermission(projectId: string, toolId: string, operation: string): ProjectToolPermissionRecord {
++    if (!this.getProject(projectId)) throw new Error("Project not found");
++    const now = Date.now();
++    const existing = this.db
++      .select()
++      .from(projectToolPermissions)
++      .where(and(eq(projectToolPermissions.projectId, projectId), eq(projectToolPermissions.toolId, toolId), eq(projectToolPermissions.operation, operation)))
++      .get();
++    const id = existing?.id ?? randomUUID();
++    this.db
++      .insert(projectToolPermissions)
++      .values({ id, projectId, toolId, operation, createdAt: existing?.createdAt ?? now, updatedAt: now })
++      .onConflictDoUpdate({
++        target: [projectToolPermissions.projectId, projectToolPermissions.toolId, projectToolPermissions.operation],
++        set: { updatedAt: now },
++      })
++      .run();
++    return this.listProjectToolPermissions(projectId).find((row) => row.id === id) ?? (() => { throw new Error("Project tool permission not found"); })();
++  }
++
++  revokeProjectToolPermission(projectId: string, toolId: string, operation: string): void {
++    this.db
++      .delete(projectToolPermissions)
++      .where(and(eq(projectToolPermissions.projectId, projectId), eq(projectToolPermissions.toolId, toolId), eq(projectToolPermissions.operation, operation)))
++      .run();
++  }
++
+   listConversations(projectId: string | null, inbox: "avulsas" | "imported" = "avulsas"): ConversationRecord[] {
+     const rows =
+       projectId === null
+@@ -2359,6 +2464,7 @@ export class HubRepos {
+       prompt: string;
+       steps: SkillRecord["steps"];
+       defaultMentions: SkillRecord["defaultMentions"];
++      allowedTools?: SkillRecord["allowedTools"];
+     }[],
+   ): void {
+     const seeded = this.db.select().from(settings).where(eq(settings.key, SKILL_FACTORY_SEEDED_KEY)).get();
+@@ -2378,6 +2484,7 @@ export class HubRepos {
+         preferredModel: item.preferredModel,
+         defaultMentions: item.defaultMentions,
+         steps: item.steps,
++        allowedTools: item.allowedTools ?? [],
+         factoryId: item.factoryId,
+       });
+     }
+@@ -2400,6 +2507,7 @@ export class HubRepos {
+     preferredModel?: string | null;
+     defaultMentions: SkillRecord["defaultMentions"];
+     steps: SkillRecord["steps"];
++    allowedTools?: SkillRecord["allowedTools"];
+     factoryId?: string | null;
+   }): SkillRecord {
+     const id = randomUUID();
+@@ -2449,6 +2557,7 @@ export class HubRepos {
+       preferredModel?: string | null;
+       defaultMentions?: SkillRecord["defaultMentions"];
+       steps?: SkillRecord["steps"];
++      allowedTools?: SkillRecord["allowedTools"];
+     },
+   ): SkillRecord {
+     const existing = this.getSkill(id);
+@@ -2463,6 +2572,7 @@ export class HubRepos {
+       preferredModel: patch.preferredModel !== undefined ? patch.preferredModel : existing.preferredModel,
+       defaultMentions: patch.defaultMentions ?? existing.defaultMentions,
+       steps: patch.steps ?? existing.steps,
++      allowedTools: patch.allowedTools ?? existing.allowedTools,
+     };
+     this.db
+       .update(skills)
+@@ -2844,14 +2954,15 @@ export class HubRepos {
+     prompt: string;
+     steps: SkillRecord["steps"];
+     defaultMentions: SkillRecord["defaultMentions"];
++    allowedTools?: SkillRecord["allowedTools"];
+   }): string {
+     return JSON.stringify({
+-      version: 1,
++      version: 2,
+       kind: "skill",
+       prompt: input.prompt.slice(0, 16_000),
+       steps: input.steps.slice(0, 12),
+       defaultMentions: input.defaultMentions.slice(0, 8),
+-      tools: [],
++      allowedTools: (input.allowedTools ?? []).slice(0, 8),
+     });
+   }
+ 
+@@ -2864,7 +2975,9 @@ export class HubRepos {
+       prompt: string;
+       steps: SkillRecord["steps"];
+       defaultMentions: SkillRecord["defaultMentions"];
+-    } = { prompt: "", steps: [], defaultMentions: [] };
++      allowedTools: SkillRecord["allowedTools"];
++      contractVersion: 1 | 2;
++    } = { prompt: "", steps: [], defaultMentions: [], allowedTools: [], contractVersion: 1 };
+     try {
+       const parsed: unknown = JSON.parse(decryptUtf8(row.definitionCipher, this.masterKey));
+       if (
+@@ -2903,10 +3016,18 @@ export class HubRepos {
+                   typeof item.query === "string",
+               ),
+           ),
++          allowedTools:
++            "allowedTools" in parsed && Array.isArray(parsed.allowedTools)
++              ? parsed.allowedTools.filter(
++                  (item): item is SkillRecord["allowedTools"][number] =>
++                    Boolean(item && typeof item === "object" && "toolId" in item && "operation" in item && (item as { toolId?: unknown }).toolId === "project-filesystem.read-file" && (item as { operation?: unknown }).operation === "read"),
++                )
++              : [],
++          contractVersion: "version" in parsed && parsed.version === 2 ? 2 : 1,
+         };
+       }
+     } catch {
+-      definition = { prompt: "", steps: [], defaultMentions: [] };
++      definition = { prompt: "", steps: [], defaultMentions: [], allowedTools: [], contractVersion: 1 };
+     }
+     return {
+       id: row.id,
+@@ -2917,8 +3038,9 @@ export class HubRepos {
+       preferredModel: row.preferredModel ?? null,
+       defaultMentions: definition.defaultMentions,
+       steps: definition.steps,
++      allowedTools: definition.allowedTools,
+       factoryId: row.factoryId ?? null,
+-      contractVersion: 1,
++      contractVersion: definition.contractVersion,
+       createdAt: iso(row.createdAt),
+       updatedAt: iso(row.updatedAt),
+     };
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index f2e0d90..1647725 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -24,9 +24,18 @@ export {
+   type HubPlaygroundApi,
+   type HubArtifactsApi,
+   type HubSkillsApi,
++  type HubToolsApi,
+   type HubWindowApi,
+   type HubQuickAiApi,
+ } from "./hub-api";
++export {
++  TOOL_ID_PROJECT_FILESYSTEM_READ,
++  toolIdSchema,
++  toolEffectSchema,
++  toolActivityStatusSchema,
++  skillAllowedToolSchema,
++  type SkillAllowedTool,
++} from "./tools";
+ export {
+   evaluateSpendCaps,
+   evaluatePlaygroundCaps,
+@@ -106,9 +115,12 @@ export {
+   SKILL_CONTRACT_VERSION,
+   SKILL_FOLDERS,
+   skillContractV1Schema,
++  skillContractV2Schema,
+   skillDefaultMentionSchema,
+   skillStepSchema,
+   type SkillContractV1,
++  type SkillContractV2,
++  type SkillContract,
+   type SkillDefaultMention,
+   type SkillFolder,
+   type SkillStep,
+@@ -218,6 +230,13 @@ export {
+   workspaceSetTaskDoneInputSchema,
+   projectCreateInputSchema,
+   projectDtoSchema,
++  toolProjectStateSchema,
++  toolProjectGetInputSchema,
++  toolProjectRootPickResultSchema,
++  toolReadRequestInputSchema,
++  toolActivityDtoSchema,
++  toolReadRequestResultSchema,
++  toolActivityResultSchema,
+   projectListResultSchema,
+   projectUpdateInputSchema,
+   searchHitSchema,
+@@ -321,6 +340,12 @@ export {
+   type PacketPreviewResult,
+   type ProjectCreateInput,
+   type ProjectDto,
++  type ToolProjectState,
++  type ToolProjectGetInput,
++  type ToolProjectRootPickResult,
++  type ToolReadRequestInput,
++  type ToolActivityDto,
++  type ToolReadRequestResult,
+   type ProjectUpdateInput,
+   type ProviderDto,
+   type SearchHit,
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index 85e7b4a..4012483 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -32,6 +32,8 @@ import {
+   skillCreateInputSchema,
+   skillDtoSchema,
+   conversationWorkspaceDtoSchema,
++  toolReadRequestInputSchema,
++  toolReadRequestResultSchema,
+ } from "./ipc-schemas";
+ 
+ describe("emptyIpcPayloadSchema", () => {
+@@ -493,8 +495,8 @@ describe("wave 16 artifact contracts", () => {
+   });
+ });
+ 
+-describe("wave 17 skill contracts", () => {
+-  it("accepts a skill dto and rejects tools on create", () => {
++describe("wave 17/22 skill contracts", () => {
++  it("keeps v1 DTOs readable and permits only allowlisted tools on create", () => {
+     const dto = {
+       id: "11111111-1111-4111-8111-111111111111",
+       folder: "development",
+@@ -522,5 +524,34 @@ describe("wave 17 skill contracts", () => {
+         steps: [{ id: "one", title: "One", section: "First section." }],
+       }).steps,
+     ).toHaveLength(1);
++    expect(() => skillCreateInputSchema.parse({ folder: "development", title: "Custom", description: "A custom skill", prompt: "Do the work", preferredModel: null, defaultMentions: [], steps: [], allowedTools: [{ toolId: "shell", operation: "read" }] })).toThrow();
++  });
++});
++
++describe("wave 22 tool IPC contracts", () => {
++  it("accepts only a bounded relative project path and a redacted completed activity", () => {
++    const input = {
++      projectId: "11111111-1111-4111-8111-111111111111",
++      relativePath: "docs/README.md",
++    };
++    expect(toolReadRequestInputSchema.parse(input)).toEqual(input);
++    expect(() => toolReadRequestInputSchema.parse({ ...input, extra: "secret" })).toThrow();
++    expect(
++      toolReadRequestResultSchema.parse({
++        kind: "completed",
++        content: "safe output",
++        activity: {
++          id: "22222222-2222-4222-8222-222222222222",
++          projectId: input.projectId,
++          toolId: "project-filesystem.read-file",
++          operation: "read",
++          effect: "read",
++          status: "completed",
++          argsSummary: "path: docs/README.md",
++          resultSummary: "README.md",
++          createdAt: "2026-09-21T00:00:00.000Z",
++        },
++      }).kind,
++    ).toBe("completed");
+   });
+ });
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index 91447e3..6815b17 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -13,6 +13,7 @@ import {
+   packetSliceSchema,
+   portablePacketOriginSchema,
+ } from "./portable-packet";
++import { skillAllowedToolSchema, toolActivityStatusSchema, toolEffectSchema, toolIdSchema } from "./tools";
+ 
+ export const spendCapScopeSchema = z.enum(["request", "day", "global"]);
+ export const capBlockScopeSchema = z.enum(["request", "day", "global", "project", "provider"]);
+@@ -74,6 +75,48 @@ export const projectDtoSchema = z.object({
+ 
+ export type ProjectDto = z.infer<typeof projectDtoSchema>;
+ 
++export const toolProjectStateSchema = z.object({
++  projectId: z.string().uuid(),
++  rootLabel: z.string().min(1).max(260).nullable(),
++  allowedTools: z.array(toolIdSchema).max(16),
++}).strict();
++export type ToolProjectState = z.infer<typeof toolProjectStateSchema>;
++
++export const toolProjectGetInputSchema = z.object({ projectId: z.string().uuid() }).strict();
++export type ToolProjectGetInput = z.infer<typeof toolProjectGetInputSchema>;
++
++export const toolProjectRootPickResultSchema = z.discriminatedUnion("status", [
++  toolProjectStateSchema.extend({ status: z.literal("selected") }).strict(),
++  z.object({ status: z.literal("cancelled") }).strict(),
++]);
++export type ToolProjectRootPickResult = z.infer<typeof toolProjectRootPickResultSchema>;
++
++export const toolReadRequestInputSchema = z.object({
++  projectId: z.string().uuid(),
++  relativePath: z.string().min(1).max(1024),
++}).strict();
++export type ToolReadRequestInput = z.infer<typeof toolReadRequestInputSchema>;
++
++export const toolActivityDtoSchema = z.object({
++  id: z.string().uuid(),
++  projectId: z.string().uuid(),
++  toolId: toolIdSchema,
++  operation: z.literal("read"),
++  effect: toolEffectSchema,
++  status: toolActivityStatusSchema,
++  argsSummary: z.string().max(200),
++  resultSummary: z.string().max(260).nullable(),
++  createdAt: isoTimestampSchema,
++}).strict();
++export type ToolActivityDto = z.infer<typeof toolActivityDtoSchema>;
++
++export const toolReadRequestResultSchema = z.discriminatedUnion("kind", [
++  z.object({ kind: z.literal("denied"), activity: toolActivityDtoSchema }).strict(),
++  z.object({ kind: z.literal("completed"), activity: toolActivityDtoSchema, content: z.string().max(16_000) }).strict(),
++]);
++export type ToolReadRequestResult = z.infer<typeof toolReadRequestResultSchema>;
++export const toolActivityResultSchema = toolActivityDtoSchema.nullable();
++
+ export const projectListResultSchema = z.array(projectDtoSchema);
+ 
+ const projectFieldsSchema = z.object({
+@@ -1230,8 +1273,9 @@ export const skillDtoSchema = z
+     preferredModel: z.string().min(1).max(128).nullable(),
+     defaultMentions: z.array(skillDefaultMentionDtoSchema).max(8),
+     steps: z.array(skillStepDtoSchema).max(12),
++    allowedTools: z.array(skillAllowedToolSchema).max(8).optional(),
+     factoryId: z.string().min(1).max(40).nullable(),
+-    contractVersion: z.literal(1),
++    contractVersion: z.union([z.literal(1), z.literal(2)]),
+     createdAt: isoTimestampSchema,
+     updatedAt: isoTimestampSchema,
+   })
+@@ -1250,6 +1294,7 @@ export const skillCreateInputSchema = z
+     preferredModel: z.string().trim().min(1).max(128).nullable(),
+     defaultMentions: z.array(skillDefaultMentionDtoSchema).max(8),
+     steps: z.array(skillStepDtoSchema).max(12),
++    allowedTools: z.array(skillAllowedToolSchema).max(8).optional(),
+   })
+   .strict();
+ 
+@@ -1265,6 +1310,7 @@ export const skillUpdateInputSchema = z
+     preferredModel: z.string().trim().min(1).max(128).nullable().optional(),
+     defaultMentions: z.array(skillDefaultMentionDtoSchema).max(8).optional(),
+     steps: z.array(skillStepDtoSchema).max(12).optional(),
++    allowedTools: z.array(skillAllowedToolSchema).max(8).optional(),
+   })
+   .strict();
+ 
+diff --git a/apps/desktop/src/main/tools.ts b/apps/desktop/src/main/tools.ts
+new file mode 100644
+index 0000000..0e701e2
+--- /dev/null
++++ b/apps/desktop/src/main/tools.ts
+@@ -0,0 +1,85 @@
++import { basename } from "node:path";
++import { BrowserWindow, dialog, type OpenDialogOptions, type WebContents } from "electron";
++import { ToolRouter, type ToolActivity, type ToolExecutionResult, type ToolPermissionRequest } from "@ai-hub/tools";
++import {
++  TOOL_ID_PROJECT_FILESYSTEM_READ,
++  type ToolProjectRootPickResult,
++  type ToolProjectState,
++  type ToolReadRequestInput,
++  type ToolReadRequestResult,
++} from "@ai-hub/shared";
++import { getHubDatabase } from "./persistence";
++
++const router = new ToolRouter({
++  getProjectToolRoot: (projectId) => getHubDatabase().repos.getProjectToolRoot(projectId),
++  hasProjectToolPermission: (projectId, toolId, operation) =>
++    getHubDatabase().repos.hasProjectToolPermission(projectId, toolId, operation),
++  grantProjectToolPermission: (projectId, toolId, operation) => {
++    getHubDatabase().repos.grantProjectToolPermission(projectId, toolId, operation);
++  },
++});
++let latestActivity: ToolActivity | null = null;
++
++function projectState(projectId: string): ToolProjectState {
++  const root = getHubDatabase().repos.getProjectToolRoot(projectId);
++  return {
++    projectId,
++    rootLabel: root ? basename(root.rootPath) : null,
++    allowedTools: getHubDatabase().repos.hasProjectToolPermission(projectId, TOOL_ID_PROJECT_FILESYSTEM_READ, "read")
++      ? [TOOL_ID_PROJECT_FILESYSTEM_READ]
++      : [],
++  };
++}
++
++function isPermission(value: ToolExecutionResult | ToolPermissionRequest): value is ToolPermissionRequest {
++  return "requiresDestructiveConfirmation" in value;
++}
++
++function isActivity(value: ToolExecutionResult | ToolActivity): value is ToolActivity {
++  return "status" in value && !("output" in value);
++}
++
++function completed(result: ToolExecutionResult): { kind: "completed"; activity: ToolActivity; content: string } {
++  return { kind: "completed", activity: result.activity, content: result.output };
++}
++
++export function getToolProjectState(projectId: string): ToolProjectState {
++  return projectState(projectId);
++}
++
++export async function pickProjectToolRoot(projectId: string, sender: Electron.WebContents): Promise<ToolProjectRootPickResult> {
++  if (!getHubDatabase().repos.getProject(projectId)) throw new Error("Project not found");
++  const parent = BrowserWindow.fromWebContents(sender);
++  const options: OpenDialogOptions = { properties: ["openDirectory", "createDirectory"] };
++  const choice = parent ? await dialog.showOpenDialog(parent, options) : await dialog.showOpenDialog(options);
++  if (choice.canceled || !choice.filePaths[0]) return { status: "cancelled" };
++  getHubDatabase().repos.setProjectToolRoot(projectId, choice.filePaths[0]);
++  return { status: "selected", ...projectState(projectId) };
++}
++
++function record(result: ToolExecutionResult | ToolActivity): void {
++  latestActivity = isActivity(result) ? result : result.activity;
++}
++
++export function getLatestToolActivity(): ToolActivity | null { return latestActivity; }
++
++export async function requestToolRead(input: ToolReadRequestInput, sender: WebContents): Promise<ToolReadRequestResult> {
++  const result = await router.request({ projectId: input.projectId, toolId: TOOL_ID_PROJECT_FILESYSTEM_READ, relativePath: input.relativePath }, sender.id);
++  if (!isPermission(result)) { record(result); return completed(result); }
++  const parent = BrowserWindow.fromWebContents(sender);
++  const portuguese = getHubDatabase().repos.getAppearance().locale === "pt-BR";
++  const options = {
++    type: "question" as const,
++    buttons: portuguese ? ["Permitir uma vez", "Sempre neste projeto", "Negar"] : ["Allow once", "Always in this project", "Deny"],
++    defaultId: 0,
++    cancelId: 2,
++    message: portuguese ? "Permissão necessária" : "Permission required",
++    detail: portuguese ? `${result.toolId} solicita acesso de leitura a ${result.argsSummary}.` : `${result.toolId} requests read access to ${result.argsSummary}.`,
++    noLink: true,
++  };
++  const answer = parent ? await dialog.showMessageBox(parent, options) : await dialog.showMessageBox(options);
++  const decision = answer.response === 0 ? "allow_once" : answer.response === 1 ? "allow_project" : "deny";
++  const settled = await router.decide(result.id, decision, sender.id);
++  record(settled);
++  return isActivity(settled) ? { kind: "denied", activity: settled } : completed(settled);
++}
+diff --git a/docs/ADR/ADR-W22-001-main-owned-mcp-tool-router.md b/docs/ADR/ADR-W22-001-main-owned-mcp-tool-router.md
+new file mode 100644
+index 0000000..8b081c9
+--- /dev/null
++++ b/docs/ADR/ADR-W22-001-main-owned-mcp-tool-router.md
+@@ -0,0 +1,33 @@
++# ADR-W22-001-main-owned-mcp-tool-router
++
++- **Status:** accepted
++- **Onda:** W22
++- **Data:** 2026-09-21
++- **Deciders:** Codex / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++MCP usa rede, stdio e, em conectores locais, filesystem. Expor qualquer um desses recursos ao renderer quebraria a fronteira de confiança do Hub.
++
++## Decisão
++
++`packages/tools` concentra o Tool Router e clientes JSON-RPC MCP para stdio e SSE. O processo main é o único chamador desses clientes; preload expõe apenas DTOs Zod de pedido e atividade redigida. A decisão acontece no diálogo nativo do main, sem canal de aprovação no renderer. O conector de referência de filesystem também é invocado pelo método MCP `tools/call` no main.
++
++## Alternativas consideradas
++
++- **Renderer como cliente MCP:** recusada por expor stdio/rede e por permitir bypass de permissões.
++- **Tool calling nativo em todos os adapters:** adiado; ampliaria providers e anteciparia o loop da W23.
++
++## Consequências
++
++- Mantém o renderer sem Node, filesystem, processos ou URLs MCP.
++- A W22 oferece ação de leitura explicitamente iniciada pelo usuário; Assist não ganha loop autônomo.
++- Configuração de servidores MCP externos e autenticação dedicada podem evoluir sem mudar a fronteira.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 22)
++- `docs/reviews/W22/REVIEW.md`
++- `docs/ADR/ADR-W01-003-keytar-and-ipc-secrets.md`
+diff --git a/docs/ADR/ADR-W22-002-project-scoped-tool-permissions.md b/docs/ADR/ADR-W22-002-project-scoped-tool-permissions.md
+new file mode 100644
+index 0000000..78bf9c7
+--- /dev/null
++++ b/docs/ADR/ADR-W22-002-project-scoped-tool-permissions.md
+@@ -0,0 +1,31 @@
++# ADR-W22-002-project-scoped-tool-permissions
++
++- **Status:** accepted
++- **Onda:** W22
++- **Data:** 2026-09-21
++- **Deciders:** Codex / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++Uma autorização global faria uma ferramenta de um projeto ler outro projeto. A confirmação precisa ser explícita e não pode ser reutilizada por outro renderer ou pedido tardio.
++
++## Decisão
++
++Permissões persistentes são grants de somente leitura identificados por `project_id`, `tool_id` e operação. A confirmação acontece em diálogo nativo do processo main; o renderer não possui API para aprová-la. `allow_once` existe apenas em memória, com TTL e vínculo ao `WebContents`; `deny` não executa nem persiste. Trocar a raiz revoga os grants do projeto. Efeitos write, destructive e unknown não podem receber grant persistente e exigem confirmação adicional.
++
++## Alternativas consideradas
++
++- **Allowlist global por ferramenta:** recusada por vazar poder entre projetos.
++- **Persistir deny:** recusada; uma negativa é decisão pontual e não deve impedir uma solicitação futura compreensível.
++
++## Consequências
++
++- Grants sobrevivem reinício sem registrar conteúdo ou argumentos de tool.
++- A W23 reutiliza a mesma política, mas não recebe autorização implícita.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 22)
++- `docs/reviews/W22/REVIEW.md`
+diff --git a/docs/ADR/ADR-W22-003-realpath-scoped-filesystem-connector.md b/docs/ADR/ADR-W22-003-realpath-scoped-filesystem-connector.md
+new file mode 100644
+index 0000000..1b16ca8
+--- /dev/null
++++ b/docs/ADR/ADR-W22-003-realpath-scoped-filesystem-connector.md
+@@ -0,0 +1,31 @@
++# ADR-W22-003-realpath-scoped-filesystem-connector
++
++- **Status:** accepted
++- **Onda:** W22
++- **Data:** 2026-09-21
++- **Deciders:** Codex / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++Uma string de path relativo não basta para conter junctions e symlinks. A raiz do projeto também é dado local sensível e não deve ir em texto claro ao SQLite nem ao renderer.
++
++## Decisão
++
++A raiz é cifrada em `project_tool_roots`. O connector aceita apenas paths relativos sem drive, absoluto, NUL ou `..`; resolve `realpath` da raiz e do alvo, abre o alvo sem seguir symlink quando a plataforma oferece `O_NOFOLLOW`, revalida o path após abrir e lê no máximo 64 KiB + 1 byte pelo handle. A saída é redigida e a UI recebe apenas o nome da raiz/atividade resumida.
++
++## Alternativas consideradas
++
++- **Checagem textual de prefixo:** recusada por permitir sibling prefix e escape por symlink.
++- **Raiz em plaintext no projeto:** recusada por aumentar a exposição de metadados locais.
++
++## Consequências
++
++- A leitura usa handle limitado e mitiga a troca de path entre validação e leitura; `O_NOFOLLOW` reforça onde suportado.
++- Arquivos inexistentes, diretórios e escapes falham antes de qualquer conteúdo ser retornado.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 22)
++- `docs/reviews/W22/REVIEW.md`
+diff --git "a/packages/tools\\tsconfig.json" "b/packages/tools\\tsconfig.json"
+new file mode 100644
+index 0000000..00c5dc2
+--- /dev/null
++++ "b/packages/tools\\tsconfig.json"
+@@ -0,0 +1,6 @@
++{
++  "extends": "../../tsconfig.base.json",
++  "compilerOptions": { "noEmit": true, "types": ["node"] },
++  "include": ["src"],
++  "exclude": ["src/**/*.test.ts"]
++}
+diff --git "a/packages/tools\\src\\types.ts" "b/packages/tools\\src\\types.ts"
+new file mode 100644
+index 0000000..71d20ef
+--- /dev/null
++++ "b/packages/tools\\src\\types.ts"
+@@ -0,0 +1,46 @@
++export const PROJECT_FILESYSTEM_TOOL_ID = "project-filesystem.read-file" as const;
++export const PROJECT_FILESYSTEM_OPERATION = "read" as const;
++
++export type ToolEffect = "read" | "write" | "destructive" | "unknown";
++export type PermissionDecision = "allow_once" | "allow_project" | "deny";
++export type ToolActivityStatus = "permission_required" | "denied" | "running" | "completed" | "failed";
++
++export interface ToolActivity {
++  id: string;
++  projectId: string;
++  toolId: typeof PROJECT_FILESYSTEM_TOOL_ID;
++  operation: typeof PROJECT_FILESYSTEM_OPERATION;
++  effect: ToolEffect;
++  status: ToolActivityStatus;
++  argsSummary: string;
++  resultSummary: string | null;
++  createdAt: string;
++}
++
++export interface ToolPermissionRequest {
++  id: string;
++  projectId: string;
++  toolId: typeof PROJECT_FILESYSTEM_TOOL_ID;
++  operation: typeof PROJECT_FILESYSTEM_OPERATION;
++  effect: ToolEffect;
++  argsSummary: string;
++  requiresDestructiveConfirmation: boolean;
++  createdAt: string;
++}
++
++export interface ToolExecutionRequest {
++  projectId: string;
++  toolId: typeof PROJECT_FILESYSTEM_TOOL_ID;
++  relativePath: string;
++}
++
++export interface ToolExecutionResult {
++  activity: ToolActivity;
++  output: string;
++}
++
++export interface ProjectToolStore {
++  getProjectToolRoot(projectId: string): { rootPath: string } | null;
++  hasProjectToolPermission(projectId: string, toolId: string, operation: string): boolean;
++  grantProjectToolPermission(projectId: string, toolId: string, operation: string): void;
++}
+diff --git "a/packages/tools\\src\\router.ts" "b/packages/tools\\src\\router.ts"
+new file mode 100644
+index 0000000..d953f74
+--- /dev/null
++++ "b/packages/tools\\src\\router.ts"
+@@ -0,0 +1,60 @@
++import { randomUUID } from "node:crypto";
++import { redactSecrets } from "@ai-hub/security";
++import { ProjectFilesystemMcpClient } from "./mcp";
++import { PROJECT_FILESYSTEM_OPERATION, PROJECT_FILESYSTEM_TOOL_ID, type PermissionDecision, type ProjectToolStore, type ToolActivity, type ToolExecutionRequest, type ToolExecutionResult, type ToolPermissionRequest } from "./types";
++
++const REQUEST_TTL_MS = 5 * 60_000;
++const MAX_OUTPUT_CHARS = 16_000;
++
++interface PendingRequest { request: ToolExecutionRequest; permission: ToolPermissionRequest; requesterId: number; expiresAt: number; }
++
++export class ToolRouter {
++  private readonly pending = new Map<string, PendingRequest>();
++  constructor(private readonly store: ProjectToolStore) {}
++
++  async request(request: ToolExecutionRequest, requesterId: number): Promise<ToolExecutionResult | ToolPermissionRequest> {
++    this.prune();
++    if (this.store.hasProjectToolPermission(request.projectId, request.toolId, PROJECT_FILESYSTEM_OPERATION)) return this.execute(request);
++    const permission: ToolPermissionRequest = {
++      id: randomUUID(), projectId: request.projectId, toolId: request.toolId, operation: PROJECT_FILESYSTEM_OPERATION,
++      effect: "read", argsSummary: `path: ${redactSecrets(request.relativePath).slice(0, 180)}`,
++      requiresDestructiveConfirmation: false, createdAt: new Date().toISOString(),
++    };
++    this.pending.set(permission.id, { request, permission, requesterId, expiresAt: Date.now() + REQUEST_TTL_MS });
++    return permission;
++  }
++
++  async decide(id: string, decision: PermissionDecision, requesterId: number, destructiveConfirmed = false): Promise<ToolExecutionResult | ToolActivity> {
++    this.prune();
++    const pending = this.pending.get(id);
++    if (!pending || pending.requesterId !== requesterId) throw new Error("tools:permission_not_found");
++    this.pending.delete(id);
++    if (pending.permission.requiresDestructiveConfirmation && !destructiveConfirmed) throw new Error("tools:destructive_confirmation_required");
++    if (decision === "deny") return this.activity(pending.permission, "denied", null);
++    if (decision === "allow_project" && pending.permission.effect !== "read") throw new Error("tools:persistent_permission_forbidden");
++    if (decision === "allow_project") this.store.grantProjectToolPermission(pending.request.projectId, pending.request.toolId, PROJECT_FILESYSTEM_OPERATION);
++    return this.execute(pending.request);
++  }
++
++  private async execute(request: ToolExecutionRequest): Promise<ToolExecutionResult> {
++    if (request.toolId !== PROJECT_FILESYSTEM_TOOL_ID) throw new Error("tools:not_allowed");
++    const root = this.store.getProjectToolRoot(request.projectId);
++    if (!root) throw new Error("tools:root_not_configured");
++    const activity = this.activity({ projectId: request.projectId, toolId: request.toolId, operation: PROJECT_FILESYSTEM_OPERATION, effect: "read", argsSummary: `path: ${redactSecrets(request.relativePath).slice(0, 180)}`, id: randomUUID(), createdAt: new Date().toISOString() }, "running", null);
++    try {
++      const raw = await new ProjectFilesystemMcpClient(root.rootPath).request({ method: "tools/call", params: { name: "read_file", arguments: { path: request.relativePath } } });
++      if (!raw || typeof raw !== "object" || typeof (raw as { content?: unknown }).content !== "string" || typeof (raw as { fileName?: unknown }).fileName !== "string" || typeof (raw as { truncated?: unknown }).truncated !== "boolean") throw new Error("tools:mcp_invalid_response");
++      const file = raw as { content: string; fileName: string; truncated: boolean };
++      const output = redactSecrets(file.content).slice(0, MAX_OUTPUT_CHARS);
++      return { activity: { ...activity, status: "completed", resultSummary: `${file.fileName}${file.truncated ? " (truncated)" : ""}` }, output };
++    } catch (error) {
++      const code = error instanceof Error ? error.message : "tools:failed";
++      throw new Error(code);
++    }
++  }
++
++  private activity(request: Pick<ToolPermissionRequest, "id" | "projectId" | "toolId" | "operation" | "effect" | "argsSummary" | "createdAt">, status: ToolActivity["status"], resultSummary: string | null): ToolActivity {
++    return { id: request.id, projectId: request.projectId, toolId: request.toolId, operation: request.operation, effect: request.effect, status, argsSummary: request.argsSummary, resultSummary, createdAt: request.createdAt };
++  }
++  private prune(): void { const now = Date.now(); for (const [id, pending] of this.pending) if (pending.expiresAt <= now) this.pending.delete(id); }
++}
+diff --git "a/packages/tools\\src\\router.test.ts" "b/packages/tools\\src\\router.test.ts"
+new file mode 100644
+index 0000000..951683c
+--- /dev/null
++++ "b/packages/tools\\src\\router.test.ts"
+@@ -0,0 +1,50 @@
++import { mkdtemp, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { describe, expect, it } from "vitest";
++import { ToolRouter } from "./router";
++import { PROJECT_FILESYSTEM_TOOL_ID, type ProjectToolStore } from "./types";
++
++function store(rootPath: string): ProjectToolStore & { grants: Set<string> } {
++  const grants = new Set<string>();
++  return {
++    grants,
++    getProjectToolRoot: () => ({ rootPath }),
++    hasProjectToolPermission: (projectId, toolId, operation) => grants.has(`${projectId}:${toolId}:${operation}`),
++    grantProjectToolPermission: (projectId, toolId, operation) => { grants.add(`${projectId}:${toolId}:${operation}`); },
++  };
++}
++
++describe("ToolRouter permission center", () => {
++  it("does not execute on deny, consumes one-time approval, and scopes persistent grants to a project", async () => {
++    const root = await mkdtemp(join(tmpdir(), "ai-hub-router-"));
++    try {
++      await writeFile(join(root, "readme.txt"), "safe output");
++      const backing = store(root);
++      const router = new ToolRouter(backing);
++      const requested = await router.request({ projectId: "project-a", toolId: PROJECT_FILESYSTEM_TOOL_ID, relativePath: "readme.txt" }, 10);
++      if (!("requiresDestructiveConfirmation" in requested)) throw new Error("Expected permission");
++      await expect(router.decide(requested.id, "deny", 10)).resolves.toMatchObject({ status: "denied" });
++      const once = await router.request({ projectId: "project-a", toolId: PROJECT_FILESYSTEM_TOOL_ID, relativePath: "readme.txt" }, 10);
++      if (!("requiresDestructiveConfirmation" in once)) throw new Error("Expected permission");
++      await expect(router.decide(once.id, "allow_once", 10)).resolves.toMatchObject({ output: "safe output" });
++      expect(backing.grants.size).toBe(0);
++      const always = await router.request({ projectId: "project-a", toolId: PROJECT_FILESYSTEM_TOOL_ID, relativePath: "readme.txt" }, 10);
++      if (!("requiresDestructiveConfirmation" in always)) throw new Error("Expected permission");
++      await router.decide(always.id, "allow_project", 10);
++      await expect(router.request({ projectId: "project-a", toolId: PROJECT_FILESYSTEM_TOOL_ID, relativePath: "readme.txt" }, 10)).resolves.toMatchObject({ output: "safe output" });
++      await expect(router.request({ projectId: "project-b", toolId: PROJECT_FILESYSTEM_TOOL_ID, relativePath: "readme.txt" }, 10)).resolves.toMatchObject({ requiresDestructiveConfirmation: false });
++    } finally { await rm(root, { recursive: true, force: true }); }
++  });
++
++  it("binds a pending permission request to its renderer", async () => {
++    const root = await mkdtemp(join(tmpdir(), "ai-hub-router-"));
++    try {
++      await writeFile(join(root, "readme.txt"), "safe output");
++      const router = new ToolRouter(store(root));
++      const requested = await router.request({ projectId: "project-a", toolId: PROJECT_FILESYSTEM_TOOL_ID, relativePath: "readme.txt" }, 10);
++      if (!("requiresDestructiveConfirmation" in requested)) throw new Error("Expected permission");
++      await expect(router.decide(requested.id, "allow_once", 11)).rejects.toThrow("tools:permission_not_found");
++    } finally { await rm(root, { recursive: true, force: true }); }
++  });
++});
+diff --git "a/packages/tools\\src\\mcp.ts" "b/packages/tools\\src\\mcp.ts"
+new file mode 100644
+index 0000000..441804f
+--- /dev/null
++++ "b/packages/tools\\src\\mcp.ts"
+@@ -0,0 +1,121 @@
++import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
++import { readScopedFile } from "./filesystem";
++
++export interface McpRequest { method: string; params?: Record<string, unknown>; }
++export interface McpResponse { id: number; result?: unknown; error?: { code: number; message: string }; }
++export interface McpClient { request(request: McpRequest, signal?: AbortSignal): Promise<unknown>; close(): Promise<void>; }
++export const MCP_REQUEST_TIMEOUT_MS = 15_000;
++const MAX_MCP_RESPONSE_BYTES = 256 * 1024;
++
++/** Main-only reference MCP connector for a project's scoped filesystem. */
++export class ProjectFilesystemMcpClient implements McpClient {
++  constructor(private readonly rootPath: string) {}
++  async request(request: McpRequest, signal?: AbortSignal): Promise<unknown> {
++    if (signal?.aborted) throw new Error("tools:aborted");
++    if (request.method !== "tools/call" || request.params?.name !== "read_file") throw new Error("tools:mcp_method_not_found");
++    const args = request.params.arguments;
++    if (!args || typeof args !== "object" || typeof (args as { path?: unknown }).path !== "string") throw new Error("tools:mcp_invalid_params");
++    const file = await readScopedFile(this.rootPath, (args as { path: string }).path);
++    return { content: file.content, fileName: file.fileName, truncated: file.truncated };
++  }
++  async close(): Promise<void> {}
++}
++
++function parseJsonRpc(value: string): McpResponse | null {
++  try {
++    const parsed: unknown = JSON.parse(value);
++    if (!parsed || typeof parsed !== "object" || !("id" in parsed) || typeof (parsed as { id?: unknown }).id !== "number") return null;
++    return parsed as McpResponse;
++  } catch { return null; }
++}
++
++export class StdioMcpClient implements McpClient {
++  private readonly child: ChildProcessWithoutNullStreams;
++  private nextId = 1;
++  private buffer = "";
++  private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
++
++  constructor(command: string, args: readonly string[]) {
++    this.child = spawn(command, [...args], { shell: false, windowsHide: true, env: { PATH: process.env.PATH ?? "" } });
++    this.child.stdout.on("data", (chunk: Buffer) => this.receive(chunk.toString("utf8")));
++    this.child.stderr.resume();
++    this.child.once("error", () => this.rejectAll(new Error("tools:mcp_unavailable")));
++    this.child.once("exit", () => this.rejectAll(new Error("tools:mcp_disconnected")));
++  }
++
++  async request(request: McpRequest, signal?: AbortSignal): Promise<unknown> {
++    if (signal?.aborted) throw new Error("tools:aborted");
++    const id = this.nextId++;
++    const payload = `${JSON.stringify({ jsonrpc: "2.0", id, ...request })}\n`;
++    return new Promise<unknown>((resolve, reject) => {
++      const timeout = setTimeout(() => { this.pending.delete(id); reject(new Error("tools:mcp_timeout")); }, MCP_REQUEST_TIMEOUT_MS);
++      const abort = (): void => { clearTimeout(timeout); this.pending.delete(id); reject(new Error("tools:aborted")); };
++      signal?.addEventListener("abort", abort, { once: true });
++      this.pending.set(id, { resolve: (value) => { clearTimeout(timeout); signal?.removeEventListener("abort", abort); resolve(value); }, reject: (error) => { clearTimeout(timeout); signal?.removeEventListener("abort", abort); reject(error); } });
++      this.child.stdin.write(payload, (error) => { if (error) { clearTimeout(timeout); this.pending.delete(id); reject(new Error("tools:mcp_unavailable")); } });
++    });
++  }
++
++  async close(): Promise<void> { this.rejectAll(new Error("tools:mcp_closed")); this.child.kill(); }
++
++  private receive(text: string): void {
++    this.buffer += text;
++    if (Buffer.byteLength(this.buffer, "utf8") > MAX_MCP_RESPONSE_BYTES) { this.rejectAll(new Error("tools:mcp_response_too_large")); this.child.kill(); return; }
++    const lines = this.buffer.split("\n");
++    this.buffer = lines.pop() ?? "";
++    for (const line of lines) {
++      const response = parseJsonRpc(line);
++      if (!response) continue;
++      const pending = this.pending.get(response.id);
++      if (!pending) continue;
++      this.pending.delete(response.id);
++      if (response.error) pending.reject(new Error(`tools:mcp:${response.error.code}`)); else pending.resolve(response.result);
++    }
++  }
++
++  private rejectAll(error: Error): void { for (const pending of this.pending.values()) pending.reject(error); this.pending.clear(); }
++}
++
++export class SseMcpClient implements McpClient {
++  constructor(private readonly endpoint: URL, private readonly allowInsecureLocalhost = false) {
++    const local = endpoint.hostname === "127.0.0.1" || endpoint.hostname === "localhost" || endpoint.hostname === "::1";
++    if (endpoint.username || endpoint.password || endpoint.search || (endpoint.protocol !== "https:" && !(this.allowInsecureLocalhost && local && endpoint.protocol === "http:"))) throw new Error("tools:unsafe_mcp_url");
++  }
++  async request(request: McpRequest, signal?: AbortSignal): Promise<unknown> {
++    const controller = new AbortController();
++    const timeout = setTimeout(() => controller.abort(), MCP_REQUEST_TIMEOUT_MS);
++    const abort = (): void => controller.abort();
++    signal?.addEventListener("abort", abort, { once: true });
++    try {
++      const response = await fetch(this.endpoint, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, ...request }), signal: controller.signal });
++      if (!response.ok) throw new Error(`tools:mcp_http_${response.status}`);
++      const body = await readBodyLimited(response);
++      const json = response.headers.get("content-type")?.includes("text/event-stream") ? body.split(/\r?\n/).find((line) => line.startsWith("data:"))?.slice(5).trim() : body;
++      const parsed = json ? parseJsonRpc(json) : null;
++      if (!parsed) throw new Error("tools:mcp_invalid_response");
++      if (parsed.error) throw new Error(`tools:mcp:${parsed.error.code}`);
++      return parsed.result;
++    } catch (error) {
++      if (error instanceof Error && error.message.startsWith("tools:")) throw error;
++      throw new Error(signal?.aborted ? "tools:aborted" : "tools:mcp_unavailable");
++    } finally { clearTimeout(timeout); signal?.removeEventListener("abort", abort); }
++  }
++  async close(): Promise<void> {}
++}
++
++async function readBodyLimited(response: Response): Promise<string> {
++  if (!response.body) return "";
++  const reader = response.body.getReader();
++  const chunks: Uint8Array[] = [];
++  let total = 0;
++  try {
++    while (true) {
++      const next = await reader.read();
++      if (next.done) break;
++      total += next.value.byteLength;
++      if (total > MAX_MCP_RESPONSE_BYTES) throw new Error("tools:mcp_response_too_large");
++      chunks.push(next.value);
++    }
++  } finally { reader.releaseLock(); }
++  return new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
++}
+diff --git "a/packages/tools\\src\\mcp.test.ts" "b/packages/tools\\src\\mcp.test.ts"
+new file mode 100644
+index 0000000..cb54f05
+--- /dev/null
++++ "b/packages/tools\\src\\mcp.test.ts"
+@@ -0,0 +1,30 @@
++import { createServer } from "node:http";
++import { once } from "node:events";
++import { describe, expect, it } from "vitest";
++import { SseMcpClient, StdioMcpClient } from "./mcp";
++
++describe("MCP transports", () => {
++  it("uses JSON-RPC over stdio without a shell", async () => {
++    const program = "process.stdin.on('data', b => { for (const line of b.toString().trim().split('\\n')) { const x = JSON.parse(line); process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:x.id,result:{ok:x.method}})+'\\n'); } });";
++    const client = new StdioMcpClient(process.execPath, ["-e", program]);
++    try {
++      await expect(client.request({ method: "tools/list" })).resolves.toEqual({ ok: "tools/list" });
++    } finally { await client.close(); }
++  });
++
++  it("parses a one-shot SSE JSON-RPC response and rejects credential URLs", async () => {
++    const server = createServer((_request, response) => {
++      response.writeHead(200, { "content-type": "text/event-stream" });
++      response.end('data: {"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n\n');
++    });
++    server.listen(0, "127.0.0.1");
++    await once(server, "listening");
++    const address = server.address();
++    if (!address || typeof address === "string") throw new Error("Expected TCP address");
++    const client = new SseMcpClient(new URL(`http://127.0.0.1:${address.port}/mcp`), true);
++    try {
++      await expect(client.request({ method: "tools/list" })).resolves.toEqual({ ok: true });
++      expect(() => new SseMcpClient(new URL(`http://user:secret@127.0.0.1:${address.port}/mcp`))).toThrow("tools:unsafe_mcp_url");
++    } finally { await client.close(); server.close(); }
++  });
++});
+diff --git "a/packages/tools\\src\\index.ts" "b/packages/tools\\src\\index.ts"
+new file mode 100644
+index 0000000..49686f9
+--- /dev/null
++++ "b/packages/tools\\src\\index.ts"
+@@ -0,0 +1,4 @@
++export { assertSafeRelativePath, readScopedFile, MAX_TOOL_FILE_BYTES } from "./filesystem";
++export { ProjectFilesystemMcpClient, StdioMcpClient, SseMcpClient, type McpClient, type McpRequest, type McpResponse } from "./mcp";
++export { ToolRouter } from "./router";
++export { PROJECT_FILESYSTEM_OPERATION, PROJECT_FILESYSTEM_TOOL_ID, type PermissionDecision, type ProjectToolStore, type ToolActivity, type ToolActivityStatus, type ToolEffect, type ToolExecutionRequest, type ToolExecutionResult, type ToolPermissionRequest } from "./types";
+diff --git "a/packages/tools\\src\\filesystem.ts" "b/packages/tools\\src\\filesystem.ts"
+new file mode 100644
+index 0000000..6b74e65
+--- /dev/null
++++ "b/packages/tools\\src\\filesystem.ts"
+@@ -0,0 +1,47 @@
++import { constants } from "node:fs";
++import { open, realpath } from "node:fs/promises";
++import { basename, isAbsolute, relative, resolve, sep } from "node:path";
++
++export const MAX_TOOL_FILE_BYTES = 64 * 1024;
++
++export function assertSafeRelativePath(value: string): string {
++  if (value.length === 0 || value.length > 1024 || value.includes("\0") || isAbsolute(value) || /^[a-z]:[\\/]/i.test(value)) {
++    throw new Error("tools:invalid_path");
++  }
++  const normalized = value.replace(/\\/g, "/");
++  if (normalized.split("/").some((part) => part.length === 0 || part === "." || part === "..")) {
++    throw new Error("tools:invalid_path");
++  }
++  return normalized;
++}
++
++function isWithinRoot(root: string, candidate: string): boolean {
++  const rel = relative(root, candidate);
++  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
++}
++
++export async function readScopedFile(rootPath: string, relativePath: string): Promise<{ content: string; fileName: string; truncated: boolean }> {
++  try {
++    const safePath = assertSafeRelativePath(relativePath);
++    const root = await realpath(rootPath);
++    const candidate = await realpath(resolve(root, safePath));
++    if (!isWithinRoot(root, candidate)) throw new Error("tools:path_outside_root");
++    const handle = await open(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
++    try {
++      const resolvedAfterOpen = await realpath(candidate);
++      if (!isWithinRoot(root, resolvedAfterOpen)) throw new Error("tools:path_outside_root");
++      const info = await handle.stat();
++      if (!info.isFile()) throw new Error("tools:not_a_file");
++      const buffer = Buffer.allocUnsafe(Math.min(info.size, MAX_TOOL_FILE_BYTES + 1));
++      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
++      return {
++        content: buffer.subarray(0, Math.min(bytesRead, MAX_TOOL_FILE_BYTES)).toString("utf8"),
++        fileName: basename(resolvedAfterOpen),
++        truncated: info.size > MAX_TOOL_FILE_BYTES || bytesRead > MAX_TOOL_FILE_BYTES,
++      };
++    } finally { await handle.close(); }
++  } catch (error) {
++    if (error instanceof Error && error.message.startsWith("tools:")) throw error;
++    throw new Error("tools:read_failed");
++  }
++}
+diff --git "a/packages/tools\\src\\filesystem.test.ts" "b/packages/tools\\src\\filesystem.test.ts"
+new file mode 100644
+index 0000000..93580bf
+--- /dev/null
++++ "b/packages/tools\\src\\filesystem.test.ts"
+@@ -0,0 +1,49 @@
++import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { describe, expect, it } from "vitest";
++import { assertSafeRelativePath, MAX_TOOL_FILE_BYTES, readScopedFile } from "./filesystem";
++
++describe("scoped filesystem connector", () => {
++  it("rejects absolute paths, traversal, and Windows drive paths", () => {
++    expect(() => assertSafeRelativePath("../secret.txt")).toThrow("tools:invalid_path");
++    expect(() => assertSafeRelativePath("C:\\secret.txt")).toThrow("tools:invalid_path");
++    expect(() => assertSafeRelativePath("/secret.txt")).toThrow("tools:invalid_path");
++  });
++
++  it("reads only a real file inside the configured root", async () => {
++    const root = await mkdtemp(join(tmpdir(), "ai-hub-tools-"));
++    try {
++      await writeFile(join(root, "safe.txt"), "hello");
++      await expect(readScopedFile(root, "safe.txt")).resolves.toMatchObject({ content: "hello", fileName: "safe.txt" });
++    } finally { await rm(root, { recursive: true, force: true }); }
++  });
++
++  it("does not leak an absolute root when a file is missing", async () => {
++    const root = await mkdtemp(join(tmpdir(), "ai-hub-tools-"));
++    try {
++      await expect(readScopedFile(root, "missing.txt")).rejects.toThrow("tools:read_failed");
++      await expect(readScopedFile(root, "missing.txt")).rejects.not.toThrow(root);
++    } finally { await rm(root, { recursive: true, force: true }); }
++  });
++
++  it("reads only the bounded prefix of a larger file", async () => {
++    const root = await mkdtemp(join(tmpdir(), "ai-hub-tools-"));
++    try {
++      await writeFile(join(root, "large.txt"), "x".repeat(MAX_TOOL_FILE_BYTES + 10));
++      const output = await readScopedFile(root, "large.txt");
++      expect(output.content).toHaveLength(MAX_TOOL_FILE_BYTES);
++      expect(output.truncated).toBe(true);
++    } finally { await rm(root, { recursive: true, force: true }); }
++  });
++
++  it("rejects a symlink that escapes the project root", async () => {
++    const root = await mkdtemp(join(tmpdir(), "ai-hub-tools-root-"));
++    const outside = await mkdtemp(join(tmpdir(), "ai-hub-tools-outside-"));
++    try {
++      await writeFile(join(outside, "secret.txt"), "secret");
++      await symlink(join(outside, "secret.txt"), join(root, "escape.txt"), "file");
++      await expect(readScopedFile(root, "escape.txt")).rejects.toThrow("tools:path_outside_root");
++    } finally { await Promise.all([rm(root, { recursive: true, force: true }), rm(outside, { recursive: true, force: true })]); }
++  });
++});
+diff --git "a/packages/tools\\package.json" "b/packages/tools\\package.json"
+new file mode 100644
+index 0000000..0f59ea9
+--- /dev/null
++++ "b/packages/tools\\package.json"
+@@ -0,0 +1,23 @@
++{
++  "name": "@ai-hub/tools",
++  "version": "0.0.0",
++  "private": true,
++  "type": "module",
++  "exports": {
++    ".": {
++      "types": "./src/index.ts",
++      "default": "./src/index.ts"
++    }
++  },
++  "scripts": {
++    "typecheck": "tsc --noEmit -p tsconfig.json",
++    "lint": "eslint src --max-warnings 0",
++    "test": "vitest run"
++  },
++  "dependencies": {
++    "@ai-hub/security": "workspace:*"
++  },
++  "devDependencies": {
++    "vitest": "^3.2.4"
++  }
++}
