@@ -94,6 +94,10 @@ export const IpcChannel = {
   skillsUpdate: "skills:update",
   skillsRemove: "skills:remove",
   skillsResolve: "skills:resolve",
+  toolsGetProject: "tools:getProject",
+  toolsPickProjectRoot: "tools:pickProjectRoot",
+  toolsRequestRead: "tools:requestRead",
+  toolsGetLatestActivity: "tools:getLatestActivity",
 } as const;
 
 export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
