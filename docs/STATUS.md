@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave 
 
 | Field | Value |
 |---|---|
-| Wave | **W24** |
+| Wave | **W25** |
 | Marco | D — V2 agents + local |
-| State | `review` |
-| Last completed | **W23** |
-| Next action | Run the mandatory W24 independent DoD and trust-boundary reviews. |
+| State | `pending` |
+| Last completed | **W24** |
+| Next action | Start W25 Developer mode only after an explicit request. |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
@@ -54,5 +54,5 @@ None.
 
 | Kind | Path |
 |---|---|
-| Review | `docs/reviews/W23/REVIEW.md` |
-| Latest ADR | `docs/ADR/ADR-W23-002-persisted-bounded-agent-runs.md` |
+| Review | `docs/reviews/W24/REVIEW.md` |
+| Latest ADR | `docs/ADR/ADR-W24-001-persisted-orchestration-graph-and-handoffs.md` |
