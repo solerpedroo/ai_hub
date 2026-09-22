@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave 
 
 | Field | Value |
 |---|---|
-| Wave | **W22** |
-| Marco | C — V1 |
-| State | `pending` |
-| Last completed | **W21** |
-| Next action | Start W22: MCP + Permission Center |
+| Wave | **W23** |
+| Marco | D — V2 agents + local |
+| State | `complete` |
+| Last completed | **W22** |
+| Next action | Start W23 — Agentes (loop único) only after a new wave-start gate |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
@@ -47,10 +47,11 @@ None.
 - W17 fechada. Skills cifradas; `/skill` + `@skill`; contrato `tools: []` para W23.
 - W18 fechada: Privacy Center, Context Firewall, Cost Tracker e caps por projeto/provider.
 - W19 fechada: Quick AI, clipboard intelligence, seleção via copy + atalho e tray/background.
+- W22 fechada: MCP scoped ao projeto, Permission Center no main, HUD redigido e allowlist declarativa para skills.
 
 ## Last review / ADR
 
 | Kind | Path |
 |---|---|
-| Review | `docs/reviews/W20/REVIEW.md` |
-| Latest ADR | `docs/ADR/ADR-W20-001-council-explicit-multi-model-deliberation.md` |
+| Review | `docs/reviews/W22/REVIEW.md` |
+| Latest ADR | `docs/ADR/ADR-W22-004-skill-contract-v2-tool-allowlist.md` |
