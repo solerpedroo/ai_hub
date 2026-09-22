@@ -105,6 +105,8 @@ import type {
   AgentListInput,
   AgentRunDto,
   AgentRunDetail,
+  OrchestrationPrepareInput,
+  OrchestrationRunDetail,
   ProviderKeyDto,
   SecretsSaveInput,
   SecretsTestInput,
@@ -294,6 +296,16 @@ export interface HubAgentsApi {
   cancel: (input: AgentIdInput) => Promise<AgentRunDetail>;
 }
 
+export interface HubOrchestrationsApi {
+  prepare: (input: OrchestrationPrepareInput) => Promise<OrchestrationRunDetail>;
+  get: (input: AgentIdInput) => Promise<OrchestrationRunDetail>;
+  list: (input: AgentListInput) => Promise<OrchestrationRunDetail[]>;
+  start: (input: AgentIdInput) => Promise<OrchestrationRunDetail>;
+  pause: (input: AgentIdInput) => Promise<OrchestrationRunDetail>;
+  resume: (input: AgentIdInput) => Promise<OrchestrationRunDetail>;
+  cancel: (input: AgentIdInput) => Promise<OrchestrationRunDetail>;
+}
+
 export interface HubChatApi {
   send: (input: ChatSendInput) => Promise<ChatSendResult>;
   abort: (input: ChatAbortInput) => Promise<void>;
@@ -332,6 +344,7 @@ export interface HubApi {
   skills: HubSkillsApi;
   tools: HubToolsApi;
   agents: HubAgentsApi;
+  orchestrations: HubOrchestrationsApi;
 }
 
 export type { AppLocale, ThemeMode };
