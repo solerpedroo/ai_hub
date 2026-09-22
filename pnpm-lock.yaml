@@ -53,6 +53,9 @@ importers:
       '@ai-hub/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+      '@ai-hub/tools':
+        specifier: workspace:*
+        version: link:../../packages/tools
       '@electron-toolkit/utils':
         specifier: ^4.0.0
         version: 4.0.0(electron@37.10.3)
@@ -251,6 +254,16 @@ importers:
       '@types/node':
         specifier: ^22.18.1
         version: 22.20.3
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/debug@4.1.13)(@types/node@22.20.3)(jiti@2.7.0)
+
+  packages/tools:
+    dependencies:
+      '@ai-hub/security':
+        specifier: workspace:*
+        version: link:../security
+    devDependencies:
       vitest:
         specifier: ^3.2.4
         version: 3.2.7(@types/debug@4.1.13)(@types/node@22.20.3)(jiti@2.7.0)
