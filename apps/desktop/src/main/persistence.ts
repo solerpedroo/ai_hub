@@ -46,6 +46,7 @@ export async function bootPersistence(): Promise<HubDatabase> {
     await seedE2eWorkspace(hub);
   }
   hub.repos.interruptOrphanStreams();
+  hub.repos.interruptOrphanAgentRuns();
   return hub;
 }
 
