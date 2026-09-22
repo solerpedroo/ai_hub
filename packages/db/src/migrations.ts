@@ -313,6 +313,48 @@ CREATE UNIQUE INDEX project_tool_permissions_scope_idx
   ON project_tool_permissions(project_id, tool_id, operation);
 `;
 
+export const MIGRATION_0017_SQL = `
+CREATE TABLE agent_runs (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  parent_run_id TEXT,
+  kind TEXT NOT NULL DEFAULT 'single',
+  status TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  goal_cipher TEXT NOT NULL,
+  plan_cipher TEXT NOT NULL,
+  source_skill_id TEXT,
+  max_steps INTEGER NOT NULL,
+  budget_usd TEXT NOT NULL,
+  timeout_seconds INTEGER NOT NULL,
+  report_artifact_id TEXT REFERENCES artifacts(id) ON DELETE SET NULL,
+  created_at INTEGER NOT NULL,
+  started_at INTEGER,
+  finished_at INTEGER
+);
+CREATE INDEX agent_runs_conversation_idx ON agent_runs(conversation_id);
+CREATE INDEX agent_runs_status_idx ON agent_runs(status);
+CREATE TABLE agent_steps (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  title_cipher TEXT NOT NULL,
+  status TEXT NOT NULL,
+  tool_id TEXT,
+  summary_cipher TEXT,
+  detail_cipher TEXT,
+  tokens_in INTEGER,
+  tokens_out INTEGER,
+  cost_usd TEXT,
+  started_at INTEGER,
+  finished_at INTEGER
+);
+CREATE UNIQUE INDEX agent_steps_run_ordinal_idx ON agent_steps(run_id, ordinal);
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
@@ -330,4 +372,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 14, sql: MIGRATION_0014_SQL },
   { version: 15, sql: MIGRATION_0015_SQL },
   { version: 16, sql: MIGRATION_0016_SQL },
+  { version: 17, sql: MIGRATION_0017_SQL },
 ];
