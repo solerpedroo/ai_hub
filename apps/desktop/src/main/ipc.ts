@@ -116,6 +116,12 @@ import {
   windowIsMaximizedResultSchema,
   clipboardTextSchema,
   workspaceSessionSchema,
+  toolProjectGetInputSchema,
+  toolProjectStateSchema,
+  toolProjectRootPickResultSchema,
+  toolReadRequestInputSchema,
+  toolReadRequestResultSchema,
+  toolActivityResultSchema,
 } from "@ai-hub/shared";
 import { redactSecrets, safeErrorMessage } from "@ai-hub/security";
 import { abortChat, sendChat } from "./chat-session";
@@ -143,6 +149,7 @@ import { exportArtifact, toArtifactDto } from "./artifacts";
 import { testProviderKey } from "./provider-health";
 import { localDayStartMs } from "./spend-guard";
 import { checkForAppUpdates } from "./updater";
+import { getLatestToolActivity, getToolProjectState, pickProjectToolRoot, requestToolRead } from "./tools";
 
 function registerHandler<TIn, TOut>(
   channel: string,
@@ -194,6 +201,19 @@ export function registerWorkspaceIpc(): void {
   registerHandler(IpcChannel.projectsRemove, idInputSchema, ipcAckResultSchema, (input) => {
     getHubDatabase().repos.removeProject(input.id);
   });
+
+  registerHandler(IpcChannel.toolsGetProject, toolProjectGetInputSchema, toolProjectStateSchema, (input) =>
+    getToolProjectState(input.projectId),
+  );
+  registerHandler(IpcChannel.toolsPickProjectRoot, toolProjectGetInputSchema, toolProjectRootPickResultSchema, (input, event) =>
+    pickProjectToolRoot(input.projectId, event.sender),
+  );
+  registerHandler(IpcChannel.toolsRequestRead, toolReadRequestInputSchema, toolReadRequestResultSchema, (input, event) =>
+    requestToolRead(input, event.sender),
+  );
+  registerHandler(IpcChannel.toolsGetLatestActivity, emptyIpcPayloadSchema, toolActivityResultSchema, () =>
+    getLatestToolActivity(),
+  );
 
   registerHandler(
     IpcChannel.conversationsList,
@@ -658,8 +678,8 @@ export function registerWorkspaceIpc(): void {
         preferredModel: input.preferredModel,
         defaultMentions: input.defaultMentions,
         steps: input.steps,
+        ...(input.allowedTools !== undefined ? { allowedTools: input.allowedTools } : {}),
       }),
-      contractVersion: 1 as const,
     }),
   );
 
@@ -673,8 +693,8 @@ export function registerWorkspaceIpc(): void {
         ...(input.preferredModel !== undefined ? { preferredModel: input.preferredModel } : {}),
         ...(input.defaultMentions !== undefined ? { defaultMentions: input.defaultMentions } : {}),
         ...(input.steps !== undefined ? { steps: input.steps } : {}),
+        ...(input.allowedTools !== undefined ? { allowedTools: input.allowedTools } : {}),
       }),
-      contractVersion: 1 as const,
     }),
   );
 
