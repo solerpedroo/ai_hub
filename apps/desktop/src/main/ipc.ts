@@ -122,6 +122,11 @@ import {
   toolReadRequestInputSchema,
   toolReadRequestResultSchema,
   toolActivityResultSchema,
+  agentPrepareInputSchema,
+  agentIdInputSchema,
+  agentListInputSchema,
+  agentListResultSchema,
+  agentRunDetailSchema,
 } from "@ai-hub/shared";
 import { redactSecrets, safeErrorMessage } from "@ai-hub/security";
 import { abortChat, sendChat } from "./chat-session";
@@ -150,6 +155,7 @@ import { testProviderKey } from "./provider-health";
 import { localDayStartMs } from "./spend-guard";
 import { checkForAppUpdates } from "./updater";
 import { getLatestToolActivity, getToolProjectState, pickProjectToolRoot, requestToolRead } from "./tools";
+import { cancelAgentRun, getAgentRun, listAgentRuns, pauseAgentRun, prepareAgentRun, resumeAgentRun, startAgentRun } from "./agent-runner";
 
 function registerHandler<TIn, TOut>(
   channel: string,
@@ -214,6 +220,20 @@ export function registerWorkspaceIpc(): void {
   registerHandler(IpcChannel.toolsGetLatestActivity, emptyIpcPayloadSchema, toolActivityResultSchema, () =>
     getLatestToolActivity(),
   );
+  registerHandler(IpcChannel.agentsPrepare, agentPrepareInputSchema, agentRunDetailSchema, (input, event) =>
+    prepareAgentRun({
+      ...input,
+      maxSteps: input.maxSteps ?? 6,
+      budgetUsd: input.budgetUsd ?? "1.000000",
+      timeoutSeconds: input.timeoutSeconds ?? 300,
+    }, event.sender),
+  );
+  registerHandler(IpcChannel.agentsGet, agentIdInputSchema, agentRunDetailSchema, (input) => getAgentRun(input));
+  registerHandler(IpcChannel.agentsList, agentListInputSchema, agentListResultSchema, (input) => listAgentRuns(input));
+  registerHandler(IpcChannel.agentsStart, agentIdInputSchema, agentRunDetailSchema, (input, event) => startAgentRun(input, event.sender));
+  registerHandler(IpcChannel.agentsPause, agentIdInputSchema, agentRunDetailSchema, (input) => pauseAgentRun(input));
+  registerHandler(IpcChannel.agentsResume, agentIdInputSchema, agentRunDetailSchema, (input, event) => resumeAgentRun(input, event.sender));
+  registerHandler(IpcChannel.agentsCancel, agentIdInputSchema, agentRunDetailSchema, (input) => cancelAgentRun(input));
 
   registerHandler(
     IpcChannel.conversationsList,
