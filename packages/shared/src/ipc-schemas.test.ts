@@ -34,6 +34,9 @@ import {
   conversationWorkspaceDtoSchema,
   toolReadRequestInputSchema,
   toolReadRequestResultSchema,
+  agentPrepareInputSchema,
+  agentRunDetailSchema,
+  agentIdInputSchema,
 } from "./ipc-schemas";
 
 describe("emptyIpcPayloadSchema", () => {
@@ -553,5 +556,63 @@ describe("wave 22 tool IPC contracts", () => {
         },
       }).kind,
     ).toBe("completed");
+  });
+});
+
+describe("wave 23 agent IPC contracts", () => {
+  const input = {
+    projectId: "11111111-1111-4111-8111-111111111111",
+    conversationId: "22222222-2222-4222-8222-222222222222",
+    providerKeyId: "33333333-3333-4333-8333-333333333333",
+    model: "gpt-4o-mini",
+    goal: "Analyze the project.",
+    relativePaths: ["README.md", "src/app.ts", "package.json"],
+    maxSteps: 6,
+    budgetUsd: "1.000000",
+    timeoutSeconds: 300,
+  };
+
+  it("accepts only a bounded explicit plan before a run starts", () => {
+    expect(agentPrepareInputSchema.parse(input).relativePaths).toHaveLength(3);
+    expect(() => agentPrepareInputSchema.parse({ ...input, relativePaths: ["../secrets.txt"] })).toThrow();
+    expect(() => agentPrepareInputSchema.parse({ ...input, relativePaths: ["C:\\\\secrets.txt"] })).toThrow();
+    expect(() => agentPrepareInputSchema.parse({ ...input, maxSteps: 5 })).toThrow();
+    expect(() => agentPrepareInputSchema.parse({ ...input, extra: "nope" })).toThrow();
+  });
+
+  it("never exposes encrypted step detail through the renderer DTO", () => {
+    const dto = {
+      id: "44444444-4444-4444-8444-444444444444",
+      projectId: input.projectId,
+      conversationId: input.conversationId,
+      parentRunId: null,
+      kind: "single",
+      status: "awaiting_confirmation",
+      provider: "openai",
+      model: input.model,
+      goalSummary: input.goal,
+      planSummary: "Read the selected files.",
+      maxSteps: 6,
+      budgetUsd: "1.000000",
+      timeoutSeconds: 300,
+      reportArtifactId: null,
+      createdAt: "2026-09-22T00:00:00.000Z",
+      startedAt: null,
+      finishedAt: null,
+      steps: [],
+    };
+    expect(agentRunDetailSchema.parse(dto).steps).toEqual([]);
+    expect(() => agentRunDetailSchema.parse({ ...dto, providerKeyId: input.providerKeyId })).toThrow();
+  });
+
+  it("binds every run control command to its project and conversation", () => {
+    const control = {
+      id: "44444444-4444-4444-8444-444444444444",
+      projectId: input.projectId,
+      conversationId: input.conversationId,
+    };
+    expect(agentIdInputSchema.parse(control)).toEqual(control);
+    expect(() => agentIdInputSchema.parse({ id: control.id })).toThrow();
+    expect(() => agentIdInputSchema.parse({ ...control, extra: true })).toThrow();
   });
 });
