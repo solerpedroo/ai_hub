@@ -258,6 +258,48 @@ export const projectToolPermissions = sqliteTable(
   (table) => [uniqueIndex("project_tool_permissions_scope_idx").on(table.projectId, table.toolId, table.operation)],
 );
 
+export const agentRuns = sqliteTable("agent_runs", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id").notNull(),
+  conversationId: text("conversation_id").notNull(),
+  parentRunId: text("parent_run_id"),
+  kind: text("kind").notNull().default("single"),
+  status: text("status").notNull(),
+  provider: text("provider").notNull(),
+  model: text("model").notNull(),
+  goalCipher: text("goal_cipher").notNull(),
+  planCipher: text("plan_cipher").notNull(),
+  sourceSkillId: text("source_skill_id"),
+  maxSteps: integer("max_steps").notNull(),
+  budgetUsd: text("budget_usd").notNull(),
+  timeoutSeconds: integer("timeout_seconds").notNull(),
+  reportArtifactId: text("report_artifact_id"),
+  createdAt: integer("created_at", { mode: "number" }).notNull(),
+  startedAt: integer("started_at", { mode: "number" }),
+  finishedAt: integer("finished_at", { mode: "number" }),
+});
+
+export const agentSteps = sqliteTable(
+  "agent_steps",
+  {
+    id: text("id").primaryKey(),
+    runId: text("run_id").notNull(),
+    ordinal: integer("ordinal").notNull(),
+    kind: text("kind").notNull(),
+    titleCipher: text("title_cipher").notNull(),
+    status: text("status").notNull(),
+    toolId: text("tool_id"),
+    summaryCipher: text("summary_cipher"),
+    detailCipher: text("detail_cipher"),
+    tokensIn: integer("tokens_in"),
+    tokensOut: integer("tokens_out"),
+    costUsd: text("cost_usd"),
+    startedAt: integer("started_at", { mode: "number" }),
+    finishedAt: integer("finished_at", { mode: "number" }),
+  },
+  (table) => [uniqueIndex("agent_steps_run_ordinal_idx").on(table.runId, table.ordinal)],
+);
+
 export const schema = {
   projects,
   conversations,
@@ -283,4 +325,6 @@ export const schema = {
   artifacts,
   projectToolRoots,
   projectToolPermissions,
+  agentRuns,
+  agentSteps,
 };
