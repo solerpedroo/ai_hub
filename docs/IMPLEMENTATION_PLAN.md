@@ -860,17 +860,17 @@ Council **não** é orquestração de agentes: N modelos, um packet, sem tools. 
 
 **Sub-tasks:**
 
-- [ ] Desbloquear modo `orchestrate`. Grafo versionado: supervisor, nós (agente/skill/tool), arestas de handoff, join sequencial ou paralelo limitado
-- [ ] Especialistas de fábrica: Explorer (ler/mapear), Reviewer (riscos), Writer (artifact). O usuário vê quem está ativo
-- [ ] Handoff = mensagem de sistema inspecionável + subset do packet; **não** reenviar o projeto inteiro em silêncio
-- [ ] Modelo/esforço por nó: default = do supervisor; desvio **pede confirmação** (custo/privacidade mudam)
-- [ ] Orçamento: cap da corrida compartilhado (default) ou partilhado por nó; hard-stop no grafo inteiro; estimar N× no paralelo **antes** de disparar
-- [ ] Permission Center: cada tool de cada especialista pede permissão; “permitir sempre neste projeto” não vaza para outro projeto nem para o supervisor fazer delete
-- [ ] Abort/pause cancela filhos; persistir grafo (`agent_runs.parent_run_id` / `kind: orchestrated`)
-- [ ] Distinguir na UI: Council (W20) vs um agente (W23) vs orquestração (esta onda)
-- [ ] Vitest: halt em cap, deny de permissão, abort, paralelo limitado, sem fallback de modelo silencioso
-- [ ] Debug/observabilidade: sem keys, sem headers, args de tool redigidos
-- [ ] i18n pt-BR + en
+- [x] Desbloquear modo `orchestrate`. Grafo versionado: supervisor, nós (agente/skill/tool), arestas de handoff, join sequencial ou paralelo limitado
+- [x] Especialistas de fábrica: Explorer (ler/mapear), Reviewer (riscos), Writer (artifact). O usuário vê quem está ativo
+- [x] Handoff = mensagem de sistema inspecionável + subset do packet; **não** reenviar o projeto inteiro em silêncio
+- [x] Modelo/esforço por nó: default = do supervisor; desvio **pede confirmação** (custo/privacidade mudam)
+- [x] Orçamento: cap da corrida compartilhado (default) ou partilhado por nó; hard-stop no grafo inteiro; estimar N× no paralelo **antes** de disparar
+- [x] Permission Center: cada tool de cada especialista pede permissão; “permitir sempre neste projeto” não vaza para outro projeto nem para o supervisor fazer delete
+- [x] Abort/pause cancela filhos; persistir grafo (`agent_runs.parent_run_id` / `kind: orchestrated`)
+- [x] Distinguir na UI: Council (W20) vs um agente (W23) vs orquestração (esta onda)
+- [x] Vitest: halt em cap, deny de permissão, abort, paralelo limitado, sem fallback de modelo silencioso
+- [x] Debug/observabilidade: sem keys, sem headers, args de tool redigidos
+- [x] i18n pt-BR + en
 
 **DoD:** “analise este projeto” corre supervisor + 2 especialistas, o usuário vê tokens e papéis, cancela no meio, e negar filesystem num especialista não derruba o grafo inteiro sem estado persistido. Filesystem continua scoped.
 
