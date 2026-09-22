@@ -109,3 +109,5 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W22-002](./ADR-W22-002-project-scoped-tool-permissions.md) | W22 | Permissões de tools escopadas por projeto | accepted |
 | [ADR-W22-003](./ADR-W22-003-realpath-scoped-filesystem-connector.md) | W22 | Connector filesystem com realpath e escopo | accepted |
 | [ADR-W22-004](./ADR-W22-004-skill-contract-v2-tool-allowlist.md) | W22 | Contrato Skill v2 com allowlist de tools | accepted |
+| [ADR-W23-001](./ADR-W23-001-main-owned-single-agent-runner.md) | W23 | Runner de agente único no processo main | accepted |
+| [ADR-W23-002](./ADR-W23-002-persisted-bounded-agent-runs.md) | W23 | Corridas de agente persistidas e limitadas | accepted |
