@@ -32,5 +32,10 @@ export {
   type SkillFolder,
   type ArtifactRecord,
   type ArtifactKind,
+  type AgentRunRecord,
+  type AgentRunStatus,
+  type AgentStepRecord,
+  type AgentStepStatus,
+  type AgentStepKind,
 } from "./repos";
 export { schema } from "./schema";
