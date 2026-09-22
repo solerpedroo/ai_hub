@@ -1,11 +1,12 @@
 import { z } from "zod";
 import { mentionTypeSchema } from "./gateway";
 import { interpolatePrompt, PROMPT_FOLDERS, type PromptFolder, type PromptVariableValues } from "./prompts";
+import { skillAllowedToolSchema } from "./tools";
 
 export const SKILL_FOLDERS = PROMPT_FOLDERS;
 export type SkillFolder = PromptFolder;
 
-export const SKILL_CONTRACT_VERSION = 1 as const;
+export const SKILL_CONTRACT_VERSION = 2 as const;
 
 export const skillStepSchema = z
   .object({
@@ -28,7 +29,7 @@ export type SkillDefaultMention = z.infer<typeof skillDefaultMentionSchema>;
 
 export const skillContractV1Schema = z
   .object({
-    version: z.literal(SKILL_CONTRACT_VERSION),
+    version: z.literal(1),
     kind: z.literal("skill"),
     prompt: z.string().trim().min(1).max(16_000),
     steps: z.array(skillStepSchema).max(12),
@@ -38,6 +39,20 @@ export const skillContractV1Schema = z
   .strict();
 
 export type SkillContractV1 = z.infer<typeof skillContractV1Schema>;
+
+export const skillContractV2Schema = z
+  .object({
+    version: z.literal(SKILL_CONTRACT_VERSION),
+    kind: z.literal("skill"),
+    prompt: z.string().trim().min(1).max(16_000),
+    steps: z.array(skillStepSchema).max(12),
+    defaultMentions: z.array(skillDefaultMentionSchema).max(8),
+    allowedTools: z.array(skillAllowedToolSchema).max(8),
+  })
+  .strict();
+
+export type SkillContractV2 = z.infer<typeof skillContractV2Schema>;
+export type SkillContract = SkillContractV1 | SkillContractV2;
 
 export function isSkillFolder(value: string): value is SkillFolder {
   return (SKILL_FOLDERS as readonly string[]).includes(value);
@@ -231,13 +246,13 @@ Follow every step heading below.`,
   },
 ];
 
-export function factorySkillContract(item: (typeof FACTORY_SKILLS)[number]): SkillContractV1 {
-  return skillContractV1Schema.parse({
+export function factorySkillContract(item: (typeof FACTORY_SKILLS)[number]): SkillContractV2 {
+  return skillContractV2Schema.parse({
     version: SKILL_CONTRACT_VERSION,
     kind: "skill",
     prompt: item.prompt,
     steps: item.steps,
     defaultMentions: item.defaultMentions,
-    tools: [],
+    allowedTools: [],
   });
 }
