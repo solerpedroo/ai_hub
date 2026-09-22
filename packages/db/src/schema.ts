@@ -266,6 +266,7 @@ export const agentRuns = sqliteTable("agent_runs", {
   kind: text("kind").notNull().default("single"),
   status: text("status").notNull(),
   provider: text("provider").notNull(),
+  providerKeyId: text("provider_key_id").notNull(),
   model: text("model").notNull(),
   goalCipher: text("goal_cipher").notNull(),
   planCipher: text("plan_cipher").notNull(),
