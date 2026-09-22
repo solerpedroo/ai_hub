@@ -2882,6 +2882,11 @@ export class HubRepos {
     for (const row of rows) {
       this.db.update(agentRuns).set({ status: "interrupted", finishedAt: now }).where(eq(agentRuns.id, row.id)).run();
       this.db.update(agentSteps).set({ status: "interrupted", finishedAt: now }).where(and(eq(agentSteps.runId, row.id), eq(agentSteps.status, "running"))).run();
+      if (row.kind === "orchestrated" && row.role === "supervisor") {
+        for (const handoff of this.db.select().from(agentHandoffs).where(eq(agentHandoffs.rootRunId, row.id)).all()) {
+          if (handoff.status === "pending" || handoff.status === "ready") this.db.update(agentHandoffs).set({ status: "interrupted", finishedAt: now }).where(eq(agentHandoffs.id, handoff.id)).run();
+        }
+      }
     }
     return rows.length;
   }
