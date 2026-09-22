@@ -105,6 +105,13 @@ export const IpcChannel = {
   agentsPause: "agents:pause",
   agentsResume: "agents:resume",
   agentsCancel: "agents:cancel",
+  orchestrationsPrepare: "orchestrations:prepare",
+  orchestrationsGet: "orchestrations:get",
+  orchestrationsList: "orchestrations:list",
+  orchestrationsStart: "orchestrations:start",
+  orchestrationsPause: "orchestrations:pause",
+  orchestrationsResume: "orchestrations:resume",
+  orchestrationsCancel: "orchestrations:cancel",
 } as const;
 
 export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
