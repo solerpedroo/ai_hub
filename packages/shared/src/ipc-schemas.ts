@@ -18,6 +18,11 @@ import {
   AGENT_MAX_READ_PATHS,
   AGENT_MAX_STEPS,
   agentBudgetUsdSchema,
+  agentBudgetModeSchema,
+  agentHandoffJoinKindSchema,
+  agentHandoffStatusSchema,
+  agentRoleSchema,
+  agentRunKindSchema,
   agentRunStatusSchema,
   agentStepKindSchema,
   agentStepStatusSchema,
@@ -213,6 +218,42 @@ export type AgentIdInput = z.infer<typeof agentIdInputSchema>;
 export const agentListInputSchema = z.object({ conversationId: z.string().uuid() }).strict();
 export type AgentListInput = z.infer<typeof agentListInputSchema>;
 export const agentListResultSchema = z.array(agentRunDtoSchema).max(50);
+
+export const orchestrationPrepareInputSchema = z.object({
+  projectId: z.string().uuid(), conversationId: z.string().uuid(), providerKeyId: z.string().uuid(),
+  model: z.string().trim().min(1).max(128), goal: z.string().trim().min(1).max(4_000),
+  relativePaths: z.array(agentRelativePathSchema).min(1).max(AGENT_MAX_READ_PATHS),
+  maxSteps: z.number().int().min(4).max(AGENT_MAX_STEPS).default(AGENT_MAX_STEPS), budgetUsd: agentBudgetUsdSchema.default("1.000000"), timeoutSeconds: z.number().int().min(30).max(600).default(300), skillId: z.string().uuid().nullable().optional(),
+  parallelism: z.literal(2).default(2), budgetMode: z.enum(["shared", "per_node"]).default("shared"),
+}).strict().superRefine((value, context) => {
+  if (value.relativePaths.length + 3 > value.maxSteps) context.addIssue({ code: z.ZodIssueCode.custom, path: ["maxSteps"], message: "maxSteps must cover plan, reads, report and artifact" });
+});
+export type OrchestrationPrepareInput = z.infer<typeof orchestrationPrepareInputSchema>;
+
+export const agentNodeDtoSchema = agentRunDtoSchema.extend({
+  kind: z.literal("orchestrated"),
+  role: agentRoleSchema.exclude(["single"]),
+  effort: effortLevelSchema,
+  isModelOverride: z.boolean(),
+  tokensIn: z.number().int().nonnegative(), tokensOut: z.number().int().nonnegative(), costUsd: z.string().regex(/^\d+\.\d{6}$/),
+}).strict();
+export type AgentNodeDto = z.infer<typeof agentNodeDtoSchema>;
+
+export const agentHandoffDtoSchema = z.object({
+  id: z.string().uuid(), rootRunId: z.string().uuid(), fromRunId: z.string().uuid(), toRunId: z.string().uuid(),
+  ordinal: z.number().int().positive(), joinKind: agentHandoffJoinKindSchema, status: agentHandoffStatusSchema,
+  systemMessageSummary: z.string().max(400), packetSubsetSummary: z.string().max(400), tokenEstimate: z.number().int().nonnegative(),
+  createdAt: isoTimestampSchema, finishedAt: isoTimestampSchema.nullable(),
+}).strict();
+export type AgentHandoffDto = z.infer<typeof agentHandoffDtoSchema>;
+
+export const orchestrationRunDetailSchema = agentRunDtoSchema.extend({
+  kind: z.literal("orchestrated"), role: z.literal("supervisor"), graphVersion: z.literal(1), budgetMode: z.enum(["shared", "per_node"]),
+  nodes: z.array(agentNodeDtoSchema).min(3).max(4), handoffs: z.array(agentHandoffDtoSchema).max(8),
+}).strict();
+export type OrchestrationRunDetail = z.infer<typeof orchestrationRunDetailSchema>;
+export const orchestrationListResultSchema = z.array(orchestrationRunDetailSchema).max(20);
+export type OrchestrationListResult = z.infer<typeof orchestrationListResultSchema>;
 
 export const projectListResultSchema = z.array(projectDtoSchema);
 
