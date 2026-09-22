@@ -822,13 +822,13 @@ Council **não** é orquestração de agentes: N modelos, um packet, sem tools. 
 
 **Sub-tasks:**
 
-- [ ] Pacote `packages/tools` nasce aqui (não antes)
-- [ ] Tool Router interno; MCP client (stdio / sse)
-- [ ] Permissões: uma vez / sempre neste projeto / negar
-- [ ] Confirmação extra para destrutivo (delete, overwrite em massa)
-- [ ] Conectores iniciais: filesystem **scoped ao projeto**, 1 MCP de referência
-- [ ] Tool calls na observabilidade e no HUD da W21 (nome, args redigidos, resultado truncado)
-- [ ] Skills podem declarar tools permitidas (contrato da W17)
+- [x] Pacote `packages/tools` nasce aqui (não antes)
+- [x] Tool Router interno; MCP client (stdio / sse)
+- [x] Permissões: uma vez / sempre neste projeto / negar
+- [x] Confirmação extra para destrutivo (delete, overwrite em massa)
+- [x] Conectores iniciais: filesystem **scoped ao projeto**, 1 MCP de referência
+- [x] Tool calls na observabilidade e no HUD da W21 (nome, args redigidos, resultado truncado)
+- [x] Skills podem declarar tools permitidas (contrato da W17)
 
 **DoD:** chat lê arquivo do projeto via MCP só depois de “Permitir uma vez”; negar funciona. Renderer jamais fala stdio/MCP direto.
 
