@@ -13,6 +13,7 @@ import {
   packetSliceSchema,
   portablePacketOriginSchema,
 } from "./portable-packet";
+import { skillAllowedToolSchema, toolActivityStatusSchema, toolEffectSchema, toolIdSchema } from "./tools";
 
 export const spendCapScopeSchema = z.enum(["request", "day", "global"]);
 export const capBlockScopeSchema = z.enum(["request", "day", "global", "project", "provider"]);
@@ -73,6 +74,48 @@ export const projectDtoSchema = z.object({
 });
 
 export type ProjectDto = z.infer<typeof projectDtoSchema>;
+
+export const toolProjectStateSchema = z.object({
+  projectId: z.string().uuid(),
+  rootLabel: z.string().min(1).max(260).nullable(),
+  allowedTools: z.array(toolIdSchema).max(16),
+}).strict();
+export type ToolProjectState = z.infer<typeof toolProjectStateSchema>;
+
+export const toolProjectGetInputSchema = z.object({ projectId: z.string().uuid() }).strict();
+export type ToolProjectGetInput = z.infer<typeof toolProjectGetInputSchema>;
+
+export const toolProjectRootPickResultSchema = z.discriminatedUnion("status", [
+  toolProjectStateSchema.extend({ status: z.literal("selected") }).strict(),
+  z.object({ status: z.literal("cancelled") }).strict(),
+]);
+export type ToolProjectRootPickResult = z.infer<typeof toolProjectRootPickResultSchema>;
+
+export const toolReadRequestInputSchema = z.object({
+  projectId: z.string().uuid(),
+  relativePath: z.string().min(1).max(1024),
+}).strict();
+export type ToolReadRequestInput = z.infer<typeof toolReadRequestInputSchema>;
+
+export const toolActivityDtoSchema = z.object({
+  id: z.string().uuid(),
+  projectId: z.string().uuid(),
+  toolId: toolIdSchema,
+  operation: z.literal("read"),
+  effect: toolEffectSchema,
+  status: toolActivityStatusSchema,
+  argsSummary: z.string().max(200),
+  resultSummary: z.string().max(260).nullable(),
+  createdAt: isoTimestampSchema,
+}).strict();
+export type ToolActivityDto = z.infer<typeof toolActivityDtoSchema>;
+
+export const toolReadRequestResultSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("denied"), activity: toolActivityDtoSchema }).strict(),
+  z.object({ kind: z.literal("completed"), activity: toolActivityDtoSchema, content: z.string().max(16_000) }).strict(),
+]);
+export type ToolReadRequestResult = z.infer<typeof toolReadRequestResultSchema>;
+export const toolActivityResultSchema = toolActivityDtoSchema.nullable();
 
 export const projectListResultSchema = z.array(projectDtoSchema);
 
@@ -1230,8 +1273,9 @@ export const skillDtoSchema = z
     preferredModel: z.string().min(1).max(128).nullable(),
     defaultMentions: z.array(skillDefaultMentionDtoSchema).max(8),
     steps: z.array(skillStepDtoSchema).max(12),
+    allowedTools: z.array(skillAllowedToolSchema).max(8).optional(),
     factoryId: z.string().min(1).max(40).nullable(),
-    contractVersion: z.literal(1),
+    contractVersion: z.union([z.literal(1), z.literal(2)]),
     createdAt: isoTimestampSchema,
     updatedAt: isoTimestampSchema,
   })
@@ -1250,6 +1294,7 @@ export const skillCreateInputSchema = z
     preferredModel: z.string().trim().min(1).max(128).nullable(),
     defaultMentions: z.array(skillDefaultMentionDtoSchema).max(8),
     steps: z.array(skillStepDtoSchema).max(12),
+    allowedTools: z.array(skillAllowedToolSchema).max(8).optional(),
   })
   .strict();
 
@@ -1265,6 +1310,7 @@ export const skillUpdateInputSchema = z
     preferredModel: z.string().trim().min(1).max(128).nullable().optional(),
     defaultMentions: z.array(skillDefaultMentionDtoSchema).max(8).optional(),
     steps: z.array(skillStepDtoSchema).max(12).optional(),
+    allowedTools: z.array(skillAllowedToolSchema).max(8).optional(),
   })
   .strict();
 
