@@ -20,8 +20,9 @@ export function listSkillDtos(): SkillDto[] {
     preferredModel: row.preferredModel,
     defaultMentions: row.defaultMentions,
     steps: row.steps,
+    allowedTools: row.allowedTools,
     factoryId: row.factoryId,
-    contractVersion: 1 as const,
+    contractVersion: row.contractVersion,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   }));
