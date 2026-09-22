@@ -19,6 +19,13 @@ const router = new ToolRouter({
   },
 });
 let latestActivity: ToolActivity | null = null;
+let permissionDialogQueue: Promise<void> = Promise.resolve();
+
+function serializePermissionDialog<T>(task: () => Promise<T>): Promise<T> {
+  const next = permissionDialogQueue.then(task, task);
+  permissionDialogQueue = next.then(() => undefined, () => undefined);
+  return next;
+}
 
 function projectState(projectId: string): ToolProjectState {
   const root = getHubDatabase().repos.getProjectToolRoot(projectId);
@@ -77,7 +84,7 @@ export async function requestToolRead(input: ToolReadRequestInput, sender: WebCo
     detail: portuguese ? `${result.toolId} solicita acesso de leitura a ${result.argsSummary}.` : `${result.toolId} requests read access to ${result.argsSummary}.`,
     noLink: true,
   };
-  const answer = parent ? await dialog.showMessageBox(parent, options) : await dialog.showMessageBox(options);
+  const answer = await serializePermissionDialog(() => parent ? dialog.showMessageBox(parent, options) : dialog.showMessageBox(options));
   const decision = answer.response === 0 ? "allow_once" : answer.response === 1 ? "allow_project" : "deny";
   const settled = await router.decide(result.id, decision, sender.id);
   record(settled);
