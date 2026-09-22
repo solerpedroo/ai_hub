@@ -7,10 +7,11 @@ import {
   isSkillFolder,
   parseSkillSlashDraft,
   skillContractV1Schema,
+  skillContractV2Schema,
 } from "./skills";
 
 describe("skills contract", () => {
-  it("seeds five factory skills with a versioned empty tools hook", () => {
+  it("seeds five factory skills with a versioned declarative tool allowlist", () => {
     expect(FACTORY_SKILLS.map((item) => item.factoryId)).toEqual([
       "code-review",
       "summarize-pdf",
@@ -23,9 +24,9 @@ describe("skills contract", () => {
     );
     for (const skill of FACTORY_SKILLS) {
       const contract = factorySkillContract(skill);
-      expect(contract.version).toBe(1);
+      expect(contract.version).toBe(2);
       expect(contract.kind).toBe("skill");
-      expect(contract.tools).toEqual([]);
+      expect(contract.allowedTools).toEqual([]);
       expect(contract.steps.length).toBeGreaterThan(0);
       expect(isSkillFolder(skill.folder)).toBe(true);
     }
@@ -44,6 +45,18 @@ describe("skills contract", () => {
         tools: [{ name: "bash" }],
       }),
     ).toThrow();
+  });
+
+  it("permits only registered tool references in the v2 contract", () => {
+    expect(skillContractV2Schema.parse({
+      version: 2,
+      kind: "skill",
+      prompt: "Review",
+      steps: [],
+      defaultMentions: [],
+      allowedTools: [{ toolId: "project-filesystem.read-file", operation: "read" }],
+    }).allowedTools).toHaveLength(1);
+    expect(() => skillContractV2Schema.parse({ version: 2, kind: "skill", prompt: "Review", steps: [], defaultMentions: [], allowedTools: [{ toolId: "shell", operation: "read" }] })).toThrow();
   });
 
   it("composes step sections and interpolates project variables", () => {
