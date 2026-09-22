@@ -1,5 +1,5 @@
 export { applyMigrations } from "./migrate";
-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL, MIGRATION_0013_SQL, MIGRATION_0014_SQL, MIGRATION_0015_SQL, MIGRATION_0016_SQL, MIGRATION_0017_SQL } from "./migrations";
+export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL, MIGRATION_0013_SQL, MIGRATION_0014_SQL, MIGRATION_0015_SQL, MIGRATION_0016_SQL, MIGRATION_0017_SQL, MIGRATION_0018_SQL } from "./migrations";
 export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
 export {
   HubRepos,
@@ -37,5 +37,11 @@ export {
   type AgentStepRecord,
   type AgentStepStatus,
   type AgentStepKind,
+  type AgentRunKind,
+  type AgentRole,
+  type AgentBudgetMode,
+  type AgentHandoffJoinKind,
+  type AgentHandoffStatus,
+  type AgentHandoffRecord,
 } from "./repos";
 export { schema } from "./schema";
