@@ -29,6 +29,7 @@ import {
   type ArtifactDto,
   type ProviderKeyDto,
   type HealthSummaryDto,
+  type ToolActivityDto,
 } from "@ai-hub/shared";
 import {
   ChatComposer,
@@ -247,6 +248,10 @@ export function HomeView({
     null,
   );
   const [tagDraft, setTagDraft] = useState("");
+  const [toolPath, setToolPath] = useState("");
+  const [toolActivity, setToolActivity] = useState<ToolActivityDto | null>(null);
+  const [toolBusy, setToolBusy] = useState(false);
+  const [toolError, setToolError] = useState<string | null>(null);
   const [projectName, setProjectName] = useState(project?.name ?? "");
   const [projectColor, setProjectColor] = useState<string | null>(project?.color ?? null);
   const [projectInstructions, setProjectInstructions] = useState(
@@ -280,6 +285,12 @@ export function HomeView({
       setEffortLevel(selectedConversation.effortLevel);
     }
   }, [selectedConversation]);
+  useEffect(() => {
+    if (!project) { setToolActivity(null); return; }
+    void window.hub.tools.getLatestActivity().then((activity) => {
+      setToolActivity(activity?.projectId === project.id ? activity : null);
+    }).catch(() => setToolActivity(null));
+  }, [project]);
   const saveRunSettings = async (nextMode: typeof runMode, nextEffort: typeof effortLevel): Promise<void> => {
     if (!selectedConversationId) return;
     if (nextMode === "agent" || nextMode === "orchestrate") return;
@@ -607,6 +618,24 @@ export function HomeView({
         setSkillRun(null);
       }
     });
+  };
+
+  const appendToolOutput = (content: string, activity: ToolActivityDto): void => {
+    setToolActivity(activity);
+    setDraft((current) => `${current}${current.trim().length > 0 ? "\n\n" : ""}[${t("tools.untrustedContext")}: ${activity.resultSummary ?? activity.toolId}]\n\`\`\`text\n${content}\n\`\`\``);
+  };
+
+  const requestProjectFile = async (): Promise<void> => {
+    if (!project || toolPath.trim().length === 0) return;
+    setToolError(null);
+    setToolBusy(true);
+    try {
+      const result = await window.hub.tools.requestRead({ projectId: project.id, relativePath: toolPath.trim() });
+      setToolActivity(result.activity);
+      if (result.kind === "completed") { appendToolOutput(result.content, result.activity); setToolPath(""); }
+      if (result.kind === "denied") setToolError(t("tools.error.denied"));
+    } catch { setToolError(t("tools.error.read")); }
+    finally { setToolBusy(false); }
   };
 
   return (
@@ -1466,7 +1495,16 @@ export function HomeView({
                   <span>{t("hud.tokens")}: {runHud?.tokensIn ?? "—"}/{runHud?.tokensOut ?? "—"}</span><span>{t("hud.turnCost")}: {runHud?.costUsd ?? conversationCost ?? "—"}</span>
                   <span>{t("hud.thinking")}: {runHud?.tokensThinking ?? "—"}</span><span>{t("hud.cache")}: {runHud?.cacheReadTokens ?? "—"}/{runHud?.cacheWriteTokens ?? "—"}</span>
                   {runHud?.thinkingSupported === false ? <span>{t("hud.thinkingUnavailable")}</span> : null}
+                  {toolActivity ? <span data-testid="tool-activity">{t("tools.activity")}: {toolActivity.toolId} · {toolActivity.argsSummary} · {toolActivity.resultSummary ?? t(`tools.status.${toolActivity.status}`)}</span> : null}
                 </div>
+                {project ? (
+                  <div className="flex flex-wrap items-center gap-2 border-t px-2 py-1.5" data-testid="permission-center">
+                    <Input className="h-7 max-w-64" value={toolPath} onChange={(event) => setToolPath(event.target.value)} placeholder={t("tools.pathPlaceholder")} aria-label={t("tools.pathPlaceholder")} />
+                    <Button type="button" size="sm" variant="outline" disabled={toolBusy || toolPath.trim().length === 0} onClick={() => void requestProjectFile()} data-testid="tools-read-file">{t("tools.readFile")}</Button>
+                    <Button type="button" size="sm" variant="ghost" disabled={toolBusy} onClick={() => void window.hub.tools.pickProjectRoot({ projectId: project.id })}>{t("tools.chooseRoot")}</Button>
+                    {toolError ? <span role="alert" className="text-destructive">{toolError}</span> : null}
+                  </div>
+                ) : null}
                 <ChatComposer
                   key={selectedConversationId}
                   value={draft}
