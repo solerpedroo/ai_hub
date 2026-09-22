@@ -65,16 +65,19 @@ interface ActiveRun {
   model: string;
   provider: string;
   reservationId: string | null;
+  orchestrationRootId: string | null;
 }
 
 const runs = new Map<string, ActiveRun>();
-const runByConversation = new Map<string, string>();
+const runByConversation = new Map<string, Set<string>>();
 
 /** Main-process-only Council hook. It is deliberately not part of the IPC schema. */
 type PreparedChatSendInput = ChatSendInput & {
   __preparedPacket?: ProviderAgnosticPacket;
   __skipCaps?: boolean;
   __councilRole?: import("@ai-hub/shared").CouncilRole;
+  /** Internal only: allows bounded sibling specialist branches from one persisted graph. */
+  __orchestrationRootId?: string;
 };
 
 function adapterFor(slug: string, baseUrl: string | null): ProviderAdapter {
@@ -289,7 +292,11 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
     }
   }
   input = { ...input, privacyMode: prefs.privacyMode };
-  if (runByConversation.has(input.conversationId)) {
+  const activeConversationRuns = runByConversation.get(input.conversationId);
+  const isSameOrchestration = input.__orchestrationRootId !== undefined
+    && activeConversationRuns !== undefined
+    && [...activeConversationRuns].every((runId) => runs.get(runId)?.orchestrationRootId === input.__orchestrationRootId);
+  if (activeConversationRuns && !isSameOrchestration) {
     throw new Error("A stream is already running in this conversation");
   }
 
@@ -313,7 +320,7 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
   const adapter = adapterFor(key.providerSlug, repos.getCustomBaseUrl(key.id));
 
   const existing = repos.listMessages(input.conversationId);
-  if (existing.some((item) => item.status === "streaming")) {
+  if (existing.some((item) => item.status === "streaming") && !isSameOrchestration) {
     throw new Error("A stream is already running in this conversation");
   }
 
@@ -578,9 +585,12 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
     model: input.model,
     provider: key.providerSlug,
     reservationId,
+    orchestrationRootId: input.__orchestrationRootId ?? null,
   };
   runs.set(runId, run);
-  runByConversation.set(input.conversationId, runId);
+  const conversationRuns = runByConversation.get(input.conversationId) ?? new Set<string>();
+  conversationRuns.add(runId);
+  runByConversation.set(input.conversationId, conversationRuns);
 
   const secret = key.secret;
   void (async () => {
@@ -738,7 +748,9 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
         repos.releaseSpendReservation(run.reservationId);
       }
       runs.delete(runId);
-      runByConversation.delete(input.conversationId);
+      const remainingConversationRuns = runByConversation.get(input.conversationId);
+      remainingConversationRuns?.delete(runId);
+      if (!remainingConversationRuns || remainingConversationRuns.size === 0) runByConversation.delete(input.conversationId);
     }
   })();
 
