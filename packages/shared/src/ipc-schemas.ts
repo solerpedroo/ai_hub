@@ -204,7 +204,11 @@ export type AgentRunDto = z.infer<typeof agentRunDtoSchema>;
 export const agentRunDetailSchema = agentRunDtoSchema.extend({ steps: z.array(agentStepDtoSchema).max(AGENT_MAX_STEPS) }).strict();
 export type AgentRunDetail = z.infer<typeof agentRunDetailSchema>;
 
-export const agentIdInputSchema = z.object({ id: z.string().uuid() }).strict();
+export const agentIdInputSchema = z.object({
+  id: z.string().uuid(),
+  projectId: z.string().uuid(),
+  conversationId: z.string().uuid(),
+}).strict();
 export type AgentIdInput = z.infer<typeof agentIdInputSchema>;
 export const agentListInputSchema = z.object({ conversationId: z.string().uuid() }).strict();
 export type AgentListInput = z.infer<typeof agentListInputSchema>;
