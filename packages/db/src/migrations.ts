@@ -356,6 +356,30 @@ CREATE TABLE agent_steps (
 CREATE UNIQUE INDEX agent_steps_run_ordinal_idx ON agent_steps(run_id, ordinal);
 `;
 
+export const MIGRATION_0018_SQL = `
+ALTER TABLE agent_runs ADD COLUMN role TEXT NOT NULL DEFAULT 'single';
+ALTER TABLE agent_runs ADD COLUMN graph_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE agent_runs ADD COLUMN budget_mode TEXT NOT NULL DEFAULT 'single';
+CREATE INDEX agent_runs_parent_idx ON agent_runs(parent_run_id);
+CREATE TABLE agent_handoffs (
+  id TEXT PRIMARY KEY,
+  root_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+  from_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+  to_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL,
+  join_kind TEXT NOT NULL,
+  status TEXT NOT NULL,
+  system_message_cipher TEXT NOT NULL,
+  packet_subset_cipher TEXT NOT NULL,
+  token_estimate INTEGER NOT NULL,
+  summary_cipher TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  finished_at INTEGER
+);
+CREATE UNIQUE INDEX agent_handoffs_root_ordinal_idx ON agent_handoffs(root_run_id, ordinal);
+CREATE INDEX agent_handoffs_to_idx ON agent_handoffs(to_run_id);
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
@@ -374,4 +398,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 15, sql: MIGRATION_0015_SQL },
   { version: 16, sql: MIGRATION_0016_SQL },
   { version: 17, sql: MIGRATION_0017_SQL },
+  { version: 18, sql: MIGRATION_0018_SQL },
 ];
