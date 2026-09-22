@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave 
 
 | Field | Value |
 |---|---|
-| Wave | **W23** |
+| Wave | **W24** |
 | Marco | D — V2 agents + local |
-| State | `in_progress` |
-| Last completed | **W22** |
-| Next action | Map the single-agent run lifecycle, persistence and W22 permission intersection |
+| State | `pending` |
+| Last completed | **W23** |
+| Next action | Start W24 only after choosing the orchestration graph and handoff contract |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
@@ -41,6 +41,7 @@ None.
 - W15: conversas `kind=playground` sem GC; `waitForChatRun` sem timeout; UI `running` cai quando o IPC devolve (streams podem continuar); títulos factory em inglês na DB.
 - W16: `navigate-to 'none'` pode ser no-op; locks Electron fecham o iframe. Capture de artifact falha em silêncio. Lista IPC teto 100. Pin é família, não galeria de projeto. Bundle mermaid no renderer.
 - W17: stepper não segue headings do stream; palette só corre Code Review por atalho; factory títulos EN na DB; `skills:list` devolve prompt no renderer (como prompts W15).
+- W23: não há teste isolado do runner para cancelamento durante diálogo nativo/timeout; `skill.steps[]` orienta a síntese e a allowlist executa a leitura, mas ainda não há grafo de tool por etapa.
 
 ## Notes for the next session
 
@@ -53,5 +54,5 @@ None.
 
 | Kind | Path |
 |---|---|
-| Review | `docs/reviews/W22/REVIEW.md` |
-| Latest ADR | `docs/ADR/ADR-W22-004-skill-contract-v2-tool-allowlist.md` |
+| Review | `docs/reviews/W23/REVIEW.md` |
+| Latest ADR | `docs/ADR/ADR-W23-002-persisted-bounded-agent-runs.md` |
