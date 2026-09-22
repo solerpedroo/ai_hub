@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave 
 |---|---|
 | Wave | **W24** |
 | Marco | D — V2 agents + local |
-| State | `pending` |
+| State | `review` |
 | Last completed | **W23** |
-| Next action | Start W24 only after choosing the orchestration graph and handoff contract |
+| Next action | Run the mandatory W24 independent DoD and trust-boundary reviews. |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
