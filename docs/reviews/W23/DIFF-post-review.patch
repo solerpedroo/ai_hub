@@ -1,0 +1,297 @@
+warning: in the working copy of 'apps/desktop/src/renderer/src/components/layout/home-view.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'apps/desktop/src/renderer/src/locales/en.json', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'apps/desktop/src/renderer/src/locales/pt-BR.json', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'packages/shared/src/ipc-schemas.test.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'packages/shared/src/ipc-schemas.ts', LF will be replaced by CRLF the next time Git touches it
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index 1638950..d94d819 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -27,6 +27,7 @@ import {
+   type PromptDto,
+   type SkillDto,
+   type ArtifactDto,
++  type AgentRunDetail,
+   type ProviderKeyDto,
+   type HealthSummaryDto,
+   type ToolActivityDto,
+@@ -252,6 +253,9 @@ export function HomeView({
+   const [toolActivity, setToolActivity] = useState<ToolActivityDto | null>(null);
+   const [toolBusy, setToolBusy] = useState(false);
+   const [toolError, setToolError] = useState<string | null>(null);
++  const [agentRun, setAgentRun] = useState<AgentRunDetail | null>(null);
++  const [agentPaths, setAgentPaths] = useState("README.md\npackage.json\nsrc/index.ts");
++  const [agentBusy, setAgentBusy] = useState(false);
+   const [projectName, setProjectName] = useState(project?.name ?? "");
+   const [projectColor, setProjectColor] = useState<string | null>(project?.color ?? null);
+   const [projectInstructions, setProjectInstructions] = useState(
+@@ -291,9 +295,30 @@ export function HomeView({
+       setToolActivity(activity?.projectId === project.id ? activity : null);
+     }).catch(() => setToolActivity(null));
+   }, [project]);
++  useEffect(() => {
++    if (!selectedConversationId) { setAgentRun(null); return; }
++    void window.hub.agents.list({ conversationId: selectedConversationId }).then(async (runs) => {
++      const latest = runs[0];
++      setAgentRun(latest ? await window.hub.agents.get({ id: latest.id, projectId: latest.projectId, conversationId: latest.conversationId }) : null);
++    }).catch(() => setAgentRun(null));
++  }, [selectedConversationId]);
++  useEffect(() => {
++    if (!agentRun || agentRun.status !== "running") return;
++    const timer = window.setInterval(() => {
++      void window.hub.agents.get({ id: agentRun.id, projectId: agentRun.projectId, conversationId: agentRun.conversationId }).then(setAgentRun).catch(() => undefined);
++    }, 700);
++    return () => window.clearInterval(timer);
++  }, [agentRun]);
++  useEffect(() => {
++    if (!agentRun?.reportArtifactId || !selectedConversationId) return;
++    void window.hub.artifacts.list({ conversationId: selectedConversationId }).then((rows) => {
++      setArtifacts(rows);
++      setCanvasId(agentRun.reportArtifactId);
++    }).catch(() => undefined);
++  }, [agentRun?.reportArtifactId, selectedConversationId]);
+   const saveRunSettings = async (nextMode: typeof runMode, nextEffort: typeof effortLevel): Promise<void> => {
+     if (!selectedConversationId) return;
+-    if (nextMode === "agent" || nextMode === "orchestrate") return;
++    if (nextMode === "orchestrate") return;
+     setRunMode(nextMode); setEffortLevel(nextEffort);
+     await window.hub.conversations.setRunSettings({ conversationId: selectedConversationId, runMode: nextMode, effortLevel: nextEffort });
+   };
+@@ -607,6 +632,13 @@ export function HomeView({
+         });
+       }
+     }
++    if (runMode === "agent") {
++      const matchedSkill = skillMention
++        ? librarySkills.find((skill) => skill.id === skillMention.id || skill.title.toLowerCase() === (skillMention.query ?? "").toLowerCase())
++        : null;
++      void prepareAgent(content, matchedSkill?.id);
++      return;
++    }
+     const route = autoRouter && routedModel ? { keyId: routedModel.key.id, model: routedModel.model.id, runMode, effortLevel } : { keyId: selectedKeyId ?? "", model: selectedModel, runMode, effortLevel };
+     void onSend(content, mentions, route).then((ok) => {
+       if (ok) {
+@@ -638,6 +670,40 @@ export function HomeView({
+     finally { setToolBusy(false); }
+   };
+ 
++  const prepareAgent = async (goal: string, skillId?: string): Promise<void> => {
++    if (!project || !selectedConversationId || !selectedKeyId || goal.trim().length === 0) return;
++    const paths = agentPaths.split(/\r?\n|,/).map((path) => path.trim()).filter(Boolean).slice(0, 3);
++    if (paths.length === 0) { setToolError(t("agents.error.paths")); return; }
++    setAgentBusy(true); setToolError(null);
++    try {
++      const prepared = await window.hub.agents.prepare({
++        projectId: project.id,
++        conversationId: selectedConversationId,
++        providerKeyId: selectedKeyId,
++        model: selectedModel,
++        goal,
++        relativePaths: paths,
++        maxSteps: Math.min(6, paths.length + 3),
++        budgetUsd: "1.000000",
++        timeoutSeconds: 300,
++        ...(skillId ? { skillId } : {}),
++      });
++      setAgentRun(prepared);
++      setDraft("");
++    } catch { setToolError(t("agents.error.prepare")); }
++    finally { setAgentBusy(false); }
++  };
++
++  const controlAgent = async (action: "start" | "pause" | "resume" | "cancel"): Promise<void> => {
++    if (!agentRun) return;
++    setAgentBusy(true); setToolError(null);
++    try {
++      const updated = await window.hub.agents[action]({ id: agentRun.id, projectId: agentRun.projectId, conversationId: agentRun.conversationId });
++      setAgentRun(updated);
++    } catch { setToolError(t("agents.error.control")); }
++    finally { setAgentBusy(false); }
++  };
++
+   return (
+     <div className="flex h-full min-h-0">
+       <section className="flex w-64 shrink-0 flex-col border-r">
+@@ -913,7 +979,7 @@ export function HomeView({
+                       ))}
+                     </select>
+                   </label>
+-                  <label className="flex items-center gap-1 text-[11px]"><span>{t("runMode.label")}</span><select className="h-8 rounded border bg-background px-1" value={runMode} onChange={(event) => void saveRunSettings(event.target.value as typeof runMode, effortLevel)}><option value="assist">Assist</option><option value="plan">Plan</option><option value="agent" disabled>Agent (W23)</option><option value="orchestrate" disabled>Orchestrate (W24)</option></select></label>
++                  <label className="flex items-center gap-1 text-[11px]"><span>{t("runMode.label")}</span><select className="h-8 rounded border bg-background px-1" value={runMode} onChange={(event) => void saveRunSettings(event.target.value as typeof runMode, effortLevel)}><option value="assist">Assist</option><option value="plan">Plan</option><option value="agent">{t("agents.mode")}</option><option value="orchestrate" disabled>Orchestrate (W24)</option></select></label>
+                   <label className="flex items-center gap-1 text-[11px"><span>{t("effort.label")}</span><select className="h-8 rounded border bg-background px-1" value={effortLevel} onChange={(event) => void saveRunSettings(runMode, event.target.value as typeof effortLevel)}>{["low", "medium", "high", "max"].map((level) => <option key={level} value={level}>{level}</option>)}</select></label>
+                   <label className="flex items-center gap-1">
+                     <span className="text-muted-foreground">{t("workspace.model")}</span>
+@@ -1497,6 +1563,51 @@ export function HomeView({
+                   {runHud?.thinkingSupported === false ? <span>{t("hud.thinkingUnavailable")}</span> : null}
+                   {toolActivity ? <span data-testid="tool-activity">{t("tools.activity")}: {toolActivity.toolId} · {toolActivity.argsSummary} · {toolActivity.resultSummary ?? t(`tools.status.${toolActivity.status}`)}</span> : null}
+                 </div>
++                {runMode === "agent" || agentRun ? (
++                  <section className="border-t px-2 py-2" data-testid="agent-run">
++                    <div className="flex items-center justify-between gap-2">
++                      <p className="text-[12px] font-medium">{t("agents.title")}</p>
++                      {agentRun ? <span className="text-[11px] text-muted-foreground" data-testid="agent-status">{t(`agents.status.${agentRun.status}`)}</span> : null}
++                    </div>
++                    {!agentRun ? (
++                      <>
++                        <textarea
++                          className="mt-1 min-h-16 w-full rounded border bg-background px-2 py-1 text-[12px]"
++                          value={agentPaths}
++                          onChange={(event) => setAgentPaths(event.target.value)}
++                          aria-label={t("agents.pathsLabel")}
++                          placeholder={t("agents.pathsPlaceholder")}
++                        />
++                        <Button type="button" size="sm" variant="ghost" className="mt-1" onClick={() => setDraft(t("agents.factory.goal"))}>
++                          {t("agents.factory.action")}
++                        </Button>
++                      </>
++                    ) : (
++                      <>
++                        <p className="mt-1 text-[11px] text-muted-foreground">{agentRun.planSummary}</p>
++                        <p className="mt-1 text-[11px] text-muted-foreground">{t("agents.limits", { steps: agentRun.maxSteps, budget: agentRun.budgetUsd, seconds: agentRun.timeoutSeconds })}</p>
++                        <ol className="mt-1 flex flex-wrap gap-1">
++                          {agentRun.steps.map((step) => (
++                            <li key={step.id} className="rounded border px-1.5 py-0.5 text-[11px]" data-testid="agent-step" data-status={step.status}>
++                              {step.ordinal}. {step.title} · {t(`agents.step.${step.status}`)}
++                              {step.tokensIn !== null || step.tokensOut !== null ? ` · ${t("agents.step.tokens", { input: step.tokensIn ?? 0, output: step.tokensOut ?? 0 })}` : ""}
++                              {step.costUsd !== null ? ` · ${t("agents.step.cost", { usd: step.costUsd })}` : ""}
++                            </li>
++                          ))}
++                        </ol>
++                        {agentRun.status === "awaiting_confirmation" ? (
++                          <div className="mt-2 flex flex-wrap items-center gap-2">
++                            <p className="text-[11px] text-muted-foreground">{t("agents.confirmDisclosure", { provider: agentRun.provider, model: agentRun.model })}</p>
++                            <Button type="button" size="sm" disabled={agentBusy} onClick={() => void controlAgent("start")} data-testid="agent-confirm">{t("agents.confirm")}</Button>
++                            <Button type="button" size="sm" variant="outline" disabled={agentBusy} onClick={() => void controlAgent("cancel")}>{t("agents.cancel")}</Button>
++                          </div>
++                        ) : null}
++                        {agentRun.status === "running" ? <div className="mt-2 flex gap-2"><Button type="button" size="sm" variant="outline" disabled={agentBusy} onClick={() => void controlAgent("pause")}>{t("agents.pause")}</Button><Button type="button" size="sm" variant="outline" disabled={agentBusy} onClick={() => void controlAgent("cancel")}>{t("agents.cancel")}</Button></div> : null}
++                        {agentRun.status === "paused" ? <div className="mt-2 flex gap-2"><Button type="button" size="sm" disabled={agentBusy} onClick={() => void controlAgent("resume")}>{t("agents.resume")}</Button><Button type="button" size="sm" variant="outline" disabled={agentBusy} onClick={() => void controlAgent("cancel")}>{t("agents.cancel")}</Button></div> : null}
++                      </>
++                    )}
++                  </section>
++                ) : null}
+                 {project ? (
+                   <div className="flex flex-wrap items-center gap-2 border-t px-2 py-1.5" data-testid="permission-center">
+                     <Input className="h-7 max-w-64" value={toolPath} onChange={(event) => setToolPath(event.target.value)} placeholder={t("tools.pathPlaceholder")} aria-label={t("tools.pathPlaceholder")} />
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 1d51d06..91395a7 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -480,5 +480,8 @@
+   "runMode.label": "Mode", "effort.label": "Effort",
+   "council.router.model": "Recommended model", "council.router.auto": "Automatic", "council.router.confirmed": "Route confirmed", "council.router.recommended": "recommended", "council.router.cost": "Estimated first-model cost: ${{usd}}", "council.router.latency": "Latency: {{ms}} ms", "council.router.speed.fast": "Speed: fast", "council.router.speed.balanced": "Speed: balanced", "council.router.speed.frontier": "Speed: frontier", "council.router.confirm": "Confirm route", "council.router.reject": "Reject route",
+   "quickAi.title": "Quick AI", "quickAi.close": "Close", "quickAi.placeholder": "Ask something or paste content…", "quickAi.clipboard": "Read clipboard", "quickAi.formatJson": "Format JSON", "quickAi.toInterface": "TS interface", "quickAi.explainJson": "Explain JSON", "quickAi.diagnoseStack": "Diagnose stack", "quickAi.sendToProject": "Send to current project", "quickAi.model": "Model", "quickAi.estimate": "Estimate: ${{usd}}", "quickAi.estimateUnavailable": "Estimate available on send", "quickAi.send": "Send", "quickAi.cancel": "Cancel", "quickAi.sending": "Sending…", "quickAi.error.setup": "Configure a provider key before sending.", "quickAi.error.send": "Could not send the question.", "quickAi.conversationTitle": "Quick AI", "quickAi.explainPrefix": "Explain this JSON clearly:", "quickAi.diagnosePrefix": "Diagnose this stack trace and suggest a fix:", "council.title": "AI Council", "council.placeholder": "Question for the council…", "council.run": "Start debate", "council.running": "Debating…", "council.synthesis": "Synthesis", "council.divergences": "Divergences (heuristic)", "council.none": "None highlighted", "council.error.setup": "Open a conversation and configure at least two models.", "council.error.run": "Could not complete the Council.", "council.router.simple": "Router: simple question → fast route; confirm before sending.", "council.router.code": "Router: code → balanced route; confirm before sending.", "council.router.complex": "Router: complex task → frontier route; confirm before sending.",
+-  "tools.pathPlaceholder": "Relative project path (for example, src/app.ts)", "tools.readFile": "Read file", "tools.chooseRoot": "Choose root", "tools.permission": "Allow {{tool}} to read this file?", "tools.allowOnce": "Allow once", "tools.allowProject": "Always in this project", "tools.deny": "Deny", "tools.activity": "Tool", "tools.untrustedContext": "Untrusted tool content", "tools.status.permission_required": "awaiting permission", "tools.status.denied": "denied", "tools.status.running": "running", "tools.status.completed": "completed", "tools.status.failed": "failed", "tools.error.denied": "The read was denied.", "tools.error.read": "Could not read that project file."
++  "tools.pathPlaceholder": "Relative project path (for example, src/app.ts)", "tools.readFile": "Read file", "tools.chooseRoot": "Choose root", "tools.permission": "Allow {{tool}} to read this file?", "tools.allowOnce": "Allow once", "tools.allowProject": "Always in this project", "tools.deny": "Deny", "tools.activity": "Tool", "tools.untrustedContext": "Untrusted tool content", "tools.status.permission_required": "awaiting permission", "tools.status.denied": "denied", "tools.status.running": "running", "tools.status.completed": "completed", "tools.status.failed": "failed", "tools.error.denied": "The read was denied.", "tools.error.read": "Could not read that project file.",
++  "agents.title": "Single agent", "agents.mode": "Agent", "agents.pathsLabel": "Project files to analyze", "agents.pathsPlaceholder": "One relative project path per line (up to 3)", "agents.factory.goal": "Analyze the selected project files and report the architecture, risks, and next steps.", "agents.factory.action": "Use Analyze this project", "agents.confirmDisclosure": "After confirmation, selected file content can be sent to {{provider}} / {{model}} to generate the report.", "agents.confirm": "Confirm plan", "agents.pause": "Pause", "agents.resume": "Resume", "agents.cancel": "Cancel", "agents.limits": "Limit: {{steps}} steps · ${{budget}} · {{seconds}}s", "agents.error.paths": "Add at least one relative project file path.", "agents.error.prepare": "Could not prepare the agent run. Choose a project root and an active model key.", "agents.error.control": "Could not update the agent run.",
++  "agents.status.awaiting_confirmation": "awaiting confirmation", "agents.status.running": "running", "agents.status.paused": "paused", "agents.status.cancelled": "cancelled", "agents.status.completed": "completed", "agents.status.completed_with_errors": "completed with errors", "agents.status.stopped_budget": "stopped by budget", "agents.status.stopped_timeout": "stopped by time limit", "agents.status.interrupted": "interrupted", "agents.status.failed": "failed",
++  "agents.step.pending": "pending", "agents.step.running": "running", "agents.step.completed": "completed", "agents.step.failed": "failed", "agents.step.skipped": "skipped", "agents.step.cancelled": "cancelled", "agents.step.interrupted": "interrupted", "agents.step.tokens": "tokens {{input}}/{{output}}", "agents.step.cost": "cost ${{usd}}"
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index 174346b..1237961 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -480,5 +480,8 @@
+   "runMode.label": "Modo", "effort.label": "Esforço",
+   "council.router.model": "Modelo recomendado", "council.router.auto": "Automático", "council.router.confirmed": "Rota confirmada", "council.router.recommended": "recomendado", "council.router.cost": "Custo estimado do primeiro modelo: US$ {{usd}}", "council.router.latency": "Latência: {{ms}} ms", "council.router.speed.fast": "Velocidade: rápida", "council.router.speed.balanced": "Velocidade: equilibrada", "council.router.speed.frontier": "Velocidade: frontier", "council.router.confirm": "Confirmar rota", "council.router.reject": "Recusar rota",
+   "quickAi.title": "Quick AI", "quickAi.close": "Fechar", "quickAi.placeholder": "Pergunte algo ou cole conteúdo…", "quickAi.clipboard": "Ler clipboard", "quickAi.formatJson": "Formatar JSON", "quickAi.toInterface": "Interface TS", "quickAi.explainJson": "Explicar JSON", "quickAi.diagnoseStack": "Diagnosticar stack", "quickAi.sendToProject": "Mandar ao projeto atual", "quickAi.model": "Modelo", "quickAi.estimate": "Estimativa: US$ {{usd}}", "quickAi.estimateUnavailable": "Estimativa disponível ao enviar", "quickAi.send": "Enviar", "quickAi.cancel": "Cancelar", "quickAi.sending": "Enviando…", "quickAi.error.setup": "Configure uma chave de provider antes de enviar.", "quickAi.error.send": "Não foi possível enviar a pergunta.", "quickAi.conversationTitle": "Quick AI", "quickAi.explainPrefix": "Explique este JSON de forma clara:", "quickAi.diagnosePrefix": "Diagnostique este stack trace e sugira uma correção:", "council.title": "AI Council", "council.placeholder": "Pergunta para o conselho…", "council.run": "Iniciar debate", "council.running": "Debatendo…", "council.synthesis": "Síntese", "council.divergences": "Divergências (heurística)", "council.none": "Nenhuma destacada", "council.error.setup": "Abra uma conversa e configure ao menos dois modelos.", "council.error.run": "Não foi possível concluir o Council.", "council.router.simple": "Router: pergunta simples → rota rápida; confirme antes de enviar.", "council.router.code": "Router: código → rota equilibrada; confirme antes de enviar.", "council.router.complex": "Router: tarefa complexa → rota frontier; confirme antes de enviar.",
+-  "tools.pathPlaceholder": "Caminho relativo no projeto (ex.: src/app.ts)", "tools.readFile": "Ler arquivo", "tools.chooseRoot": "Escolher raiz", "tools.permission": "Permitir {{tool}} ler este arquivo?", "tools.allowOnce": "Permitir uma vez", "tools.allowProject": "Sempre neste projeto", "tools.deny": "Negar", "tools.activity": "Tool", "tools.untrustedContext": "Conteúdo de tool não confiável", "tools.status.permission_required": "aguarda permissão", "tools.status.denied": "negada", "tools.status.running": "em execução", "tools.status.completed": "concluída", "tools.status.failed": "falhou", "tools.error.denied": "A leitura foi negada.", "tools.error.read": "Não foi possível ler esse arquivo do projeto."
++  "tools.pathPlaceholder": "Caminho relativo no projeto (ex.: src/app.ts)", "tools.readFile": "Ler arquivo", "tools.chooseRoot": "Escolher raiz", "tools.permission": "Permitir {{tool}} ler este arquivo?", "tools.allowOnce": "Permitir uma vez", "tools.allowProject": "Sempre neste projeto", "tools.deny": "Negar", "tools.activity": "Tool", "tools.untrustedContext": "Conteúdo de tool não confiável", "tools.status.permission_required": "aguarda permissão", "tools.status.denied": "negada", "tools.status.running": "em execução", "tools.status.completed": "concluída", "tools.status.failed": "falhou", "tools.error.denied": "A leitura foi negada.", "tools.error.read": "Não foi possível ler esse arquivo do projeto.",
++  "agents.title": "Agente único", "agents.mode": "Agente", "agents.pathsLabel": "Arquivos do projeto para analisar", "agents.pathsPlaceholder": "Um caminho relativo do projeto por linha (até 3)", "agents.factory.goal": "Analise os arquivos selecionados do projeto e reporte a arquitetura, os riscos e os próximos passos.", "agents.factory.action": "Usar Analisar este projeto", "agents.confirmDisclosure": "Após sua confirmação, o conteúdo dos arquivos selecionados poderá ser enviado para {{provider}} / {{model}} para gerar o relatório.", "agents.confirm": "Confirmar plano", "agents.pause": "Pausar", "agents.resume": "Retomar", "agents.cancel": "Cancelar", "agents.limits": "Limite: {{steps}} passos · US$ {{budget}} · {{seconds}}s", "agents.error.paths": "Adicione ao menos um caminho relativo de arquivo do projeto.", "agents.error.prepare": "Não foi possível preparar a execução do agente. Escolha uma raiz do projeto e uma chave de modelo ativa.", "agents.error.control": "Não foi possível atualizar a execução do agente.",
++  "agents.status.awaiting_confirmation": "aguarda confirmação", "agents.status.running": "em execução", "agents.status.paused": "pausado", "agents.status.cancelled": "cancelado", "agents.status.completed": "concluído", "agents.status.completed_with_errors": "concluído com erros", "agents.status.stopped_budget": "interrompido pelo orçamento", "agents.status.stopped_timeout": "interrompido pelo limite de tempo", "agents.status.interrupted": "interrompido", "agents.status.failed": "falhou",
++  "agents.step.pending": "pendente", "agents.step.running": "em execução", "agents.step.completed": "concluído", "agents.step.failed": "falhou", "agents.step.skipped": "ignorado", "agents.step.cancelled": "cancelado", "agents.step.interrupted": "interrompido", "agents.step.tokens": "tokens {{input}}/{{output}}", "agents.step.cost": "custo US$ {{usd}}"
+ }
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index 4012483..f45570b 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -34,6 +34,9 @@ import {
+   conversationWorkspaceDtoSchema,
+   toolReadRequestInputSchema,
+   toolReadRequestResultSchema,
++  agentPrepareInputSchema,
++  agentRunDetailSchema,
++  agentIdInputSchema,
+ } from "./ipc-schemas";
+ 
+ describe("emptyIpcPayloadSchema", () => {
+@@ -555,3 +558,61 @@ describe("wave 22 tool IPC contracts", () => {
+     ).toBe("completed");
+   });
+ });
++
++describe("wave 23 agent IPC contracts", () => {
++  const input = {
++    projectId: "11111111-1111-4111-8111-111111111111",
++    conversationId: "22222222-2222-4222-8222-222222222222",
++    providerKeyId: "33333333-3333-4333-8333-333333333333",
++    model: "gpt-4o-mini",
++    goal: "Analyze the project.",
++    relativePaths: ["README.md", "src/app.ts", "package.json"],
++    maxSteps: 6,
++    budgetUsd: "1.000000",
++    timeoutSeconds: 300,
++  };
++
++  it("accepts only a bounded explicit plan before a run starts", () => {
++    expect(agentPrepareInputSchema.parse(input).relativePaths).toHaveLength(3);
++    expect(() => agentPrepareInputSchema.parse({ ...input, relativePaths: ["../secrets.txt"] })).toThrow();
++    expect(() => agentPrepareInputSchema.parse({ ...input, relativePaths: ["C:\\\\secrets.txt"] })).toThrow();
++    expect(() => agentPrepareInputSchema.parse({ ...input, maxSteps: 5 })).toThrow();
++    expect(() => agentPrepareInputSchema.parse({ ...input, extra: "nope" })).toThrow();
++  });
++
++  it("never exposes encrypted step detail through the renderer DTO", () => {
++    const dto = {
++      id: "44444444-4444-4444-8444-444444444444",
++      projectId: input.projectId,
++      conversationId: input.conversationId,
++      parentRunId: null,
++      kind: "single",
++      status: "awaiting_confirmation",
++      provider: "openai",
++      model: input.model,
++      goalSummary: input.goal,
++      planSummary: "Read the selected files.",
++      maxSteps: 6,
++      budgetUsd: "1.000000",
++      timeoutSeconds: 300,
++      reportArtifactId: null,
++      createdAt: "2026-09-22T00:00:00.000Z",
++      startedAt: null,
++      finishedAt: null,
++      steps: [],
++    };
++    expect(agentRunDetailSchema.parse(dto).steps).toEqual([]);
++    expect(() => agentRunDetailSchema.parse({ ...dto, providerKeyId: input.providerKeyId })).toThrow();
++  });
++
++  it("binds every run control command to its project and conversation", () => {
++    const control = {
++      id: "44444444-4444-4444-8444-444444444444",
++      projectId: input.projectId,
++      conversationId: input.conversationId,
++    };
++    expect(agentIdInputSchema.parse(control)).toEqual(control);
++    expect(() => agentIdInputSchema.parse({ id: control.id })).toThrow();
++    expect(() => agentIdInputSchema.parse({ ...control, extra: true })).toThrow();
++  });
++});
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index 3b24e28..00070bd 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -204,7 +204,11 @@ export type AgentRunDto = z.infer<typeof agentRunDtoSchema>;
+ export const agentRunDetailSchema = agentRunDtoSchema.extend({ steps: z.array(agentStepDtoSchema).max(AGENT_MAX_STEPS) }).strict();
+ export type AgentRunDetail = z.infer<typeof agentRunDetailSchema>;
+ 
+-export const agentIdInputSchema = z.object({ id: z.string().uuid() }).strict();
++export const agentIdInputSchema = z.object({
++  id: z.string().uuid(),
++  projectId: z.string().uuid(),
++  conversationId: z.string().uuid(),
++}).strict();
+ export type AgentIdInput = z.infer<typeof agentIdInputSchema>;
+ export const agentListInputSchema = z.object({ conversationId: z.string().uuid() }).strict();
+ export type AgentListInput = z.infer<typeof agentListInputSchema>;
+
