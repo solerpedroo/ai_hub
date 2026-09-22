@@ -117,6 +117,12 @@ import {
   windowIsMaximizedResultSchema,
   clipboardTextSchema,
   workspaceSessionSchema,
+  toolProjectGetInputSchema,
+  toolProjectStateSchema,
+  toolProjectRootPickResultSchema,
+  toolReadRequestInputSchema,
+  toolReadRequestResultSchema,
+  toolActivityResultSchema,
 } from "@ai-hub/shared";
 
 const empty = emptyIpcPayloadSchema.parse({});
@@ -485,6 +491,12 @@ const hub: HubApi = {
     remove: (input) => invokeAckWith(IpcChannel.skillsRemove, input, idInputSchema),
     resolve: (input) =>
       invokeParsed(IpcChannel.skillsResolve, input, skillResolveInputSchema, skillResolveResultSchema),
+  },
+  tools: {
+    getProject: (input) => invokeParsed(IpcChannel.toolsGetProject, input, toolProjectGetInputSchema, toolProjectStateSchema),
+    pickProjectRoot: (input) => invokeParsed(IpcChannel.toolsPickProjectRoot, input, toolProjectGetInputSchema, toolProjectRootPickResultSchema),
+    requestRead: (input) => invokeParsed(IpcChannel.toolsRequestRead, input, toolReadRequestInputSchema, toolReadRequestResultSchema),
+    getLatestActivity: () => invokeParsed(IpcChannel.toolsGetLatestActivity, empty, emptyIpcPayloadSchema, toolActivityResultSchema),
   },
 };
 
