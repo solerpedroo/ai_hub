@@ -59,6 +59,24 @@ describe("hub database", () => {
     hub.close();
   });
 
+  it("encrypts project roots and isolates persistent tool permissions by project", () => {
+    const { hub } = openTestDb();
+    const first = hub.repos.createProject("First");
+    const second = hub.repos.createProject("Second");
+    hub.repos.setProjectToolRoot(first.id, "C:\\private-project");
+    expect(hub.repos.getProjectToolRoot(first.id)?.rootPath).toBe("C:\\private-project");
+    expect(dumpAllText(hub.sqlite)).not.toContain("C:\\private-project");
+    hub.repos.grantProjectToolPermission(first.id, "project-filesystem.read-file", "read");
+    expect(hub.repos.hasProjectToolPermission(first.id, "project-filesystem.read-file", "read")).toBe(true);
+    expect(hub.repos.hasProjectToolPermission(second.id, "project-filesystem.read-file", "read")).toBe(false);
+    hub.repos.setProjectToolRoot(first.id, "C:\\another-project");
+    expect(hub.repos.hasProjectToolPermission(first.id, "project-filesystem.read-file", "read")).toBe(false);
+    hub.repos.clearProjectToolRoot(first.id);
+    expect(hub.repos.getProjectToolRoot(first.id)).toBeNull();
+    expect(hub.repos.hasProjectToolPermission(first.id, "project-filesystem.read-file", "read")).toBe(false);
+    hub.close();
+  });
+
   it("accepts linear messages (null parent) and a branch (parent set)", () => {
     const { hub } = openTestDb();
     const project = hub.repos.createProject("Graph");
@@ -139,10 +157,10 @@ describe("hub database", () => {
       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
       applyMigrations(second.sqlite);
-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(15);
+      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(16);
       second.close();
     } finally {
-      rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 });
     }
   });
 
