@@ -105,3 +105,7 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W19-001](./ADR-W19-001-shared-renderer-quick-ai-overlay.md) | W19 | Overlay Quick AI no renderer compartilhado | accepted |
 | [ADR-W20-001](./ADR-W20-001-council-explicit-multi-model-deliberation.md) | W20 | Council multi-modelo explícito | accepted |
 | [ADR-W21-001](./ADR-W21-001-run-modes-effort-hud.md) | W21 | Run modes, esforço e HUD de uso | accepted |
+| [ADR-W22-001](./ADR-W22-001-main-owned-mcp-tool-router.md) | W22 | MCP e Tool Router no processo main | accepted |
+| [ADR-W22-002](./ADR-W22-002-project-scoped-tool-permissions.md) | W22 | Permissões de tools escopadas por projeto | accepted |
+| [ADR-W22-003](./ADR-W22-003-realpath-scoped-filesystem-connector.md) | W22 | Connector filesystem com realpath e escopo | accepted |
+| [ADR-W22-004](./ADR-W22-004-skill-contract-v2-tool-allowlist.md) | W22 | Contrato Skill v2 com allowlist de tools | accepted |
