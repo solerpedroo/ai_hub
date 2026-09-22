@@ -100,6 +100,11 @@ import type {
   ToolProjectState,
   ToolReadRequestInput,
   ToolReadRequestResult,
+  AgentPrepareInput,
+  AgentIdInput,
+  AgentListInput,
+  AgentRunDto,
+  AgentRunDetail,
   ProviderKeyDto,
   SecretsSaveInput,
   SecretsTestInput,
@@ -279,6 +284,16 @@ export interface HubToolsApi {
   getLatestActivity: () => Promise<ToolActivityDto | null>;
 }
 
+export interface HubAgentsApi {
+  prepare: (input: AgentPrepareInput) => Promise<AgentRunDetail>;
+  get: (input: AgentIdInput) => Promise<AgentRunDetail>;
+  list: (input: AgentListInput) => Promise<AgentRunDto[]>;
+  start: (input: AgentIdInput) => Promise<AgentRunDetail>;
+  pause: (input: AgentIdInput) => Promise<AgentRunDetail>;
+  resume: (input: AgentIdInput) => Promise<AgentRunDetail>;
+  cancel: (input: AgentIdInput) => Promise<AgentRunDetail>;
+}
+
 export interface HubChatApi {
   send: (input: ChatSendInput) => Promise<ChatSendResult>;
   abort: (input: ChatAbortInput) => Promise<void>;
@@ -316,6 +331,7 @@ export interface HubApi {
   artifacts: HubArtifactsApi;
   skills: HubSkillsApi;
   tools: HubToolsApi;
+  agents: HubAgentsApi;
 }
 
 export type { AppLocale, ThemeMode };
