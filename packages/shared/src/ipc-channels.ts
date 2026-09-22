@@ -98,6 +98,13 @@ export const IpcChannel = {
   toolsPickProjectRoot: "tools:pickProjectRoot",
   toolsRequestRead: "tools:requestRead",
   toolsGetLatestActivity: "tools:getLatestActivity",
+  agentsPrepare: "agents:prepare",
+  agentsGet: "agents:get",
+  agentsList: "agents:list",
+  agentsStart: "agents:start",
+  agentsPause: "agents:pause",
+  agentsResume: "agents:resume",
+  agentsCancel: "agents:cancel",
 } as const;
 
 export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
