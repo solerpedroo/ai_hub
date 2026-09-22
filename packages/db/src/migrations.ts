@@ -322,6 +322,7 @@ CREATE TABLE agent_runs (
   kind TEXT NOT NULL DEFAULT 'single',
   status TEXT NOT NULL,
   provider TEXT NOT NULL,
+  provider_key_id TEXT NOT NULL REFERENCES provider_keys(id) ON DELETE RESTRICT,
   model TEXT NOT NULL,
   goal_cipher TEXT NOT NULL,
   plan_cipher TEXT NOT NULL,
