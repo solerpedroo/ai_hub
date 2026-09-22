@@ -224,7 +224,7 @@ export const orchestrationPrepareInputSchema = z.object({
   model: z.string().trim().min(1).max(128), goal: z.string().trim().min(1).max(4_000),
   relativePaths: z.array(agentRelativePathSchema).min(1).max(AGENT_MAX_READ_PATHS),
   maxSteps: z.number().int().min(4).max(AGENT_MAX_STEPS).default(AGENT_MAX_STEPS), budgetUsd: agentBudgetUsdSchema.default("1.000000"), timeoutSeconds: z.number().int().min(30).max(600).default(300), skillId: z.string().uuid().nullable().optional(),
-  parallelism: z.literal(2).default(2), budgetMode: z.enum(["shared", "per_node"]).default("shared"),
+  parallelism: z.literal(2).default(2), budgetMode: z.literal("shared").default("shared"),
 }).strict().superRefine((value, context) => {
   if (value.relativePaths.length + 3 > value.maxSteps) context.addIssue({ code: z.ZodIssueCode.custom, path: ["maxSteps"], message: "maxSteps must cover plan, reads, report and artifact" });
 });
@@ -248,7 +248,7 @@ export const agentHandoffDtoSchema = z.object({
 export type AgentHandoffDto = z.infer<typeof agentHandoffDtoSchema>;
 
 export const orchestrationRunDetailSchema = agentRunDtoSchema.extend({
-  kind: z.literal("orchestrated"), role: z.literal("supervisor"), graphVersion: z.literal(1), budgetMode: z.enum(["shared", "per_node"]),
+  kind: z.literal("orchestrated"), role: z.literal("supervisor"), graphVersion: z.literal(1), budgetMode: z.literal("shared"),
   nodes: z.array(agentNodeDtoSchema).min(3).max(4), handoffs: z.array(agentHandoffDtoSchema).max(8),
 }).strict();
 export type OrchestrationRunDetail = z.infer<typeof orchestrationRunDetailSchema>;
