@@ -27,6 +27,7 @@ import {
   type PromptDto,
   type SkillDto,
   type ArtifactDto,
+  type AgentRunDetail,
   type ProviderKeyDto,
   type HealthSummaryDto,
   type ToolActivityDto,
@@ -252,6 +253,9 @@ export function HomeView({
   const [toolActivity, setToolActivity] = useState<ToolActivityDto | null>(null);
   const [toolBusy, setToolBusy] = useState(false);
   const [toolError, setToolError] = useState<string | null>(null);
+  const [agentRun, setAgentRun] = useState<AgentRunDetail | null>(null);
+  const [agentPaths, setAgentPaths] = useState("README.md\npackage.json\nsrc/index.ts");
+  const [agentBusy, setAgentBusy] = useState(false);
   const [projectName, setProjectName] = useState(project?.name ?? "");
   const [projectColor, setProjectColor] = useState<string | null>(project?.color ?? null);
   const [projectInstructions, setProjectInstructions] = useState(
@@ -291,9 +295,30 @@ export function HomeView({
       setToolActivity(activity?.projectId === project.id ? activity : null);
     }).catch(() => setToolActivity(null));
   }, [project]);
+  useEffect(() => {
+    if (!selectedConversationId) { setAgentRun(null); return; }
+    void window.hub.agents.list({ conversationId: selectedConversationId }).then(async (runs) => {
+      const latest = runs[0];
+      setAgentRun(latest ? await window.hub.agents.get({ id: latest.id, projectId: latest.projectId, conversationId: latest.conversationId }) : null);
+    }).catch(() => setAgentRun(null));
+  }, [selectedConversationId]);
+  useEffect(() => {
+    if (!agentRun || agentRun.status !== "running") return;
+    const timer = window.setInterval(() => {
+      void window.hub.agents.get({ id: agentRun.id, projectId: agentRun.projectId, conversationId: agentRun.conversationId }).then(setAgentRun).catch(() => undefined);
+    }, 700);
+    return () => window.clearInterval(timer);
+  }, [agentRun]);
+  useEffect(() => {
+    if (!agentRun?.reportArtifactId || !selectedConversationId) return;
+    void window.hub.artifacts.list({ conversationId: selectedConversationId }).then((rows) => {
+      setArtifacts(rows);
+      setCanvasId(agentRun.reportArtifactId);
+    }).catch(() => undefined);
+  }, [agentRun?.reportArtifactId, selectedConversationId]);
   const saveRunSettings = async (nextMode: typeof runMode, nextEffort: typeof effortLevel): Promise<void> => {
     if (!selectedConversationId) return;
-    if (nextMode === "agent" || nextMode === "orchestrate") return;
+    if (nextMode === "orchestrate") return;
     setRunMode(nextMode); setEffortLevel(nextEffort);
     await window.hub.conversations.setRunSettings({ conversationId: selectedConversationId, runMode: nextMode, effortLevel: nextEffort });
   };
@@ -607,6 +632,13 @@ export function HomeView({
         });
       }
     }
+    if (runMode === "agent") {
+      const matchedSkill = skillMention
+        ? librarySkills.find((skill) => skill.id === skillMention.id || skill.title.toLowerCase() === (skillMention.query ?? "").toLowerCase())
+        : null;
+      void prepareAgent(content, matchedSkill?.id);
+      return;
+    }
     const route = autoRouter && routedModel ? { keyId: routedModel.key.id, model: routedModel.model.id, runMode, effortLevel } : { keyId: selectedKeyId ?? "", model: selectedModel, runMode, effortLevel };
     void onSend(content, mentions, route).then((ok) => {
       if (ok) {
@@ -636,6 +668,40 @@ export function HomeView({
       if (result.kind === "denied") setToolError(t("tools.error.denied"));
     } catch { setToolError(t("tools.error.read")); }
     finally { setToolBusy(false); }
+  };
+
+  const prepareAgent = async (goal: string, skillId?: string): Promise<void> => {
+    if (!project || !selectedConversationId || !selectedKeyId || goal.trim().length === 0) return;
+    const paths = agentPaths.split(/\r?\n|,/).map((path) => path.trim()).filter(Boolean).slice(0, 3);
+    if (paths.length === 0) { setToolError(t("agents.error.paths")); return; }
+    setAgentBusy(true); setToolError(null);
+    try {
+      const prepared = await window.hub.agents.prepare({
+        projectId: project.id,
+        conversationId: selectedConversationId,
+        providerKeyId: selectedKeyId,
+        model: selectedModel,
+        goal,
+        relativePaths: paths,
+        maxSteps: Math.min(6, paths.length + 3),
+        budgetUsd: "1.000000",
+        timeoutSeconds: 300,
+        ...(skillId ? { skillId } : {}),
+      });
+      setAgentRun(prepared);
+      setDraft("");
+    } catch { setToolError(t("agents.error.prepare")); }
+    finally { setAgentBusy(false); }
+  };
+
+  const controlAgent = async (action: "start" | "pause" | "resume" | "cancel"): Promise<void> => {
+    if (!agentRun) return;
+    setAgentBusy(true); setToolError(null);
+    try {
+      const updated = await window.hub.agents[action]({ id: agentRun.id, projectId: agentRun.projectId, conversationId: agentRun.conversationId });
+      setAgentRun(updated);
+    } catch { setToolError(t("agents.error.control")); }
+    finally { setAgentBusy(false); }
   };
 
   return (
@@ -913,7 +979,7 @@ export function HomeView({
                       ))}
                     </select>
                   </label>
-                  <label className="flex items-center gap-1 text-[11px]"><span>{t("runMode.label")}</span><select className="h-8 rounded border bg-background px-1" value={runMode} onChange={(event) => void saveRunSettings(event.target.value as typeof runMode, effortLevel)}><option value="assist">Assist</option><option value="plan">Plan</option><option value="agent" disabled>Agent (W23)</option><option value="orchestrate" disabled>Orchestrate (W24)</option></select></label>
+                  <label className="flex items-center gap-1 text-[11px]"><span>{t("runMode.label")}</span><select className="h-8 rounded border bg-background px-1" value={runMode} onChange={(event) => void saveRunSettings(event.target.value as typeof runMode, effortLevel)}><option value="assist">Assist</option><option value="plan">Plan</option><option value="agent">{t("agents.mode")}</option><option value="orchestrate" disabled>Orchestrate (W24)</option></select></label>
                   <label className="flex items-center gap-1 text-[11px"><span>{t("effort.label")}</span><select className="h-8 rounded border bg-background px-1" value={effortLevel} onChange={(event) => void saveRunSettings(runMode, event.target.value as typeof effortLevel)}>{["low", "medium", "high", "max"].map((level) => <option key={level} value={level}>{level}</option>)}</select></label>
                   <label className="flex items-center gap-1">
                     <span className="text-muted-foreground">{t("workspace.model")}</span>
@@ -1497,6 +1563,51 @@ export function HomeView({
                   {runHud?.thinkingSupported === false ? <span>{t("hud.thinkingUnavailable")}</span> : null}
                   {toolActivity ? <span data-testid="tool-activity">{t("tools.activity")}: {toolActivity.toolId} · {toolActivity.argsSummary} · {toolActivity.resultSummary ?? t(`tools.status.${toolActivity.status}`)}</span> : null}
                 </div>
+                {runMode === "agent" || agentRun ? (
+                  <section className="border-t px-2 py-2" data-testid="agent-run">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-[12px] font-medium">{t("agents.title")}</p>
+                      {agentRun ? <span className="text-[11px] text-muted-foreground" data-testid="agent-status">{t(`agents.status.${agentRun.status}`)}</span> : null}
+                    </div>
+                    {!agentRun ? (
+                      <>
+                        <textarea
+                          className="mt-1 min-h-16 w-full rounded border bg-background px-2 py-1 text-[12px]"
+                          value={agentPaths}
+                          onChange={(event) => setAgentPaths(event.target.value)}
+                          aria-label={t("agents.pathsLabel")}
+                          placeholder={t("agents.pathsPlaceholder")}
+                        />
+                        <Button type="button" size="sm" variant="ghost" className="mt-1" onClick={() => setDraft(t("agents.factory.goal"))}>
+                          {t("agents.factory.action")}
+                        </Button>
+                      </>
+                    ) : (
+                      <>
+                        <p className="mt-1 text-[11px] text-muted-foreground">{agentRun.planSummary}</p>
+                        <p className="mt-1 text-[11px] text-muted-foreground">{t("agents.limits", { steps: agentRun.maxSteps, budget: agentRun.budgetUsd, seconds: agentRun.timeoutSeconds })}</p>
+                        <ol className="mt-1 flex flex-wrap gap-1">
+                          {agentRun.steps.map((step) => (
+                            <li key={step.id} className="rounded border px-1.5 py-0.5 text-[11px]" data-testid="agent-step" data-status={step.status}>
+                              {step.ordinal}. {step.title} · {t(`agents.step.${step.status}`)}
+                              {step.tokensIn !== null || step.tokensOut !== null ? ` · ${t("agents.step.tokens", { input: step.tokensIn ?? 0, output: step.tokensOut ?? 0 })}` : ""}
+                              {step.costUsd !== null ? ` · ${t("agents.step.cost", { usd: step.costUsd })}` : ""}
+                            </li>
+                          ))}
+                        </ol>
+                        {agentRun.status === "awaiting_confirmation" ? (
+                          <div className="mt-2 flex flex-wrap items-center gap-2">
+                            <p className="text-[11px] text-muted-foreground">{t("agents.confirmDisclosure", { provider: agentRun.provider, model: agentRun.model })}</p>
+                            <Button type="button" size="sm" disabled={agentBusy} onClick={() => void controlAgent("start")} data-testid="agent-confirm">{t("agents.confirm")}</Button>
+                            <Button type="button" size="sm" variant="outline" disabled={agentBusy} onClick={() => void controlAgent("cancel")}>{t("agents.cancel")}</Button>
+                          </div>
+                        ) : null}
+                        {agentRun.status === "running" ? <div className="mt-2 flex gap-2"><Button type="button" size="sm" variant="outline" disabled={agentBusy} onClick={() => void controlAgent("pause")}>{t("agents.pause")}</Button><Button type="button" size="sm" variant="outline" disabled={agentBusy} onClick={() => void controlAgent("cancel")}>{t("agents.cancel")}</Button></div> : null}
+                        {agentRun.status === "paused" ? <div className="mt-2 flex gap-2"><Button type="button" size="sm" disabled={agentBusy} onClick={() => void controlAgent("resume")}>{t("agents.resume")}</Button><Button type="button" size="sm" variant="outline" disabled={agentBusy} onClick={() => void controlAgent("cancel")}>{t("agents.cancel")}</Button></div> : null}
+                      </>
+                    )}
+                  </section>
+                ) : null}
                 {project ? (
                   <div className="flex flex-wrap items-center gap-2 border-t px-2 py-1.5" data-testid="permission-center">
                     <Input className="h-7 max-w-64" value={toolPath} onChange={(event) => setToolPath(event.target.value)} placeholder={t("tools.pathPlaceholder")} aria-label={t("tools.pathPlaceholder")} />
