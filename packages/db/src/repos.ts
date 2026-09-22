@@ -29,6 +29,7 @@ import {
   artifacts,
   agentRuns,
   agentSteps,
+  agentHandoffs,
   messageReceipts,
   messages,
   projects,
@@ -74,13 +75,21 @@ export interface ProjectToolPermissionRecord {
 export type AgentRunStatus = "awaiting_confirmation" | "running" | "paused" | "cancelled" | "completed" | "completed_with_errors" | "stopped_budget" | "stopped_timeout" | "interrupted" | "failed";
 export type AgentStepStatus = "pending" | "running" | "completed" | "failed" | "skipped" | "cancelled" | "interrupted";
 export type AgentStepKind = "plan" | "tool" | "report" | "artifact";
+export type AgentRunKind = "single" | "orchestrated";
+export type AgentRole = "single" | "supervisor" | "explorer" | "reviewer" | "writer";
+export type AgentBudgetMode = "single" | "shared" | "per_node";
+export type AgentHandoffJoinKind = "sequential" | "parallel";
+export type AgentHandoffStatus = "pending" | "ready" | "consumed" | "cancelled" | "interrupted";
 
 export interface AgentRunRecord {
   id: string;
   projectId: string;
   conversationId: string;
   parentRunId: string | null;
-  kind: "single";
+  kind: AgentRunKind;
+  role: AgentRole;
+  graphVersion: number;
+  budgetMode: AgentBudgetMode;
   status: AgentRunStatus;
   provider: string;
   providerKeyId: string;
@@ -94,6 +103,22 @@ export interface AgentRunRecord {
   reportArtifactId: string | null;
   createdAt: string;
   startedAt: string | null;
+  finishedAt: string | null;
+}
+
+export interface AgentHandoffRecord {
+  id: string;
+  rootRunId: string;
+  fromRunId: string;
+  toRunId: string;
+  ordinal: number;
+  joinKind: AgentHandoffJoinKind;
+  status: AgentHandoffStatus;
+  systemMessage: string;
+  packetSubset: string;
+  tokenEstimate: number;
+  summary: string;
+  createdAt: string;
   finishedAt: string | null;
 }
 
@@ -2678,6 +2703,11 @@ export class HubRepos {
     budgetUsd: string;
     timeoutSeconds: number;
     steps: Array<{ kind: AgentStepKind; title: string; toolId?: string | null }>;
+    parentRunId?: string | null;
+    kind?: AgentRunKind;
+    role?: AgentRole;
+    graphVersion?: number;
+    budgetMode?: AgentBudgetMode;
   }): AgentRunRecord {
     const id = randomUUID();
     const now = Date.now();
@@ -2686,8 +2716,11 @@ export class HubRepos {
         id,
         projectId: input.projectId,
         conversationId: input.conversationId,
-        parentRunId: null,
-        kind: "single",
+        parentRunId: input.parentRunId ?? null,
+        kind: input.kind ?? "single",
+        role: input.role ?? "single",
+        graphVersion: input.graphVersion ?? 1,
+        budgetMode: input.budgetMode ?? "single",
         status: "awaiting_confirmation",
         provider: input.provider,
         providerKeyId: input.providerKeyId,
@@ -2744,6 +2777,63 @@ export class HubRepos {
       .sort((left, right) => left.ordinal - right.ordinal);
   }
 
+  createAgentHandoff(input: {
+    rootRunId: string;
+    fromRunId: string;
+    toRunId: string;
+    ordinal: number;
+    joinKind: AgentHandoffJoinKind;
+    systemMessage: string;
+    packetSubset: string;
+    tokenEstimate: number;
+    summary: string;
+  }): AgentHandoffRecord {
+    const id = randomUUID();
+    const now = Date.now();
+    this.db.insert(agentHandoffs).values({
+      id,
+      rootRunId: input.rootRunId,
+      fromRunId: input.fromRunId,
+      toRunId: input.toRunId,
+      ordinal: input.ordinal,
+      joinKind: input.joinKind,
+      status: "pending",
+      systemMessageCipher: encryptUtf8(input.systemMessage.slice(0, 8_000), this.masterKey),
+      packetSubsetCipher: encryptUtf8(input.packetSubset.slice(0, 32_000), this.masterKey),
+      tokenEstimate: input.tokenEstimate,
+      summaryCipher: encryptUtf8(input.summary.slice(0, 400), this.masterKey),
+      createdAt: now,
+      finishedAt: null,
+    }).run();
+    const created = this.db.select().from(agentHandoffs).where(eq(agentHandoffs.id, id)).get();
+    if (!created) throw new Error("Agent handoff not found");
+    return this.toAgentHandoff(created);
+  }
+
+  listAgentHandoffs(rootRunId: string): AgentHandoffRecord[] {
+    return this.db.select().from(agentHandoffs).where(eq(agentHandoffs.rootRunId, rootRunId)).all()
+      .map((row) => this.toAgentHandoff(row)).sort((left, right) => left.ordinal - right.ordinal);
+  }
+
+  updateAgentHandoff(id: string, patch: {
+    status?: AgentHandoffStatus;
+    packetSubset?: string;
+    tokenEstimate?: number;
+    summary?: string;
+    finishedAt?: number | null;
+  }): AgentHandoffRecord {
+    this.db.update(agentHandoffs).set({
+      ...(patch.status !== undefined ? { status: patch.status } : {}),
+      ...(patch.packetSubset !== undefined ? { packetSubsetCipher: encryptUtf8(patch.packetSubset.slice(0, 32_000), this.masterKey) } : {}),
+      ...(patch.tokenEstimate !== undefined ? { tokenEstimate: patch.tokenEstimate } : {}),
+      ...(patch.summary !== undefined ? { summaryCipher: encryptUtf8(patch.summary.slice(0, 400), this.masterKey) } : {}),
+      ...(patch.finishedAt !== undefined ? { finishedAt: patch.finishedAt } : {}),
+    }).where(eq(agentHandoffs.id, id)).run();
+    const updated = this.db.select().from(agentHandoffs).where(eq(agentHandoffs.id, id)).get();
+    if (!updated) throw new Error("Agent handoff not found");
+    return this.toAgentHandoff(updated);
+  }
+
   updateAgentRun(id: string, patch: {
     status?: AgentRunStatus;
     reportArtifactId?: string | null;
@@ -2787,7 +2877,7 @@ export class HubRepos {
   }
 
   interruptOrphanAgentRuns(): number {
-    const rows = this.db.select().from(agentRuns).where(and(eq(agentRuns.kind, "single"), eq(agentRuns.status, "running"))).all();
+    const rows = this.db.select().from(agentRuns).where(eq(agentRuns.status, "running")).all();
     const now = Date.now();
     for (const row of rows) {
       this.db.update(agentRuns).set({ status: "interrupted", finishedAt: now }).where(eq(agentRuns.id, row.id)).run();
@@ -3267,7 +3357,10 @@ export class HubRepos {
       projectId: row.projectId,
       conversationId: row.conversationId,
       parentRunId: row.parentRunId ?? null,
-      kind: "single",
+      kind: row.kind === "orchestrated" ? "orchestrated" : "single",
+      role: row.role === "supervisor" || row.role === "explorer" || row.role === "reviewer" || row.role === "writer" ? row.role : "single",
+      graphVersion: row.graphVersion,
+      budgetMode: row.budgetMode === "shared" || row.budgetMode === "per_node" ? row.budgetMode : "single",
       status: asAgentRunStatus(row.status),
       provider: row.provider,
       providerKeyId: row.providerKeyId,
@@ -3300,6 +3393,24 @@ export class HubRepos {
       tokensOut: row.tokensOut ?? null,
       costUsd: row.costUsd ?? null,
       startedAt: row.startedAt === null || row.startedAt === undefined ? null : iso(row.startedAt),
+      finishedAt: row.finishedAt === null || row.finishedAt === undefined ? null : iso(row.finishedAt),
+    };
+  }
+
+  private toAgentHandoff(row: typeof agentHandoffs.$inferSelect): AgentHandoffRecord {
+    return {
+      id: row.id,
+      rootRunId: row.rootRunId,
+      fromRunId: row.fromRunId,
+      toRunId: row.toRunId,
+      ordinal: row.ordinal,
+      joinKind: row.joinKind === "parallel" ? "parallel" : "sequential",
+      status: row.status === "ready" || row.status === "consumed" || row.status === "cancelled" || row.status === "interrupted" ? row.status : "pending",
+      systemMessage: decryptUtf8(row.systemMessageCipher, this.masterKey),
+      packetSubset: decryptUtf8(row.packetSubsetCipher, this.masterKey),
+      tokenEstimate: row.tokenEstimate,
+      summary: decryptUtf8(row.summaryCipher, this.masterKey),
+      createdAt: iso(row.createdAt),
       finishedAt: row.finishedAt === null || row.finishedAt === undefined ? null : iso(row.finishedAt),
     };
   }
