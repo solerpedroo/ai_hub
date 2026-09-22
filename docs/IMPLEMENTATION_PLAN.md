@@ -841,13 +841,13 @@ Council **não** é orquestração de agentes: N modelos, um packet, sem tools. 
 
 **Sub-tasks:**
 
-- [ ] Desbloquear modo `agent` (W21): tools permitidas pelo Permission Center; Plan mode do agente = produzir plano **sem** tools até o usuário confirmar
-- [ ] Plano de etapas visível; pause / cancel / max steps / budget (liga no spend cap + HUD)
-- [ ] Agente de fábrica: “analisar este projeto” (ler → mapear → report em artifact)
-- [ ] Loop infinito impossível: teto de steps + teto de custo + teto de tempo
-- [ ] Cada step é inspecionável; falha de tool não engole o plano; tokens por step no HUD
-- [ ] Skill com `steps[]` passa a executar tools de verdade quando declaradas
-- [ ] Schema `agent_runs` / `agent_steps` (migration nesta onda, não ad-hoc)
+- [x] Desbloquear modo `agent` (W21): tools permitidas pelo Permission Center; Plan mode do agente = produzir plano **sem** tools até o usuário confirmar
+- [x] Plano de etapas visível; pause / cancel / max steps / budget (liga no spend cap + HUD)
+- [x] Agente de fábrica: “analisar este projeto” (ler → mapear → report em artifact)
+- [x] Loop infinito impossível: teto de steps + teto de custo + teto de tempo
+- [x] Cada step é inspecionável; falha de tool não engole o plano; tokens por step no HUD
+- [x] Skill com `steps[]` passa a executar tools de verdade quando declaradas
+- [x] Schema `agent_runs` / `agent_steps` (migration nesta onda, não ad-hoc)
 
 **DoD:** usuário acompanha 6 passos num relatório, cancela no 3, estado persiste; modo Assist não dispara tools.
 
