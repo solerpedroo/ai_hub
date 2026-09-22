@@ -157,7 +157,7 @@ describe("hub database", () => {
       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
       applyMigrations(second.sqlite);
-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(16);
+      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(17);
       second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 });
@@ -793,6 +793,47 @@ describe("hub database", () => {
     expect(dumpAllText(hub.sqlite)).not.toContain("Prepare {{project}}");
     expect(hub.repos.getSkill(custom.id)?.prompt).toBe("Prepare {{project}}");
     expect(hub.repos.getSkill(custom.id)?.defaultMentions).toEqual([{ type: "file", query: "diff" }]);
+    hub.close();
+  });
+
+  it("persists a bounded agent run and encrypted inspectable steps", async () => {
+    const { hub } = openTestDb();
+    const project = hub.repos.createProject("Agent project");
+    const conversation = hub.repos.createConversation(project.id, "Agent chat");
+    const key = await hub.repos.saveProviderKey({
+      providerSlug: "openai",
+      label: "agent",
+      secret: "sk-agentfixtureNEVERSQLITE9999",
+    });
+    const run = hub.repos.createAgentRun({
+      projectId: project.id,
+      conversationId: conversation.id,
+      provider: "openai",
+      providerKeyId: key.id,
+      model: "gpt-4o-mini",
+      goal: "Inspect the selected source files.",
+      plan: "Read two files, report, and save an artifact.",
+      maxSteps: 5,
+      budgetUsd: "1.000000",
+      timeoutSeconds: 300,
+      steps: [
+        { kind: "plan", title: "Confirm plan" },
+        { kind: "tool", title: "Read README.md", toolId: "project-filesystem.read-file" },
+        { kind: "tool", title: "Read package.json", toolId: "project-filesystem.read-file" },
+        { kind: "report", title: "Write report" },
+        { kind: "artifact", title: "Save artifact" },
+      ],
+    });
+    const firstStep = hub.repos.listAgentSteps(run.id)[0];
+    expect(firstStep?.ordinal).toBe(1);
+    hub.repos.updateAgentStep(firstStep!.id, { status: "completed", summary: "Confirmed", detail: "private selected-file detail", finishedAt: Date.now() });
+    hub.repos.updateAgentRun(run.id, { status: "paused", startedAt: Date.now() });
+    expect(hub.repos.getAgentRun(run.id)?.goal).toBe("Inspect the selected source files.");
+    expect(hub.repos.listAgentSteps(run.id)[0]?.detail).toBe("private selected-file detail");
+    const dump = dumpAllText(hub.sqlite);
+    expect(dump).not.toContain("Inspect the selected source files.");
+    expect(dump).not.toContain("private selected-file detail");
+    expect(hub.repos.listAgentRuns(conversation.id)).toHaveLength(1);
     hub.close();
   });
 
