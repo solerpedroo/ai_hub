@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave 
 |---|---|
 | Wave | **W23** |
 | Marco | D — V2 agents + local |
-| State | `complete` |
+| State | `in_progress` |
 | Last completed | **W22** |
-| Next action | Start W23 — Agentes (loop único) only after a new wave-start gate |
+| Next action | Map the single-agent run lifecycle, persistence and W22 permission intersection |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
