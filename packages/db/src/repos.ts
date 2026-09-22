@@ -22,6 +22,8 @@ import {
   importJobs,
   projectFiles,
   projectMemories,
+  projectToolPermissions,
+  projectToolRoots,
   prompts,
   skills,
   artifacts,
@@ -47,6 +49,22 @@ export interface ProjectRecord {
   instructions: string | null;
   preferredModel: string | null;
   preferredProvider: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProjectToolRootRecord {
+  projectId: string;
+  rootPath: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProjectToolPermissionRecord {
+  id: string;
+  projectId: string;
+  toolId: string;
+  operation: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -243,8 +261,9 @@ export interface SkillRecord {
   preferredModel: string | null;
   defaultMentions: Array<{ type: "file" | "conversation" | "memory" | "prompt" | "skill" | "packet"; query: string }>;
   steps: Array<{ id: string; title: string; section: string }>;
+  allowedTools: Array<{ toolId: "project-filesystem.read-file"; operation: "read" }>;
   factoryId: string | null;
-  contractVersion: 1;
+  contractVersion: 1 | 2;
   createdAt: string;
   updatedAt: string;
 }
@@ -671,6 +690,92 @@ export class HubRepos {
   removeProject(id: string): void {
     this.db.update(conversations).set({ projectId: null }).where(eq(conversations.projectId, id)).run();
     this.db.delete(projects).where(eq(projects.id, id)).run();
+  }
+
+  getProjectToolRoot(projectId: string): ProjectToolRootRecord | null {
+    const row = this.db.select().from(projectToolRoots).where(eq(projectToolRoots.projectId, projectId)).get();
+    if (!row) return null;
+    return {
+      projectId: row.projectId,
+      rootPath: decryptUtf8(row.rootCipher, this.masterKey),
+      createdAt: iso(row.createdAt),
+      updatedAt: iso(row.updatedAt),
+    };
+  }
+
+  setProjectToolRoot(projectId: string, rootPath: string): ProjectToolRootRecord {
+    if (!this.getProject(projectId)) throw new Error("Project not found");
+    const now = Date.now();
+    this.db.transaction((tx) => {
+      tx.delete(projectToolPermissions).where(eq(projectToolPermissions.projectId, projectId)).run();
+      tx
+        .insert(projectToolRoots)
+        .values({ projectId, rootCipher: encryptUtf8(rootPath, this.masterKey), createdAt: now, updatedAt: now })
+        .onConflictDoUpdate({
+          target: projectToolRoots.projectId,
+          set: { rootCipher: encryptUtf8(rootPath, this.masterKey), updatedAt: now },
+        })
+        .run();
+    });
+    const saved = this.getProjectToolRoot(projectId);
+    if (!saved) throw new Error("Project tool root not found");
+    return saved;
+  }
+
+  clearProjectToolRoot(projectId: string): void {
+    this.db.delete(projectToolRoots).where(eq(projectToolRoots.projectId, projectId)).run();
+    this.db.delete(projectToolPermissions).where(eq(projectToolPermissions.projectId, projectId)).run();
+  }
+
+  listProjectToolPermissions(projectId: string): ProjectToolPermissionRecord[] {
+    return this.db
+      .select()
+      .from(projectToolPermissions)
+      .where(eq(projectToolPermissions.projectId, projectId))
+      .all()
+      .map((row) => ({
+        id: row.id,
+        projectId: row.projectId,
+        toolId: row.toolId,
+        operation: row.operation,
+        createdAt: iso(row.createdAt),
+        updatedAt: iso(row.updatedAt),
+      }));
+  }
+
+  hasProjectToolPermission(projectId: string, toolId: string, operation: string): boolean {
+    return this.db
+      .select()
+      .from(projectToolPermissions)
+      .where(and(eq(projectToolPermissions.projectId, projectId), eq(projectToolPermissions.toolId, toolId), eq(projectToolPermissions.operation, operation)))
+      .get() !== undefined;
+  }
+
+  grantProjectToolPermission(projectId: string, toolId: string, operation: string): ProjectToolPermissionRecord {
+    if (!this.getProject(projectId)) throw new Error("Project not found");
+    const now = Date.now();
+    const existing = this.db
+      .select()
+      .from(projectToolPermissions)
+      .where(and(eq(projectToolPermissions.projectId, projectId), eq(projectToolPermissions.toolId, toolId), eq(projectToolPermissions.operation, operation)))
+      .get();
+    const id = existing?.id ?? randomUUID();
+    this.db
+      .insert(projectToolPermissions)
+      .values({ id, projectId, toolId, operation, createdAt: existing?.createdAt ?? now, updatedAt: now })
+      .onConflictDoUpdate({
+        target: [projectToolPermissions.projectId, projectToolPermissions.toolId, projectToolPermissions.operation],
+        set: { updatedAt: now },
+      })
+      .run();
+    return this.listProjectToolPermissions(projectId).find((row) => row.id === id) ?? (() => { throw new Error("Project tool permission not found"); })();
+  }
+
+  revokeProjectToolPermission(projectId: string, toolId: string, operation: string): void {
+    this.db
+      .delete(projectToolPermissions)
+      .where(and(eq(projectToolPermissions.projectId, projectId), eq(projectToolPermissions.toolId, toolId), eq(projectToolPermissions.operation, operation)))
+      .run();
   }
 
   listConversations(projectId: string | null, inbox: "avulsas" | "imported" = "avulsas"): ConversationRecord[] {
@@ -2359,6 +2464,7 @@ export class HubRepos {
       prompt: string;
       steps: SkillRecord["steps"];
       defaultMentions: SkillRecord["defaultMentions"];
+      allowedTools?: SkillRecord["allowedTools"];
     }[],
   ): void {
     const seeded = this.db.select().from(settings).where(eq(settings.key, SKILL_FACTORY_SEEDED_KEY)).get();
@@ -2378,6 +2484,7 @@ export class HubRepos {
         preferredModel: item.preferredModel,
         defaultMentions: item.defaultMentions,
         steps: item.steps,
+        allowedTools: item.allowedTools ?? [],
         factoryId: item.factoryId,
       });
     }
@@ -2400,6 +2507,7 @@ export class HubRepos {
     preferredModel?: string | null;
     defaultMentions: SkillRecord["defaultMentions"];
     steps: SkillRecord["steps"];
+    allowedTools?: SkillRecord["allowedTools"];
     factoryId?: string | null;
   }): SkillRecord {
     const id = randomUUID();
@@ -2449,6 +2557,7 @@ export class HubRepos {
       preferredModel?: string | null;
       defaultMentions?: SkillRecord["defaultMentions"];
       steps?: SkillRecord["steps"];
+      allowedTools?: SkillRecord["allowedTools"];
     },
   ): SkillRecord {
     const existing = this.getSkill(id);
@@ -2463,6 +2572,7 @@ export class HubRepos {
       preferredModel: patch.preferredModel !== undefined ? patch.preferredModel : existing.preferredModel,
       defaultMentions: patch.defaultMentions ?? existing.defaultMentions,
       steps: patch.steps ?? existing.steps,
+      allowedTools: patch.allowedTools ?? existing.allowedTools,
     };
     this.db
       .update(skills)
@@ -2844,14 +2954,15 @@ export class HubRepos {
     prompt: string;
     steps: SkillRecord["steps"];
     defaultMentions: SkillRecord["defaultMentions"];
+    allowedTools?: SkillRecord["allowedTools"];
   }): string {
     return JSON.stringify({
-      version: 1,
+      version: 2,
       kind: "skill",
       prompt: input.prompt.slice(0, 16_000),
       steps: input.steps.slice(0, 12),
       defaultMentions: input.defaultMentions.slice(0, 8),
-      tools: [],
+      allowedTools: (input.allowedTools ?? []).slice(0, 8),
     });
   }
 
@@ -2864,7 +2975,9 @@ export class HubRepos {
       prompt: string;
       steps: SkillRecord["steps"];
       defaultMentions: SkillRecord["defaultMentions"];
-    } = { prompt: "", steps: [], defaultMentions: [] };
+      allowedTools: SkillRecord["allowedTools"];
+      contractVersion: 1 | 2;
+    } = { prompt: "", steps: [], defaultMentions: [], allowedTools: [], contractVersion: 1 };
     try {
       const parsed: unknown = JSON.parse(decryptUtf8(row.definitionCipher, this.masterKey));
       if (
@@ -2903,10 +3016,18 @@ export class HubRepos {
                   typeof item.query === "string",
               ),
           ),
+          allowedTools:
+            "allowedTools" in parsed && Array.isArray(parsed.allowedTools)
+              ? parsed.allowedTools.filter(
+                  (item): item is SkillRecord["allowedTools"][number] =>
+                    Boolean(item && typeof item === "object" && "toolId" in item && "operation" in item && (item as { toolId?: unknown }).toolId === "project-filesystem.read-file" && (item as { operation?: unknown }).operation === "read"),
+                )
+              : [],
+          contractVersion: "version" in parsed && parsed.version === 2 ? 2 : 1,
         };
       }
     } catch {
-      definition = { prompt: "", steps: [], defaultMentions: [] };
+      definition = { prompt: "", steps: [], defaultMentions: [], allowedTools: [], contractVersion: 1 };
     }
     return {
       id: row.id,
@@ -2917,8 +3038,9 @@ export class HubRepos {
       preferredModel: row.preferredModel ?? null,
       defaultMentions: definition.defaultMentions,
       steps: definition.steps,
+      allowedTools: definition.allowedTools,
       factoryId: row.factoryId ?? null,
-      contractVersion: 1,
+      contractVersion: definition.contractVersion,
       createdAt: iso(row.createdAt),
       updatedAt: iso(row.updatedAt),
     };
