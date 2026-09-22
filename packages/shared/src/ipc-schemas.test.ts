@@ -630,7 +630,7 @@ describe("wave 24 orchestration IPC contracts", () => {
     };
     expect(orchestrationPrepareInputSchema.parse(input).parallelism).toBe(2);
     expect(() => orchestrationPrepareInputSchema.parse({ ...input, parallelism: 3 })).toThrow();
-    expect(orchestrationPrepareInputSchema.parse({ ...input, budgetMode: "per_node" }).budgetMode).toBe("per_node");
+    expect(() => orchestrationPrepareInputSchema.parse({ ...input, budgetMode: "per_node" })).toThrow();
   });
 
   it("keeps model selection explicit in every rendered node", () => {
