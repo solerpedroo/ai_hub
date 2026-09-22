@@ -264,6 +264,9 @@ export const agentRuns = sqliteTable("agent_runs", {
   conversationId: text("conversation_id").notNull(),
   parentRunId: text("parent_run_id"),
   kind: text("kind").notNull().default("single"),
+  role: text("role").notNull().default("single"),
+  graphVersion: integer("graph_version", { mode: "number" }).notNull().default(1),
+  budgetMode: text("budget_mode").notNull().default("single"),
   status: text("status").notNull(),
   provider: text("provider").notNull(),
   providerKeyId: text("provider_key_id").notNull(),
@@ -301,6 +304,26 @@ export const agentSteps = sqliteTable(
   (table) => [uniqueIndex("agent_steps_run_ordinal_idx").on(table.runId, table.ordinal)],
 );
 
+export const agentHandoffs = sqliteTable(
+  "agent_handoffs",
+  {
+    id: text("id").primaryKey(),
+    rootRunId: text("root_run_id").notNull(),
+    fromRunId: text("from_run_id").notNull(),
+    toRunId: text("to_run_id").notNull(),
+    ordinal: integer("ordinal").notNull(),
+    joinKind: text("join_kind").notNull(),
+    status: text("status").notNull(),
+    systemMessageCipher: text("system_message_cipher").notNull(),
+    packetSubsetCipher: text("packet_subset_cipher").notNull(),
+    tokenEstimate: integer("token_estimate").notNull(),
+    summaryCipher: text("summary_cipher").notNull(),
+    createdAt: integer("created_at", { mode: "number" }).notNull(),
+    finishedAt: integer("finished_at", { mode: "number" }),
+  },
+  (table) => [uniqueIndex("agent_handoffs_root_ordinal_idx").on(table.rootRunId, table.ordinal)],
+);
+
 export const schema = {
   projects,
   conversations,
@@ -328,4 +351,5 @@ export const schema = {
   projectToolPermissions,
   agentRuns,
   agentSteps,
+  agentHandoffs,
 };
