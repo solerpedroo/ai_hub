@@ -127,6 +127,9 @@ import {
   agentListInputSchema,
   agentListResultSchema,
   agentRunDetailSchema,
+  orchestrationPrepareInputSchema,
+  orchestrationRunDetailSchema,
+  orchestrationListResultSchema,
 } from "@ai-hub/shared";
 import { redactSecrets, safeErrorMessage } from "@ai-hub/security";
 import { abortChat, sendChat } from "./chat-session";
@@ -156,6 +159,7 @@ import { localDayStartMs } from "./spend-guard";
 import { checkForAppUpdates } from "./updater";
 import { getLatestToolActivity, getToolProjectState, pickProjectToolRoot, requestToolRead } from "./tools";
 import { cancelAgentRun, getAgentRun, listAgentRuns, pauseAgentRun, prepareAgentRun, resumeAgentRun, startAgentRun } from "./agent-runner";
+import { cancelOrchestration, getOrchestration, listOrchestrations, pauseOrchestration, prepareOrchestration, resumeOrchestration, startOrchestration } from "./orchestration-runner";
 
 function registerHandler<TIn, TOut>(
   channel: string,
@@ -234,6 +238,13 @@ export function registerWorkspaceIpc(): void {
   registerHandler(IpcChannel.agentsPause, agentIdInputSchema, agentRunDetailSchema, (input) => pauseAgentRun(input));
   registerHandler(IpcChannel.agentsResume, agentIdInputSchema, agentRunDetailSchema, (input, event) => resumeAgentRun(input, event.sender));
   registerHandler(IpcChannel.agentsCancel, agentIdInputSchema, agentRunDetailSchema, (input) => cancelAgentRun(input));
+  registerHandler(IpcChannel.orchestrationsPrepare, orchestrationPrepareInputSchema, orchestrationRunDetailSchema, (input, event) => prepareOrchestration({ ...input, maxSteps: input.maxSteps ?? 6, budgetUsd: input.budgetUsd ?? "1.000000", timeoutSeconds: input.timeoutSeconds ?? 300, parallelism: input.parallelism ?? 2, budgetMode: input.budgetMode ?? "shared" }, event.sender));
+  registerHandler(IpcChannel.orchestrationsGet, agentIdInputSchema, orchestrationRunDetailSchema, (input) => getOrchestration(input));
+  registerHandler(IpcChannel.orchestrationsList, agentListInputSchema, orchestrationListResultSchema, (input) => listOrchestrations(input.conversationId));
+  registerHandler(IpcChannel.orchestrationsStart, agentIdInputSchema, orchestrationRunDetailSchema, (input, event) => startOrchestration(input, event.sender));
+  registerHandler(IpcChannel.orchestrationsPause, agentIdInputSchema, orchestrationRunDetailSchema, (input) => pauseOrchestration(input));
+  registerHandler(IpcChannel.orchestrationsResume, agentIdInputSchema, orchestrationRunDetailSchema, (input, event) => resumeOrchestration(input, event.sender));
+  registerHandler(IpcChannel.orchestrationsCancel, agentIdInputSchema, orchestrationRunDetailSchema, (input) => cancelOrchestration(input));
 
   registerHandler(
     IpcChannel.conversationsList,
