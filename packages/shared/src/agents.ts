@@ -2,6 +2,15 @@ import { z } from "zod";
 
 export const AGENT_MAX_STEPS = 6;
 export const AGENT_MAX_READ_PATHS = 3;
+export const ORCHESTRATION_MAX_PARALLEL_NODES = 2;
+export const agentRunKindSchema = z.enum(["single", "orchestrated"]);
+export const agentRoleSchema = z.enum(["single", "supervisor", "explorer", "reviewer", "writer"]);
+export const agentBudgetModeSchema = z.enum(["single", "shared", "per_node"]);
+export const agentHandoffJoinKindSchema = z.enum(["sequential", "parallel"]);
+export const agentHandoffStatusSchema = z.enum(["pending", "ready", "consumed", "cancelled", "interrupted"]);
+export type AgentRunKind = z.infer<typeof agentRunKindSchema>;
+export type AgentRole = z.infer<typeof agentRoleSchema>;
+export type AgentBudgetMode = z.infer<typeof agentBudgetModeSchema>;
 
 export const agentRunStatusSchema = z.enum([
   "awaiting_confirmation",
