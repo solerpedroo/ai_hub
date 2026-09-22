@@ -238,6 +238,26 @@ export const artifacts = sqliteTable("artifacts", {
   createdAt: integer("created_at", { mode: "number" }).notNull(),
 });
 
+export const projectToolRoots = sqliteTable("project_tool_roots", {
+  projectId: text("project_id").primaryKey(),
+  rootCipher: text("root_cipher").notNull(),
+  createdAt: integer("created_at", { mode: "number" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "number" }).notNull(),
+});
+
+export const projectToolPermissions = sqliteTable(
+  "project_tool_permissions",
+  {
+    id: text("id").primaryKey(),
+    projectId: text("project_id").notNull(),
+    toolId: text("tool_id").notNull(),
+    operation: text("operation").notNull(),
+    createdAt: integer("created_at", { mode: "number" }).notNull(),
+    updatedAt: integer("updated_at", { mode: "number" }).notNull(),
+  },
+  (table) => [uniqueIndex("project_tool_permissions_scope_idx").on(table.projectId, table.toolId, table.operation)],
+);
+
 export const schema = {
   projects,
   conversations,
@@ -261,4 +281,6 @@ export const schema = {
   prompts,
   skills,
   artifacts,
+  projectToolRoots,
+  projectToolPermissions,
 };
