@@ -294,6 +294,25 @@ ALTER TABLE conversations ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'assist';
 ALTER TABLE conversations ADD COLUMN effort_level TEXT NOT NULL DEFAULT 'medium';
 `;
 
+export const MIGRATION_0016_SQL = `
+CREATE TABLE project_tool_roots (
+  project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  root_cipher TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE project_tool_permissions (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  tool_id TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX project_tool_permissions_scope_idx
+  ON project_tool_permissions(project_id, tool_id, operation);
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
@@ -310,4 +329,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 13, sql: MIGRATION_0013_SQL },
   { version: 14, sql: MIGRATION_0014_SQL },
   { version: 15, sql: MIGRATION_0015_SQL },
+  { version: 16, sql: MIGRATION_0016_SQL },
 ];
