@@ -358,7 +358,7 @@ export function mergePacketWithTail(
       pinned: isPinned(item),
     });
   }
-  let kept = [...frozen, ...live];
+  const kept = [...frozen, ...live];
   const system = payload.system;
   if (maxTokenBudget !== undefined) {
     while (kept.length > 1 && estimateTokens(system, kept) > maxTokenBudget) {
