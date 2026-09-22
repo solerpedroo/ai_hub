@@ -14,6 +14,14 @@ import {
   portablePacketOriginSchema,
 } from "./portable-packet";
 import { skillAllowedToolSchema, toolActivityStatusSchema, toolEffectSchema, toolIdSchema } from "./tools";
+import {
+  AGENT_MAX_READ_PATHS,
+  AGENT_MAX_STEPS,
+  agentBudgetUsdSchema,
+  agentRunStatusSchema,
+  agentStepKindSchema,
+  agentStepStatusSchema,
+} from "./agents";
 
 export const spendCapScopeSchema = z.enum(["request", "day", "global"]);
 export const capBlockScopeSchema = z.enum(["request", "day", "global", "project", "provider"]);
@@ -116,6 +124,91 @@ export const toolReadRequestResultSchema = z.discriminatedUnion("kind", [
 ]);
 export type ToolReadRequestResult = z.infer<typeof toolReadRequestResultSchema>;
 export const toolActivityResultSchema = toolActivityDtoSchema.nullable();
+
+const agentRelativePathSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(1024)
+  .refine(
+    (value) =>
+      !value.includes("\0") &&
+      !/^(?:[a-z]:[\\/]|[\\/])/i.test(value) &&
+      !value.replace(/\\/g, "/").split("/").some((part) => part === "" || part === "." || part === ".."),
+    "relative project path required",
+  );
+
+export const agentPrepareInputSchema = z
+  .object({
+    projectId: z.string().uuid(),
+    conversationId: z.string().uuid(),
+    providerKeyId: z.string().uuid(),
+    model: z.string().trim().min(1).max(128),
+    goal: z.string().trim().min(1).max(4_000),
+    relativePaths: z.array(agentRelativePathSchema).min(1).max(AGENT_MAX_READ_PATHS),
+    maxSteps: z.number().int().min(4).max(AGENT_MAX_STEPS).default(AGENT_MAX_STEPS),
+    budgetUsd: agentBudgetUsdSchema.default("1.000000"),
+    timeoutSeconds: z.number().int().min(30).max(600).default(300),
+    skillId: z.string().uuid().nullable().optional(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.relativePaths.length + 3 > value.maxSteps) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["maxSteps"], message: "maxSteps must cover plan, reads, report and artifact" });
+    }
+  });
+export type AgentPrepareInput = z.infer<typeof agentPrepareInputSchema>;
+
+export const agentStepDtoSchema = z
+  .object({
+    id: z.string().uuid(),
+    runId: z.string().uuid(),
+    ordinal: z.number().int().min(1).max(AGENT_MAX_STEPS),
+    kind: agentStepKindSchema,
+    title: z.string().min(1).max(160),
+    status: agentStepStatusSchema,
+    toolId: toolIdSchema.nullable(),
+    summary: z.string().max(400).nullable(),
+    tokensIn: z.number().int().nonnegative().nullable(),
+    tokensOut: z.number().int().nonnegative().nullable(),
+    costUsd: z.string().nullable(),
+    startedAt: isoTimestampSchema.nullable(),
+    finishedAt: isoTimestampSchema.nullable(),
+  })
+  .strict();
+export type AgentStepDto = z.infer<typeof agentStepDtoSchema>;
+
+export const agentRunDtoSchema = z
+  .object({
+    id: z.string().uuid(),
+    projectId: z.string().uuid(),
+    conversationId: z.string().uuid(),
+    parentRunId: z.string().uuid().nullable(),
+    kind: z.literal("single"),
+    status: agentRunStatusSchema,
+    provider: z.string().min(1).max(64),
+    model: z.string().min(1).max(128),
+    goalSummary: z.string().max(400),
+    planSummary: z.string().max(1_000),
+    maxSteps: z.number().int().min(1).max(AGENT_MAX_STEPS),
+    budgetUsd: agentBudgetUsdSchema,
+    timeoutSeconds: z.number().int().min(30).max(600),
+    reportArtifactId: z.string().uuid().nullable(),
+    createdAt: isoTimestampSchema,
+    startedAt: isoTimestampSchema.nullable(),
+    finishedAt: isoTimestampSchema.nullable(),
+  })
+  .strict();
+export type AgentRunDto = z.infer<typeof agentRunDtoSchema>;
+
+export const agentRunDetailSchema = agentRunDtoSchema.extend({ steps: z.array(agentStepDtoSchema).max(AGENT_MAX_STEPS) }).strict();
+export type AgentRunDetail = z.infer<typeof agentRunDetailSchema>;
+
+export const agentIdInputSchema = z.object({ id: z.string().uuid() }).strict();
+export type AgentIdInput = z.infer<typeof agentIdInputSchema>;
+export const agentListInputSchema = z.object({ conversationId: z.string().uuid() }).strict();
+export type AgentListInput = z.infer<typeof agentListInputSchema>;
+export const agentListResultSchema = z.array(agentRunDtoSchema).max(50);
 
 export const projectListResultSchema = z.array(projectDtoSchema);
 
