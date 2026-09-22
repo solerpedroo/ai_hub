@@ -25,6 +25,7 @@ interface ActiveAgentRun {
   resumeRequested: boolean;
   cancelRequested: boolean;
   orchestrationRootId: string | null;
+  skipCaps: boolean;
 }
 
 const activeRuns = new Map<string, ActiveAgentRun>();
@@ -157,11 +158,11 @@ export async function prepareAgentRun(input: AgentPrepareInput, _sender: WebCont
 export function getAgentRun(input: AgentIdInput): AgentRunDetail { return detail(requireRun(input)); }
 export function listAgentRuns(input: AgentListInput): AgentRunDto[] { return getHubDatabase().repos.listAgentRuns(input.conversationId).filter((run) => run.kind === "single").map(toRunDto); }
 
-export function startAgentRun(input: AgentIdInput, sender: WebContents, options: { orchestrationRootId?: string } = {}): AgentRunDetail {
+export function startAgentRun(input: AgentIdInput, sender: WebContents, options: { orchestrationRootId?: string; skipCaps?: boolean } = {}): AgentRunDetail {
   const run = requireRun(input, options.orchestrationRootId !== undefined);
   if (run.status !== "awaiting_confirmation" && run.status !== "paused") throw new Error("agents:not_startable");
   if (activeRuns.has(run.id)) throw new Error("agents:already_running");
-  const active: ActiveAgentRun = { abort: new AbortController(), sender, chatRunId: null, pauseRequested: false, resumeRequested: false, cancelRequested: false, orchestrationRootId: options.orchestrationRootId ?? null };
+  const active: ActiveAgentRun = { abort: new AbortController(), sender, chatRunId: null, pauseRequested: false, resumeRequested: false, cancelRequested: false, orchestrationRootId: options.orchestrationRootId ?? null, skipCaps: options.skipCaps ?? false };
   activeRuns.set(run.id, active);
   const updated = getHubDatabase().repos.updateAgentRun(run.id, run.startedAt
     ? { status: "running", finishedAt: null }
@@ -180,7 +181,7 @@ export function pauseAgentRun(input: AgentIdInput, options: { orchestrationRootI
   return detail(getHubDatabase().repos.updateAgentRun(run.id, { status: "paused" }));
 }
 
-export function resumeAgentRun(input: AgentIdInput, sender: WebContents, options: { orchestrationRootId?: string } = {}): AgentRunDetail {
+export function resumeAgentRun(input: AgentIdInput, sender: WebContents, options: { orchestrationRootId?: string; skipCaps?: boolean } = {}): AgentRunDetail {
   const run = requireRun(input, options.orchestrationRootId !== undefined);
   const active = activeRuns.get(run.id);
   if (run.status === "paused" && active?.pauseRequested && !active.cancelRequested) {
@@ -282,6 +283,7 @@ async function execute(runId: string, active: ActiveAgentRun): Promise<void> {
           runMode: "agent",
           maxTokens: 1024,
           __preparedPacket: isolatedPacket,
+          ...(active.skipCaps ? { __skipCaps: true } : {}),
           ...(active.orchestrationRootId ? { __orchestrationRootId: active.orchestrationRootId } : {}),
         }, active.sender);
         active.chatRunId = result.runId;
@@ -324,7 +326,7 @@ async function execute(runId: string, active: ActiveAgentRun): Promise<void> {
       activeRuns.delete(runId);
       const current = requireStoredRun(runId);
       if (active.resumeRequested && !active.cancelRequested && current.status === "paused") {
-        startAgentRun(runIdentity(current), active.sender, active.orchestrationRootId ? { orchestrationRootId: active.orchestrationRootId } : {});
+        startAgentRun(runIdentity(current), active.sender, active.orchestrationRootId ? { orchestrationRootId: active.orchestrationRootId, skipCaps: active.skipCaps } : {});
       }
     }
   }
