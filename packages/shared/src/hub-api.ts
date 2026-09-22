@@ -94,6 +94,12 @@ import type {
   SkillUpdateInput,
   SkillResolveInput,
   SkillResolveResult,
+  ToolActivityDto,
+  ToolProjectGetInput,
+  ToolProjectRootPickResult,
+  ToolProjectState,
+  ToolReadRequestInput,
+  ToolReadRequestResult,
   ProviderKeyDto,
   SecretsSaveInput,
   SecretsTestInput,
@@ -266,6 +272,13 @@ export interface HubSkillsApi {
   resolve: (input: SkillResolveInput) => Promise<SkillResolveResult>;
 }
 
+export interface HubToolsApi {
+  getProject: (input: ToolProjectGetInput) => Promise<ToolProjectState>;
+  pickProjectRoot: (input: ToolProjectGetInput) => Promise<ToolProjectRootPickResult>;
+  requestRead: (input: ToolReadRequestInput) => Promise<ToolReadRequestResult>;
+  getLatestActivity: () => Promise<ToolActivityDto | null>;
+}
+
 export interface HubChatApi {
   send: (input: ChatSendInput) => Promise<ChatSendResult>;
   abort: (input: ChatAbortInput) => Promise<void>;
@@ -302,6 +315,7 @@ export interface HubApi {
   council: HubCouncilApi;
   artifacts: HubArtifactsApi;
   skills: HubSkillsApi;
+  tools: HubToolsApi;
 }
 
 export type { AppLocale, ThemeMode };
