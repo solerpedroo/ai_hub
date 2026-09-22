@@ -111,3 +111,4 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W22-004](./ADR-W22-004-skill-contract-v2-tool-allowlist.md) | W22 | Contrato Skill v2 com allowlist de tools | accepted |
 | [ADR-W23-001](./ADR-W23-001-main-owned-single-agent-runner.md) | W23 | Runner de agente único no processo main | accepted |
 | [ADR-W23-002](./ADR-W23-002-persisted-bounded-agent-runs.md) | W23 | Corridas de agente persistidas e limitadas | accepted |
+| [ADR-W24-001](./ADR-W24-001-persisted-orchestration-graph-and-handoffs.md) | W24 | Grafo de orquestração e handoffs persistidos | accepted |
