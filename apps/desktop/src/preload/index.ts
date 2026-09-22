@@ -128,6 +128,9 @@ import {
   agentListInputSchema,
   agentListResultSchema,
   agentRunDetailSchema,
+  orchestrationPrepareInputSchema,
+  orchestrationRunDetailSchema,
+  orchestrationListResultSchema,
 } from "@ai-hub/shared";
 
 const empty = emptyIpcPayloadSchema.parse({});
@@ -511,6 +514,15 @@ const hub: HubApi = {
     pause: (input) => invokeParsed(IpcChannel.agentsPause, input, agentIdInputSchema, agentRunDetailSchema),
     resume: (input) => invokeParsed(IpcChannel.agentsResume, input, agentIdInputSchema, agentRunDetailSchema),
     cancel: (input) => invokeParsed(IpcChannel.agentsCancel, input, agentIdInputSchema, agentRunDetailSchema),
+  },
+  orchestrations: {
+    prepare: (input) => invokeParsed(IpcChannel.orchestrationsPrepare, input, orchestrationPrepareInputSchema, orchestrationRunDetailSchema),
+    get: (input) => invokeParsed(IpcChannel.orchestrationsGet, input, agentIdInputSchema, orchestrationRunDetailSchema),
+    list: (input) => invokeParsed(IpcChannel.orchestrationsList, input, agentListInputSchema, orchestrationListResultSchema),
+    start: (input) => invokeParsed(IpcChannel.orchestrationsStart, input, agentIdInputSchema, orchestrationRunDetailSchema),
+    pause: (input) => invokeParsed(IpcChannel.orchestrationsPause, input, agentIdInputSchema, orchestrationRunDetailSchema),
+    resume: (input) => invokeParsed(IpcChannel.orchestrationsResume, input, agentIdInputSchema, orchestrationRunDetailSchema),
+    cancel: (input) => invokeParsed(IpcChannel.orchestrationsCancel, input, agentIdInputSchema, orchestrationRunDetailSchema),
   },
 };
 
