@@ -37,6 +37,8 @@ import {
   agentPrepareInputSchema,
   agentRunDetailSchema,
   agentIdInputSchema,
+  orchestrationPrepareInputSchema,
+  agentNodeDtoSchema,
 } from "./ipc-schemas";
 
 describe("emptyIpcPayloadSchema", () => {
@@ -614,5 +616,29 @@ describe("wave 23 agent IPC contracts", () => {
     expect(agentIdInputSchema.parse(control)).toEqual(control);
     expect(() => agentIdInputSchema.parse({ id: control.id })).toThrow();
     expect(() => agentIdInputSchema.parse({ ...control, extra: true })).toThrow();
+  });
+});
+
+describe("wave 24 orchestration IPC contracts", () => {
+  it("limits the factory graph to the shared two-node parallelism", () => {
+    const input = {
+      projectId: "11111111-1111-4111-8111-111111111111",
+      conversationId: "22222222-2222-4222-8222-222222222222",
+      providerKeyId: "33333333-3333-4333-8333-333333333333",
+      model: "gpt-4o-mini", goal: "Analyze the project", relativePaths: ["README.md"], maxSteps: 4,
+      budgetUsd: "1.000000", timeoutSeconds: 300, parallelism: 2, budgetMode: "shared" as const,
+    };
+    expect(orchestrationPrepareInputSchema.parse(input).parallelism).toBe(2);
+    expect(() => orchestrationPrepareInputSchema.parse({ ...input, parallelism: 3 })).toThrow();
+    expect(orchestrationPrepareInputSchema.parse({ ...input, budgetMode: "per_node" }).budgetMode).toBe("per_node");
+  });
+
+  it("keeps model selection explicit in every rendered node", () => {
+    const node = {
+      id: "44444444-4444-4444-8444-444444444444", projectId: "11111111-1111-4111-8111-111111111111", conversationId: "22222222-2222-4222-8222-222222222222", parentRunId: "55555555-5555-4555-8555-555555555555", kind: "orchestrated" as const, role: "explorer" as const, effort: "medium" as const, isModelOverride: false,
+      status: "awaiting_confirmation" as const, provider: "openai", model: "gpt-4o-mini", goalSummary: "Analyze", planSummary: "Map", maxSteps: 4, budgetUsd: "0.400000", timeoutSeconds: 300, reportArtifactId: null, createdAt: "2026-09-22T00:00:00.000Z", startedAt: null, finishedAt: null, tokensIn: 0, tokensOut: 0, costUsd: "0.000000",
+    };
+    expect(agentNodeDtoSchema.parse(node).isModelOverride).toBe(false);
+    expect(() => agentNodeDtoSchema.parse({ ...node, providerKeyId: "33333333-3333-4333-8333-333333333333" })).toThrow();
   });
 });
