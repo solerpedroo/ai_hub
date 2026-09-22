@@ -27,6 +27,8 @@ import {
   prompts,
   skills,
   artifacts,
+  agentRuns,
+  agentSteps,
   messageReceipts,
   messages,
   projects,
@@ -67,6 +69,48 @@ export interface ProjectToolPermissionRecord {
   operation: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export type AgentRunStatus = "awaiting_confirmation" | "running" | "paused" | "cancelled" | "completed" | "completed_with_errors" | "stopped_budget" | "stopped_timeout" | "interrupted" | "failed";
+export type AgentStepStatus = "pending" | "running" | "completed" | "failed" | "skipped" | "cancelled" | "interrupted";
+export type AgentStepKind = "plan" | "tool" | "report" | "artifact";
+
+export interface AgentRunRecord {
+  id: string;
+  projectId: string;
+  conversationId: string;
+  parentRunId: string | null;
+  kind: "single";
+  status: AgentRunStatus;
+  provider: string;
+  model: string;
+  goal: string;
+  plan: string;
+  sourceSkillId: string | null;
+  maxSteps: number;
+  budgetUsd: string;
+  timeoutSeconds: number;
+  reportArtifactId: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+export interface AgentStepRecord {
+  id: string;
+  runId: string;
+  ordinal: number;
+  kind: AgentStepKind;
+  title: string;
+  status: AgentStepStatus;
+  toolId: string | null;
+  summary: string | null;
+  detail: string | null;
+  tokensIn: number | null;
+  tokensOut: number | null;
+  costUsd: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
 }
 
 export interface ProjectWriteFields {
@@ -478,6 +522,29 @@ function snippetAround(text: string, token: string, radius = 48): string {
 
 function clip(text: string, max: number): string {
   return text.length <= max ? text : text.slice(0, max);
+}
+
+function asAgentRunStatus(value: string): AgentRunStatus {
+  switch (value) {
+    case "awaiting_confirmation": case "running": case "paused": case "cancelled":
+    case "completed": case "completed_with_errors": case "stopped_budget":
+    case "stopped_timeout": case "interrupted": case "failed": return value;
+    default: return "failed";
+  }
+}
+
+function asAgentStepStatus(value: string): AgentStepStatus {
+  switch (value) {
+    case "pending": case "running": case "completed": case "failed": case "skipped":
+    case "cancelled": case "interrupted": return value;
+    default: return "failed";
+  }
+}
+
+function asAgentStepKind(value: string): AgentStepKind {
+  return value === "plan" || value === "tool" || value === "report" || value === "artifact"
+    ? value
+    : "report";
 }
 
 function toSearchHit(input: {
@@ -2595,6 +2662,135 @@ export class HubRepos {
 
   removeSkill(id: string): void {
     this.db.delete(skills).where(eq(skills.id, id)).run();
+  }
+
+  createAgentRun(input: {
+    projectId: string;
+    conversationId: string;
+    provider: string;
+    model: string;
+    goal: string;
+    plan: string;
+    sourceSkillId?: string | null;
+    maxSteps: number;
+    budgetUsd: string;
+    timeoutSeconds: number;
+    steps: Array<{ kind: AgentStepKind; title: string; toolId?: string | null }>;
+  }): AgentRunRecord {
+    const id = randomUUID();
+    const now = Date.now();
+    this.db.transaction((tx) => {
+      tx.insert(agentRuns).values({
+        id,
+        projectId: input.projectId,
+        conversationId: input.conversationId,
+        parentRunId: null,
+        kind: "single",
+        status: "awaiting_confirmation",
+        provider: input.provider,
+        model: input.model,
+        goalCipher: encryptUtf8(input.goal.slice(0, 4_000), this.masterKey),
+        planCipher: encryptUtf8(input.plan.slice(0, 8_000), this.masterKey),
+        sourceSkillId: input.sourceSkillId ?? null,
+        maxSteps: input.maxSteps,
+        budgetUsd: input.budgetUsd,
+        timeoutSeconds: input.timeoutSeconds,
+        reportArtifactId: null,
+        createdAt: now,
+        startedAt: null,
+        finishedAt: null,
+      }).run();
+      input.steps.forEach((step, index) => {
+        tx.insert(agentSteps).values({
+          id: randomUUID(),
+          runId: id,
+          ordinal: index + 1,
+          kind: step.kind,
+          titleCipher: encryptUtf8(step.title.slice(0, 160), this.masterKey),
+          status: "pending",
+          toolId: step.toolId ?? null,
+          summaryCipher: null,
+          detailCipher: null,
+          tokensIn: null,
+          tokensOut: null,
+          costUsd: null,
+          startedAt: null,
+          finishedAt: null,
+        }).run();
+      });
+    });
+    const created = this.getAgentRun(id);
+    if (!created) throw new Error("Agent run not found");
+    return created;
+  }
+
+  getAgentRun(id: string): AgentRunRecord | null {
+    const row = this.db.select().from(agentRuns).where(eq(agentRuns.id, id)).get();
+    return row ? this.toAgentRun(row) : null;
+  }
+
+  listAgentRuns(conversationId: string): AgentRunRecord[] {
+    return this.db.select().from(agentRuns).where(eq(agentRuns.conversationId, conversationId)).all()
+      .map((row) => this.toAgentRun(row))
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  listAgentSteps(runId: string): AgentStepRecord[] {
+    return this.db.select().from(agentSteps).where(eq(agentSteps.runId, runId)).all()
+      .map((row) => this.toAgentStep(row))
+      .sort((left, right) => left.ordinal - right.ordinal);
+  }
+
+  updateAgentRun(id: string, patch: {
+    status?: AgentRunStatus;
+    reportArtifactId?: string | null;
+    startedAt?: number | null;
+    finishedAt?: number | null;
+  }): AgentRunRecord {
+    this.db.update(agentRuns).set({
+      ...(patch.status !== undefined ? { status: patch.status } : {}),
+      ...(patch.reportArtifactId !== undefined ? { reportArtifactId: patch.reportArtifactId } : {}),
+      ...(patch.startedAt !== undefined ? { startedAt: patch.startedAt } : {}),
+      ...(patch.finishedAt !== undefined ? { finishedAt: patch.finishedAt } : {}),
+    }).where(eq(agentRuns.id, id)).run();
+    const updated = this.getAgentRun(id);
+    if (!updated) throw new Error("Agent run not found");
+    return updated;
+  }
+
+  updateAgentStep(id: string, patch: {
+    status?: AgentStepStatus;
+    summary?: string | null;
+    detail?: string | null;
+    tokensIn?: number | null;
+    tokensOut?: number | null;
+    costUsd?: string | null;
+    startedAt?: number | null;
+    finishedAt?: number | null;
+  }): AgentStepRecord {
+    this.db.update(agentSteps).set({
+      ...(patch.status !== undefined ? { status: patch.status } : {}),
+      ...(patch.summary !== undefined ? { summaryCipher: patch.summary === null ? null : encryptUtf8(patch.summary.slice(0, 400), this.masterKey) } : {}),
+      ...(patch.detail !== undefined ? { detailCipher: patch.detail === null ? null : encryptUtf8(patch.detail.slice(0, 100_000), this.masterKey) } : {}),
+      ...(patch.tokensIn !== undefined ? { tokensIn: patch.tokensIn } : {}),
+      ...(patch.tokensOut !== undefined ? { tokensOut: patch.tokensOut } : {}),
+      ...(patch.costUsd !== undefined ? { costUsd: patch.costUsd } : {}),
+      ...(patch.startedAt !== undefined ? { startedAt: patch.startedAt } : {}),
+      ...(patch.finishedAt !== undefined ? { finishedAt: patch.finishedAt } : {}),
+    }).where(eq(agentSteps.id, id)).run();
+    const updated = this.db.select().from(agentSteps).where(eq(agentSteps.id, id)).get();
+    if (!updated) throw new Error("Agent step not found");
+    return this.toAgentStep(updated);
+  }
+
+  interruptOrphanAgentRuns(): number {
+    const rows = this.db.select().from(agentRuns).where(and(eq(agentRuns.kind, "single"), eq(agentRuns.status, "running"))).all();
+    const now = Date.now();
+    for (const row of rows) {
+      this.db.update(agentRuns).set({ status: "interrupted", finishedAt: now }).where(eq(agentRuns.id, row.id)).run();
+      this.db.update(agentSteps).set({ status: "interrupted", finishedAt: now }).where(and(eq(agentSteps.runId, row.id), eq(agentSteps.status, "running"))).run();
+    }
+    return rows.length;
   }
 
   createArtifact(input: {
