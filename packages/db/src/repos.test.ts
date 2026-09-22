@@ -157,7 +157,7 @@ describe("hub database", () => {
       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
       applyMigrations(second.sqlite);
-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(17);
+      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(18);
       second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 });
@@ -834,6 +834,25 @@ describe("hub database", () => {
     expect(dump).not.toContain("Inspect the selected source files.");
     expect(dump).not.toContain("private selected-file detail");
     expect(hub.repos.listAgentRuns(conversation.id)).toHaveLength(1);
+    hub.close();
+  });
+
+  it("persists an encrypted orchestration graph and redaction-safe handoff lifecycle", async () => {
+    const { hub } = openTestDb();
+    const project = hub.repos.createProject("Graph project");
+    const conversation = hub.repos.createConversation(project.id, "Graph chat");
+    const key = await hub.repos.saveProviderKey({ providerSlug: "openai", label: "graph", secret: "sk-graphfixtureNEVERSQLITE9999" });
+    const root = hub.repos.createAgentRun({ projectId: project.id, conversationId: conversation.id, provider: "openai", providerKeyId: key.id, model: "gpt-4o-mini", goal: "Analyze graph", plan: "Supervisor plan", maxSteps: 3, budgetUsd: "1.000000", timeoutSeconds: 300, kind: "orchestrated", role: "supervisor", graphVersion: 1, budgetMode: "shared", steps: [{ kind: "plan", title: "Confirm" }] });
+    const writer = hub.repos.createAgentRun({ projectId: project.id, conversationId: conversation.id, parentRunId: root.id, provider: "openai", providerKeyId: key.id, model: "gpt-4o-mini", goal: "Write graph", plan: "Writer plan", maxSteps: 3, budgetUsd: "0.200000", timeoutSeconds: 300, kind: "orchestrated", role: "writer", graphVersion: 1, budgetMode: "shared", steps: [{ kind: "report", title: "Write" }] });
+    const handoff = hub.repos.createAgentHandoff({ rootRunId: root.id, fromRunId: root.id, toRunId: writer.id, ordinal: 1, joinKind: "parallel", systemMessage: "System handoff private", packetSubset: "private specialist evidence", tokenEstimate: 12, summary: "Specialist summary" });
+    const ready = hub.repos.updateAgentHandoff(handoff.id, { status: "ready", packetSubset: "updated private evidence", tokenEstimate: 18, summary: "Updated summary", finishedAt: Date.now() });
+    expect(hub.repos.getAgentRun(root.id)?.role).toBe("supervisor");
+    expect(ready.status).toBe("ready");
+    expect(ready.packetSubset).toBe("updated private evidence");
+    const dump = dumpAllText(hub.sqlite);
+    expect(dump).not.toContain("private specialist evidence");
+    expect(dump).not.toContain("updated private evidence");
+    expect(dump).not.toContain("System handoff private");
     hub.close();
   });
 
