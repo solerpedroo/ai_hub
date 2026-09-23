@@ -42,6 +42,7 @@ import {
   developerDiffInputSchema,
   developerReviewInputSchema,
   developerTerminalInputSchema,
+  localProviderStatusSchema,
 } from "./ipc-schemas";
 
 describe("emptyIpcPayloadSchema", () => {
@@ -80,6 +81,13 @@ describe("developer tool IPC contracts", () => {
   it("defaults the review intent and rejects extra transport fields", () => {
     expect(developerReviewInputSchema.parse({ projectId, conversationId: "22222222-2222-4222-8222-222222222222", providerKeyId: "33333333-3333-4333-8333-333333333333", model: "test-model" }).intent).toBe("code_review");
     expect(() => developerDiffInputSchema.parse({ projectId, shell: true })).toThrow();
+  });
+});
+
+describe("local provider IPC contract", () => {
+  it("returns only bounded model identities and offline capability", () => {
+    expect(localProviderStatusSchema.parse({ available: true, models: [{ id: "llama3.2:latest", label: "llama3.2:latest" }], pdfRagAvailable: true }).models[0]?.id).toBe("llama3.2:latest");
+    expect(() => localProviderStatusSchema.parse({ available: true, models: [], pdfRagAvailable: true, secret: "not allowed" })).toThrow();
   });
 });
 
