@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave 
 
 | Field | Value |
 |---|---|
-| Wave | **W26** |
-| Marco | D — V2 agents + local |
+| Wave | **W27** |
+| Marco | E — V3 ecosystem |
 | State | `pending` |
-| Last completed | **W25** |
-| Next action | Start Wave 26 — Ollama + offline. |
+| Last completed | **W26** |
+| Next action | Iniciar Wave 27 (Research, Study, Notes, Tasks) com skill `wave-start`. |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
@@ -42,9 +42,11 @@ None.
 - W16: `navigate-to 'none'` pode ser no-op; locks Electron fecham o iframe. Capture de artifact falha em silêncio. Lista IPC teto 100. Pin é família, não galeria de projeto. Bundle mermaid no renderer.
 - W17: stepper não segue headings do stream; palette só corre Code Review por atalho; factory títulos EN na DB; `skills:list` devolve prompt no renderer (como prompts W15).
 - W23: não há teste isolado do runner para cancelamento durante diálogo nativo/timeout; `skill.steps[]` orienta a síntese e a allowlist executa a leitura, mas ainda não há grafo de tool por etapa.
+- W26: nesta máquina Ollama CUDA falhou (`device kernel image is invalid`); prova física usou CPU. Caps batch (council/playground) ainda podem hard-stopar Ollama com teto USD esgotado; chat path isenta.
 
 ## Notes for the next session
 
+- W26 fechada: Ollama first-class sem keytar; fallback local com confirmação; receipts custo 0; badge offline; embeddings hashed continuam offline. Prova física em `docs/reviews/W26/PHYSICAL-DOD.md`.
 - W17 fechada. Skills cifradas; `/skill` + `@skill`; contrato `tools: []` para W23.
 - W18 fechada: Privacy Center, Context Firewall, Cost Tracker e caps por projeto/provider.
 - W19 fechada: Quick AI, clipboard intelligence, seleção via copy + atalho e tray/background.
@@ -54,5 +56,5 @@ None.
 
 | Kind | Path |
 |---|---|
-| Review | `docs/reviews/W25/REVIEW.md` |
-| Latest ADR | `docs/ADR/ADR-W25-001-main-owned-read-only-developer-tools.md` |
+| Review | `docs/reviews/W26/REVIEW.md` |
+| Latest ADR | `docs/ADR/ADR-W26-001-local-ollama-provider-and-offline-embeddings.md` |
