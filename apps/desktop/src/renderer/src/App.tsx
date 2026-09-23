@@ -257,22 +257,25 @@ export function App(): JSX.Element {
   useEffect(() => {
     void (async () => {
       try {
-        const [projectList, keys, session, prefs] = await Promise.all([
+        const [projectList, keys, session, prefs, local] = await Promise.all([
           loadProjects(),
           loadKeys(),
           window.hub.settings.getSession(),
           window.hub.prefs.get(),
+          window.hub.providers.localStatus(),
         ]);
         const matchingKey =
           keys.find(
             (item) =>
               item.status === "active" &&
-              findCatalogModel(session.model, item.providerSlug) !== null,
+              (item.providerSlug === "ollama"
+                ? local.models.some((model) => model.id === session.model)
+                : findCatalogModel(session.model, item.providerSlug) !== null),
           ) ??
           keys.find((item) => item.status === "active") ??
           null;
         setSelectedKeyId(matchingKey?.id ?? null);
-        if (matchingKey?.providerSlug === "custom") {
+        if (matchingKey?.providerSlug === "custom" || matchingKey?.providerSlug === "ollama") {
           setSelectedModel(session.model);
         } else if (
           matchingKey &&
@@ -358,9 +361,10 @@ export function App(): JSX.Element {
     void loadHealth();
     const handle = window.setInterval(() => {
       void loadHealth();
+      void loadKeys();
     }, 8_000);
     return () => window.clearInterval(handle);
-  }, [loadHealth]);
+  }, [loadHealth, loadKeys]);
 
   useEffect(() => {
     void window.hub.costs
@@ -421,7 +425,7 @@ export function App(): JSX.Element {
 
   useEffect(() => {
     const key = providerKeys.find((item) => item.id === selectedKeyId);
-    if (!key || key.providerSlug === "custom") {
+    if (!key || key.providerSlug === "custom" || key.providerSlug === "ollama") {
       return;
     }
     if (!findCatalogModel(selectedModel, key.providerSlug)) {
