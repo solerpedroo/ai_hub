@@ -101,6 +101,7 @@ import {
   projectUpdateInputSchema,
   providerKeyDtoSchema,
   providerKeyListResultSchema,
+  localProviderStatusSchema,
   providerListResultSchema,
   searchInputSchema,
   searchResultSchema,
@@ -162,6 +163,7 @@ import { getLatestToolActivity, getToolProjectState, pickProjectToolRoot, reques
 import { cancelAgentRun, getAgentRun, listAgentRuns, pauseAgentRun, prepareAgentRun, resumeAgentRun, startAgentRun } from "./agent-runner";
 import { cancelOrchestration, getOrchestration, listOrchestrations, pauseOrchestration, prepareOrchestration, resumeOrchestration, startOrchestration } from "./orchestration-runner";
 import { developerDiff, developerReview, developerStatus, developerTerminal, developerTree } from "./developer-tools";
+import { getLocalProviderStatus, localProviderKey } from "./local-provider";
 
 function registerHandler<TIn, TOut>(
   channel: string,
@@ -473,9 +475,15 @@ export function registerWorkspaceIpc(): void {
     getHubDatabase().repos.listProviders(),
   );
 
-  registerHandler(IpcChannel.secretsList, emptyIpcPayloadSchema, providerKeyListResultSchema, () =>
-    getHubDatabase().repos.listProviderKeys(),
+  registerHandler(IpcChannel.localProviderStatus, emptyIpcPayloadSchema, localProviderStatusSchema, () =>
+    getLocalProviderStatus(true),
   );
+
+  registerHandler(IpcChannel.secretsList, emptyIpcPayloadSchema, providerKeyListResultSchema, async () => {
+    const keys = await getHubDatabase().repos.listProviderKeys();
+    const local = await getLocalProviderStatus();
+    return local.available && local.models.length > 0 ? [...keys, localProviderKey()] : keys;
+  });
 
   registerHandler(IpcChannel.secretsSave, secretsSaveInputSchema, providerKeyDtoSchema, (input) =>
     getHubDatabase().repos.saveProviderKey(input),
