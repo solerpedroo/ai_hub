@@ -89,7 +89,7 @@ export function parseSkillSlashDraft(draft: string): { query: string | null; rem
 }
 
 export const FACTORY_SKILLS: readonly {
-  factoryId: "code-review" | "summarize-pdf" | "meeting-prep" | "explain-error" | "write-rfc";
+  factoryId: "code-review" | "generate-tests" | "explain-architecture" | "summarize-pdf" | "meeting-prep" | "explain-error" | "write-rfc";
   folder: SkillFolder;
   title: string;
   description: string;
@@ -125,6 +125,40 @@ Follow every step heading below in the same order. Do not skip a heading.`,
         title: "Suggestions",
         section: "Propose the smallest concrete follow-ups. Ask for a missing diff if none was provided.",
       },
+    ],
+    defaultMentions: [],
+  },
+  {
+    factoryId: "generate-tests",
+    folder: "development",
+    title: "Generate Tests",
+    description: "Propose focused tests from a Git diff without changing files.",
+    preferredModel: null,
+    prompt: `You are a test engineer for {{project}}.
+Project goal: {{goal}}
+Respond in {{language}}.
+Follow every step heading below in the same order. Do not write files.`,
+    steps: [
+      { id: "coverage", title: "Coverage", section: "Identify the changed behaviors and the test boundaries that matter." },
+      { id: "cases", title: "Test cases", section: "Propose concrete cases, assertions, and edge cases with their target files." },
+      { id: "gaps", title: "Gaps", section: "Call out assumptions, fixtures, or missing seams that block reliable tests." },
+    ],
+    defaultMentions: [],
+  },
+  {
+    factoryId: "explain-architecture",
+    folder: "development",
+    title: "Explain Architecture",
+    description: "Explain dependencies, boundaries, and risks from a Git diff.",
+    preferredModel: null,
+    prompt: `You are an architect reviewing changes in {{project}}.
+Project goal: {{goal}}
+Respond in {{language}}.
+Follow every step heading below in the same order.`,
+    steps: [
+      { id: "structure", title: "Structure", section: "Explain the components, dependencies, and data flow touched by the diff." },
+      { id: "boundaries", title: "Boundaries", section: "Identify trust, API, persistence, or ownership boundaries affected." },
+      { id: "validation", title: "Validation", section: "List risks and the smallest checks that validate the architecture." },
     ],
     defaultMentions: [],
   },
