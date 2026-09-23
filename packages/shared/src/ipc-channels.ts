@@ -43,6 +43,7 @@ export const IpcChannel = {
   settingsGetSession: "settings:getSession",
   settingsSetSession: "settings:setSession",
   providersList: "providers:list",
+  localProviderStatus: "local:status",
   secretsList: "secrets:list",
   secretsSave: "secrets:save",
   secretsRemove: "secrets:remove",
