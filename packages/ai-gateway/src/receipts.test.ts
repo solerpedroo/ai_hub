@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import { composeReceipt } from "./receipts";
 
 describe("composeReceipt", () => {
+  it("records zero cost and measured latency for local models without catalog prices", () => {
+    expect(composeReceipt({ provider: "ollama", model: "llama3.2:latest", tokensIn: 12, tokensOut: 4, estimatedIn: 1, estimatedOut: 1, latencyMs: 57, errorCode: null })).toMatchObject({ costUsd: "0.000000", latencyMs: 57, tokensIn: 12, tokensOut: 4 });
+  });
   it("uses catalog prices when usage is present", () => {
     const receipt = composeReceipt({
       provider: "openai",
