@@ -38,7 +38,7 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
   const extraSystem =
     input.extraSystem !== undefined && input.extraSystem.trim().length > 0 ? firewallText(input.extraSystem.trim()) : null;
   const catalog = findCatalogModel(input.model, input.providerSlug);
-  const contextWindow = catalog?.contextWindow ?? 128_000;
+  const contextWindow = catalog?.contextWindow ?? (input.providerSlug === "ollama" ? 8_192 : 128_000);
   const path = repos.listActivePath(input.conversationId);
   const pending =
     input.pendingContent !== undefined && input.pendingContent.trim().length > 0
@@ -198,6 +198,7 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
     input.maxTokens ?? null,
   );
   const baseCap = evaluateOutgoingCaps({
+    providerSlug: input.providerSlug,
     estimatedRequestUsd: estimatedCostUsd,
     daySpentUsd: repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() }),
     globalSpentUsd: repos.sumReceiptCostUsd({}),
@@ -205,6 +206,7 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
   });
   const scoped = repos.listScopedSpendCaps();
   const projectCap = evaluateScopedOutgoingCaps({
+    providerSlug: input.providerSlug,
     estimatedRequestUsd: estimatedCostUsd,
     spentUsd: conversation.projectId ? repos.sumReceiptCostUsd({ projectId: conversation.projectId }) : "0.000000",
     limitUsd: conversation.projectId
@@ -213,6 +215,7 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
     scope: "project",
   });
   const providerCap = evaluateScopedOutgoingCaps({
+    providerSlug: input.providerSlug,
     estimatedRequestUsd: estimatedCostUsd,
     spentUsd: repos.sumReceiptCostUsd({ providerSlug: input.providerSlug }),
     limitUsd: scoped.find((item) => item.dimension === "provider" && item.subjectId === input.providerSlug)?.limitUsd ?? null,
