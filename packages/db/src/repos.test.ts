@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { MemorySecretStore } from "@ai-hub/security";
 import { applyMigrations } from "./migrate";
 import { openHubDatabase } from "./open";
+import { OLLAMA_LOCAL_KEY_ID } from "./repos";
 
 function openTestDb() {
   const masterKey = randomBytes(32);
@@ -26,6 +27,13 @@ function dumpAllText(sqlite: { prepare: (sql: string) => { all: () => unknown[] 
 }
 
 describe("hub database", () => {
+  it("resolves the local provider without persisting a key or a secret", async () => {
+    const { hub } = openTestDb();
+    expect(await hub.repos.getProviderSecret(OLLAMA_LOCAL_KEY_ID)).toEqual({ id: OLLAMA_LOCAL_KEY_ID, providerSlug: "ollama", secret: "" });
+    expect(await hub.repos.listProviderKeys()).toEqual([]);
+    expect(dumpAllText(hub.sqlite)).not.toContain(OLLAMA_LOCAL_KEY_ID);
+    hub.close();
+  });
   it("creates project and conversation that round-trip decrypted", () => {
     const { hub } = openTestDb();
     const project = hub.repos.createProject("Alpha");
