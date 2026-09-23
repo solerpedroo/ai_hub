@@ -3,6 +3,9 @@ import { BrowserWindow, dialog, type OpenDialogOptions, type WebContents } from 
 import { ToolRouter, type ToolActivity, type ToolExecutionResult, type ToolPermissionRequest } from "@ai-hub/tools";
 import {
   TOOL_ID_PROJECT_FILESYSTEM_READ,
+  TOOL_ID_DEVELOPER_EXPLORER,
+  TOOL_ID_DEVELOPER_GIT,
+  TOOL_ID_DEVELOPER_TERMINAL,
   type ToolProjectRootPickResult,
   type ToolProjectState,
   type ToolReadRequestInput,
@@ -32,9 +35,8 @@ function projectState(projectId: string): ToolProjectState {
   return {
     projectId,
     rootLabel: root ? basename(root.rootPath) : null,
-    allowedTools: getHubDatabase().repos.hasProjectToolPermission(projectId, TOOL_ID_PROJECT_FILESYSTEM_READ, "read")
-      ? [TOOL_ID_PROJECT_FILESYSTEM_READ]
-      : [],
+    allowedTools: [TOOL_ID_PROJECT_FILESYSTEM_READ, TOOL_ID_DEVELOPER_EXPLORER, TOOL_ID_DEVELOPER_GIT]
+      .filter((toolId) => getHubDatabase().repos.hasProjectToolPermission(projectId, toolId, "read")),
   };
 }
 
@@ -69,6 +71,41 @@ function record(result: ToolExecutionResult | ToolActivity): void {
 }
 
 export function getLatestToolActivity(): ToolActivity | null { return latestActivity; }
+
+export function settleDeveloperActivity(status: "completed" | "failed", resultSummary: string): void {
+  if (latestActivity && latestActivity.toolId.startsWith("developer.")) latestActivity = { ...latestActivity, status, resultSummary: resultSummary.slice(0, 260) };
+}
+
+/**
+ * One-shot consent for fixed, main-process developer diagnostics. These actions
+ * deliberately do not receive an "always allow" option: their scope is narrow
+ * and each invocation remains visible to the user.
+ */
+export async function requestDeveloperPermission(projectId: string, sender: WebContents, toolId: typeof TOOL_ID_DEVELOPER_EXPLORER | typeof TOOL_ID_DEVELOPER_GIT | typeof TOOL_ID_DEVELOPER_TERMINAL | "developer.git.review", operation: "read" | "execute", detail: string): Promise<void> {
+  if (!getHubDatabase().repos.getProject(projectId)) throw new Error("tools:project_not_found");
+  if (operation === "read" && getHubDatabase().repos.hasProjectToolPermission(projectId, toolId, operation)) {
+    latestActivity = { id: crypto.randomUUID(), projectId, toolId, operation, effect: "read", status: "completed", argsSummary: detail.slice(0, 200), resultSummary: "Project permission", createdAt: new Date().toISOString() };
+    return;
+  }
+  const parent = BrowserWindow.fromWebContents(sender);
+  const portuguese = getHubDatabase().repos.getAppearance().locale === "pt-BR";
+  const options = {
+    type: "question" as const,
+    buttons: operation === "read" ? (portuguese ? ["Permitir uma vez", "Sempre neste projeto", "Negar"] : ["Allow once", "Always in this project", "Deny"]) : (portuguese ? ["Permitir uma vez", "Negar"] : ["Allow once", "Deny"]),
+    defaultId: 0,
+    cancelId: operation === "read" ? 2 : 1,
+    message: portuguese ? "Permissão do modo desenvolvedor" : "Developer Mode permission",
+    detail,
+    noLink: true,
+  };
+  const answer = await serializePermissionDialog(() => parent ? dialog.showMessageBox(parent, options) : dialog.showMessageBox(options));
+  if (answer.response !== 0 && !(operation === "read" && answer.response === 1)) {
+    latestActivity = { id: crypto.randomUUID(), projectId, toolId, operation, effect: operation === "read" ? "read" : "unknown", status: "denied", argsSummary: detail.slice(0, 200), resultSummary: null, createdAt: new Date().toISOString() };
+    throw new Error("tools:permission_denied");
+  }
+  if (operation === "read" && answer.response === 1) getHubDatabase().repos.grantProjectToolPermission(projectId, toolId, operation);
+  latestActivity = { id: crypto.randomUUID(), projectId, toolId, operation, effect: operation === "read" ? "read" : "unknown", status: "running", argsSummary: detail.slice(0, 200), resultSummary: null, createdAt: new Date().toISOString() };
+}
 
 export async function requestToolRead(input: ToolReadRequestInput, sender: WebContents): Promise<ToolReadRequestResult> {
   const result = await router.request({ projectId: input.projectId, toolId: TOOL_ID_PROJECT_FILESYSTEM_READ, relativePath: input.relativePath }, sender.id);
