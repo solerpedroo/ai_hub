@@ -3,6 +3,7 @@ export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL,
 export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
 export {
   HubRepos,
+  OLLAMA_LOCAL_KEY_ID,
   type AppearanceRecord,
   type ConversationRecord,
   type MessageRecord,
