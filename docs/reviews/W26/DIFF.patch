@@ -1,0 +1,996 @@
+diff --git a/apps/desktop/e2e/rag.spec.ts b/apps/desktop/e2e/rag.spec.ts
+index 203c27e..dbb229b 100644
+--- a/apps/desktop/e2e/rag.spec.ts
++++ b/apps/desktop/e2e/rag.spec.ts
+@@ -51,6 +51,9 @@ test("indexes 10 PDFs and cites the matching chunk", async () => {
+     const window = await app.firstWindow();
+     const composer = window.getByTestId("chat-composer");
+     await composer.waitFor({ state: "visible", timeout: 30_000 });
++    await window.getByTestId("packet-open").click();
++    await window.getByTestId("packet-privacy").selectOption("maximum");
++    await window.getByTestId("packet-dialog").press("Escape");
+     await window.getByTestId("files-attach").click();
+     await expect(window.getByTestId("files-chip").first()).toBeVisible({ timeout: 30_000 });
+     await composer.fill("where is the citation-marker about payments?");
+diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts
+index a331e1c..f1e786a 100644
+--- a/apps/desktop/src/main/chat-session.ts
++++ b/apps/desktop/src/main/chat-session.ts
+@@ -53,6 +53,7 @@ import { resolveSendMentions } from "./mentions";
+ import { getHubDatabase } from "./persistence";
+ import { loadAutoProjectContext } from "./project-context";
+ import { estimateOutgoingCostUsd, evaluateOutgoingCaps, evaluateScopedOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
++import { getLocalProviderStatus, localProviderKey } from "./local-provider";
+ 
+ interface ActiveRun {
+   runId: string;
+@@ -82,6 +83,16 @@ type PreparedChatSendInput = ChatSendInput & {
+ 
+ function adapterFor(slug: string, baseUrl: string | null): ProviderAdapter {
+   if (isE2eMode()) {
++    const fixtureFailure = process.env.AI_HUB_E2E_CLOUD_FAILURE;
++    if (slug !== "ollama" && (fixtureFailure === "network" || fixtureFailure === "timeout")) {
++      return {
++        ...createMockOpenAIAdapter(),
++        async *chatStream(request) {
++          if (fixtureFailure) throw new GatewayError(fixtureFailure, "E2E cloud failure");
++          yield* createMockOpenAIAdapter().chatStream(request);
++        },
++      };
++    }
+     return createMockOpenAIAdapter();
+   }
+   if (slug === "custom") {
+@@ -206,7 +217,7 @@ function compileOutgoing(
+     input.extraSystem !== undefined && input.extraSystem.trim().length > 0 ? input.extraSystem.trim() : null;
+   const catalog = findCatalogModel(input.model, providerSlug);
+   const maxTokenBudget =
+-    input.compactHistory === true ? (catalog?.contextWindow ?? 128_000) : undefined;
++    input.compactHistory === true ? (catalog?.contextWindow ?? (providerSlug === "ollama" ? 8_192 : 128_000)) : undefined;
+   const privacyMode = input.privacyMode ?? "standard";
+   if (conversation.activePacketId) {
+     const stored = getHubDatabase().repos.getContextPacket(conversation.activePacketId);
+@@ -309,7 +320,10 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
+   if (!key) {
+     throw new GatewayError("auth", "gateway:auth");
+   }
+-  if (key.providerSlug === "custom") {
++  if (key.providerSlug === "ollama") {
++    const local = await getLocalProviderStatus(true);
++    if (!local.available || !local.models.some((model) => model.id === input.model)) throw new GatewayError("network", "ollama:model_unavailable");
++  } else if (key.providerSlug === "custom") {
+     if (input.model.trim().length === 0) {
+       throw new Error("unknown_model");
+     }
+@@ -457,7 +471,7 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
+   }
+ 
+   const catalog = findCatalogModel(input.model, key.providerSlug);
+-  const contextWindow = catalog?.contextWindow ?? 128_000;
++  const contextWindow = catalog?.contextWindow ?? (key.providerSlug === "ollama" ? 8_192 : 128_000);
+   const overflow = packet.tokenEstimate > contextWindow;
+   if (overflow) {
+     throw new GatewayError("context_overflow", "gateway:context_overflow");
+@@ -714,10 +728,13 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
+         });
+       }
+       const keys = await repos.listProviderKeys();
++      const local = (code === "network" || code === "timeout") && run.provider !== "ollama" ? await getLocalProviderStatus(true) : null;
+       const suggestion =
+         code === "aborted"
+           ? null
+-          : suggestFallbackProvider({
++          : local?.available && local.models[0]
++            ? { providerSlug: "ollama", keyId: localProviderKey().id, model: local.models[0].id }
++            : suggestFallbackProvider({
+               failedProvider: run.provider,
+               keys,
+               summaries: summarizeProviderHealth(repos.listRecentHealthSamples()),
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index c980885..9b8b216 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -101,6 +101,7 @@ import {
+   projectUpdateInputSchema,
+   providerKeyDtoSchema,
+   providerKeyListResultSchema,
++  localProviderStatusSchema,
+   providerListResultSchema,
+   searchInputSchema,
+   searchResultSchema,
+@@ -162,6 +163,7 @@ import { getLatestToolActivity, getToolProjectState, pickProjectToolRoot, reques
+ import { cancelAgentRun, getAgentRun, listAgentRuns, pauseAgentRun, prepareAgentRun, resumeAgentRun, startAgentRun } from "./agent-runner";
+ import { cancelOrchestration, getOrchestration, listOrchestrations, pauseOrchestration, prepareOrchestration, resumeOrchestration, startOrchestration } from "./orchestration-runner";
+ import { developerDiff, developerReview, developerStatus, developerTerminal, developerTree } from "./developer-tools";
++import { getLocalProviderStatus, localProviderKey } from "./local-provider";
+ 
+ function registerHandler<TIn, TOut>(
+   channel: string,
+@@ -473,10 +475,16 @@ export function registerWorkspaceIpc(): void {
+     getHubDatabase().repos.listProviders(),
+   );
+ 
+-  registerHandler(IpcChannel.secretsList, emptyIpcPayloadSchema, providerKeyListResultSchema, () =>
+-    getHubDatabase().repos.listProviderKeys(),
++  registerHandler(IpcChannel.localProviderStatus, emptyIpcPayloadSchema, localProviderStatusSchema, () =>
++    getLocalProviderStatus(true),
+   );
+ 
++  registerHandler(IpcChannel.secretsList, emptyIpcPayloadSchema, providerKeyListResultSchema, async () => {
++    const keys = await getHubDatabase().repos.listProviderKeys();
++    const local = await getLocalProviderStatus();
++    return local.available && local.models.length > 0 ? [...keys, localProviderKey()] : keys;
++  });
++
+   registerHandler(IpcChannel.secretsSave, secretsSaveInputSchema, providerKeyDtoSchema, (input) =>
+     getHubDatabase().repos.saveProviderKey(input),
+   );
+diff --git a/apps/desktop/src/main/packet-file.ts b/apps/desktop/src/main/packet-file.ts
+index be50221..115a652 100644
+--- a/apps/desktop/src/main/packet-file.ts
++++ b/apps/desktop/src/main/packet-file.ts
+@@ -121,7 +121,7 @@ export function compileAndSavePacket(input: PacketsCompileInput): ContextPacketD
+     })),
+   };
+   const detailed = compileActivePathDetailed(
+-    input.compact === true ? { ...compiled, maxTokenBudget: catalog?.contextWindow ?? 128_000 } : compiled,
++    input.compact === true ? { ...compiled, maxTokenBudget: catalog?.contextWindow ?? (input.providerSlug === "ollama" ? 8_192 : 128_000) } : compiled,
+   );
+   const lastUser = [...compiled.messages].reverse().find((item) => item.role === "user")?.content ?? "";
+   const autoContext = loadAutoProjectContext(
+diff --git a/apps/desktop/src/main/packet-preview.ts b/apps/desktop/src/main/packet-preview.ts
+index c454769..637623c 100644
+--- a/apps/desktop/src/main/packet-preview.ts
++++ b/apps/desktop/src/main/packet-preview.ts
+@@ -38,7 +38,7 @@ export function previewPacket(input: PacketPreviewInput): PacketPreviewResult {
+   const extraSystem =
+     input.extraSystem !== undefined && input.extraSystem.trim().length > 0 ? firewallText(input.extraSystem.trim()) : null;
+   const catalog = findCatalogModel(input.model, input.providerSlug);
+-  const contextWindow = catalog?.contextWindow ?? 128_000;
++  const contextWindow = catalog?.contextWindow ?? (input.providerSlug === "ollama" ? 8_192 : 128_000);
+   const path = repos.listActivePath(input.conversationId);
+   const pending =
+     input.pendingContent !== undefined && input.pendingContent.trim().length > 0
+diff --git a/apps/desktop/src/main/spend-guard.ts b/apps/desktop/src/main/spend-guard.ts
+index 47fcaea..931c1d7 100644
+--- a/apps/desktop/src/main/spend-guard.ts
++++ b/apps/desktop/src/main/spend-guard.ts
+@@ -33,6 +33,7 @@ export function estimateOutgoingCostUsd(
+   tokensIn: number,
+   maxTokens: number | null | undefined,
+ ): string | null {
++  if (providerSlug === "ollama") return "0.000000";
+   const catalog = findCatalogModel(model, providerSlug);
+   if (!catalog) {
+     return null;
+@@ -47,6 +48,7 @@ export function evaluateOutgoingCaps(input: {
+   globalSpentUsd: string;
+   limits: SpendCapLimits;
+ }): { blocked: SpendCapScope | null; warnings: SpendCapScope[] } {
++  if (input.estimatedRequestUsd === "0.000000") return { blocked: null, warnings: [] };
+   const result = evaluateSpendCaps(input);
+   return { blocked: result.blocked, warnings: result.warnings };
+ }
+@@ -57,6 +59,7 @@ export function evaluateScopedOutgoingCaps(input: {
+   limitUsd: string | null;
+   scope: "project" | "provider";
+ }): { blocked: "project" | "provider" | null; warnings: ("project" | "provider")[] } {
++  if (input.estimatedRequestUsd === "0.000000") return { blocked: null, warnings: [] };
+   if (input.limitUsd === null || input.estimatedRequestUsd === null) return { blocked: null, warnings: [] };
+   const result = evaluateSpendCaps({
+     estimatedRequestUsd: input.estimatedRequestUsd,
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index 3083411..61abef8 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -102,6 +102,7 @@ import {
+   projectUpdateInputSchema,
+   providerKeyDtoSchema,
+   providerKeyListResultSchema,
++  localProviderStatusSchema,
+   providerListResultSchema,
+   searchInputSchema,
+   searchResultSchema,
+@@ -300,6 +301,7 @@ const hub: HubApi = {
+   },
+   providers: {
+     list: () => invokeParsed(IpcChannel.providersList, empty, emptyIpcPayloadSchema, providerListResultSchema),
++    localStatus: () => invokeParsed(IpcChannel.localProviderStatus, empty, emptyIpcPayloadSchema, localProviderStatusSchema),
+   },
+   secrets: {
+     list: () => invokeParsed(IpcChannel.secretsList, empty, emptyIpcPayloadSchema, providerKeyListResultSchema),
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index 1799c89..5fe558f 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -257,22 +257,25 @@ export function App(): JSX.Element {
+   useEffect(() => {
+     void (async () => {
+       try {
+-        const [projectList, keys, session, prefs] = await Promise.all([
++        const [projectList, keys, session, prefs, local] = await Promise.all([
+           loadProjects(),
+           loadKeys(),
+           window.hub.settings.getSession(),
+           window.hub.prefs.get(),
++          window.hub.providers.localStatus(),
+         ]);
+         const matchingKey =
+           keys.find(
+             (item) =>
+               item.status === "active" &&
+-              findCatalogModel(session.model, item.providerSlug) !== null,
++              (item.providerSlug === "ollama"
++                ? local.models.some((model) => model.id === session.model)
++                : findCatalogModel(session.model, item.providerSlug) !== null),
+           ) ??
+           keys.find((item) => item.status === "active") ??
+           null;
+         setSelectedKeyId(matchingKey?.id ?? null);
+-        if (matchingKey?.providerSlug === "custom") {
++        if (matchingKey?.providerSlug === "custom" || matchingKey?.providerSlug === "ollama") {
+           setSelectedModel(session.model);
+         } else if (
+           matchingKey &&
+@@ -358,9 +361,10 @@ export function App(): JSX.Element {
+     void loadHealth();
+     const handle = window.setInterval(() => {
+       void loadHealth();
++      void loadKeys();
+     }, 8_000);
+     return () => window.clearInterval(handle);
+-  }, [loadHealth]);
++  }, [loadHealth, loadKeys]);
+ 
+   useEffect(() => {
+     void window.hub.costs
+@@ -421,7 +425,7 @@ export function App(): JSX.Element {
+ 
+   useEffect(() => {
+     const key = providerKeys.find((item) => item.id === selectedKeyId);
+-    if (!key || key.providerSlug === "custom") {
++    if (!key || key.providerSlug === "custom" || key.providerSlug === "ollama") {
+       return;
+     }
+     if (!findCatalogModel(selectedModel, key.providerSlug)) {
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index e2eb5af..2754ffb 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -3,7 +3,6 @@ import { useTranslation } from "react-i18next";
+ import {
+   activePath,
+   catalogModelsForProvider,
+-  findCatalogModel,
+   recommendModelRoute,
+   isMentionStubType,
+   MAX_MENTION_TOKENS,
+@@ -30,6 +29,7 @@ import {
+   type AgentRunDetail,
+   type OrchestrationRunDetail,
+   type ProviderKeyDto,
++  type LocalProviderStatusDto,
+   type HealthSummaryDto,
+   type ToolActivityDto,
+ } from "@ai-hub/shared";
+@@ -256,6 +256,7 @@ export function HomeView({
+   const [toolError, setToolError] = useState<string | null>(null);
+   const [developerOutput, setDeveloperOutput] = useState<string | null>(null);
+   const [developerBusy, setDeveloperBusy] = useState(false);
++  const [localStatus, setLocalStatus] = useState<LocalProviderStatusDto | null>(null);
+   const [developerTerminalCommand, setDeveloperTerminalCommand] = useState<"git-status" | "git-diff" | "git-log" | "node-version">("git-status");
+   const [agentRun, setAgentRun] = useState<AgentRunDetail | null>(null);
+   const [orchestrationRun, setOrchestrationRun] = useState<OrchestrationRunDetail | null>(null);
+@@ -275,9 +276,21 @@ export function HomeView({
+   const selectedKey =
+     providerKeys.find((key) => key.id === selectedKeyId) ?? providerKeys[0] ?? null;
+   const providerSlug = selectedKey?.providerSlug ?? null;
+-  const models = providerSlug ? catalogModelsForProvider(providerSlug) : [];
++  const localModels: CatalogModel[] = (localStatus?.models ?? []).map((model) => ({ id: model.id, label: model.label, provider: "ollama", contextWindow: 8_192, inputUsdPerMillion: 0, outputUsdPerMillion: 0, vision: false, tools: false }));
++  const localReady = localStatus?.available === true && localModels.length > 0;
++  const models = providerSlug === "ollama" ? localModels : providerSlug ? catalogModelsForProvider(providerSlug) : [];
+   const selectedCatalog: CatalogModel | null =
+-    providerSlug && selectedModel ? findCatalogModel(selectedModel, providerSlug) : null;
++    providerSlug && selectedModel ? models.find((model) => model.id === selectedModel) ?? null : null;
++  useEffect(() => {
++    let active = true;
++    const refresh = (): void => { void window.hub.providers.localStatus().then((status) => { if (active) setLocalStatus(status); }).catch(() => { if (active) setLocalStatus({ available: false, models: [], pdfRagAvailable: true }); }); };
++    refresh();
++    const timer = window.setInterval(refresh, 8_000);
++    return () => { active = false; window.clearInterval(timer); };
++  }, []);
++  useEffect(() => {
++    if (providerSlug === "ollama" && localStatus?.models[0] && !localStatus.models.some((model) => model.id === selectedModel)) onSelectModel(localStatus.models[0].id);
++  }, [providerSlug, localStatus, selectedModel, onSelectModel]);
+   const routerRecommendation = recommendModelRoute(draft);
+   const routedModel = providerKeys.flatMap((key) => catalogModelsForProvider(key.providerSlug).map((model) => ({ key, model, cost: model.inputUsdPerMillion + model.outputUsdPerMillion, latency: health.find((sample) => sample.providerSlug === key.providerSlug)?.lastLatencyMs ?? Number.MAX_SAFE_INTEGER }))).sort((left, right) => routerRecommendation.tier === "frontier" ? right.cost - left.cost || left.latency - right.latency : left.cost - right.cost || left.latency - right.latency)[0] ?? null;
+   const hasKey =
+@@ -1017,6 +1030,7 @@ export function HomeView({
+         {selectedConversationId ? (
+           <>
+             <header className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
++              <span className="rounded border px-2 py-1 text-[11px]" role="status" data-testid="offline-status">{localReady ? t(providerSlug === "ollama" ? "offline.localMode" : "offline.cloudMode") : t(localStatus?.available ? "offline.noModels" : "offline.localUnavailable")}</span>
+               {providerKeys.length === 0 ? (
+                 <p className="text-muted-foreground">{t("workspace.noKey")}</p>
+               ) : (
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 9d6f5f2..3a7947c 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -485,5 +485,6 @@
+   "agents.status.awaiting_confirmation": "awaiting confirmation", "agents.status.running": "running", "agents.status.paused": "paused", "agents.status.cancelled": "cancelled", "agents.status.completed": "completed", "agents.status.completed_with_errors": "completed with errors", "agents.status.stopped_budget": "stopped by budget", "agents.status.stopped_timeout": "stopped by time limit", "agents.status.interrupted": "interrupted", "agents.status.failed": "failed",
+   "agents.step.pending": "pending", "agents.step.running": "running", "agents.step.completed": "completed", "agents.step.failed": "failed", "agents.step.skipped": "skipped", "agents.step.cancelled": "cancelled", "agents.step.interrupted": "interrupted", "agents.step.tokens": "tokens {{input}}/{{output}}", "agents.step.cost": "cost ${{usd}}",
+   "orchestration.title": "Orchestration", "orchestration.mode": "Orchestrate", "orchestration.empty": "Select project files above, then send a goal to prepare the graph.", "orchestration.disclosure": "Supervisor and all specialists use {{provider}} / {{model}}; shared graph cap: ${{budget}}. Any different model requires a new explicit confirmation.", "orchestration.usage": "tokens {{input}}/{{output}} · ${{cost}}", "orchestration.confirm": "Confirm graph", "orchestration.error.prepare": "Could not prepare the orchestration. Choose a project root and an active model key.", "orchestration.error.control": "Could not update the orchestration.", "orchestration.role.explorer": "Explorer", "orchestration.role.reviewer": "Reviewer", "orchestration.role.writer": "Writer", "orchestration.handoff.pending": "pending", "orchestration.handoff.ready": "ready", "orchestration.handoff.consumed": "consumed", "orchestration.handoff.cancelled": "cancelled", "orchestration.handoff.interrupted": "interrupted",
+-  "developer.title": "Developer Mode", "developer.tree": "Explorer", "developer.status": "Git status", "developer.diff": "Git diff", "developer.terminal": "Terminal diagnostic", "developer.review": "Review diff", "developer.tests": "Generate tests", "developer.architecture": "Explain architecture", "developer.hint": "Read-only project and Git tools; each use asks for permission.", "developer.error": "Developer tool could not run."
++  "developer.title": "Developer Mode", "developer.tree": "Explorer", "developer.status": "Git status", "developer.diff": "Git diff", "developer.terminal": "Terminal diagnostic", "developer.review": "Review diff", "developer.tests": "Generate tests", "developer.architecture": "Explain architecture", "developer.hint": "Read-only project and Git tools; each use asks for permission.", "developer.error": "Developer tool could not run.",
++  "offline.localMode": "Local mode · Ollama and PDF RAG in maximum mode work without internet; cloud needs internet", "offline.cloudMode": "Cloud selected · Ollama and PDF RAG in maximum mode available locally", "offline.noModels": "Ollama running without installed models · PDF RAG in maximum mode remains local", "offline.localUnavailable": "Ollama unavailable · PDF RAG in maximum mode remains local; cloud needs internet"
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index f63d25c..bcd920f 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -485,5 +485,6 @@
+   "agents.status.awaiting_confirmation": "aguarda confirmação", "agents.status.running": "em execução", "agents.status.paused": "pausado", "agents.status.cancelled": "cancelado", "agents.status.completed": "concluído", "agents.status.completed_with_errors": "concluído com erros", "agents.status.stopped_budget": "interrompido pelo orçamento", "agents.status.stopped_timeout": "interrompido pelo limite de tempo", "agents.status.interrupted": "interrompido", "agents.status.failed": "falhou",
+   "agents.step.pending": "pendente", "agents.step.running": "em execução", "agents.step.completed": "concluído", "agents.step.failed": "falhou", "agents.step.skipped": "ignorado", "agents.step.cancelled": "cancelado", "agents.step.interrupted": "interrompido", "agents.step.tokens": "tokens {{input}}/{{output}}", "agents.step.cost": "custo US$ {{usd}}",
+   "orchestration.title": "Orquestração", "orchestration.mode": "Orquestrar", "orchestration.empty": "Selecione os arquivos do projeto acima e envie um objetivo para preparar o grafo.", "orchestration.disclosure": "Supervisor e todos os especialistas usam {{provider}} / {{model}}; cap compartilhado do grafo: US$ {{budget}}. Um modelo diferente exige nova confirmação explícita.", "orchestration.usage": "tokens {{input}}/{{output}} · US$ {{cost}}", "orchestration.confirm": "Confirmar grafo", "orchestration.error.prepare": "Não foi possível preparar a orquestração. Escolha uma raiz do projeto e uma chave de modelo ativa.", "orchestration.error.control": "Não foi possível atualizar a orquestração.", "orchestration.role.explorer": "Explorador", "orchestration.role.reviewer": "Revisor", "orchestration.role.writer": "Redator", "orchestration.handoff.pending": "pendente", "orchestration.handoff.ready": "pronto", "orchestration.handoff.consumed": "consumido", "orchestration.handoff.cancelled": "cancelado", "orchestration.handoff.interrupted": "interrompido",
+-  "developer.title": "Modo Desenvolvedor", "developer.tree": "Explorer", "developer.status": "Status do Git", "developer.diff": "Diff do Git", "developer.terminal": "Diagnóstico do terminal", "developer.review": "Revisar diff", "developer.tests": "Gerar testes", "developer.architecture": "Explicar arquitetura", "developer.hint": "Ferramentas somente-leitura do projeto e Git; cada uso pede permissão.", "developer.error": "Não foi possível executar a ferramenta de desenvolvimento."
++  "developer.title": "Modo Desenvolvedor", "developer.tree": "Explorer", "developer.status": "Status do Git", "developer.diff": "Diff do Git", "developer.terminal": "Diagnóstico do terminal", "developer.review": "Revisar diff", "developer.tests": "Gerar testes", "developer.architecture": "Explicar arquitetura", "developer.hint": "Ferramentas somente-leitura do projeto e Git; cada uso pede permissão.", "developer.error": "Não foi possível executar a ferramenta de desenvolvimento.",
++  "offline.localMode": "Modo local · Ollama e RAG dos PDFs no modo máximo funcionam sem internet; cloud precisa de internet", "offline.cloudMode": "Cloud selecionada · Ollama e RAG dos PDFs no modo máximo disponíveis localmente", "offline.noModels": "Ollama ativo, sem modelos instalados · RAG dos PDFs no modo máximo segue local", "offline.localUnavailable": "Ollama indisponível · RAG dos PDFs no modo máximo segue local; cloud precisa de internet"
+ }
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index 5afc484..6c282ce 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -113,3 +113,4 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider
+ | [ADR-W23-002](./ADR-W23-002-persisted-bounded-agent-runs.md) | W23 | Corridas de agente persistidas e limitadas | accepted |
+ | [ADR-W24-001](./ADR-W24-001-persisted-orchestration-graph-and-handoffs.md) | W24 | Grafo de orquestração e handoffs persistidos | accepted |
+ | [ADR-W25-001](./ADR-W25-001-main-owned-read-only-developer-tools.md) | W25 | Ferramentas de desenvolvimento somente-leitura no main | accepted |
++| [ADR-W26-001](./ADR-W26-001-local-ollama-provider-and-offline-embeddings.md) | W26 | Provider Ollama local e embeddings offline | accepted |
+diff --git a/docs/IMPLEMENTATION_PLAN.md b/docs/IMPLEMENTATION_PLAN.md
+index e22b5e8..b471b22 100644
+--- a/docs/IMPLEMENTATION_PLAN.md
++++ b/docs/IMPLEMENTATION_PLAN.md
+@@ -900,11 +900,11 @@ Council **não** é orquestração de agentes: N modelos, um packet, sem tools.
+ 
+ **Sub-tasks:**
+ 
+-- [ ] Adapter Ollama; detecção de daemon; listar modelos locais
+-- [ ] Embeddings locais para RAG offline
+-- [ ] Modo offline explícito: o que funciona / o que não (badge)
+-- [ ] Fallback local quando a internet cai — **com aviso** (nunca silencioso)
+-- [ ] Receipts de modelos locais: custo `0`, latency real; HUD da W21 continua honesto
++- [x] Adapter Ollama; detecção de daemon; listar modelos locais
++- [x] Embeddings locais para RAG offline
++- [x] Modo offline explícito: o que funciona / o que não (badge)
++- [x] Fallback local quando a internet cai — **com aviso** (nunca silencioso)
++- [x] Receipts de modelos locais: custo `0`, latency real; HUD da W21 continua honesto
+ 
+ **DoD:** desligar Wi-Fi, conversar com Llama local, RAG do projeto continua nos PDFs já indexados.
+ 
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 5e055a9..4c02e73 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave
+ |---|---|
+ | Wave | **W26** |
+ | Marco | D — V2 agents + local |
+-| State | `pending` |
++| State | `review` |
+ | Last completed | **W25** |
+-| Next action | Start Wave 26 — Ollama + offline. |
++| Next action | Revisão independente W26 e validação física do DoD com Ollama instalado e Wi-Fi desligado. |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+diff --git a/packages/ai-gateway/src/index.ts b/packages/ai-gateway/src/index.ts
+index 06cfd94..71d0c77 100644
+--- a/packages/ai-gateway/src/index.ts
++++ b/packages/ai-gateway/src/index.ts
+@@ -44,3 +44,4 @@ export {
+   type ComposedReceipt,
+   type ComposeReceiptInput,
+ } from "./receipts";
++export { createOllamaAdapter, OLLAMA_BASE_URL } from "./ollama-adapter";
+diff --git a/packages/ai-gateway/src/receipts.test.ts b/packages/ai-gateway/src/receipts.test.ts
+index b827643..764bdc6 100644
+--- a/packages/ai-gateway/src/receipts.test.ts
++++ b/packages/ai-gateway/src/receipts.test.ts
+@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
+ import { composeReceipt } from "./receipts";
+ 
+ describe("composeReceipt", () => {
++  it("records zero cost and measured latency for local models without catalog prices", () => {
++    expect(composeReceipt({ provider: "ollama", model: "llama3.2:latest", tokensIn: 12, tokensOut: 4, estimatedIn: 1, estimatedOut: 1, latencyMs: 57, errorCode: null })).toMatchObject({ costUsd: "0.000000", latencyMs: 57, tokensIn: 12, tokensOut: 4 });
++  });
+   it("uses catalog prices when usage is present", () => {
+     const receipt = composeReceipt({
+       provider: "openai",
+diff --git a/packages/ai-gateway/src/receipts.ts b/packages/ai-gateway/src/receipts.ts
+index fd53817..32f9001 100644
+--- a/packages/ai-gateway/src/receipts.ts
++++ b/packages/ai-gateway/src/receipts.ts
+@@ -36,7 +36,7 @@ export function composeReceipt(input: ComposeReceiptInput): ComposedReceipt {
+     tokensIn,
+     tokensOut,
+     latencyMs: input.latencyMs,
+-    costUsd:
++    costUsd: input.provider === "ollama" ? "0.000000" :
+       input.reportedCostUsd !== undefined && input.reportedCostUsd !== null
+         ? input.reportedCostUsd
+         : catalog
+diff --git a/packages/ai-gateway/src/registry.test.ts b/packages/ai-gateway/src/registry.test.ts
+index 2f27d12..c0caf1a 100644
+--- a/packages/ai-gateway/src/registry.test.ts
++++ b/packages/ai-gateway/src/registry.test.ts
+@@ -31,6 +31,7 @@ describe("resolveAdapter", () => {
+     expect(resolveAdapter("anthropic").id).toBe("anthropic");
+     expect(resolveAdapter("google").id).toBe("google");
+     expect(resolveAdapter("groq").id).toBe("groq");
++    expect(resolveAdapter("ollama").id).toBe("ollama");
+     expect(resolveAdapter("custom", { baseUrl: "http://127.0.0.1:8080/v1" }).id).toBe("custom");
+   });
+ 
+diff --git a/packages/ai-gateway/src/registry.ts b/packages/ai-gateway/src/registry.ts
+index 11cae6d..c41a06e 100644
+--- a/packages/ai-gateway/src/registry.ts
++++ b/packages/ai-gateway/src/registry.ts
+@@ -5,6 +5,7 @@ import { createGeminiAdapter } from "./gemini-adapter";
+ import { createGroqAdapter } from "./groq-adapter";
+ import { createOpenAIAdapter, createOpenAICompatibleAdapter, mergeOpenAICompatibleOptions } from "./openai-adapter";
+ import { createOpenRouterAdapter } from "./openrouter-adapter";
++import { createOllamaAdapter } from "./ollama-adapter";
+ 
+ export interface ResolveAdapterOptions {
+   fetch?: typeof fetch;
+@@ -12,7 +13,7 @@ export interface ResolveAdapterOptions {
+   timeoutMs?: number;
+ }
+ 
+-const KNOWN_SLUGS = ["openai", "openrouter", "anthropic", "google", "groq", "custom"] as const;
++const KNOWN_SLUGS = ["openai", "openrouter", "anthropic", "google", "groq", "custom", "ollama"] as const;
+ 
+ export type ProviderSlug = (typeof KNOWN_SLUGS)[number];
+ 
+@@ -32,6 +33,8 @@ export function resolveAdapter(slug: string, options: ResolveAdapterOptions = {}
+       return createGeminiAdapter(options);
+     case "groq":
+       return createGroqAdapter(options);
++    case "ollama":
++      return createOllamaAdapter(options);
+     case "custom": {
+       if (options.baseUrl === undefined || options.baseUrl.trim().length === 0) {
+         throw new GatewayError("unknown", "Custom provider requires a base URL");
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index 7d4963e..542ce82 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -3,6 +3,7 @@ export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL,
+ export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
+ export {
+   HubRepos,
++  OLLAMA_LOCAL_KEY_ID,
+   type AppearanceRecord,
+   type ConversationRecord,
+   type MessageRecord,
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index 358b8a4..0823d81 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
+ import { MemorySecretStore } from "@ai-hub/security";
+ import { applyMigrations } from "./migrate";
+ import { openHubDatabase } from "./open";
++import { OLLAMA_LOCAL_KEY_ID } from "./repos";
+ 
+ function openTestDb() {
+   const masterKey = randomBytes(32);
+@@ -26,6 +27,13 @@ function dumpAllText(sqlite: { prepare: (sql: string) => { all: () => unknown[]
+ }
+ 
+ describe("hub database", () => {
++  it("resolves the local provider without persisting a key or a secret", async () => {
++    const { hub } = openTestDb();
++    expect(await hub.repos.getProviderSecret(OLLAMA_LOCAL_KEY_ID)).toEqual({ id: OLLAMA_LOCAL_KEY_ID, providerSlug: "ollama", secret: "" });
++    expect(await hub.repos.listProviderKeys()).toEqual([]);
++    expect(dumpAllText(hub.sqlite)).not.toContain(OLLAMA_LOCAL_KEY_ID);
++    hub.close();
++  });
+   it("creates project and conversation that round-trip decrypted", () => {
+     const { hub } = openTestDb();
+     const project = hub.repos.createProject("Alpha");
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 2b8cde3..0a3925f 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -437,6 +437,7 @@ const SPEND_CAP_OVERRIDES_KEY = "spend-cap-overrides";
+ const MEMORY_OPT_OUT_PREFIX = "memory-opt-out:";
+ const PROMPT_FACTORY_SEEDED_KEY = "prompt-factory-seeded";
+ const SKILL_FACTORY_SEEDED_KEY = "skill-factory-seeded";
++export const OLLAMA_LOCAL_KEY_ID = "26000000-0000-4000-8000-000000000001";
+ const DEFAULT_SESSION: WorkspaceSessionRecord = {
+   projectId: null,
+   conversationId: null,
+@@ -2046,6 +2047,7 @@ export class HubRepos {
+   }
+ 
+   async getProviderSecret(id: string): Promise<ProviderSecretRecord | null> {
++    if (id === OLLAMA_LOCAL_KEY_ID) return { id, providerSlug: "ollama", secret: "" };
+     const row = this.db.select().from(providerKeys).where(eq(providerKeys.id, id)).get();
+     if (!row) {
+       return null;
+diff --git a/packages/memory/src/memory.test.ts b/packages/memory/src/memory.test.ts
+index fffe913..1428d14 100644
+--- a/packages/memory/src/memory.test.ts
++++ b/packages/memory/src/memory.test.ts
+@@ -46,9 +46,10 @@ describe("retrieveChunks", () => {
+ });
+ 
+ describe("allowsProjectContext", () => {
+-  it("excludes memories and RAG in strict privacy", () => {
+-    expect(allowsProjectContext("standard")).toBe(true);
+-    expect(allowsProjectContext("strict")).toBe(false);
++  it("includes project context only in maximum privacy mode", () => {
++    expect(allowsProjectContext("maximum")).toBe(true);
++    expect(allowsProjectContext("normal")).toBe(false);
++    expect(allowsProjectContext("private")).toBe(false);
+   });
+ });
+ 
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index 9b690ab..05658a9 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -118,6 +118,7 @@ import type {
+   OrchestrationPrepareInput,
+   OrchestrationRunDetail,
+   ProviderKeyDto,
++  LocalProviderStatusDto,
+   SecretsSaveInput,
+   SecretsTestInput,
+   SecretsTestResult,
+@@ -183,6 +184,7 @@ export interface HubUpdatesApi {
+ 
+ export interface HubProvidersApi {
+   list: () => Promise<ProviderDto[]>;
++  localStatus: () => Promise<LocalProviderStatusDto>;
+ }
+ 
+ export interface HubSecretsApi {
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 07c2aad..6960e36 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -320,6 +320,7 @@ export {
+   providerDtoSchema,
+   providerKeyDtoSchema,
+   providerKeyListResultSchema,
++  localProviderStatusSchema,
+   providerListResultSchema,
+   secretsSaveInputSchema,
+   secretsTestInputSchema,
+@@ -462,6 +463,7 @@ export {
+   type WorkspaceAddTaskInput,
+   type WorkspaceSetTaskDoneInput,
+   type ProviderKeyDto,
++  type LocalProviderStatusDto,
+   type SecretsSaveInput,
+   type SecretsTestInput,
+   type SecretsTestResult,
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index 056b80c..79ceb43 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -43,6 +43,7 @@ export const IpcChannel = {
+   settingsGetSession: "settings:getSession",
+   settingsSetSession: "settings:setSession",
+   providersList: "providers:list",
++  localProviderStatus: "local:status",
+   secretsList: "secrets:list",
+   secretsSave: "secrets:save",
+   secretsRemove: "secrets:remove",
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index 4a0291b..321ea28 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -42,6 +42,7 @@ import {
+   developerDiffInputSchema,
+   developerReviewInputSchema,
+   developerTerminalInputSchema,
++  localProviderStatusSchema,
+ } from "./ipc-schemas";
+ 
+ describe("emptyIpcPayloadSchema", () => {
+@@ -83,6 +84,13 @@ describe("developer tool IPC contracts", () => {
+   });
+ });
+ 
++describe("local provider IPC contract", () => {
++  it("returns only bounded model identities and offline capability", () => {
++    expect(localProviderStatusSchema.parse({ available: true, models: [{ id: "llama3.2:latest", label: "llama3.2:latest" }], pdfRagAvailable: true }).models[0]?.id).toBe("llama3.2:latest");
++    expect(() => localProviderStatusSchema.parse({ available: true, models: [], pdfRagAvailable: true, secret: "not allowed" })).toThrow();
++  });
++});
++
+ describe("messageCreateInputSchema", () => {
+   it("allows a null parent for a linear thread", () => {
+     const parsed = messageCreateInputSchema.parse({
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index b4032d1..c10e0dd 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -18,11 +18,9 @@ import {
+   AGENT_MAX_READ_PATHS,
+   AGENT_MAX_STEPS,
+   agentBudgetUsdSchema,
+-  agentBudgetModeSchema,
+   agentHandoffJoinKindSchema,
+   agentHandoffStatusSchema,
+   agentRoleSchema,
+-  agentRunKindSchema,
+   agentRunStatusSchema,
+   agentStepKindSchema,
+   agentStepStatusSchema,
+@@ -531,6 +529,13 @@ export type ProviderKeyDto = z.infer<typeof providerKeyDtoSchema>;
+ 
+ export const providerKeyListResultSchema = z.array(providerKeyDtoSchema);
+ 
++export const localProviderStatusSchema = z.object({
++  available: z.boolean(),
++  models: z.array(z.object({ id: z.string().min(1).max(128), label: z.string().min(1).max(128) }).strict()).max(256),
++  pdfRagAvailable: z.literal(true),
++}).strict();
++export type LocalProviderStatusDto = z.infer<typeof localProviderStatusSchema>;
++
+ export const secretsSaveInputSchema = z
+   .object({
+     providerSlug: z.string().min(1).max(64),
+diff --git a/apps/desktop/e2e/offline.spec.ts b/apps/desktop/e2e/offline.spec.ts
+new file mode 100644
+index 0000000..a03fb60
+--- /dev/null
++++ b/apps/desktop/e2e/offline.spec.ts
+@@ -0,0 +1,58 @@
++import { createRequire } from "node:module";
++import { mkdtempSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { _electron as electron, expect, test } from "@playwright/test";
++
++const require = createRequire(import.meta.url);
++const electronBinary = require("electron") as string;
++const appRoot = path.join(fileURLToPath(new URL("..", import.meta.url)));
++
++test("selects an installed local model and records a zero-cost response", async () => {
++  const dir = mkdtempSync(path.join(tmpdir(), "ai-hub-offline-"));
++  const pdf = path.join(dir, "local-source.pdf");
++  const stream = "BT /F1 12 Tf 72 720 Td (Offline citation-marker payments use PostgreSQL) Tj ET";
++  writeFileSync(pdf, Buffer.from(`%PDF-1.1\n1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj\n4 0 obj << /Length ${stream.length} >>\nstream\n${stream}\nendstream\nendobj\n5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n`, "latin1"));
++  const app = await electron.launch({ executablePath: electronBinary, args: [path.join(appRoot, "out/main/index.js")], cwd: appRoot, env: { ...process.env, AI_HUB_E2E: "1", AI_HUB_E2E_OLLAMA_MODEL: "llama-fixture:latest", AI_HUB_E2E_ATTACH_FILE: pdf, NODE_ENV: "production" } });
++  try {
++    const window = await app.firstWindow();
++    await window.getByTestId("chat-composer").waitFor({ state: "visible", timeout: 30_000 });
++    const key = window.getByTestId("workspace-key");
++    const localId = await key.locator("option").filter({ hasText: "ollama" }).getAttribute("value");
++    expect(localId).not.toBeNull();
++    await key.selectOption(localId!);
++    await expect(window.getByTestId("workspace-model")).toHaveValue("llama-fixture:latest");
++    await expect(window.getByTestId("offline-status")).toContainText("local");
++    await window.getByTestId("packet-open").click();
++    await window.getByTestId("packet-privacy").selectOption("maximum");
++    await window.getByTestId("packet-dialog").press("Escape");
++    await window.getByTestId("files-attach").click();
++    await expect(window.getByTestId("files-chip").first()).toBeVisible({ timeout: 30_000 });
++    await window.getByTestId("chat-composer").fill("Offline citation-marker payments use PostgreSQL");
++    await expect(window.getByTestId("citation-rag").filter({ hasText: "local-source.pdf" })).toBeVisible({ timeout: 15_000 });
++    await window.getByTestId("chat-composer").press("Enter");
++    await expect(window.getByTestId("message-assistant")).toHaveAttribute("data-status", "complete", { timeout: 30_000 });
++    await expect(window.getByTestId("message-assistant")).toContainText("Hello from mock");
++    await expect(window.getByTestId("receipt-open")).toContainText("0.000000");
++  } finally { await app.close(); }
++});
++
++test("offers an explicit local fallback after a cloud timeout", async () => {
++  const app = await electron.launch({ executablePath: electronBinary, args: [path.join(appRoot, "out/main/index.js")], cwd: appRoot, env: { ...process.env, AI_HUB_E2E: "1", AI_HUB_E2E_OLLAMA_MODEL: "llama-fixture:latest", AI_HUB_E2E_CLOUD_FAILURE: "timeout", NODE_ENV: "production" } });
++  try {
++    const window = await app.firstWindow();
++    const composer = window.getByTestId("chat-composer");
++    await composer.waitFor({ state: "visible", timeout: 30_000 });
++    await expect(window.getByTestId("workspace-key")).not.toHaveValue("26000000-0000-4000-8000-000000000001");
++    await composer.fill("Use a local model if cloud is unavailable");
++    await composer.press("Enter");
++    const fallback = window.getByTestId("fallback-dialog");
++    await expect(fallback).toContainText("ollama", { timeout: 30_000 });
++    await expect(window.getByTestId("message-assistant")).toHaveAttribute("data-status", "interrupted");
++    await window.getByTestId("fallback-confirm").click();
++    await expect(window.getByTestId("workspace-model")).toHaveValue("llama-fixture:latest");
++    await expect(window.getByTestId("message-assistant").last()).toHaveAttribute("data-status", "complete", { timeout: 30_000 });
++    await expect(window.getByTestId("receipt-open").last()).toContainText("0.000000");
++  } finally { await app.close(); }
++});
+diff --git a/apps/desktop/src/main/local-provider.ts b/apps/desktop/src/main/local-provider.ts
+new file mode 100644
+index 0000000..ac8d133
+--- /dev/null
++++ b/apps/desktop/src/main/local-provider.ts
+@@ -0,0 +1,44 @@
++import { createOllamaAdapter } from "@ai-hub/ai-gateway";
++import { OLLAMA_LOCAL_KEY_ID } from "@ai-hub/db";
++import type { ProviderKeyDto } from "@ai-hub/shared";
++import { isE2eMode } from "./e2e-mode";
++
++export { OLLAMA_LOCAL_KEY_ID };
++
++export interface LocalProviderStatus {
++  available: boolean;
++  models: Array<{ id: string; label: string }>;
++  pdfRagAvailable: true;
++}
++
++let cached: { value: LocalProviderStatus; expiresAt: number } | null = null;
++
++export async function getLocalProviderStatus(force = false): Promise<LocalProviderStatus> {
++  if (isE2eMode() && process.env.AI_HUB_E2E_OLLAMA_MODEL) {
++    const id = process.env.AI_HUB_E2E_OLLAMA_MODEL;
++    return { available: true, models: [{ id, label: id }], pdfRagAvailable: true };
++  }
++  if (!force && cached && cached.expiresAt > Date.now()) return cached.value;
++  let value: LocalProviderStatus;
++  try {
++    const models = await createOllamaAdapter({ timeoutMs: 2_000 }).discoverModels(AbortSignal.timeout(2_000));
++    value = { available: true, models: models.slice(0, 256), pdfRagAvailable: true };
++  } catch {
++    value = { available: false, models: [], pdfRagAvailable: true };
++  }
++  cached = { value, expiresAt: Date.now() + 5_000 };
++  return value;
++}
++
++export function localProviderKey(): ProviderKeyDto {
++  return {
++    id: OLLAMA_LOCAL_KEY_ID,
++    providerSlug: "ollama",
++    label: "Ollama local",
++    maskedKey: "local…",
++    last4: "local",
++    status: "active",
++    endpointUrl: null,
++    createdAt: "2026-09-23T00:00:00.000Z",
++  };
++}
+diff --git a/apps/desktop/src/main/spend-guard.test.ts b/apps/desktop/src/main/spend-guard.test.ts
+new file mode 100644
+index 0000000..a782881
+--- /dev/null
++++ b/apps/desktop/src/main/spend-guard.test.ts
+@@ -0,0 +1,21 @@
++import { describe, expect, it } from "vitest";
++import { estimateOutgoingCostUsd, evaluateOutgoingCaps, evaluateScopedOutgoingCaps } from "./spend-guard";
++
++describe("local zero-cost spend caps", () => {
++  it("does not block an Ollama send after USD limits are exhausted", () => {
++    const estimate = estimateOutgoingCostUsd("llama3.2", "ollama", 100, 100);
++    expect(estimate).toBe("0.000000");
++    expect(evaluateOutgoingCaps({
++      estimatedRequestUsd: estimate,
++      daySpentUsd: "5.000000",
++      globalSpentUsd: "10.000000",
++      limits: { request: "0", day: "5.000000", global: "10.000000" },
++    })).toEqual({ blocked: null, warnings: [] });
++    expect(evaluateScopedOutgoingCaps({
++      estimatedRequestUsd: estimate,
++      spentUsd: "5.000000",
++      limitUsd: "5.000000",
++      scope: "project",
++    })).toEqual({ blocked: null, warnings: [] });
++  });
++});
+diff --git a/docs/ADR/ADR-W26-001-local-ollama-provider-and-offline-embeddings.md b/docs/ADR/ADR-W26-001-local-ollama-provider-and-offline-embeddings.md
+new file mode 100644
+index 0000000..8fb1963
+--- /dev/null
++++ b/docs/ADR/ADR-W26-001-local-ollama-provider-and-offline-embeddings.md
+@@ -0,0 +1,39 @@
++# ADR-W26-001-local-ollama-provider-and-offline-embeddings
++
++- **Status:** accepted
++- **Onda:** W26
++- **Data:** 2026-09-23
++- **Deciders:** Codex / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++Ollama usa um daemon local e modelos instalados dinamicamente. O contrato anterior exige chave no keytar e catálogo estático, enquanto o índice de PDFs já usa embeddings locais determinísticos e cifrados.
++
++## Decisão
++
++Ollama é um provider local de primeira classe, sem segredo ou chave falsa persistida. O main expõe uma identidade local fixa e consulta `127.0.0.1:11434` para detectar o daemon e listar modelos; o envio valida o modelo instalado antes do dispatch. O adapter usa a API nativa `/api/chat`, com streaming, abort e uso reportado. Receipts locais têm custo `0.000000` e latência medida.
++
++O índice de PDFs existente mantém embeddings locais determinísticos, sem dependência do daemon de embeddings: arquivos já indexados permanecem pesquisáveis quando a internet está desligada. Migração para embeddings Ollama exigiria versionamento e reindexação do espaço vetorial; não misturaremos vetores incompatíveis nesta onda.
++
++Fallback de provider remoto para local requer escolha explícita do usuário e modelo instalado. Nenhuma tentativa é redirecionada silenciosamente.
++
++## Alternativas consideradas
++
++- Armazenar uma chave fictícia para Ollama: rejeitado por confundir a fronteira de segredos.
++- Adicionar modelos Ollama ao catálogo estático: rejeitado porque instalações diferem por máquina.
++- Reindexar automaticamente com `/api/embed`: rejeitado porque quebraria o índice existente sem versão de embedding e impediria RAG quando o daemon de embedding não estivesse disponível.
++
++## Consequências
++
++- O main mantém a única chamada HTTP local; renderer recebe DTOs limitados e validados.
++- Um daemon ausente aparece como indisponível e não impede uso dos providers remotos.
++- O endpoint loopback é uma fronteira de confiança local: outro processo na mesma máquina que ocupe a porta 11434 pode se passar pelo daemon e receber o packet após escolha explícita do usuário.
++- O embedding hashed existente é local e funciona offline, mas tem qualidade semântica inferior a um modelo neural; uma futura migração precisa de versão e reindexação explícitas.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 26)
++- `docs/reviews/W26/REVIEW.md`
++- `docs/ADR/ADR-W14-001-local-hashed-embeddings.md`
+diff --git a/packages/ai-gateway/src/ollama-adapter.test.ts b/packages/ai-gateway/src/ollama-adapter.test.ts
+new file mode 100644
+index 0000000..46fe9cd
+--- /dev/null
++++ b/packages/ai-gateway/src/ollama-adapter.test.ts
+@@ -0,0 +1,48 @@
++import { describe, expect, it } from "vitest";
++import type { ProviderAgnosticPacket } from "@ai-hub/shared";
++import { createOllamaAdapter } from "./ollama-adapter";
++
++const packet: ProviderAgnosticPacket = { version: 1, system: "Be concise", messages: [{ role: "user", content: "hello" }], tokenEstimate: 4, excluded: [] };
++
++describe("Ollama adapter", () => {
++  it("discovers installed models and streams native NDJSON usage without an API key", async () => {
++    const calls: Array<{ url: string; authorization: string | null; body: unknown }> = [];
++    const adapter = createOllamaAdapter({ fetch: async (input, init) => {
++      calls.push({ url: String(input), authorization: new Headers(init?.headers).get("Authorization"), body: init?.body ? JSON.parse(String(init.body)) as unknown : null });
++      if (String(input).endsWith("/api/tags")) return Response.json({ models: [{ name: "llama3.2:latest" }] });
++      return new Response(new ReadableStream({ start(controller) {
++        const encoder = new TextEncoder();
++        controller.enqueue(encoder.encode('{"message":{"content":"Hello"},"done":false}\n'));
++        controller.enqueue(encoder.encode('{"message":{"content":" local"},"done":false}\n{"done":true,"prompt_eval_count":8,"eval_count":2}\n'));
++        controller.close();
++      } }), { status: 200 });
++    } });
++    expect(await adapter.discoverModels(new AbortController().signal)).toEqual([{ id: "llama3.2:latest", label: "llama3.2:latest" }]);
++    const events = [];
++    for await (const event of adapter.chatStream({ secret: "", model: "llama3.2:latest", packet, signal: new AbortController().signal })) events.push(event);
++    expect(events).toEqual([{ type: "delta", text: "Hello" }, { type: "delta", text: " local" }, { type: "usage", tokensIn: 8, tokensOut: 2, costUsd: "0.000000" }]);
++    expect(calls.map((call) => call.url)).toEqual(["http://127.0.0.1:11434/api/tags", "http://127.0.0.1:11434/api/chat"]);
++    expect(calls.every((call) => call.authorization === null)).toBe(true);
++    expect(calls[1]?.body).toMatchObject({ model: "llama3.2:latest", stream: true, options: { num_ctx: 8_192 }, messages: [{ role: "system", content: "Be concise" }, { role: "user", content: "hello" }] });
++  });
++
++  it("classifies a cancelled stream as aborted", async () => {
++    const controller = new AbortController();
++    const adapter = createOllamaAdapter({ fetch: async (_input, _init) => {
++      return new Response(new ReadableStream({ start(stream) {
++        controller.abort();
++        stream.error(new DOMException("Aborted", "AbortError"));
++      } }), { status: 200 });
++    } });
++    await expect(async () => { for await (const _event of adapter.chatStream({ secret: "", model: "llama3.2", packet, signal: controller.signal })) { /* consume */ } }).rejects.toMatchObject({ code: "aborted" });
++  });
++
++  it("rejects a stream without a terminal done chunk", async () => {
++    const adapter = createOllamaAdapter({ fetch: async () => new Response('{"message":{"content":"partial"},"done":false}\n', { status: 200 }) });
++    const events = [];
++    await expect(async () => {
++      for await (const event of adapter.chatStream({ secret: "", model: "llama3.2", packet, signal: new AbortController().signal })) events.push(event);
++    }).rejects.toMatchObject({ code: "network" });
++    expect(events).toEqual([{ type: "delta", text: "partial" }]);
++  });
++});
+diff --git a/packages/ai-gateway/src/ollama-adapter.ts b/packages/ai-gateway/src/ollama-adapter.ts
+new file mode 100644
+index 0000000..a4a55cc
+--- /dev/null
++++ b/packages/ai-gateway/src/ollama-adapter.ts
+@@ -0,0 +1,103 @@
++import { redactSecrets } from "@ai-hub/security";
++import type { ChatStreamEvent, ChatStreamRequest, ModelRef, ProviderAdapter } from "./adapter";
++import { councilDispatchInstruction } from "./adapter";
++import { GatewayError } from "./errors";
++
++export const OLLAMA_BASE_URL = "http://127.0.0.1:11434";
++
++interface OllamaOptions { fetch?: typeof fetch; baseUrl?: string; timeoutMs?: number }
++
++function object(value: unknown): Record<string, unknown> | null {
++  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
++}
++
++function transportError(error: unknown, signal: AbortSignal, timeout: AbortSignal): never {
++  if (error instanceof GatewayError) throw error;
++  if (signal.aborted) throw new GatewayError("aborted", "Local request aborted");
++  if (timeout.aborted) throw new GatewayError("timeout", "Ollama request timed out");
++  throw new GatewayError("network", redactSecrets(error instanceof Error ? error.message : "Ollama is unavailable"));
++}
++
++export function createOllamaAdapter(options: OllamaOptions = {}): ProviderAdapter & { discoverModels(signal: AbortSignal): Promise<ModelRef[]> } {
++  const fetchFn = options.fetch ?? fetch;
++  const baseUrl = options.baseUrl ?? OLLAMA_BASE_URL;
++  const timeoutMs = options.timeoutMs ?? 120_000;
++  const request = async (path: string, signal: AbortSignal, body?: unknown): Promise<{ response: Response; timeout: AbortSignal }> => {
++    const timeout = AbortSignal.timeout(timeoutMs);
++    try {
++      const response = await fetchFn(`${baseUrl}${path}`, {
++        method: body === undefined ? "GET" : "POST",
++        ...(body === undefined ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
++        signal: AbortSignal.any([signal, timeout]),
++      });
++      if (!response.ok) {
++        const code = response.status === 404 ? "unknown" : "network";
++        throw new GatewayError(code, `Ollama HTTP ${response.status}`);
++      }
++      return { response, timeout };
++    } catch (error) { return transportError(error, signal, timeout); }
++  };
++  return {
++    id: "ollama",
++    listModels(): ModelRef[] { return []; },
++    capabilities() { return { streaming: true, tools: false, thinking: false }; },
++    async discoverModels(signal: AbortSignal): Promise<ModelRef[]> {
++      const { response } = await request("/api/tags", signal);
++      const data = object(await response.json());
++      if (!data || !Array.isArray(data.models)) throw new GatewayError("unknown", "Invalid Ollama models response");
++      return data.models.flatMap((entry) => {
++        const row = object(entry);
++        const id = row?.name;
++        return typeof id === "string" && id.length > 0 && id.length <= 128 ? [{ id, label: id }] : [];
++      });
++    },
++    async testConnection(_secret: string, signal: AbortSignal): Promise<void> { await this.discoverModels(signal); },
++    async *chatStream(input: ChatStreamRequest): AsyncIterable<ChatStreamEvent> {
++      const messages: Array<{ role: string; content: string; images?: string[] }> = [];
++      const instruction = councilDispatchInstruction(input.councilRole);
++      if (instruction) messages.push({ role: "system", content: instruction });
++      if (input.packet.system) messages.push({ role: "system", content: input.packet.system });
++      messages.push(...input.packet.messages.map(({ role, content }) => ({ role, content })));
++      if (input.images?.length) {
++        const last = messages.at(-1);
++        if (last?.role === "user") last.images = input.images.map((image) => image.data);
++      }
++      const body = { model: input.model, messages, stream: true, options: { num_ctx: 8_192, temperature: input.temperature ?? 1, ...(input.maxTokens ? { num_predict: input.maxTokens } : {}) } };
++      const { response, timeout } = await request("/api/chat", input.signal, body);
++      if (!response.body) throw new GatewayError("network", "Ollama response had no body");
++      const reader = response.body.getReader();
++      const decoder = new TextDecoder();
++      let pending = "";
++      let completed = false;
++      try {
++        while (true) {
++          const { value, done } = await reader.read();
++          if (done) break;
++          pending += decoder.decode(value, { stream: true });
++          let newline = pending.indexOf("\n");
++          while (newline >= 0) {
++            const line = pending.slice(0, newline).trim();
++            pending = pending.slice(newline + 1);
++            if (line) {
++              let parsed: unknown;
++              try { parsed = JSON.parse(line) as unknown; } catch { throw new GatewayError("network", "Invalid Ollama stream chunk"); }
++              const row = object(parsed);
++              const error = row?.error;
++              if (typeof error === "string") throw new GatewayError("unknown", redactSecrets(error));
++              const message = object(row?.message);
++              if (typeof message?.content === "string" && message.content) yield { type: "delta", text: message.content };
++              if (row?.done === true) {
++                completed = true;
++                yield { type: "usage", tokensIn: typeof row.prompt_eval_count === "number" ? row.prompt_eval_count : 0, tokensOut: typeof row.eval_count === "number" ? row.eval_count : 0, costUsd: "0.000000" };
++              }
++            }
++            newline = pending.indexOf("\n");
++          }
++        }
++        if (pending.trim()) throw new GatewayError("network", "Incomplete Ollama stream");
++        if (!completed) throw new GatewayError("network", "Ollama stream ended before completion");
++      } catch (error) { transportError(error, input.signal, timeout); }
++      finally { reader.releaseLock(); }
++    },
++  };
++}
