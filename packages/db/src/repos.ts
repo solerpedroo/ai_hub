@@ -2560,10 +2560,6 @@ export class HubRepos {
       allowedTools?: SkillRecord["allowedTools"];
     }[],
   ): void {
-    const seeded = this.db.select().from(settings).where(eq(settings.key, SKILL_FACTORY_SEEDED_KEY)).get();
-    if (seeded?.value === "1") {
-      return;
-    }
     for (const item of items) {
       const existing = this.db.select().from(skills).where(eq(skills.factoryId, item.factoryId)).get();
       if (existing) {
