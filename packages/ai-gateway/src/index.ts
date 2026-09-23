@@ -44,3 +44,4 @@ export {
   type ComposedReceipt,
   type ComposeReceiptInput,
 } from "./receipts";
+export { createOllamaAdapter, OLLAMA_BASE_URL } from "./ollama-adapter";
