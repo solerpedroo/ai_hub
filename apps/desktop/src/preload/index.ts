@@ -102,6 +102,7 @@ import {
   projectUpdateInputSchema,
   providerKeyDtoSchema,
   providerKeyListResultSchema,
+  localProviderStatusSchema,
   providerListResultSchema,
   searchInputSchema,
   searchResultSchema,
@@ -300,6 +301,7 @@ const hub: HubApi = {
   },
   providers: {
     list: () => invokeParsed(IpcChannel.providersList, empty, emptyIpcPayloadSchema, providerListResultSchema),
+    localStatus: () => invokeParsed(IpcChannel.localProviderStatus, empty, emptyIpcPayloadSchema, localProviderStatusSchema),
   },
   secrets: {
     list: () => invokeParsed(IpcChannel.secretsList, empty, emptyIpcPayloadSchema, providerKeyListResultSchema),
