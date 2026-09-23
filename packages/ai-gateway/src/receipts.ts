@@ -36,7 +36,7 @@ export function composeReceipt(input: ComposeReceiptInput): ComposedReceipt {
     tokensIn,
     tokensOut,
     latencyMs: input.latencyMs,
-    costUsd:
+    costUsd: input.provider === "ollama" ? "0.000000" :
       input.reportedCostUsd !== undefined && input.reportedCostUsd !== null
         ? input.reportedCostUsd
         : catalog
