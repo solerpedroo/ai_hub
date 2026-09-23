@@ -900,11 +900,11 @@ Council **não** é orquestração de agentes: N modelos, um packet, sem tools. 
 
 **Sub-tasks:**
 
-- [ ] Adapter Ollama; detecção de daemon; listar modelos locais
-- [ ] Embeddings locais para RAG offline
-- [ ] Modo offline explícito: o que funciona / o que não (badge)
-- [ ] Fallback local quando a internet cai — **com aviso** (nunca silencioso)
-- [ ] Receipts de modelos locais: custo `0`, latency real; HUD da W21 continua honesto
+- [x] Adapter Ollama; detecção de daemon; listar modelos locais
+- [x] Embeddings locais para RAG offline
+- [x] Modo offline explícito: o que funciona / o que não (badge)
+- [x] Fallback local quando a internet cai — **com aviso** (nunca silencioso)
+- [x] Receipts de modelos locais: custo `0`, latency real; HUD da W21 continua honesto
 
 **DoD:** desligar Wi-Fi, conversar com Llama local, RAG do projeto continua nos PDFs já indexados.
 
