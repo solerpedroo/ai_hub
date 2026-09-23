@@ -31,6 +31,7 @@ describe("resolveAdapter", () => {
     expect(resolveAdapter("anthropic").id).toBe("anthropic");
     expect(resolveAdapter("google").id).toBe("google");
     expect(resolveAdapter("groq").id).toBe("groq");
+    expect(resolveAdapter("ollama").id).toBe("ollama");
     expect(resolveAdapter("custom", { baseUrl: "http://127.0.0.1:8080/v1" }).id).toBe("custom");
   });
 
