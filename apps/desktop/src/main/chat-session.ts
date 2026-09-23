@@ -53,6 +53,7 @@ import { resolveSendMentions } from "./mentions";
 import { getHubDatabase } from "./persistence";
 import { loadAutoProjectContext } from "./project-context";
 import { estimateOutgoingCostUsd, evaluateOutgoingCaps, evaluateScopedOutgoingCaps, localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
+import { getLocalProviderStatus, localProviderKey } from "./local-provider";
 
 interface ActiveRun {
   runId: string;
@@ -82,6 +83,16 @@ type PreparedChatSendInput = ChatSendInput & {
 
 function adapterFor(slug: string, baseUrl: string | null): ProviderAdapter {
   if (isE2eMode()) {
+    const fixtureFailure = process.env.AI_HUB_E2E_CLOUD_FAILURE;
+    if (slug !== "ollama" && (fixtureFailure === "network" || fixtureFailure === "timeout")) {
+      return {
+        ...createMockOpenAIAdapter(),
+        async *chatStream(request) {
+          if (fixtureFailure) throw new GatewayError(fixtureFailure, "E2E cloud failure");
+          yield* createMockOpenAIAdapter().chatStream(request);
+        },
+      };
+    }
     return createMockOpenAIAdapter();
   }
   if (slug === "custom") {
@@ -206,7 +217,7 @@ function compileOutgoing(
     input.extraSystem !== undefined && input.extraSystem.trim().length > 0 ? input.extraSystem.trim() : null;
   const catalog = findCatalogModel(input.model, providerSlug);
   const maxTokenBudget =
-    input.compactHistory === true ? (catalog?.contextWindow ?? 128_000) : undefined;
+    input.compactHistory === true ? (catalog?.contextWindow ?? (providerSlug === "ollama" ? 8_192 : 128_000)) : undefined;
   const privacyMode = input.privacyMode ?? "standard";
   if (conversation.activePacketId) {
     const stored = getHubDatabase().repos.getContextPacket(conversation.activePacketId);
@@ -309,7 +320,10 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
   if (!key) {
     throw new GatewayError("auth", "gateway:auth");
   }
-  if (key.providerSlug === "custom") {
+  if (key.providerSlug === "ollama") {
+    const local = await getLocalProviderStatus(true);
+    if (!local.available || !local.models.some((model) => model.id === input.model)) throw new GatewayError("network", "ollama:model_unavailable");
+  } else if (key.providerSlug === "custom") {
     if (input.model.trim().length === 0) {
       throw new Error("unknown_model");
     }
@@ -457,7 +471,7 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
   }
 
   const catalog = findCatalogModel(input.model, key.providerSlug);
-  const contextWindow = catalog?.contextWindow ?? 128_000;
+  const contextWindow = catalog?.contextWindow ?? (key.providerSlug === "ollama" ? 8_192 : 128_000);
   const overflow = packet.tokenEstimate > contextWindow;
   if (overflow) {
     throw new GatewayError("context_overflow", "gateway:context_overflow");
@@ -473,6 +487,7 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
   const daySpentUsd = addUsd(repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() }), repos.sumReservedSpendUsd({ sinceMs: localDayStartMs() }));
   const globalSpentUsd = addUsd(repos.sumReceiptCostUsd({}), repos.sumReservedSpendUsd({}));
   const baseCap = evaluateOutgoingCaps({
+    providerSlug: key.providerSlug,
     estimatedRequestUsd: estimatedCostUsd,
     daySpentUsd,
     globalSpentUsd,
@@ -485,12 +500,14 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
   const providerCapLimit =
     scoped.find((item) => item.dimension === "provider" && item.subjectId === key.providerSlug)?.limitUsd ?? null;
   const projectCap = evaluateScopedOutgoingCaps({
+    providerSlug: key.providerSlug,
     estimatedRequestUsd: estimatedCostUsd,
     spentUsd: conversation.projectId ? addUsd(repos.sumReceiptCostUsd({ projectId: conversation.projectId }), repos.sumReservedSpendUsd({ projectId: conversation.projectId })) : "0.000000",
     limitUsd: projectCapLimit,
     scope: "project",
   });
   const providerCap = evaluateScopedOutgoingCaps({
+    providerSlug: key.providerSlug,
     estimatedRequestUsd: estimatedCostUsd,
     spentUsd: addUsd(repos.sumReceiptCostUsd({ providerSlug: key.providerSlug }), repos.sumReservedSpendUsd({ providerSlug: key.providerSlug })),
     limitUsd: providerCapLimit,
@@ -714,10 +731,13 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
         });
       }
       const keys = await repos.listProviderKeys();
+      const local = (code === "network" || code === "timeout") && run.provider !== "ollama" ? await getLocalProviderStatus(true) : null;
       const suggestion =
         code === "aborted"
           ? null
-          : suggestFallbackProvider({
+          : local?.available && local.models[0]
+            ? { providerSlug: "ollama", keyId: localProviderKey().id, model: local.models[0].id }
+            : suggestFallbackProvider({
               failedProvider: run.provider,
               keys,
               summaries: summarizeProviderHealth(repos.listRecentHealthSamples()),
