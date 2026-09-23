@@ -121,7 +121,7 @@ export function compileAndSavePacket(input: PacketsCompileInput): ContextPacketD
     })),
   };
   const detailed = compileActivePathDetailed(
-    input.compact === true ? { ...compiled, maxTokenBudget: catalog?.contextWindow ?? 128_000 } : compiled,
+    input.compact === true ? { ...compiled, maxTokenBudget: catalog?.contextWindow ?? (input.providerSlug === "ollama" ? 8_192 : 128_000) } : compiled,
   );
   const lastUser = [...compiled.messages].reverse().find((item) => item.role === "user")?.content ?? "";
   const autoContext = loadAutoProjectContext(
