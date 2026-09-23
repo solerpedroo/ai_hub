@@ -51,6 +51,9 @@ test("indexes 10 PDFs and cites the matching chunk", async () => {
     const window = await app.firstWindow();
     const composer = window.getByTestId("chat-composer");
     await composer.waitFor({ state: "visible", timeout: 30_000 });
+    await window.getByTestId("packet-open").click();
+    await window.getByTestId("packet-privacy").selectOption("maximum");
+    await window.getByTestId("packet-dialog").press("Escape");
     await window.getByTestId("files-attach").click();
     await expect(window.getByTestId("files-chip").first()).toBeVisible({ timeout: 30_000 });
     await composer.fill("where is the citation-marker about payments?");
