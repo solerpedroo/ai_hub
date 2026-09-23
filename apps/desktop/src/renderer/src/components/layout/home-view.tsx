@@ -3,7 +3,6 @@ import { useTranslation } from "react-i18next";
 import {
   activePath,
   catalogModelsForProvider,
-  findCatalogModel,
   recommendModelRoute,
   isMentionStubType,
   MAX_MENTION_TOKENS,
@@ -30,6 +29,7 @@ import {
   type AgentRunDetail,
   type OrchestrationRunDetail,
   type ProviderKeyDto,
+  type LocalProviderStatusDto,
   type HealthSummaryDto,
   type ToolActivityDto,
 } from "@ai-hub/shared";
@@ -256,6 +256,7 @@ export function HomeView({
   const [toolError, setToolError] = useState<string | null>(null);
   const [developerOutput, setDeveloperOutput] = useState<string | null>(null);
   const [developerBusy, setDeveloperBusy] = useState(false);
+  const [localStatus, setLocalStatus] = useState<LocalProviderStatusDto | null>(null);
   const [developerTerminalCommand, setDeveloperTerminalCommand] = useState<"git-status" | "git-diff" | "git-log" | "node-version">("git-status");
   const [agentRun, setAgentRun] = useState<AgentRunDetail | null>(null);
   const [orchestrationRun, setOrchestrationRun] = useState<OrchestrationRunDetail | null>(null);
@@ -275,9 +276,21 @@ export function HomeView({
   const selectedKey =
     providerKeys.find((key) => key.id === selectedKeyId) ?? providerKeys[0] ?? null;
   const providerSlug = selectedKey?.providerSlug ?? null;
-  const models = providerSlug ? catalogModelsForProvider(providerSlug) : [];
+  const localModels: CatalogModel[] = (localStatus?.models ?? []).map((model) => ({ id: model.id, label: model.label, provider: "ollama", contextWindow: 8_192, inputUsdPerMillion: 0, outputUsdPerMillion: 0, vision: false, tools: false }));
+  const localReady = localStatus?.available === true && localModels.length > 0;
+  const models = providerSlug === "ollama" ? localModels : providerSlug ? catalogModelsForProvider(providerSlug) : [];
   const selectedCatalog: CatalogModel | null =
-    providerSlug && selectedModel ? findCatalogModel(selectedModel, providerSlug) : null;
+    providerSlug && selectedModel ? models.find((model) => model.id === selectedModel) ?? null : null;
+  useEffect(() => {
+    let active = true;
+    const refresh = (): void => { void window.hub.providers.localStatus().then((status) => { if (active) setLocalStatus(status); }).catch(() => { if (active) setLocalStatus({ available: false, models: [], pdfRagAvailable: true }); }); };
+    refresh();
+    const timer = window.setInterval(refresh, 8_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
+  useEffect(() => {
+    if (providerSlug === "ollama" && localStatus?.models[0] && !localStatus.models.some((model) => model.id === selectedModel)) onSelectModel(localStatus.models[0].id);
+  }, [providerSlug, localStatus, selectedModel, onSelectModel]);
   const routerRecommendation = recommendModelRoute(draft);
   const routedModel = providerKeys.flatMap((key) => catalogModelsForProvider(key.providerSlug).map((model) => ({ key, model, cost: model.inputUsdPerMillion + model.outputUsdPerMillion, latency: health.find((sample) => sample.providerSlug === key.providerSlug)?.lastLatencyMs ?? Number.MAX_SAFE_INTEGER }))).sort((left, right) => routerRecommendation.tier === "frontier" ? right.cost - left.cost || left.latency - right.latency : left.cost - right.cost || left.latency - right.latency)[0] ?? null;
   const hasKey =
@@ -1017,6 +1030,7 @@ export function HomeView({
         {selectedConversationId ? (
           <>
             <header className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
+              <span className="rounded border px-2 py-1 text-[11px]" role="status" data-testid="offline-status">{localReady ? t(providerSlug === "ollama" ? "offline.localMode" : "offline.cloudMode") : t(localStatus?.available ? "offline.noModels" : "offline.localUnavailable")}</span>
               {providerKeys.length === 0 ? (
                 <p className="text-muted-foreground">{t("workspace.noKey")}</p>
               ) : (
