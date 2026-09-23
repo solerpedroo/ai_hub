@@ -884,11 +884,11 @@ Council **não** é orquestração de agentes: N modelos, um packet, sem tools. 
 
 **Sub-tasks:**
 
-- [ ] Explorer, terminal integrado, Git status/diff
-- [ ] AI Code Review no diff (bug, security, perf, smell, manutenibilidade)
-- [ ] Geração de testes / explicação de arquitetura via skills + tools (pode usar orquestração Reviewer+Writer)
-- [ ] Terminal e git passam pelo Permission Center
-- [ ] Review vira artifact + opcionalmente comentários por arquivo
+- [x] Explorer, terminal integrado, Git status/diff
+- [x] AI Code Review no diff (bug, security, perf, smell, manutenibilidade)
+- [x] Geração de testes / explicação de arquitetura via skills + tools (pode usar orquestração Reviewer+Writer)
+- [x] Terminal e git passam pelo Permission Center
+- [x] Review vira artifact + opcionalmente comentários por arquivo
 
 **DoD:** abrir um repo, pedir review do `git diff`, receber findings acionáveis sem o agente commitar sozinho.
 
