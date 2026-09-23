@@ -118,6 +118,7 @@ import type {
   OrchestrationPrepareInput,
   OrchestrationRunDetail,
   ProviderKeyDto,
+  LocalProviderStatusDto,
   SecretsSaveInput,
   SecretsTestInput,
   SecretsTestResult,
@@ -183,6 +184,7 @@ export interface HubUpdatesApi {
 
 export interface HubProvidersApi {
   list: () => Promise<ProviderDto[]>;
+  localStatus: () => Promise<LocalProviderStatusDto>;
 }
 
 export interface HubSecretsApi {
