@@ -5,6 +5,7 @@ import { createGeminiAdapter } from "./gemini-adapter";
 import { createGroqAdapter } from "./groq-adapter";
 import { createOpenAIAdapter, createOpenAICompatibleAdapter, mergeOpenAICompatibleOptions } from "./openai-adapter";
 import { createOpenRouterAdapter } from "./openrouter-adapter";
+import { createOllamaAdapter } from "./ollama-adapter";
 
 export interface ResolveAdapterOptions {
   fetch?: typeof fetch;
@@ -12,7 +13,7 @@ export interface ResolveAdapterOptions {
   timeoutMs?: number;
 }
 
-const KNOWN_SLUGS = ["openai", "openrouter", "anthropic", "google", "groq", "custom"] as const;
+const KNOWN_SLUGS = ["openai", "openrouter", "anthropic", "google", "groq", "custom", "ollama"] as const;
 
 export type ProviderSlug = (typeof KNOWN_SLUGS)[number];
 
@@ -32,6 +33,8 @@ export function resolveAdapter(slug: string, options: ResolveAdapterOptions = {}
       return createGeminiAdapter(options);
     case "groq":
       return createGroqAdapter(options);
+    case "ollama":
+      return createOllamaAdapter(options);
     case "custom": {
       if (options.baseUrl === undefined || options.baseUrl.trim().length === 0) {
         throw new GatewayError("unknown", "Custom provider requires a base URL");
