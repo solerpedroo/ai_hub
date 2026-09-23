@@ -33,6 +33,7 @@ export function estimateOutgoingCostUsd(
   tokensIn: number,
   maxTokens: number | null | undefined,
 ): string | null {
+  if (providerSlug === "ollama") return "0.000000";
   const catalog = findCatalogModel(model, providerSlug);
   if (!catalog) {
     return null;
@@ -42,21 +43,25 @@ export function estimateOutgoingCostUsd(
 }
 
 export function evaluateOutgoingCaps(input: {
+  providerSlug?: string;
   estimatedRequestUsd: string | null;
   daySpentUsd: string;
   globalSpentUsd: string;
   limits: SpendCapLimits;
 }): { blocked: SpendCapScope | null; warnings: SpendCapScope[] } {
+  if (input.providerSlug === "ollama" && input.estimatedRequestUsd === "0.000000") return { blocked: null, warnings: [] };
   const result = evaluateSpendCaps(input);
   return { blocked: result.blocked, warnings: result.warnings };
 }
 
 export function evaluateScopedOutgoingCaps(input: {
+  providerSlug?: string;
   estimatedRequestUsd: string | null;
   spentUsd: string;
   limitUsd: string | null;
   scope: "project" | "provider";
 }): { blocked: "project" | "provider" | null; warnings: ("project" | "provider")[] } {
+  if (input.providerSlug === "ollama" && input.estimatedRequestUsd === "0.000000") return { blocked: null, warnings: [] };
   if (input.limitUsd === null || input.estimatedRequestUsd === null) return { blocked: null, warnings: [] };
   const result = evaluateSpendCaps({
     estimatedRequestUsd: input.estimatedRequestUsd,
