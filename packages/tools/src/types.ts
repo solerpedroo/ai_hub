@@ -1,5 +1,7 @@
 export const PROJECT_FILESYSTEM_TOOL_ID = "project-filesystem.read-file" as const;
 export const PROJECT_FILESYSTEM_OPERATION = "read" as const;
+export type ToolId = typeof PROJECT_FILESYSTEM_TOOL_ID | "developer.explorer.read" | "developer.git.read" | "developer.terminal.execute" | "developer.git.review";
+export type ToolOperation = "read" | "execute";
 
 export type ToolEffect = "read" | "write" | "destructive" | "unknown";
 export type PermissionDecision = "allow_once" | "allow_project" | "deny";
@@ -8,8 +10,8 @@ export type ToolActivityStatus = "permission_required" | "denied" | "running" | 
 export interface ToolActivity {
   id: string;
   projectId: string;
-  toolId: typeof PROJECT_FILESYSTEM_TOOL_ID;
-  operation: typeof PROJECT_FILESYSTEM_OPERATION;
+  toolId: ToolId;
+  operation: ToolOperation;
   effect: ToolEffect;
   status: ToolActivityStatus;
   argsSummary: string;
@@ -20,8 +22,8 @@ export interface ToolActivity {
 export interface ToolPermissionRequest {
   id: string;
   projectId: string;
-  toolId: typeof PROJECT_FILESYSTEM_TOOL_ID;
-  operation: typeof PROJECT_FILESYSTEM_OPERATION;
+  toolId: ToolId;
+  operation: ToolOperation;
   effect: ToolEffect;
   argsSummary: string;
   requiresDestructiveConfirmation: boolean;
