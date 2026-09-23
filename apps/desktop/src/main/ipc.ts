@@ -122,6 +122,7 @@ import {
   toolReadRequestInputSchema,
   toolReadRequestResultSchema,
   toolActivityResultSchema,
+  developerProjectInputSchema, developerDiffInputSchema, developerTreeResultSchema, developerStatusResultSchema, developerDiffResultSchema, developerReviewInputSchema, developerReviewResultSchema, developerTerminalInputSchema, developerTerminalResultSchema,
   agentPrepareInputSchema,
   agentIdInputSchema,
   agentListInputSchema,
@@ -160,6 +161,7 @@ import { checkForAppUpdates } from "./updater";
 import { getLatestToolActivity, getToolProjectState, pickProjectToolRoot, requestToolRead } from "./tools";
 import { cancelAgentRun, getAgentRun, listAgentRuns, pauseAgentRun, prepareAgentRun, resumeAgentRun, startAgentRun } from "./agent-runner";
 import { cancelOrchestration, getOrchestration, listOrchestrations, pauseOrchestration, prepareOrchestration, resumeOrchestration, startOrchestration } from "./orchestration-runner";
+import { developerDiff, developerReview, developerStatus, developerTerminal, developerTree } from "./developer-tools";
 
 function registerHandler<TIn, TOut>(
   channel: string,
@@ -224,6 +226,11 @@ export function registerWorkspaceIpc(): void {
   registerHandler(IpcChannel.toolsGetLatestActivity, emptyIpcPayloadSchema, toolActivityResultSchema, () =>
     getLatestToolActivity(),
   );
+  registerHandler(IpcChannel.developerTree, developerProjectInputSchema, developerTreeResultSchema, (input, event) => developerTree(input, event.sender));
+  registerHandler(IpcChannel.developerStatus, developerProjectInputSchema, developerStatusResultSchema, (input, event) => developerStatus(input, event.sender));
+  registerHandler(IpcChannel.developerDiff, developerDiffInputSchema, developerDiffResultSchema, (input, event) => developerDiff(input, event.sender));
+  registerHandler(IpcChannel.developerReview, developerReviewInputSchema, developerReviewResultSchema, (input, event) => developerReview(input, event.sender));
+  registerHandler(IpcChannel.developerTerminal, developerTerminalInputSchema, developerTerminalResultSchema, (input, event) => developerTerminal(input, event.sender));
   registerHandler(IpcChannel.agentsPrepare, agentPrepareInputSchema, agentRunDetailSchema, (input, event) =>
     prepareAgentRun({
       ...input,
