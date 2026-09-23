@@ -100,6 +100,16 @@ import type {
   ToolProjectState,
   ToolReadRequestInput,
   ToolReadRequestResult,
+  DeveloperTreeInput,
+  DeveloperStatusInput,
+  DeveloperDiffInput,
+  DeveloperTreeResult,
+  DeveloperStatusResult,
+  DeveloperDiffResult,
+  DeveloperReviewInput,
+  DeveloperReviewResult,
+  DeveloperTerminalInput,
+  DeveloperTerminalResult,
   AgentPrepareInput,
   AgentIdInput,
   AgentListInput,
@@ -284,6 +294,11 @@ export interface HubToolsApi {
   pickProjectRoot: (input: ToolProjectGetInput) => Promise<ToolProjectRootPickResult>;
   requestRead: (input: ToolReadRequestInput) => Promise<ToolReadRequestResult>;
   getLatestActivity: () => Promise<ToolActivityDto | null>;
+  tree: (input: DeveloperTreeInput) => Promise<DeveloperTreeResult>;
+  gitStatus: (input: DeveloperStatusInput) => Promise<DeveloperStatusResult>;
+  gitDiff: (input: DeveloperDiffInput) => Promise<DeveloperDiffResult>;
+  reviewDiff: (input: DeveloperReviewInput) => Promise<DeveloperReviewResult>;
+  terminal: (input: DeveloperTerminalInput) => Promise<DeveloperTerminalResult>;
 }
 
 export interface HubAgentsApi {
