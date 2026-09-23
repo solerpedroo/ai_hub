@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave 
 
 | Field | Value |
 |---|---|
-| Wave | **W25** |
+| Wave | **W26** |
 | Marco | D — V2 agents + local |
 | State | `pending` |
-| Last completed | **W24** |
-| Next action | Start W25 Developer mode only after an explicit request. |
+| Last completed | **W25** |
+| Next action | Start Wave 26 — Ollama + offline. |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
@@ -54,5 +54,5 @@ None.
 
 | Kind | Path |
 |---|---|
-| Review | `docs/reviews/W24/REVIEW.md` |
-| Latest ADR | `docs/ADR/ADR-W24-001-persisted-orchestration-graph-and-handoffs.md` |
+| Review | `docs/reviews/W25/REVIEW.md` |
+| Latest ADR | `docs/ADR/ADR-W25-001-main-owned-read-only-developer-tools.md` |
