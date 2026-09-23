@@ -114,7 +114,7 @@ export const toolActivityDtoSchema = z.object({
   id: z.string().uuid(),
   projectId: z.string().uuid(),
   toolId: toolIdSchema,
-  operation: z.literal("read"),
+  operation: z.enum(["read", "execute"]),
   effect: toolEffectSchema,
   status: toolActivityStatusSchema,
   argsSummary: z.string().max(200),
@@ -129,6 +129,26 @@ export const toolReadRequestResultSchema = z.discriminatedUnion("kind", [
 ]);
 export type ToolReadRequestResult = z.infer<typeof toolReadRequestResultSchema>;
 export const toolActivityResultSchema = toolActivityDtoSchema.nullable();
+
+export const developerProjectInputSchema = z.object({ projectId: z.string().uuid() }).strict();
+export type DeveloperTreeInput = z.infer<typeof developerProjectInputSchema>;
+export type DeveloperStatusInput = z.infer<typeof developerProjectInputSchema>;
+export const developerDiffInputSchema = developerProjectInputSchema.extend({ relativePath: z.string().min(1).max(1024).optional() }).strict();
+export type DeveloperDiffInput = z.infer<typeof developerDiffInputSchema>;
+export const developerTreeResultSchema = z.object({ entries: z.array(z.object({ path: z.string().min(1).max(1024), kind: z.enum(["file", "directory"]) }).strict()).max(200) }).strict();
+export type DeveloperTreeResult = z.infer<typeof developerTreeResultSchema>;
+export const developerStatusResultSchema = z.object({ output: z.string().max(48_000) }).strict();
+export type DeveloperStatusResult = z.infer<typeof developerStatusResultSchema>;
+export const developerDiffResultSchema = developerStatusResultSchema;
+export type DeveloperDiffResult = z.infer<typeof developerDiffResultSchema>;
+export const developerReviewInputSchema = z.object({ projectId: z.string().uuid(), conversationId: z.string().uuid(), providerKeyId: z.string().uuid(), model: z.string().min(1).max(128), intent: z.enum(["code_review", "generate_tests", "explain_architecture"]).default("code_review") }).strict();
+export type DeveloperReviewInput = z.infer<typeof developerReviewInputSchema>;
+export const developerReviewResultSchema = z.object({ artifactId: z.string().uuid() }).strict();
+export type DeveloperReviewResult = z.infer<typeof developerReviewResultSchema>;
+export const developerTerminalInputSchema = developerProjectInputSchema.extend({ command: z.enum(["git-status", "git-diff", "git-log", "node-version"]) }).strict();
+export type DeveloperTerminalInput = z.infer<typeof developerTerminalInputSchema>;
+export const developerTerminalResultSchema = z.object({ output: z.string().max(4_000) }).strict();
+export type DeveloperTerminalResult = z.infer<typeof developerTerminalResultSchema>;
 
 const agentRelativePathSchema = z
   .string()
