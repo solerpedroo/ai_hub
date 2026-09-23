@@ -39,6 +39,9 @@ import {
   agentIdInputSchema,
   orchestrationPrepareInputSchema,
   agentNodeDtoSchema,
+  developerDiffInputSchema,
+  developerReviewInputSchema,
+  developerTerminalInputSchema,
 } from "./ipc-schemas";
 
 describe("emptyIpcPayloadSchema", () => {
@@ -63,6 +66,20 @@ describe("ipcAckResultSchema", () => {
   it("accepts undefined or null ack", () => {
     expect(ipcAckResultSchema.parse(undefined)).toBeUndefined();
     expect(ipcAckResultSchema.parse(null)).toBeNull();
+  });
+});
+
+describe("developer tool IPC contracts", () => {
+  const projectId = "11111111-1111-4111-8111-111111111111";
+
+  it("only accepts the fixed diagnostic command allowlist", () => {
+    expect(developerTerminalInputSchema.parse({ projectId, command: "git-status" })).toEqual({ projectId, command: "git-status" });
+    expect(() => developerTerminalInputSchema.parse({ projectId, command: "cmd.exe" })).toThrow();
+  });
+
+  it("defaults the review intent and rejects extra transport fields", () => {
+    expect(developerReviewInputSchema.parse({ projectId, conversationId: "22222222-2222-4222-8222-222222222222", providerKeyId: "33333333-3333-4333-8333-333333333333", model: "test-model" }).intent).toBe("code_review");
+    expect(() => developerDiffInputSchema.parse({ projectId, shell: true })).toThrow();
   });
 });
 
