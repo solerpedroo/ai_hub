@@ -18,11 +18,9 @@ import {
   AGENT_MAX_READ_PATHS,
   AGENT_MAX_STEPS,
   agentBudgetUsdSchema,
-  agentBudgetModeSchema,
   agentHandoffJoinKindSchema,
   agentHandoffStatusSchema,
   agentRoleSchema,
-  agentRunKindSchema,
   agentRunStatusSchema,
   agentStepKindSchema,
   agentStepStatusSchema,
@@ -530,6 +528,13 @@ export const providerKeyDtoSchema = z.object({
 export type ProviderKeyDto = z.infer<typeof providerKeyDtoSchema>;
 
 export const providerKeyListResultSchema = z.array(providerKeyDtoSchema);
+
+export const localProviderStatusSchema = z.object({
+  available: z.boolean(),
+  models: z.array(z.object({ id: z.string().min(1).max(128), label: z.string().min(1).max(128) }).strict()).max(256),
+  pdfRagAvailable: z.literal(true),
+}).strict();
+export type LocalProviderStatusDto = z.infer<typeof localProviderStatusSchema>;
 
 export const secretsSaveInputSchema = z
   .object({
