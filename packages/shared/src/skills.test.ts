@@ -11,9 +11,11 @@ import {
 } from "./skills";
 
 describe("skills contract", () => {
-  it("seeds five factory skills with a versioned declarative tool allowlist", () => {
+  it("seeds developer analysis factory skills with a versioned declarative tool allowlist", () => {
     expect(FACTORY_SKILLS.map((item) => item.factoryId)).toEqual([
       "code-review",
+      "generate-tests",
+      "explain-architecture",
       "summarize-pdf",
       "meeting-prep",
       "explain-error",
@@ -32,6 +34,8 @@ describe("skills contract", () => {
     }
     const review = FACTORY_SKILLS.find((item) => item.factoryId === "code-review");
     expect(review?.steps.map((step) => step.title)).toEqual(["Summary", "Risks", "Suggestions"]);
+    expect(FACTORY_SKILLS.find((item) => item.factoryId === "generate-tests")?.steps).toHaveLength(3);
+    expect(FACTORY_SKILLS.find((item) => item.factoryId === "explain-architecture")?.steps).toHaveLength(3);
   });
 
   it("rejects tools in the v1 contract", () => {
