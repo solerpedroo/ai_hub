@@ -437,6 +437,7 @@ const SPEND_CAP_OVERRIDES_KEY = "spend-cap-overrides";
 const MEMORY_OPT_OUT_PREFIX = "memory-opt-out:";
 const PROMPT_FACTORY_SEEDED_KEY = "prompt-factory-seeded";
 const SKILL_FACTORY_SEEDED_KEY = "skill-factory-seeded";
+export const OLLAMA_LOCAL_KEY_ID = "26000000-0000-4000-8000-000000000001";
 const DEFAULT_SESSION: WorkspaceSessionRecord = {
   projectId: null,
   conversationId: null,
@@ -2046,6 +2047,7 @@ export class HubRepos {
   }
 
   async getProviderSecret(id: string): Promise<ProviderSecretRecord | null> {
+    if (id === OLLAMA_LOCAL_KEY_ID) return { id, providerSlug: "ollama", secret: "" };
     const row = this.db.select().from(providerKeys).where(eq(providerKeys.id, id)).get();
     if (!row) {
       return null;
