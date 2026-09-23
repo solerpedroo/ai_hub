@@ -254,6 +254,9 @@ export function HomeView({
   const [toolActivity, setToolActivity] = useState<ToolActivityDto | null>(null);
   const [toolBusy, setToolBusy] = useState(false);
   const [toolError, setToolError] = useState<string | null>(null);
+  const [developerOutput, setDeveloperOutput] = useState<string | null>(null);
+  const [developerBusy, setDeveloperBusy] = useState(false);
+  const [developerTerminalCommand, setDeveloperTerminalCommand] = useState<"git-status" | "git-diff" | "git-log" | "node-version">("git-status");
   const [agentRun, setAgentRun] = useState<AgentRunDetail | null>(null);
   const [orchestrationRun, setOrchestrationRun] = useState<OrchestrationRunDetail | null>(null);
   const [agentPaths, setAgentPaths] = useState("README.md\npackage.json\nsrc/index.ts");
@@ -678,6 +681,31 @@ export function HomeView({
       if (result.kind === "denied") setToolError(t("tools.error.denied"));
     } catch { setToolError(t("tools.error.read")); }
     finally { setToolBusy(false); }
+  };
+
+  const runDeveloperTool = async (kind: "tree" | "status" | "diff"): Promise<void> => {
+    if (!project) return;
+    setDeveloperBusy(true); setToolError(null);
+    try {
+      if (kind === "tree") { const result = await window.hub.tools.tree({ projectId: project.id }); setDeveloperOutput(result.entries.map((item) => `${item.kind === "directory" ? "▸" : "·"} ${item.path}`).join("\n")); }
+      if (kind === "status") { const result = await window.hub.tools.gitStatus({ projectId: project.id }); setDeveloperOutput(result.output); }
+      if (kind === "diff") { const result = await window.hub.tools.gitDiff({ projectId: project.id }); setDeveloperOutput(result.output); }
+    } catch { setToolError(t("developer.error")); }
+    finally { setDeveloperBusy(false); }
+  };
+  const reviewDeveloperDiff = async (intent: "code_review" | "generate_tests" | "explain_architecture" = "code_review"): Promise<void> => {
+    if (!project || !selectedConversationId || !selectedKeyId) return;
+    setDeveloperBusy(true); setToolError(null);
+    try { const result = await window.hub.tools.reviewDiff({ projectId: project.id, conversationId: selectedConversationId, providerKeyId: selectedKeyId, model: selectedModel, intent }); setCanvasId(result.artifactId); setArtifacts(await window.hub.artifacts.list({ conversationId: selectedConversationId })); }
+    catch { setToolError(t("developer.error")); }
+    finally { setDeveloperBusy(false); }
+  };
+  const runDeveloperTerminal = async (): Promise<void> => {
+    if (!project) return;
+    setDeveloperBusy(true); setToolError(null);
+    try { const result = await window.hub.tools.terminal({ projectId: project.id, command: developerTerminalCommand }); setDeveloperOutput(result.output); }
+    catch { setToolError(t("developer.error")); }
+    finally { setDeveloperBusy(false); }
   };
 
   const prepareAgent = async (goal: string, skillId?: string): Promise<void> => {
@@ -1658,6 +1686,12 @@ export function HomeView({
                     <Button type="button" size="sm" variant="ghost" disabled={toolBusy} onClick={() => void window.hub.tools.pickProjectRoot({ projectId: project.id })}>{t("tools.chooseRoot")}</Button>
                     {toolError ? <span role="alert" className="text-destructive">{toolError}</span> : null}
                   </div>
+                ) : null}
+                {project ? (
+                  <section className="border-t px-2 py-2" data-testid="developer-mode">
+                    <div className="flex flex-wrap items-center gap-2"><p className="text-[12px] font-medium">{t("developer.title")}</p><Button type="button" size="sm" variant="outline" disabled={developerBusy} onClick={() => void runDeveloperTool("tree")}>{t("developer.tree")}</Button><Button type="button" size="sm" variant="outline" disabled={developerBusy} onClick={() => void runDeveloperTool("status")}>{t("developer.status")}</Button><Button type="button" size="sm" variant="outline" disabled={developerBusy} onClick={() => void runDeveloperTool("diff")} data-testid="developer-diff">{t("developer.diff")}</Button><select className="h-8 rounded border bg-background px-2 text-xs" value={developerTerminalCommand} onChange={(event) => setDeveloperTerminalCommand(event.target.value as typeof developerTerminalCommand)} aria-label={t("developer.terminal")}><option value="git-status">git status</option><option value="git-diff">git diff</option><option value="git-log">git log -1</option><option value="node-version">node --version</option></select><Button type="button" size="sm" variant="outline" disabled={developerBusy} onClick={() => void runDeveloperTerminal()}>{t("developer.terminal")}</Button><Button type="button" size="sm" disabled={developerBusy || !hasKey} onClick={() => void reviewDeveloperDiff()} data-testid="developer-review">{t("developer.review")}</Button><Button type="button" size="sm" variant="ghost" disabled={developerBusy || !hasKey} onClick={() => void reviewDeveloperDiff("generate_tests")}>{t("developer.tests")}</Button><Button type="button" size="sm" variant="ghost" disabled={developerBusy || !hasKey} onClick={() => void reviewDeveloperDiff("explain_architecture")}>{t("developer.architecture")}</Button></div>
+                    {developerOutput ? <pre className="mt-2 max-h-40 overflow-auto rounded bg-muted p-2 text-[11px]" data-testid="developer-output">{developerOutput}</pre> : <p className="mt-1 text-[11px] text-muted-foreground">{t("developer.hint")}</p>}
+                  </section>
                 ) : null}
                 <ChatComposer
                   key={selectedConversationId}
