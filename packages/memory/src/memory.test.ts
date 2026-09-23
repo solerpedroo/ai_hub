@@ -46,9 +46,10 @@ describe("retrieveChunks", () => {
 });
 
 describe("allowsProjectContext", () => {
-  it("excludes memories and RAG in strict privacy", () => {
-    expect(allowsProjectContext("standard")).toBe(true);
-    expect(allowsProjectContext("strict")).toBe(false);
+  it("includes project context only in maximum privacy mode", () => {
+    expect(allowsProjectContext("maximum")).toBe(true);
+    expect(allowsProjectContext("normal")).toBe(false);
+    expect(allowsProjectContext("private")).toBe(false);
   });
 });
 
