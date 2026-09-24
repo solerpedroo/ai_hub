@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
-import { ZodError, type ZodType } from "zod";
+import { ZodError, z, type ZodType } from "zod";
 import {
   IpcChannel,
   type HubApi,
@@ -70,7 +70,12 @@ import {
   workspaceConversationInputSchema,
   workspaceAddTaskInputSchema,
   workspaceSetTaskDoneInputSchema,
+  workspaceTasksFromMessageInputSchema,
   conversationTaskDtoSchema,
+  projectNoteDtoSchema,
+  notesListInputSchema,
+  notesCreateFromMessageInputSchema,
+  notesUpdateInputSchema,
   promptCreateInputSchema,
   promptDtoSchema,
   promptListResultSchema,
@@ -131,6 +136,7 @@ import {
   agentListResultSchema,
   agentRunDetailSchema,
   orchestrationPrepareInputSchema,
+  researchPrepareInputSchema,
   orchestrationRunDetailSchema,
   orchestrationListResultSchema,
 } from "@ai-hub/shared";
@@ -466,6 +472,21 @@ const hub: HubApi = {
         conversationTaskDtoSchema,
       ),
     removeTask: (input) => invokeAckWith(IpcChannel.workspaceRemoveTask, input, idInputSchema),
+    tasksFromMessage: (input) =>
+      invokeParsed(
+        IpcChannel.workspaceTasksFromMessage,
+        input,
+        workspaceTasksFromMessageInputSchema,
+        z.array(conversationTaskDtoSchema).max(40),
+      ),
+  },
+  notes: {
+    list: (input) =>
+      invokeParsed(IpcChannel.notesList, input, notesListInputSchema, z.array(projectNoteDtoSchema).max(200)),
+    createFromMessage: (input) =>
+      invokeParsed(IpcChannel.notesCreateFromMessage, input, notesCreateFromMessageInputSchema, projectNoteDtoSchema),
+    update: (input) => invokeParsed(IpcChannel.notesUpdate, input, notesUpdateInputSchema, projectNoteDtoSchema),
+    remove: (input) => invokeAckWith(IpcChannel.notesRemove, input, idInputSchema),
   },
   prompts: {
     list: () => invokeParsed(IpcChannel.promptsList, empty, emptyIpcPayloadSchema, promptListResultSchema),
@@ -525,6 +546,8 @@ const hub: HubApi = {
   },
   orchestrations: {
     prepare: (input) => invokeParsed(IpcChannel.orchestrationsPrepare, input, orchestrationPrepareInputSchema, orchestrationRunDetailSchema),
+    prepareResearch: (input) =>
+      invokeParsed(IpcChannel.researchPrepare, input, researchPrepareInputSchema, orchestrationRunDetailSchema),
     get: (input) => invokeParsed(IpcChannel.orchestrationsGet, input, agentIdInputSchema, orchestrationRunDetailSchema),
     list: (input) => invokeParsed(IpcChannel.orchestrationsList, input, agentListInputSchema, orchestrationListResultSchema),
     start: (input) => invokeParsed(IpcChannel.orchestrationsStart, input, agentIdInputSchema, orchestrationRunDetailSchema),
