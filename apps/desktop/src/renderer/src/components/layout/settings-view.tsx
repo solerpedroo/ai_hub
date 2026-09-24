@@ -487,6 +487,53 @@ export function SettingsView({
           {t("privacy.crashOptIn")}
         </label>
         <p className="text-[11px] text-muted-foreground">{t("privacy.crashDetail")}</p>
+        <h3 className="mt-2 text-[12px] font-medium">{t("voice.settings.title")}</h3>
+        <p className="text-muted-foreground">{t("voice.settings.hint")}</p>
+        <p className="text-[11px] text-amber-700 dark:text-amber-400">{t("voice.cloudWarning")}</p>
+        <label className="flex items-center gap-2 text-[13px]">
+          <input
+            type="checkbox"
+            data-testid="voice-cloud-ack-settings"
+            checked={prefs?.voiceCloudAck === true}
+            onChange={(event) => {
+              void window.hub.prefs
+                .set({ voiceCloudAck: event.target.checked })
+                .then(setPrefs)
+                .catch(() => setError(t("workspace.error.generic")));
+            }}
+          />
+          {t("voice.cloudAck")}
+        </label>
+        <label className="flex items-center gap-2 text-[13px]">
+          <input
+            type="checkbox"
+            data-testid="voice-continuous-settings"
+            checked={prefs?.voiceContinuous === true}
+            onChange={(event) => {
+              void window.hub.prefs
+                .set({ voiceContinuous: event.target.checked })
+                .then(setPrefs)
+                .catch(() => setError(t("workspace.error.generic")));
+            }}
+          />
+          {t("voice.continuous")}
+        </label>
+        <label className="flex items-center gap-2 text-[13px]">
+          <input
+            type="checkbox"
+            data-testid="voice-audio-disk-opt-in"
+            checked={prefs?.audioDiskOptIn === true}
+            disabled={prefs?.privacyMode === "private"}
+            onChange={(event) => {
+              void window.hub.prefs
+                .set({ audioDiskOptIn: event.target.checked })
+                .then(setPrefs)
+                .catch(() => setError(t("workspace.error.generic")));
+            }}
+          />
+          {t("voice.audioDiskOptIn")}
+        </label>
+        <p className="text-[11px] text-muted-foreground">{t("voice.audioDiskDetail")}</p>
       </section>
       <section className="flex flex-col gap-2">
         <h2 className="text-[12px] font-medium">{t("updates.title")}</h2>
