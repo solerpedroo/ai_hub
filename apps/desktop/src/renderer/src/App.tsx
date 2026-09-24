@@ -745,7 +745,18 @@ export function App(): JSX.Element {
 
   const openSearchHit = useCallback(
     (hit: SearchHit): void => {
-      abortIfLeaving(hit.conversationId);
+      if (hit.kind === "note") {
+        setSelectedProjectId(hit.projectId);
+        setView("home");
+        setSearchQuery("");
+        setSearchHits([]);
+        return;
+      }
+      if (!hit.conversationId) {
+        return;
+      }
+      const conversationId = hit.conversationId;
+      abortIfLeaving(conversationId);
       setSelectedProjectId(hit.projectId);
       setView("home");
       void (async () => {
@@ -754,17 +765,17 @@ export function App(): JSX.Element {
           let imported = false;
           if (
             hit.projectId === null &&
-            !convos.some((item) => item.id === hit.conversationId)
+            !convos.some((item) => item.id === conversationId)
           ) {
             convos = await loadConversations(null, true);
             imported = true;
           }
           setImportedInbox(imported);
-          setSelectedConversationId(hit.conversationId);
-          await loadMessages(hit.conversationId);
+          setSelectedConversationId(conversationId);
+          await loadMessages(conversationId);
           if (hit.messageId) {
             await window.hub.messages.activate({ id: hit.messageId });
-            await loadMessages(hit.conversationId);
+            await loadMessages(conversationId);
           }
           setSearchQuery("");
           setSearchHits([]);
