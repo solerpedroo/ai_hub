@@ -200,6 +200,22 @@ export const conversationTasks = sqliteTable("conversation_tasks", {
   titleCipher: text("title_cipher").notNull(),
   done: integer("done", { mode: "number" }).notNull().default(0),
   createdAt: integer("created_at", { mode: "number" }).notNull(),
+  sourceMessageId: text("source_message_id"),
+});
+
+export const projectNotes = sqliteTable("project_notes", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id").notNull(),
+  sourceMessageId: text("source_message_id"),
+  titleCipher: text("title_cipher").notNull(),
+  bodyCipher: text("body_cipher").notNull(),
+  createdAt: integer("created_at", { mode: "number" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "number" }).notNull(),
+});
+
+export const noteTags = sqliteTable("note_tags", {
+  noteId: text("note_id").notNull(),
+  tagId: text("tag_id").notNull(),
 });
 
 export const prompts = sqliteTable("prompts", {
@@ -344,6 +360,8 @@ export const schema = {
   fileChunks,
   conversationWorkspace,
   conversationTasks,
+  projectNotes,
+  noteTags,
   prompts,
   skills,
   artifacts,
