@@ -416,6 +416,10 @@ export interface AppPrefsRecord {
     cpf: "block" | "mask" | "allow";
     prompt_injection: "block" | "mask" | "allow";
   };
+  ttsVoiceURI: string | null;
+  voiceCloudAck: boolean;
+  audioDiskOptIn: boolean;
+  voiceContinuous: boolean;
 }
 
 const DEFAULT_APP_PREFS: AppPrefsRecord = {
@@ -426,6 +430,10 @@ const DEFAULT_APP_PREFS: AppPrefsRecord = {
   lastWizardTtftMs: null,
   privacyMode: "normal",
   firewallPolicy: { secret: "mask", token: "mask", email: "mask", cpf: "mask", prompt_injection: "block" },
+  ttsVoiceURI: null,
+  voiceCloudAck: false,
+  audioDiskOptIn: false,
+  voiceContinuous: false,
 };
 
 const UPDATE_STATUSES: readonly AppPrefsRecord["lastUpdateStatus"][] = [
@@ -1664,6 +1672,10 @@ export class HubRepos {
           ? record.privacyMode
           : DEFAULT_APP_PREFS.privacyMode,
       firewallPolicy: isFirewallPolicy(record.firewallPolicy) ? record.firewallPolicy : DEFAULT_APP_PREFS.firewallPolicy,
+      ttsVoiceURI: typeof record.ttsVoiceURI === "string" ? record.ttsVoiceURI.slice(0, 200) : null,
+      voiceCloudAck: record.voiceCloudAck === true,
+      audioDiskOptIn: record.audioDiskOptIn === true,
+      voiceContinuous: record.voiceContinuous === true,
     };
   }
 
@@ -1675,6 +1687,10 @@ export class HubRepos {
     lastWizardTtftMs?: number | null | undefined;
     privacyMode?: AppPrefsRecord["privacyMode"] | undefined;
     firewallPolicy?: AppPrefsRecord["firewallPolicy"] | undefined;
+    ttsVoiceURI?: string | null | undefined;
+    voiceCloudAck?: boolean | undefined;
+    audioDiskOptIn?: boolean | undefined;
+    voiceContinuous?: boolean | undefined;
   }): AppPrefsRecord {
     const current = this.getAppPrefs();
     const next: AppPrefsRecord = {
@@ -1685,7 +1701,14 @@ export class HubRepos {
       lastWizardTtftMs: patch.lastWizardTtftMs === undefined ? current.lastWizardTtftMs : patch.lastWizardTtftMs,
       privacyMode: patch.privacyMode ?? current.privacyMode,
       firewallPolicy: patch.firewallPolicy ?? current.firewallPolicy,
+      ttsVoiceURI: patch.ttsVoiceURI === undefined ? current.ttsVoiceURI : patch.ttsVoiceURI,
+      voiceCloudAck: patch.voiceCloudAck ?? current.voiceCloudAck,
+      audioDiskOptIn: patch.audioDiskOptIn ?? current.audioDiskOptIn,
+      voiceContinuous: patch.voiceContinuous ?? current.voiceContinuous,
     };
+    if (next.privacyMode === "private") {
+      next.audioDiskOptIn = false;
+    }
     const now = Date.now();
     this.db
       .insert(settings)
