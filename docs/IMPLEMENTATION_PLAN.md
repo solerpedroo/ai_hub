@@ -936,10 +936,10 @@ Council **não** é orquestração de agentes: N modelos, um packet, sem tools. 
 
 **Sub-tasks:**
 
-- [ ] STT → LLM → TTS
-- [ ] Conversa contínua, interrupção, histórico
-- [ ] Escolha de voz; fallback se STT/TTS for cloud (aviso de privacidade)
-- [ ] Respeita modo Privado (não gravar áudio em disco sem opt-in)
+- [x] STT → LLM → TTS
+- [x] Conversa contínua, interrupção, histórico
+- [x] Escolha de voz; fallback se STT/TTS for cloud (aviso de privacidade)
+- [x] Respeita modo Privado (não gravar áudio em disco sem opt-in)
 
 **DoD:** hands-free de uma pergunta; usuário vê o transcript e o receipt.
 
