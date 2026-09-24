@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const runModeSchema = z.enum(["plan", "assist", "agent", "orchestrate"]);
+export const runModeSchema = z.enum(["plan", "assist", "agent", "orchestrate", "research"]);
 export type RunMode = z.infer<typeof runModeSchema>;
 export const effortLevelSchema = z.enum(["low", "medium", "high", "max"]);
 export type EffortLevel = z.infer<typeof effortLevelSchema>;
