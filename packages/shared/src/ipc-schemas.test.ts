@@ -38,6 +38,9 @@ import {
   agentRunDetailSchema,
   agentIdInputSchema,
   orchestrationPrepareInputSchema,
+  researchPrepareInputSchema,
+  notesCreateFromMessageInputSchema,
+  workspaceTasksFromMessageInputSchema,
   agentNodeDtoSchema,
   developerDiffInputSchema,
   developerReviewInputSchema,
@@ -298,13 +301,17 @@ describe("project and search contracts", () => {
 
   it("rejects extra keys and overlong snippets on search hits", () => {
     const hit = {
+      kind: "conversation" as const,
       conversationId: "11111111-1111-4111-8111-111111111111",
       projectId: null,
       conversationTitle: "Kickoff",
       messageId: null,
+      noteId: null,
+      taskId: null,
       snippet: "needle",
     };
     expect(searchHitSchema.parse(hit).snippet).toBe("needle");
+    expect(() => searchHitSchema.parse({ ...hit, kind: undefined })).toThrow();
     expect(() => searchHitSchema.parse({ ...hit, apiKey: "sk-testfixtureABCDEFGH" })).toThrow();
     expect(() => searchHitSchema.parse({ ...hit, snippet: "x".repeat(401) })).toThrow();
   });
@@ -665,5 +672,64 @@ describe("wave 24 orchestration IPC contracts", () => {
     };
     expect(agentNodeDtoSchema.parse(node).isModelOverride).toBe(false);
     expect(() => agentNodeDtoSchema.parse({ ...node, providerKeyId: "33333333-3333-4333-8333-333333333333" })).toThrow();
+  });
+});
+
+describe("wave 27 notes tasks research contracts", () => {
+  it("accepts research prepare without relativePaths", () => {
+    const input = {
+      projectId: "11111111-1111-4111-8111-111111111111",
+      conversationId: "22222222-2222-4222-8222-222222222222",
+      providerKeyId: "33333333-3333-4333-8333-333333333333",
+      model: "gpt-4o-mini",
+      goal: "Research JWT auth",
+      budgetUsd: "1.000000",
+      timeoutSeconds: 300,
+    };
+    expect(researchPrepareInputSchema.parse(input).goal).toBe("Research JWT auth");
+    expect(() => researchPrepareInputSchema.parse({ ...input, relativePaths: ["a.md"] })).toThrow();
+  });
+
+  it("accepts note and task search hits", () => {
+    expect(
+      searchHitSchema.parse({
+        kind: "note",
+        conversationId: null,
+        projectId: "11111111-1111-4111-8111-111111111111",
+        conversationTitle: "JWT plan",
+        messageId: null,
+        noteId: "66666666-6666-4666-8666-666666666666",
+        taskId: null,
+        snippet: "Login endpoint",
+      }).kind,
+    ).toBe("note");
+    expect(
+      searchHitSchema.parse({
+        kind: "task",
+        conversationId: "22222222-2222-4222-8222-222222222222",
+        projectId: "11111111-1111-4111-8111-111111111111",
+        conversationTitle: "Create User model",
+        messageId: null,
+        noteId: null,
+        taskId: "77777777-7777-4777-8777-777777777777",
+        snippet: "Create User model",
+      }).kind,
+    ).toBe("task");
+  });
+
+  it("validates notes-from-message and tasks-from-message inputs", () => {
+    expect(
+      notesCreateFromMessageInputSchema.parse({
+        projectId: "11111111-1111-4111-8111-111111111111",
+        messageId: "88888888-8888-4888-8888-888888888888",
+        tags: ["auth"],
+      }).tags,
+    ).toEqual(["auth"]);
+    expect(
+      workspaceTasksFromMessageInputSchema.parse({
+        conversationId: "22222222-2222-4222-8222-222222222222",
+        messageId: "88888888-8888-4888-8888-888888888888",
+      }).messageId,
+    ).toBe("88888888-8888-4888-8888-888888888888");
   });
 });
