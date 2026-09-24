@@ -114,3 +114,4 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W24-001](./ADR-W24-001-persisted-orchestration-graph-and-handoffs.md) | W24 | Grafo de orquestração e handoffs persistidos | accepted |
 | [ADR-W25-001](./ADR-W25-001-main-owned-read-only-developer-tools.md) | W25 | Ferramentas de desenvolvimento somente-leitura no main | accepted |
 | [ADR-W26-001](./ADR-W26-001-local-ollama-provider-and-offline-embeddings.md) | W26 | Provider Ollama local e embeddings offline | accepted |
+| [ADR-W27-001](./ADR-W27-001-project-notes-and-research-graph.md) | W27 | Notes de projeto e Research no grafo W24 | accepted |
