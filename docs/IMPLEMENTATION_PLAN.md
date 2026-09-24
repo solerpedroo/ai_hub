@@ -920,11 +920,11 @@ Council **não** é orquestração de agentes: N modelos, um packet, sem tools. 
 
 **Sub-tasks:**
 
-- [ ] Research Mode: plano → fontes → síntese → relatório citável (artifact)
-- [ ] Study Mode: professor / examinador / tutor / avaliador
-- [ ] AI Notes: resposta → nota (projeto, tags, data)
-- [ ] AI Tasks: resposta → checklist persistente no projeto
-- [ ] Notes/Tasks no workspace e na busca
+- [x] Research Mode: plano → fontes → síntese → relatório citável (artifact)
+- [x] Study Mode: professor / examinador / tutor / avaliador
+- [x] AI Notes: resposta → nota (projeto, tags, data)
+- [x] AI Tasks: resposta → checklist persistente no projeto
+- [x] Notes/Tasks no workspace e na busca
 
 **DoD:** “pesquisa X” gera relatório com fontes; “vire tarefas” cria checklist editável.
 
