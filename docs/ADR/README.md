@@ -115,3 +115,4 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 | [ADR-W25-001](./ADR-W25-001-main-owned-read-only-developer-tools.md) | W25 | Ferramentas de desenvolvimento somente-leitura no main | accepted |
 | [ADR-W26-001](./ADR-W26-001-local-ollama-provider-and-offline-embeddings.md) | W26 | Provider Ollama local e embeddings offline | accepted |
 | [ADR-W27-001](./ADR-W27-001-project-notes-and-research-graph.md) | W27 | Notes de projeto e Research no grafo W24 | accepted |
+| [ADR-W28-001](./ADR-W28-001-web-speech-voice-mode.md) | W28 | Voice Mode via Web Speech; LLM só por chat:send | accepted |
