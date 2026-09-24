@@ -32,12 +32,14 @@ import {
   type LocalProviderStatusDto,
   type HealthSummaryDto,
   type ToolActivityDto,
+  type AppPrefs,
 } from "@ai-hub/shared";
 import {
   ChatComposer,
   type MentionSuggestion,
   type SlashCommandId,
 } from "@/components/chat/chat-composer";
+import { VoicePanel } from "@/components/chat/voice-panel";
 import { ConversationTree } from "@/components/chat/conversation-tree";
 import { MessageBubble } from "@/components/chat/message-bubble";
 import { ArtifactCanvas } from "@/components/chat/artifact-canvas";
@@ -143,6 +145,8 @@ export function HomeView({
   pendingSkill,
   onPendingSkillConsumed,
   onOpenSkills,
+  appPrefs,
+  onAppPrefsPatch,
 }: {
   project: ProjectDto | null;
   importedInbox: boolean;
@@ -214,8 +218,10 @@ export function HomeView({
   pendingSkill: { id?: string; query: string } | null;
   onPendingSkillConsumed: () => void;
   onOpenSkills: () => void;
+  appPrefs: AppPrefs | null;
+  onAppPrefsPatch: (patch: Partial<AppPrefs>) => Promise<void>;
 }): JSX.Element {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const modifier = window.hub.platform === "darwin" ? "⌘" : "Ctrl";
   const [title, setTitle] = useState("");
   const [draft, setDraft] = useState("");
@@ -1771,6 +1777,30 @@ export function HomeView({
                     {developerOutput ? <pre className="mt-2 max-h-40 overflow-auto rounded bg-muted p-2 text-[11px]" data-testid="developer-output">{developerOutput}</pre> : <p className="mt-1 text-[11px] text-muted-foreground">{t("developer.hint")}</p>}
                   </section>
                 ) : null}
+                <VoicePanel
+                  enabled={Boolean(selectedConversationId)}
+                  conversationId={selectedConversationId}
+                  prefs={appPrefs}
+                  messages={messages}
+                  streaming={streaming}
+                  sending={sending}
+                  hasKey={hasKey}
+                  hasConversation={Boolean(selectedConversationId)}
+                  locale={i18n.language}
+                  onSendTranscript={async (text) => {
+                    const voiceMode = runMode === "plan" || runMode === "assist" ? runMode : "assist";
+                    return onSend(text, [], {
+                      keyId: selectedKeyId ?? "",
+                      model: selectedModel,
+                      runMode: voiceMode,
+                      effortLevel,
+                    });
+                  }}
+                  onAbortChat={() => {
+                    void onAbort();
+                  }}
+                  onPrefsChange={onAppPrefsPatch}
+                />
                 <ChatComposer
                   key={selectedConversationId}
                   value={draft}
