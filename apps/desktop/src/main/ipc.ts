@@ -1,5 +1,5 @@
 import { clipboard, ipcMain } from "electron";
-import { ZodError, type ZodType } from "zod";
+import { ZodError, z, type ZodType } from "zod";
 import {
   IpcChannel,
   appearanceSettingsSchema,
@@ -69,7 +69,13 @@ import {
   workspaceConversationInputSchema,
   workspaceAddTaskInputSchema,
   workspaceSetTaskDoneInputSchema,
+  workspaceTasksFromMessageInputSchema,
   conversationTaskDtoSchema,
+  projectNoteDtoSchema,
+  notesListInputSchema,
+  notesCreateFromMessageInputSchema,
+  notesUpdateInputSchema,
+  parseChecklistItems,
   promptDtoSchema,
   promptListResultSchema,
   promptCreateInputSchema,
@@ -130,6 +136,7 @@ import {
   agentListResultSchema,
   agentRunDetailSchema,
   orchestrationPrepareInputSchema,
+  researchPrepareInputSchema,
   orchestrationRunDetailSchema,
   orchestrationListResultSchema,
 } from "@ai-hub/shared";
@@ -162,6 +169,7 @@ import { checkForAppUpdates } from "./updater";
 import { getLatestToolActivity, getToolProjectState, pickProjectToolRoot, requestToolRead } from "./tools";
 import { cancelAgentRun, getAgentRun, listAgentRuns, pauseAgentRun, prepareAgentRun, resumeAgentRun, startAgentRun } from "./agent-runner";
 import { cancelOrchestration, getOrchestration, listOrchestrations, pauseOrchestration, prepareOrchestration, resumeOrchestration, startOrchestration } from "./orchestration-runner";
+import { prepareResearch } from "./research-runner";
 import { developerDiff, developerReview, developerStatus, developerTerminal, developerTree } from "./developer-tools";
 import { getLocalProviderStatus, localProviderKey } from "./local-provider";
 
@@ -248,6 +256,7 @@ export function registerWorkspaceIpc(): void {
   registerHandler(IpcChannel.agentsResume, agentIdInputSchema, agentRunDetailSchema, (input, event) => resumeAgentRun(input, event.sender));
   registerHandler(IpcChannel.agentsCancel, agentIdInputSchema, agentRunDetailSchema, (input) => cancelAgentRun(input));
   registerHandler(IpcChannel.orchestrationsPrepare, orchestrationPrepareInputSchema, orchestrationRunDetailSchema, (input, event) => prepareOrchestration({ ...input, maxSteps: input.maxSteps ?? 6, budgetUsd: input.budgetUsd ?? "1.000000", timeoutSeconds: input.timeoutSeconds ?? 300, parallelism: input.parallelism ?? 2, budgetMode: input.budgetMode ?? "shared" }, event.sender));
+  registerHandler(IpcChannel.researchPrepare, researchPrepareInputSchema, orchestrationRunDetailSchema, (input, event) => prepareResearch({ ...input, budgetUsd: input.budgetUsd ?? "1.000000", timeoutSeconds: input.timeoutSeconds ?? 300 }, event.sender));
   registerHandler(IpcChannel.orchestrationsGet, agentIdInputSchema, orchestrationRunDetailSchema, (input) => getOrchestration(input));
   registerHandler(IpcChannel.orchestrationsList, agentListInputSchema, orchestrationListResultSchema, (input) => listOrchestrations(input.conversationId));
   registerHandler(IpcChannel.orchestrationsStart, agentIdInputSchema, orchestrationRunDetailSchema, (input, event) => startOrchestration(input, event.sender));
@@ -355,7 +364,7 @@ export function registerWorkspaceIpc(): void {
   });
 
   registerHandler(IpcChannel.searchQuery, searchInputSchema, searchResultSchema, (input) =>
-    getHubDatabase().repos.searchWorkspace(input.query),
+    searchResultSchema.parse(getHubDatabase().repos.searchWorkspace(input.query)),
   );
 
   registerHandler(IpcChannel.messagesList, messageListInputSchema, messageListResultSchema, (input) =>
@@ -610,6 +619,58 @@ export function registerWorkspaceIpc(): void {
 
   registerHandler(IpcChannel.workspaceRemoveTask, idInputSchema, ipcAckResultSchema, (input) => {
     getHubDatabase().repos.removeConversationTask(input.id);
+  });
+
+  registerHandler(IpcChannel.workspaceTasksFromMessage, workspaceTasksFromMessageInputSchema, z.array(conversationTaskDtoSchema).max(40), (input) => {
+    const repos = getHubDatabase().repos;
+    const message = repos.getMessage(input.messageId);
+    if (!message || message.conversationId !== input.conversationId) throw new Error("Message not found");
+    const titles = parseChecklistItems(message.content);
+    if (titles.length === 0) {
+      const fallback = message.content.replace(/\s+/g, " ").trim().slice(0, 240);
+      if (fallback.length < 2) throw new Error("tasks:empty_checklist");
+      return [conversationTaskDtoSchema.parse(repos.createConversationTask(input.conversationId, fallback, input.messageId))];
+    }
+    return repos.createConversationTasksFromTitles(input.conversationId, titles, input.messageId).map((task) => conversationTaskDtoSchema.parse(task));
+  });
+
+  registerHandler(IpcChannel.notesList, notesListInputSchema, z.array(projectNoteDtoSchema).max(200), (input) =>
+    getHubDatabase().repos.listProjectNotes(input.projectId).map((note) => projectNoteDtoSchema.parse(note)),
+  );
+
+  registerHandler(IpcChannel.notesCreateFromMessage, notesCreateFromMessageInputSchema, projectNoteDtoSchema, (input) => {
+    const repos = getHubDatabase().repos;
+    const message = repos.getMessage(input.messageId);
+    if (!message) throw new Error("Message not found");
+    const conversation = repos.getConversation(message.conversationId);
+    if (!conversation || conversation.projectId !== input.projectId) throw new Error("Message project mismatch");
+    const title =
+      input.title?.trim() ||
+      message.content.replace(/\s+/g, " ").trim().slice(0, 80) ||
+      "Note";
+    return projectNoteDtoSchema.parse(
+      repos.createProjectNote({
+        projectId: input.projectId,
+        title,
+        body: message.content.slice(0, 32_000),
+        sourceMessageId: input.messageId,
+        ...(input.tags ? { tags: input.tags } : {}),
+      }),
+    );
+  });
+
+  registerHandler(IpcChannel.notesUpdate, notesUpdateInputSchema, projectNoteDtoSchema, (input) =>
+    projectNoteDtoSchema.parse(
+      getHubDatabase().repos.updateProjectNote(input.id, {
+        ...(input.title !== undefined ? { title: input.title } : {}),
+        ...(input.body !== undefined ? { body: input.body } : {}),
+        ...(input.tags !== undefined ? { tags: input.tags } : {}),
+      }),
+    ),
+  );
+
+  registerHandler(IpcChannel.notesRemove, idInputSchema, ipcAckResultSchema, (input) => {
+    getHubDatabase().repos.removeProjectNote(input.id);
   });
 
   registerHandler(IpcChannel.promptsList, emptyIpcPayloadSchema, promptListResultSchema, () =>
