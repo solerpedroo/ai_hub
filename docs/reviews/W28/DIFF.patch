@@ -1,0 +1,3532 @@
+﻿diff --git a/apps/desktop/src/main/index.ts b/apps/desktop/src/main/index.ts
+index fcd177a..28a108a 100644
+--- a/apps/desktop/src/main/index.ts
++++ b/apps/desktop/src/main/index.ts
+@@ -267,6 +267,13 @@ function createTray(): void {
+ app.whenReady().then(async () => {
+   electronApp.setAppUserModelId("com.aihub.desktop");
+   applyContentSecurityPolicy();
++  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
++    if (permission === "media") {
++      callback(true);
++      return;
++    }
++    callback(false);
++  });
+   registerWindowIpc(targetWindow, (event) => BrowserWindow.fromWebContents(event.sender) === quickAiWindow);
+   try {
+     await bootPersistence();
+diff --git a/apps/desktop/src/renderer/src/App.tsx b/apps/desktop/src/renderer/src/App.tsx
+index ba41d3d..6e60605 100644
+--- a/apps/desktop/src/renderer/src/App.tsx
++++ b/apps/desktop/src/renderer/src/App.tsx
+@@ -19,6 +19,7 @@ import type {
+   ProjectFileDto,
+   ProviderKeyDto,
+   SearchHit,
++  AppPrefs,
+ } from "@ai-hub/shared";
+ import {
+   catalogModelsForProvider,
+@@ -160,6 +161,7 @@ export function App(): JSX.Element {
+   const [packetPreview, setPacketPreview] = useState<PacketPreviewResult | null>(null);
+   const [packets, setPackets] = useState<ContextPacketDto[]>([]);
+   const [privacyMode, setPrivacyMode] = useState<PacketPrivacyMode>("normal");
++  const [appPrefs, setAppPrefs] = useState<AppPrefs | null>(null);
+   const [searchQuery, setSearchQuery] = useState("");
+   const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
+   const [threadStartModel, setThreadStartModel] = useState<string | null>(null);
+@@ -297,6 +299,7 @@ export function App(): JSX.Element {
+           setExtraSystem(session.extraSystem);
+         }
+         setPrivacyMode(prefs.privacyMode);
++        setAppPrefs(prefs);
+         const showWizard = shouldShowOnboarding({
+           hasProviderKey: keys.length > 0,
+           onboardingComplete: prefs.onboardingComplete,
+@@ -380,6 +383,21 @@ export function App(): JSX.Element {
+     void loadPackets(selectedProjectId);
+   }, [loadPackets, selectedProjectId]);
+ 
++  useEffect(() => {
++    if (view !== "home" && view !== "settings") {
++      return;
++    }
++    void window.hub.prefs
++      .get()
++      .then((prefs) => {
++        setAppPrefs(prefs);
++        setPrivacyMode(prefs.privacyMode);
++      })
++      .catch(() => {
++        /* prefs refresh is best-effort */
++      });
++  }, [view]);
++
+   useEffect(() => {
+     if (!sessionReady) {
+       return;
+@@ -1044,6 +1062,16 @@ export function App(): JSX.Element {
+                   fail();
+                 }
+               }}
++              appPrefs={appPrefs}
++              onAppPrefsPatch={async (patch) => {
++                try {
++                  const next = await window.hub.prefs.set(patch);
++                  setAppPrefs(next);
++                  setPrivacyMode(next.privacyMode);
++                } catch {
++                  fail();
++                }
++              }}
+               onRegenerate={async (messageId) => {
+                 if (!selectedConversationId || !selectedKeyId) {
+                   return;
+diff --git a/apps/desktop/src/renderer/src/components/chat/voice-panel.tsx b/apps/desktop/src/renderer/src/components/chat/voice-panel.tsx
+new file mode 100644
+index 0000000..5b6aa25
+--- /dev/null
++++ b/apps/desktop/src/renderer/src/components/chat/voice-panel.tsx
+@@ -0,0 +1,300 @@
++import { type JSX, useEffect, useRef, useState } from "react";
++import { useTranslation } from "react-i18next";
++import type { AppPrefs, MessageDto } from "@ai-hub/shared";
++import { Button } from "@/components/ui/button";
++import {
++  createSpeechRecognition,
++  isSpeechRecognitionAvailable,
++  isSpeechSynthesisAvailable,
++  listTtsVoices,
++  speakText,
++  stopSpeaking,
++  type HubSpeechRecognition,
++} from "@/lib/voice-session";
++
++type VoicePhase = "idle" | "listening" | "sending" | "speaking";
++
++export function VoicePanel({
++  enabled,
++  prefs,
++  messages,
++  streaming,
++  sending,
++  hasKey,
++  hasConversation,
++  locale,
++  onSendTranscript,
++  onAbortChat,
++  onPrefsChange,
++}: {
++  enabled: boolean;
++  prefs: AppPrefs | null;
++  messages: MessageDto[];
++  streaming: boolean;
++  sending: boolean;
++  hasKey: boolean;
++  hasConversation: boolean;
++  locale: string;
++  onSendTranscript: (text: string) => Promise<boolean>;
++  onAbortChat: () => void;
++  onPrefsChange: (patch: Partial<AppPrefs>) => Promise<void>;
++}): JSX.Element | null {
++  const { t } = useTranslation();
++  const [open, setOpen] = useState(false);
++  const [phase, setPhase] = useState<VoicePhase>("idle");
++  const [interim, setInterim] = useState("");
++  const [lastTranscript, setLastTranscript] = useState("");
++  const [error, setError] = useState<string | null>(null);
++  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
++  const recognitionRef = useRef<HubSpeechRecognition | null>(null);
++  const spokenMessageIdRef = useRef<string | null>(null);
++  const continuousRef = useRef(false);
++  const listeningDesiredRef = useRef(false);
++  const startListeningRef = useRef<() => void>(() => undefined);
++
++  const cloudAck = prefs?.voiceCloudAck === true;
++  const continuous = prefs?.voiceContinuous === true;
++  const voiceURI = prefs?.ttsVoiceURI ?? null;
++  const sttOk = isSpeechRecognitionAvailable();
++  const ttsOk = isSpeechSynthesisAvailable();
++  const speechLang = locale.toLowerCase().startsWith("pt") ? "pt-BR" : "en-US";
++
++  continuousRef.current = continuous;
++
++  const stopListening = (): void => {
++    listeningDesiredRef.current = false;
++    recognitionRef.current?.stop();
++    recognitionRef.current = null;
++    setInterim("");
++    setPhase((current) => (current === "listening" ? "idle" : current));
++  };
++
++  const interrupt = (): void => {
++    listeningDesiredRef.current = false;
++    recognitionRef.current?.abort();
++    recognitionRef.current = null;
++    stopSpeaking();
++    onAbortChat();
++    setInterim("");
++    setPhase("idle");
++  };
++
++  const startListening = (): void => {
++    setError(null);
++    if (!sttOk) {
++      setError(t("voice.error.unsupported"));
++      return;
++    }
++    if (!cloudAck) {
++      setError(t("voice.error.cloudAck"));
++      return;
++    }
++    if (!hasConversation || !hasKey) {
++      setError(t("voice.error.ready"));
++      return;
++    }
++    recognitionRef.current?.abort();
++    stopSpeaking();
++    listeningDesiredRef.current = true;
++    const recognition = createSpeechRecognition({
++      lang: speechLang,
++      continuous: false,
++      onInterim: (text) => setInterim(text),
++      onFinal: (text) => {
++        setInterim("");
++        setLastTranscript(text);
++        setPhase("sending");
++        recognitionRef.current = null;
++        void onSendTranscript(text).then((ok) => {
++          if (!ok) {
++            setPhase("idle");
++            setError(t("voice.error.send"));
++            return;
++          }
++          setPhase("idle");
++        });
++      },
++      onError: (code) => {
++        if (code === "aborted" || code === "no-speech") {
++          setPhase("idle");
++          return;
++        }
++        setError(t("voice.error.stt", { code }));
++        setPhase("idle");
++      },
++      onEnd: () => {
++        setPhase((current) => (current === "listening" ? "idle" : current));
++      },
++    });
++    if (!recognition) {
++      setError(t("voice.error.unsupported"));
++      return;
++    }
++    recognitionRef.current = recognition;
++    setPhase("listening");
++    try {
++      recognition.start();
++    } catch {
++      setError(t("voice.error.unsupported"));
++      setPhase("idle");
++    }
++  };
++
++  startListeningRef.current = startListening;
++
++  useEffect(() => {
++    if (!ttsOk) return;
++    const refresh = (): void => setVoices(listTtsVoices());
++    refresh();
++    window.speechSynthesis.addEventListener("voiceschanged", refresh);
++    return () => window.speechSynthesis.removeEventListener("voiceschanged", refresh);
++  }, [ttsOk]);
++
++  useEffect(() => {
++    return () => {
++      listeningDesiredRef.current = false;
++      recognitionRef.current?.abort();
++      recognitionRef.current = null;
++      stopSpeaking();
++    };
++  }, []);
++
++  useEffect(() => {
++    if (!open || phase === "listening" || phase === "sending") return;
++    if (streaming || sending) return;
++    const last = [...messages].reverse().find((item) => item.role === "assistant" && item.status === "complete");
++    if (!last || !last.content.trim()) return;
++    if (spokenMessageIdRef.current === last.id) return;
++    if (!ttsOk) return;
++    spokenMessageIdRef.current = last.id;
++    setPhase("speaking");
++    speakText({
++      text: last.content,
++      voiceURI,
++      lang: speechLang,
++      onEnd: () => {
++        setPhase("idle");
++        if (continuousRef.current && listeningDesiredRef.current && cloudAck) {
++          startListeningRef.current();
++        }
++      },
++    });
++  }, [messages, streaming, sending, open, phase, ttsOk, voiceURI, speechLang, cloudAck]);
++
++  if (!enabled) {
++    return null;
++  }
++
++  return (
++    <section className="border-t px-2 py-2" data-testid="voice-panel">
++      <div className="flex flex-wrap items-center gap-2">
++        <p className="text-[12px] font-medium">{t("voice.title")}</p>
++        <Button
++          type="button"
++          size="sm"
++          variant={open ? "default" : "outline"}
++          aria-pressed={open}
++          data-testid="voice-toggle"
++          onClick={() => setOpen((value) => !value)}
++        >
++          {open ? t("voice.hide") : t("voice.show")}
++        </Button>
++        {open ? (
++          <>
++            <Button
++              type="button"
++              size="sm"
++              disabled={phase === "sending" || streaming || sending}
++              data-testid="voice-listen"
++              onClick={() => {
++                if (phase === "listening") {
++                  stopListening();
++                  return;
++                }
++                startListening();
++              }}
++            >
++              {phase === "listening" ? t("voice.stopListen") : t("voice.listen")}
++            </Button>
++            <Button type="button" size="sm" variant="ghost" data-testid="voice-interrupt" onClick={interrupt}>
++              {t("voice.interrupt")}
++            </Button>
++          </>
++        ) : null}
++      </div>
++      {open ? (
++        <div className="mt-2 flex flex-col gap-2">
++          {!cloudAck ? (
++            <div className="rounded border border-amber-600/40 bg-amber-500/10 p-2 text-[11px]" role="status">
++              <p>{t("voice.cloudWarning")}</p>
++              <Button
++                type="button"
++                size="sm"
++                className="mt-2"
++                data-testid="voice-cloud-ack"
++                onClick={() => {
++                  void onPrefsChange({ voiceCloudAck: true });
++                }}
++              >
++                {t("voice.cloudAck")}
++              </Button>
++            </div>
++          ) : null}
++          <p className="text-[11px] text-muted-foreground" data-testid="voice-phase" data-phase={phase}>
++            {t(`voice.phase.${phase}`)}
++          </p>
++          {interim ? (
++            <p className="text-[12px] italic text-muted-foreground" data-testid="voice-interim">
++              {interim}
++            </p>
++          ) : null}
++          {lastTranscript ? (
++            <p className="text-[12px]" data-testid="voice-transcript">
++              <span className="text-muted-foreground">{t("voice.transcript")}: </span>
++              {lastTranscript}
++            </p>
++          ) : (
++            <p className="text-[11px] text-muted-foreground">{t("voice.hint")}</p>
++          )}
++          <label className="flex items-center gap-2 text-[12px]">
++            <input
++              type="checkbox"
++              checked={continuous}
++              onChange={(event) => {
++                void onPrefsChange({ voiceContinuous: event.target.checked });
++              }}
++              data-testid="voice-continuous"
++            />
++            {t("voice.continuous")}
++          </label>
++          {ttsOk && voices.length > 0 ? (
++            <label className="flex flex-col gap-1 text-[12px]">
++              {t("voice.voice")}
++              <select
++                className="h-8 rounded border bg-background px-2 text-xs"
++                value={voiceURI ?? ""}
++                onChange={(event) => {
++                  const next = event.target.value || null;
++                  void onPrefsChange({ ttsVoiceURI: next });
++                }}
++                data-testid="voice-select"
++              >
++                <option value="">{t("voice.voiceDefault")}</option>
++                {voices.map((voice) => (
++                  <option key={voice.voiceURI} value={voice.voiceURI}>
++                    {voice.name} ({voice.lang})
++                  </option>
++                ))}
++              </select>
++            </label>
++          ) : null}
++          {error ? (
++            <p className="text-[11px] text-destructive" role="alert">
++              {error}
++            </p>
++          ) : null}
++        </div>
++      ) : null}
++    </section>
++  );
++}
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index 8927146..83e681b 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -32,12 +32,14 @@ import {
+   type LocalProviderStatusDto,
+   type HealthSummaryDto,
+   type ToolActivityDto,
++  type AppPrefs,
+ } from "@ai-hub/shared";
+ import {
+   ChatComposer,
+   type MentionSuggestion,
+   type SlashCommandId,
+ } from "@/components/chat/chat-composer";
++import { VoicePanel } from "@/components/chat/voice-panel";
+ import { ConversationTree } from "@/components/chat/conversation-tree";
+ import { MessageBubble } from "@/components/chat/message-bubble";
+ import { ArtifactCanvas } from "@/components/chat/artifact-canvas";
+@@ -143,6 +145,8 @@ export function HomeView({
+   pendingSkill,
+   onPendingSkillConsumed,
+   onOpenSkills,
++  appPrefs,
++  onAppPrefsPatch,
+ }: {
+   project: ProjectDto | null;
+   importedInbox: boolean;
+@@ -214,8 +218,10 @@ export function HomeView({
+   pendingSkill: { id?: string; query: string } | null;
+   onPendingSkillConsumed: () => void;
+   onOpenSkills: () => void;
++  appPrefs: AppPrefs | null;
++  onAppPrefsPatch: (patch: Partial<AppPrefs>) => Promise<void>;
+ }): JSX.Element {
+-  const { t } = useTranslation();
++  const { t, i18n } = useTranslation();
+   const modifier = window.hub.platform === "darwin" ? "Ôîÿ" : "Ctrl";
+   const [title, setTitle] = useState("");
+   const [draft, setDraft] = useState("");
+@@ -1771,6 +1777,21 @@ export function HomeView({
+                     {developerOutput ? <pre className="mt-2 max-h-40 overflow-auto rounded bg-muted p-2 text-[11px]" data-testid="developer-output">{developerOutput}</pre> : <p className="mt-1 text-[11px] text-muted-foreground">{t("developer.hint")}</p>}
+                   </section>
+                 ) : null}
++                <VoicePanel
++                  enabled={Boolean(selectedConversationId)}
++                  prefs={appPrefs}
++                  messages={messages}
++                  streaming={streaming}
++                  sending={sending}
++                  hasKey={hasKey}
++                  hasConversation={Boolean(selectedConversationId)}
++                  locale={i18n.language}
++                  onSendTranscript={async (text) => onSend(text, [])}
++                  onAbortChat={() => {
++                    void onAbort();
++                  }}
++                  onPrefsChange={onAppPrefsPatch}
++                />
+                 <ChatComposer
+                   key={selectedConversationId}
+                   value={draft}
+diff --git a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+index 5fc88fa..777eb82 100644
+--- a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+@@ -487,6 +487,53 @@ export function SettingsView({
+           {t("privacy.crashOptIn")}
+         </label>
+         <p className="text-[11px] text-muted-foreground">{t("privacy.crashDetail")}</p>
++        <h3 className="mt-2 text-[12px] font-medium">{t("voice.settings.title")}</h3>
++        <p className="text-muted-foreground">{t("voice.settings.hint")}</p>
++        <p className="text-[11px] text-amber-700 dark:text-amber-400">{t("voice.cloudWarning")}</p>
++        <label className="flex items-center gap-2 text-[13px]">
++          <input
++            type="checkbox"
++            data-testid="voice-cloud-ack-settings"
++            checked={prefs?.voiceCloudAck === true}
++            onChange={(event) => {
++              void window.hub.prefs
++                .set({ voiceCloudAck: event.target.checked })
++                .then(setPrefs)
++                .catch(() => setError(t("workspace.error.generic")));
++            }}
++          />
++          {t("voice.cloudAck")}
++        </label>
++        <label className="flex items-center gap-2 text-[13px]">
++          <input
++            type="checkbox"
++            data-testid="voice-continuous-settings"
++            checked={prefs?.voiceContinuous === true}
++            onChange={(event) => {
++              void window.hub.prefs
++                .set({ voiceContinuous: event.target.checked })
++                .then(setPrefs)
++                .catch(() => setError(t("workspace.error.generic")));
++            }}
++          />
++          {t("voice.continuous")}
++        </label>
++        <label className="flex items-center gap-2 text-[13px]">
++          <input
++            type="checkbox"
++            data-testid="voice-audio-disk-opt-in"
++            checked={prefs?.audioDiskOptIn === true}
++            disabled={prefs?.privacyMode === "private"}
++            onChange={(event) => {
++              void window.hub.prefs
++                .set({ audioDiskOptIn: event.target.checked })
++                .then(setPrefs)
++                .catch(() => setError(t("workspace.error.generic")));
++            }}
++          />
++          {t("voice.audioDiskOptIn")}
++        </label>
++        <p className="text-[11px] text-muted-foreground">{t("voice.audioDiskDetail")}</p>
+       </section>
+       <section className="flex flex-col gap-2">
+         <h2 className="text-[12px] font-medium">{t("updates.title")}</h2>
+diff --git a/apps/desktop/src/renderer/src/lib/voice-session.ts b/apps/desktop/src/renderer/src/lib/voice-session.ts
+new file mode 100644
+index 0000000..e661be6
+--- /dev/null
++++ b/apps/desktop/src/renderer/src/lib/voice-session.ts
+@@ -0,0 +1,136 @@
++/** Minimal typings for Chromium Web Speech used by Voice Mode (W28). */
++
++export type HubSpeechRecognitionAlternative = {
++  transcript: string;
++};
++
++export type HubSpeechRecognitionResult = {
++  isFinal: boolean;
++  length: number;
++  [index: number]: HubSpeechRecognitionAlternative;
++};
++
++export type HubSpeechRecognitionResultList = {
++  length: number;
++  [index: number]: HubSpeechRecognitionResult;
++};
++
++export type HubSpeechRecognitionEvent = {
++  results: HubSpeechRecognitionResultList;
++};
++
++export type HubSpeechRecognitionErrorEvent = {
++  error: string;
++};
++
++export type HubSpeechRecognition = {
++  continuous: boolean;
++  interimResults: boolean;
++  lang: string;
++  onresult: ((event: HubSpeechRecognitionEvent) => void) | null;
++  onerror: ((event: HubSpeechRecognitionErrorEvent) => void) | null;
++  onend: (() => void) | null;
++  start: () => void;
++  stop: () => void;
++  abort: () => void;
++};
++
++type SpeechRecognitionCtor = new () => HubSpeechRecognition;
++
++function recognitionCtor(): SpeechRecognitionCtor | null {
++  const w = window as Window & {
++    SpeechRecognition?: SpeechRecognitionCtor;
++    webkitSpeechRecognition?: SpeechRecognitionCtor;
++  };
++  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
++}
++
++export function isSpeechRecognitionAvailable(): boolean {
++  return recognitionCtor() !== null;
++}
++
++export function isSpeechSynthesisAvailable(): boolean {
++  return typeof window !== "undefined" && "speechSynthesis" in window;
++}
++
++export function listTtsVoices(): SpeechSynthesisVoice[] {
++  if (!isSpeechSynthesisAvailable()) {
++    return [];
++  }
++  return window.speechSynthesis.getVoices();
++}
++
++export function createSpeechRecognition(options: {
++  lang: string;
++  continuous: boolean;
++  onInterim: (text: string) => void;
++  onFinal: (text: string) => void;
++  onError: (code: string) => void;
++  onEnd: () => void;
++}): HubSpeechRecognition | null {
++  const Ctor = recognitionCtor();
++  if (!Ctor) {
++    return null;
++  }
++  const recognition = new Ctor();
++  recognition.continuous = options.continuous;
++  recognition.interimResults = true;
++  recognition.lang = options.lang;
++  recognition.onresult = (event) => {
++    let interim = "";
++    let finalText = "";
++    for (let i = 0; i < event.results.length; i += 1) {
++      const result = event.results[i];
++      if (!result?.[0]) continue;
++      if (result.isFinal) {
++        finalText += result[0].transcript;
++      } else {
++        interim += result[0].transcript;
++      }
++    }
++    if (interim) {
++      options.onInterim(interim.trim());
++    }
++    if (finalText.trim()) {
++      options.onFinal(finalText.trim());
++    }
++  };
++  recognition.onerror = (event) => {
++    options.onError(event.error || "unknown");
++  };
++  recognition.onend = () => {
++    options.onEnd();
++  };
++  return recognition;
++}
++
++export function speakText(input: {
++  text: string;
++  voiceURI: string | null;
++  lang: string;
++  onEnd?: () => void;
++}): SpeechSynthesisUtterance | null {
++  if (!isSpeechSynthesisAvailable() || !input.text.trim()) {
++    input.onEnd?.();
++    return null;
++  }
++  window.speechSynthesis.cancel();
++  const utterance = new SpeechSynthesisUtterance(input.text.slice(0, 8_000));
++  utterance.lang = input.lang;
++  if (input.voiceURI) {
++    const match = listTtsVoices().find((voice) => voice.voiceURI === input.voiceURI);
++    if (match) {
++      utterance.voice = match;
++    }
++  }
++  utterance.onend = () => input.onEnd?.();
++  utterance.onerror = () => input.onEnd?.();
++  window.speechSynthesis.speak(utterance);
++  return utterance;
++}
++
++export function stopSpeaking(): void {
++  if (isSpeechSynthesisAvailable()) {
++    window.speechSynthesis.cancel();
++  }
++}
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index dbe02ca..89443a0 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -1,626 +1,652 @@
+ {
+-    "app.name":  "AI Hub",
+-    "nav.home":  "Home",
+-    "nav.prompts":  "Prompts",
+-    "nav.skills":  "Skills",
+-    "nav.settings":  "Settings",
+-    "nav.debug":  "Debug",
+-    "nav.import":  "Import",
+-    "status.ready":  "Ready",
+-    "status.theme":  "Theme: {{theme}}",
+-    "status.health.empty":  "No provider health yet",
+-    "status.health.ok":  "ok",
+-    "status.health.down":  "down",
+-    "status.health.unknown":  "idle",
+-    "status.health.item":  "{{provider}} {{state}}{{latency}}{{errors}}",
+-    "status.health.latency":  " ├é┬À {{ms}}ms",
+-    "status.health.errors":  " ├é┬À {{pct}}% err",
+-    "theme.light":  "Light",
+-    "theme.dark":  "Dark",
+-    "theme.system":  "System",
+-    "theme.label":  "Theme",
+-    "locale.label":  "Language",
+-    "locale.ptBR":  "Portugu├â┬¬s",
+-    "locale.en":  "English",
+-    "window.minimize":  "Minimize",
+-    "window.maximize":  "Maximize",
+-    "window.close":  "Close",
+-    "empty.title":  "No projects yet",
+-    "empty.body":  "Create a project in the sidebar, or start an unfiled chat in Inbox.",
+-    "empty.action":  "Open settings",
+-    "settings.title":  "Appearance and keys",
+-    "settings.hint":  "Theme and language live in the local database. API keys go to Credential Manager, never SQLite.",
+-    "workspace.projects":  "Projects",
+-    "workspace.inbox":  "Inbox",
+-    "workspace.inboxHint":  "Unfiled chats",
+-    "workspace.importedInbox":  "Imported",
+-    "workspace.importedInboxHint":  "Chats brought from ChatGPT, Claude, or Gemini",
+-    "workspace.noConversationsImported":  "No imported chats here. Open Import Hub to bring an export.",
+-    "workspace.moveTo":  "Move to project",
+-    "workspace.moveInbox":  "Keep in Imported",
+-    "workspace.projectPlaceholder":  "Project name",
+-    "workspace.newProject":  "New project",
+-    "workspace.projectColor":  "Color",
+-    "workspace.projectInstructions":  "Project instructions",
+-    "workspace.projectInstructionsHint":  "Always included in the compiled packet.",
+-    "workspace.preferredProvider":  "Preferred provider",
+-    "workspace.preferredModel":  "Preferred model",
+-    "workspace.preferredNone":  "None",
+-    "workspace.saveProject":  "Save project",
+-    "workspace.deleteProject":  "Delete project",
+-    "workspace.deleteProjectConfirm":  "Delete {{name}}? Chats move to Inbox. The message tree stays.",
+-    "workspace.search":  "Search chats",
+-    "workspace.searchEmpty":  "No matches",
+-    "workspace.tags":  "Tags",
+-    "workspace.tagPlaceholder":  "Add tag",
+-    "workspace.tagAdd":  "Add",
+-    "workspace.tagRemove":  "Remove tag {{tag}}",
+-    "workspace.conversations":  "Conversations",
+-    "workspace.conversationPlaceholder":  "Conversation title",
+-    "workspace.newConversation":  "New conversation",
+-    "workspace.untitledChat":  "New chat",
+-    "workspace.noConversations":  "No conversations in this project. {{modifier}}+N starts one.",
+-    "workspace.noConversationsInbox":  "Inbox is empty. {{modifier}}+N starts an unfiled chat.",
+-    "workspace.noMessages":  "No messages yet. Type below and press Enter to send.",
+-    "workspace.pickConversation":  "Pick or create a conversation.",
+-    "workspace.packet.badge":  "~{{n}} tokens",
+-    "workspace.packet.open":  "Packet",
+-    "workspace.packet.title":  "Portable context packet",
+-    "workspace.packet.destination":  "{{provider}} ├é┬À {{model}} ├é┬À window {{window}} ├é┬À ~{{n}} tokens",
+-    "workspace.packet.privacy":  "Privacy",
+-    "workspace.packet.privacy.standard":  "Standard (project + inactive branches)",
+-    "workspace.packet.privacy.strict":  "Strict (active path only; no memories or retrieved files)",
+-    "workspace.packet.privacy.private":  "Private",
+-    "workspace.packet.privacy.normal":  "Normal",
+-    "workspace.packet.privacy.maximum":  "Maximum sharing",
+-    "workspace.packet.included":  "Included",
+-    "workspace.packet.omitted":  "Left out",
+-    "workspace.packet.empty":  "None",
+-    "workspace.packet.save":  "Save packet",
+-    "workspace.packet.export":  "Export file",
+-    "workspace.packet.import":  "Import file",
+-    "workspace.packet.apply":  "Use in this chat",
+-    "workspace.packet.using":  "In use",
+-    "workspace.packet.clear":  "Stop using packet",
+-    "workspace.packet.saved":  "Saved packets",
+-    "workspace.packet.none":  "No packets in this project yet.",
+-    "workspace.packet.untitled":  "Untitled packet",
+-    "workspace.packet.needPreview":  "Open a conversation with a key to preview the packet.",
+-    "workspace.packet.applied":  "This chat sends the applied packet plus new turns.",
+-    "workspace.packet.savedNotice":  "Packet saved in this project.",
+-    "workspace.packet.exported":  "Packet file saved.",
+-    "workspace.packet.imported":  "Packet imported into this project.",
+-    "workspace.packet.appliedNotice":  "This chat now uses the imported packet.",
+-    "workspace.packet.cleared":  "This chat compiles from the local tree again.",
+-    "workspace.packet.cancelled":  "Packet file dialog cancelled.",
+-    "workspace.packet.kind.project-instructions":  "Project instructions",
+-    "workspace.packet.kind.extra-system":  "Extra system",
+-    "workspace.packet.kind.inactive-branch":  "Inactive branch",
+-    "workspace.packet.kind.message":  "Message",
+-    "workspace.packet.kind.old-message":  "Old message",
+-    "workspace.packet.kind.privacy":  "Privacy",
+-    "workspace.packet.kind.file":  "File",
+-    "workspace.packet.kind.conversation":  "Conversation",
+-    "workspace.packet.kind.packet":  "Packet",
+-    "workspace.packet.kind.memory":  "Memory",
+-    "workspace.packet.kind.rag":  "Retrieved chunk",
+-    "workspace.packet.kind.prompt":  "Library prompt",
+-    "workspace.packet.kind.skill":  "Applied skill",
+-    "memory.title":  "Memory",
+-    "memory.add":  "Add memory",
+-    "memory.update":  "Update memory",
+-    "memory.save":  "Save",
+-    "memory.edit":  "Edit",
+-    "memory.delete":  "Delete",
+-    "memory.empty":  "No memories in this project yet.",
+-    "memory.suggest":  "Save to project memory?",
+-    "memory.ignore":  "Ignore",
+-    "memory.optOut":  "Don\u0027t auto-inject",
+-    "memory.optIn":  "Auto-inject on",
+-    "memory.titlePlaceholder":  "Short title",
+-    "memory.bodyPlaceholder":  "we use PostgreSQL",
+-    "workspace.panel.title":  "Workspace",
+-    "workspace.panel.refresh":  "Refresh",
+-    "workspace.panel.summary":  "Summary",
+-    "workspace.panel.decisions":  "Decisions",
+-    "workspace.panel.pins":  "Pins",
+-    "workspace.panel.pinCount":  "{{n}} pinned messages",
+-    "workspace.panel.artifacts":  "Artifacts",
+-    "workspace.panel.tasks":  "Tasks",
+-    "workspace.panel.taskPlaceholder":  "New task",
+-    "workspace.panel.add":  "Add",
+-    "workspace.panel.remove":  "Remove",
+-    "workspace.panel.empty":  "Nothing extracted yet.",
+-    "workspace.duplicate":  "Duplicate",
+-    "workspace.toProject":  "To project",
+-    "mentions.remove":  "Remove",
+-    "mentions.tokens":  "~{{n}} tokens",
+-    "mentions.preview":  "Will inject",
+-    "mentions.tokenWarning":  "Mentions add ~{{n}} tokens (cap {{cap}}).",
+-    "mentions.tokenOver":  "Mentions exceed the {{cap}} token cap. Oldest extra context will be dropped.",
+-    "mentions.stub":  "Available in a later wave",
+-    "mentions.type.file":  "File in this project",
+-    "mentions.type.conversation":  "Another conversation",
+-    "mentions.type.memory":  "Project memory",
+-    "mentions.type.prompt":  "Prompt library",
+-    "mentions.type.skill":  "Skill",
+-    "mentions.type.packet":  "Saved packet",
+-    "mentions.empty":  "No matches",
+-    "mentions.error.unavailable":  "That mention type is not available yet.",
+-    "mentions.error.notFound":  "That mention could not be resolved in this project.",
+-    "mentions.error.limit":  "You can mention up to 8 items per send.",
+-    "workspace.pin":  "Pin",
+-    "workspace.unpin":  "Unpin",
+-    "workspace.overflow":  "This thread is over the {{window}} token window (~{{estimate}} estimated). Compact drops oldest turns from the next packet; the tree stays.",
+-    "workspace.compact":  "Compact history",
+-    "workspace.compact.on":  "Next send will drop oldest turns to fit the window.",
+-    "workspace.compact.off":  "Send full compiled history",
+-    "workspace.modelSwitch":  "Next reply uses {{model}}. History is compiled ├óÔé¼ÔÇØ you do not need to paste a summary.",
+-    "workspace.error.generic":  "That action could not be completed. Try again.",
+-    "workspace.error.chat":  "The model request failed ({{code}}).",
+-    "workspace.error.cap":  "Spend cap reached ({{scope}}). This send was not started.",
+-    "workspace.error.unknownModel":  "That model is not in the local catalog for this provider.",
+-    "files.attach":  "Attach file",
+-    "files.attachFolder":  "Attach folder",
+-    "files.remove":  "Remove",
+-    "files.tokens":  "~{{n}} tokens",
+-    "files.visionHint":  "Needs a vision model",
+-    "files.tokenWarning":  "These files add ~{{n}} tokens before the message is sent.",
+-    "files.truncated":  "Preview is truncated",
+-    "files.error.vision":  "This model cannot read images. Pick one marked Vision or remove the image.",
+-    "files.error.tooLarge":  "That file is over the 8 MB limit.",
+-    "files.error.unsupported":  "That file type is not supported.",
+-    "files.error.projectMismatch":  "That file belongs to another project.",
+-    "files.error.limit":  "You can attach up to 8 files per send.",
+-    "workspace.error.timeout":  "The provider timed out. Retry or try another model.",
+-    "workspace.error.rate_limit":  "The provider is rate-limiting this key. Wait and retry.",
+-    "workspace.error.auth":  "The provider rejected this key. Check it in Settings.",
+-    "workspace.error.context_overflow":  "This thread exceeds the model window. Turn on Compact history and send again.",
+-    "workspace.error.quota":  "The provider reports no remaining credit on this key.",
+-    "workspace.error.network":  "The network is unreachable. Check the connection and retry.",
+-    "workspace.error.unknown":  "The provider returned an unexpected error.",
+-    "workspace.model":  "Model",
+-    "workspace.customModel":  "Custom model id",
+-    "workspace.model.vision":  "Vision",
+-    "workspace.model.tools":  "Tools",
+-    "workspace.model.price":  "${{input}} / ${{output}} per 1M tokens",
+-    "workspace.temperature":  "Temp",
+-    "workspace.maxTokens":  "Max tokens",
+-    "workspace.maxTokensDefault":  "default",
+-    "workspace.extraSystem":  "Extra system instructions",
+-    "workspace.key":  "Key",
+-    "workspace.noKey":  "Save a provider key in Settings first.",
+-    "workspace.composer.placeholder":  "Message",
+-    "workspace.composer.send":  "Send",
+-    "workspace.composer.stop":  "Stop",
+-    "workspace.composer.hint":  "Enter to send ├é┬À Shift+Enter for a new line ├é┬À Esc to stop",
+-    "workspace.composer.secretWarning":  "This looks like an API key. Do not send secrets to a model.",
+-    "workspace.composer.secretRedact":  "Remove secrets",
+-    "workspace.placeholder":  "├óÔé¼┬ª",
+-    "workspace.copy":  "Copy",
+-    "workspace.copyCode":  "Copy",
+-    "workspace.copied":  "Copied",
+-    "workspace.regenerate":  "Regenerate",
+-    "workspace.continue":  "Continue",
+-    "workspace.edit":  "Edit",
+-    "workspace.saveEdit":  "Save and send",
+-    "workspace.cancelEdit":  "Cancel",
+-    "workspace.role.user":  "You",
+-    "workspace.role.assistant":  "Assistant",
+-    "workspace.role.system":  "System",
+-    "workspace.status.streaming":  "streaming",
+-    "workspace.status.interrupted":  "interrupted",
+-    "workspace.status.aborted":  "aborted",
+-    "workspace.status.complete":  "complete",
+-    "workspace.receipt":  "{{provider}} ├é┬À {{model}} ├é┬À in {{tokensIn}} / out {{tokensOut}} ├é┬À {{cost}} ├é┬À {{latency}}ms ├é┬À {{at}}",
+-    "workspace.receipt.error":  "error {{code}}",
+-    "workspace.receipt.open":  "Receipt details",
+-    "workspace.receipt.title":  "Receipt",
+-    "workspace.receipt.created":  "Recorded {{at}}",
+-    "workspace.receipt.tokens":  "in / out",
+-    "workspace.receipt.latency":  "Latency",
+-    "workspace.receipt.source":  "Source",
+-    "workspace.receipt.source.import":  "Imported",
+-    "workspace.receipt.source.chat":  "Chat",
+-    "workspace.cost.conversation":  "Thread ${{usd}}",
+-    "workspace.cost.project":  "Project ${{usd}}",
+-    "workspace.estimate":  "Est. ${{usd}} this send",
+-    "workspace.estimate.none":  "No catalog price for a pre-send estimate",
+-    "workspace.cap.warn":  "Spend is at 80% of the {{scope}} cap.",
+-    "workspace.cap.block":  "Spend cap would block this send ({{scope}}).",
+-    "workspace.cap.allowOnce":  "Allow this once",
+-    "caps.title":  "Spend caps",
+-    "caps.hint":  "Hard-stops in USD. Empty means unlimited. 80% warns; 100% blocks until you allow once.",
+-    "caps.scope.request":  "per request",
+-    "caps.scope.day":  "per day",
+-    "caps.scope.global":  "global",
+-    "caps.unlimited":  "Unlimited",
+-    "caps.save":  "Save caps",
+-    "caps.saved":  "Caps saved",
+-    "debug.title":  "Debug / observability",
+-    "debug.hint":  "Last request metadata only. No Authorization headers, keys, or conversation body.",
+-    "debug.empty":  "No request has been compiled yet this session.",
+-    "debug.refresh":  "Refresh",
+-    "debug.provider":  "Provider",
+-    "debug.model":  "Model",
+-    "debug.retries":  "Retries",
+-    "debug.error":  "Last error",
+-    "debug.tokens":  "Token estimate",
+-    "debug.cost":  "Estimated USD",
+-    "debug.cap":  "Cap decision",
+-    "debug.overflow":  "Window overflow",
+-    "debug.at":  "Captured",
+-    "fallback.title":  "Try another provider?",
+-    "fallback.body":  "{{failed}} failed ({{code}}). {{suggested}} looks healthier. Confirm to regenerate on that key ├óÔé¼ÔÇØ this is not automatic.",
+-    "fallback.confirm":  "Try {{suggested}}",
+-    "fallback.dismiss":  "Keep this provider",
+-    "fallback.estimate":  "Estimated ${{usd}} on {{suggested}}",
+-    "command.debug":  "Open debug",
+-    "command.import":  "Open Import Hub",
+-    "command.prompts":  "Open prompt library",
+-    "command.skills":  "Open skill library",
+-    "command.runSkill":  "Run skill: {{name}}",
+-    "command.exportActive":  "Export active branch",
+-    "command.exportTree":  "Export tree JSON",
+-    "command.providers":  "Manage providers",
+-    "command.settings":  "Open settings",
+-    "command.shortcuts":  "View keyboard shortcuts",
+-    "command.unavailable":  "unavailable now",
+-    "command.searching":  "Searching conversations├óÔé¼┬ª",
+-    "command.group.actions":  "Actions",
+-    "command.group.projects":  "Projects",
+-    "command.group.models":  "Models",
+-    "command.group.conversations":  "Conversations and messages",
+-    "shortcuts.title":  "Keyboard shortcuts",
+-    "shortcuts.status":  "Shortcuts ├é┬À {{modifier}}+/",
+-    "shortcuts.palette":  "Open the Command Palette",
+-    "shortcuts.newChat":  "Create a conversation",
+-    "shortcuts.newProject":  "Focus project creation",
+-    "shortcuts.skills":  "Open the skill library",
+-    "shortcuts.cheatsheet":  "Open this guide",
+-    "shortcuts.send":  "Send a message or run a slash command",
+-    "shortcuts.newline":  "Insert a new line",
+-    "shortcuts.stop":  "Stop the stream or close a dialog",
+-    "shortcuts.slashTitle":  "Composer slash commands",
+-    "slash.model.description":  "Focus the model selector",
+-    "slash.clear.description":  "Open a clean conversation without deleting this one",
+-    "slash.compact.description":  "Toggle compaction for the next send",
+-    "slash.packet.description":  "Open the context packet",
+-    "slash.cap.description":  "Open spend caps",
+-    "slash.skill.description":  "Open the skill library, or /skill Name to run one",
+-    "workspace.sibling.prev":  "Previous alternative",
+-    "workspace.sibling.next":  "Next alternative",
+-    "workspace.sibling.count":  "{{current}} / {{total}}",
+-    "workspace.tree.title":  "Tree",
+-    "workspace.tree.hint":  "Jump to a node. The other branch stays.",
+-    "workspace.tree.show":  "Tree",
+-    "workspace.tree.hide":  "Hide tree",
+-    "workspace.tree.empty":  "No nodes yet.",
+-    "workspace.tree.forks":  "{{count}} children",
+-    "workspace.tree.rename":  "Branch name",
+-    "workspace.tree.saveName":  "Save name",
+-    "workspace.export.active":  "Export branch",
+-    "workspace.export.tree":  "Export tree JSON",
+-    "workspace.export.saved":  "Saved to {{path}}",
+-    "secrets.title":  "Provider keys",
+-    "secrets.hint":  "The full key crosses IPC only on this save, then leaves the screen. After that you only see a mask.",
+-    "secrets.provider":  "Provider",
+-    "secrets.labelField":  "Label",
+-    "secrets.secret":  "Key",
+-    "secrets.save":  "Save key",
+-    "secrets.test":  "Test connection",
+-    "secrets.testing":  "Testing├óÔé¼┬ª",
+-    "secrets.testOk":  "Connection ok ├é┬À {{ms}}ms",
+-    "secrets.testFail":  "Connection failed ({{code}}) ├é┬À {{ms}}ms",
+-    "secrets.baseUrl":  "Base URL",
+-    "secrets.remove":  "Remove",
+-    "secrets.error.save":  "Could not save the key. Check the value and try again.",
+-    "command.placeholder":  "Search commands├óÔé¼┬ª",
+-    "command.empty":  "No commands",
+-    "dialog.close":  "Close dialog",
+-    "command.theme":  "Change theme",
+-    "command.newProject":  "New project",
+-    "command.newChat":  "New chat",
+-    "command.inbox":  "Open Inbox",
+-    "command.importedInbox":  "Open Imported",
+-    "command.search":  "Search conversations",
+-    "about.title":  "About",
+-    "about.body":  "AI Hub Desktop ├óÔé¼ÔÇØ the control layer between you and AI providers. BYOK, local-first.",
+-    "onboarding.title":  "Get to your first answer",
+-    "onboarding.hint":  "Language, one provider, a connection test ├óÔé¼ÔÇØ then ask. No cloud account.",
+-    "onboarding.next":  "Continue",
+-    "onboarding.provider":  "Connect one provider",
+-    "onboarding.providerHint":  "OpenRouter is recommended. Native providers sit beside it. The key stays in Credential Manager.",
+-    "onboarding.openrouter":  "{{name}} (recommended)",
+-    "onboarding.saveTest":  "Save and test",
+-    "onboarding.ask":  "Ask your first question",
+-    "privacy.title":  "Crash reports",
+-    "privacy.hint":  "Off by default. Opt-in writes local Crashpad dumps with no upload. Annotations are only app version and platform ├óÔé¼ÔÇØ dump files can still contain process memory.",
+-    "privacy.crashOptIn":  "Enable local crash dumps",
+-    "privacy.crashDetail":  "Turning this off takes effect the next time the app starts if dumps were already enabled this session.",
+-    "privacy.center.title":  "Privacy Center",
+-    "privacy.center.hint":  "The selected policy is enforced in the main process before a request is persisted or sent.",
+-    "privacy.center.mode":  "Context sharing mode",
+-    "privacy.mode.private":  "Private",
+-    "privacy.mode.normal":  "Normal",
+-    "privacy.mode.maximum":  "Maximum sharing",
+-    "privacy.modeDetail.private":  "Only this conversation\u0027s active history and your message are sent.",
+-    "privacy.modeDetail.normal":  "Project instructions and context you explicitly choose are sent.",
+-    "privacy.modeDetail.maximum":  "Includes project memories and retrieved file context.",
+-    "privacy.firewall":  "Context Firewall",
+-    "privacy.kind.secret":  "API keys and secrets",
+-    "privacy.kind.token":  "Tokens and passwords",
+-    "privacy.kind.email":  "Email addresses",
+-    "privacy.kind.cpf":  "Brazilian CPF",
+-    "privacy.kind.prompt_injection":  "Potential prompt injection",
+-    "privacy.action.block":  "Block",
+-    "privacy.action.mask":  "Mask",
+-    "privacy.action.allow":  "Allow",
+-    "privacy.crash.title":  "Crash reports",
+-    "costTracker.title":  "Cost tracker",
+-    "costTracker.summary":  "{{month}} ├é┬À {{requests}} requests ├é┬À {{tokens}} tokens ├é┬À ${{usd}}",
+-    "costTracker.models":  "By model",
+-    "costTracker.projects":  "By project",
+-    "costTracker.loading":  "Loading monthly receipts├óÔé¼┬ª",
+-    "caps.scoped.title":  "Project and provider caps",
+-    "caps.scoped.hint":  "These limits are hard stops in addition to the global caps.",
+-    "caps.scoped.project":  "Project",
+-    "caps.scoped.provider":  "Provider",
+-    "updates.title":  "Updates",
+-    "updates.hint":  "Checks GitHub Releases. A missing feed must not break the app.",
+-    "updates.check":  "Check for updates",
+-    "updates.checking":  "Checking├óÔé¼┬ª",
+-    "updates.status.idle":  "No check yet",
+-    "updates.status.skipped":  "Skipped (development build)",
+-    "updates.status.uptodate":  "Up to date",
+-    "updates.status.available":  "Update available ({{version}})",
+-    "updates.status.unavailable":  "Update feed unavailable ├óÔé¼ÔÇØ the app keeps running",
+-    "import.title":  "Import Hub",
+-    "import.hint":  "Bring official ChatGPT, Claude, or Gemini exports. Re-importing the same chat is skipped. Binary files stay out.",
+-    "import.source":  "Export source",
+-    "import.source.chatgpt":  "ChatGPT (ZIP or conversations.json)",
+-    "import.source.claude":  "Claude (conversations.json)",
+-    "import.source.gemini":  "Gemini (MyActivity.json, best effort)",
+-    "import.geminiLimits":  "Gemini Takeout is an activity log, not a full archive. Use JSON (not HTML). Threads are grouped by chat URL; images are skipped. Some turns may be missing.",
+-    "import.destination":  "Destination",
+-    "import.destination.inbox":  "Imported inbox",
+-    "import.pickFile":  "Choose export file",
+-    "import.start":  "Start import",
+-    "import.cancel":  "Cancel",
+-    "import.fileName":  "Selected: {{name}}",
+-    "import.empty":  "No file selected yet.",
+-    "import.progress":  "Importing {{current}} / {{total}}",
+-    "import.report.title":  "Import report",
+-    "import.report.ok":  "{{count}} conversations imported",
+-    "import.report.skipped":  "{{count}} skipped (already imported)",
+-    "import.report.errors":  "{{count}} errors",
+-    "import.report.error.empty":  "A conversation had no messages and was skipped.",
+-    "import.report.error.failed":  "A conversation could not be saved.",
+-    "import.report.attachments":  "{{count}} file placeholders (binaries not imported)",
+-    "import.openDestination":  "Open imported chats",
+-    "import.error.generic":  "The import could not be completed.",
+-    "import.error.invalid_json":  "That file is not valid JSON.",
+-    "import.error.unrecognized":  "No conversations were recognized in that file.",
+-    "import.error.gemini_html":  "HTML Takeout is not supported. Export Gemini Apps activity as JSON.",
+-    "import.error.empty":  "No conversations were found in that export.",
+-    "prompts.library":  "Prompt library",
+-    "prompts.editor":  "Prompt",
+-    "prompts.playground":  "Playground",
+-    "prompts.new":  "New",
+-    "prompts.save":  "Save",
+-    "prompts.insert":  "Insert in composer",
+-    "prompts.delete":  "Delete",
+-    "prompts.run":  "Run",
+-    "prompts.running":  "Running├óÔé¼┬ª",
+-    "prompts.saveWinner":  "Save winner",
+-    "prompts.slot":  "Model {{n}}",
+-    "prompts.titlePlaceholder":  "Title",
+-    "prompts.bodyPlaceholder":  "Template using project, language, and goal variables",
+-    "prompts.playgroundPlaceholder":  "Optional extra instructions for this run",
+-    "prompts.winnerPlaceholder":  "Winner title",
+-    "prompts.winnerDefault":  "Playground winner",
+-    "prompts.playgroundEmpty":  "Run two models to compare.",
+-    "prompts.folder.development":  "Development",
+-    "prompts.folder.studies":  "Studies",
+-    "prompts.folder.work":  "Work",
+-    "prompts.factory.code-review":  "Code review",
+-    "prompts.factory.debug":  "Debug",
+-    "prompts.factory.summary":  "Summary",
+-    "prompts.factory.teacher":  "Teacher",
+-    "prompts.error.generic":  "Could not load the prompt library.",
+-    "prompts.error.save":  "Could not save that prompt.",
+-    "prompts.error.resolve":  "Could not resolve variables for the active project.",
+-    "prompts.error.run":  "Playground run failed. Each model stays on the slot you picked.",
+-    "prompts.error.slots":  "Pick two different models to run the playground.",
+-    "prompts.error.content":  "Write a prompt or select one from the library.",
+-    "artifacts.canvas":  "Canvas",
+-    "artifacts.open":  "Open canvas",
+-    "artifacts.close":  "Close",
+-    "artifacts.saveVersion":  "Save version",
+-    "artifacts.pin":  "Pin to project",
+-    "artifacts.unpin":  "Unpin",
+-    "artifacts.pinned":  "Pinned",
+-    "artifacts.version":  "v{{n}}",
+-    "artifacts.exportMd":  "Export MD",
+-    "artifacts.exportHtml":  "Export HTML",
+-    "artifacts.exportSvg":  "Export SVG",
+-    "artifacts.htmlSaveToPreview":  "Save a version to refresh the sandboxed preview.",
+-    "artifacts.mermaidError":  "Mermaid could not render this diagram.",
+-    "artifacts.kind.mermaid":  "Mermaid",
+-    "artifacts.kind.html":  "HTML",
+-    "artifacts.kind.markdown":  "Markdown",
+-    "artifacts.kind.code":  "Code",
+-    "artifacts.error":  "Could not update that artifact.",
+-    "skills.library":  "Skill library",
+-    "skills.editor":  "Skill",
+-    "skills.new":  "New",
+-    "skills.save":  "Save",
+-    "skills.delete":  "Delete",
+-    "skills.run":  "Run",
+-    "skills.steps":  "Steps",
+-    "skills.addStep":  "Add step",
+-    "skills.titlePlaceholder":  "Name",
+-    "skills.descriptionPlaceholder":  "What this skill does",
+-    "skills.promptPlaceholder":  "Skill prompt using project, language, and goal variables",
+-    "skills.modelPlaceholder":  "Preferred model id (optional)",
+-    "skills.stepTitlePlaceholder":  "Step title",
+-    "skills.stepSectionPlaceholder":  "Instructions for this step",
+-    "skills.run.title":  "Running {{name}}",
+-    "skills.folder.development":  "Development",
+-    "skills.folder.studies":  "Studies",
+-    "skills.folder.work":  "Work",
+-    "skills.factory.code-review":  "Code Review",
+-    "skills.factory.summarize-pdf":  "Summarize PDF",
+-    "skills.factory.meeting-prep":  "Prepare meeting",
+-    "skills.factory.explain-error":  "Explain error",
+-    "skills.factory.write-rfc":  "Write RFC",
+-    "skills.error.generic":  "Could not load the skill library.",
+-    "skills.error.save":  "Could not save that skill.",
+-    "hud.mode":  "Mode",
+-    "hud.effort":  "Effort",
+-    "hud.context":  "Context tokens/window",
+-    "hud.tokens":  "Tokens in/out",
+-    "hud.thinking":  "Thinking",
+-    "hud.cache":  "Cache read/write",
+-    "hud.turnCost":  "Turn cost",
+-    "hud.thinkingUnavailable":  "Thinking unavailable for this provider",
+-    "runMode.label":  "Mode",
+-    "effort.label":  "Effort",
+-    "council.router.model":  "Recommended model",
+-    "council.router.auto":  "Automatic",
+-    "council.router.confirmed":  "Route confirmed",
+-    "council.router.recommended":  "recommended",
+-    "council.router.cost":  "Estimated first-model cost: ${{usd}}",
+-    "council.router.latency":  "Latency: {{ms}} ms",
+-    "council.router.speed.fast":  "Speed: fast",
+-    "council.router.speed.balanced":  "Speed: balanced",
+-    "council.router.speed.frontier":  "Speed: frontier",
+-    "council.router.confirm":  "Confirm route",
+-    "council.router.reject":  "Reject route",
+-    "quickAi.title":  "Quick AI",
+-    "quickAi.close":  "Close",
+-    "quickAi.placeholder":  "Ask something or paste content├óÔé¼┬ª",
+-    "quickAi.clipboard":  "Read clipboard",
+-    "quickAi.formatJson":  "Format JSON",
+-    "quickAi.toInterface":  "TS interface",
+-    "quickAi.explainJson":  "Explain JSON",
+-    "quickAi.diagnoseStack":  "Diagnose stack",
+-    "quickAi.sendToProject":  "Send to current project",
+-    "quickAi.model":  "Model",
+-    "quickAi.estimate":  "Estimate: ${{usd}}",
+-    "quickAi.estimateUnavailable":  "Estimate available on send",
+-    "quickAi.send":  "Send",
+-    "quickAi.cancel":  "Cancel",
+-    "quickAi.sending":  "Sending├óÔé¼┬ª",
+-    "quickAi.error.setup":  "Configure a provider key before sending.",
+-    "quickAi.error.send":  "Could not send the question.",
+-    "quickAi.conversationTitle":  "Quick AI",
+-    "quickAi.explainPrefix":  "Explain this JSON clearly:",
+-    "quickAi.diagnosePrefix":  "Diagnose this stack trace and suggest a fix:",
+-    "council.title":  "AI Council",
+-    "council.placeholder":  "Question for the council├óÔé¼┬ª",
+-    "council.run":  "Start debate",
+-    "council.running":  "Debating├óÔé¼┬ª",
+-    "council.synthesis":  "Synthesis",
+-    "council.divergences":  "Divergences (heuristic)",
+-    "council.none":  "None highlighted",
+-    "council.error.setup":  "Open a conversation and configure at least two models.",
+-    "council.error.run":  "Could not complete the Council.",
+-    "council.router.simple":  "Router: simple question ├óÔÇáÔÇÖ fast route; confirm before sending.",
+-    "council.router.code":  "Router: code ├óÔÇáÔÇÖ balanced route; confirm before sending.",
+-    "council.router.complex":  "Router: complex task ├óÔÇáÔÇÖ frontier route; confirm before sending.",
+-    "tools.pathPlaceholder":  "Relative project path (for example, src/app.ts)",
+-    "tools.readFile":  "Read file",
+-    "tools.chooseRoot":  "Choose root",
+-    "tools.permission":  "Allow {{tool}} to read this file?",
+-    "tools.allowOnce":  "Allow once",
+-    "tools.allowProject":  "Always in this project",
+-    "tools.deny":  "Deny",
+-    "tools.activity":  "Tool",
+-    "tools.untrustedContext":  "Untrusted tool content",
+-    "tools.status.permission_required":  "awaiting permission",
+-    "tools.status.denied":  "denied",
+-    "tools.status.running":  "running",
+-    "tools.status.completed":  "completed",
+-    "tools.status.failed":  "failed",
+-    "tools.error.denied":  "The read was denied.",
+-    "tools.error.read":  "Could not read that project file.",
+-    "agents.title":  "Single agent",
+-    "agents.mode":  "Agent",
+-    "agents.pathsLabel":  "Project files to analyze",
+-    "agents.pathsPlaceholder":  "One relative project path per line (up to 3)",
+-    "agents.factory.goal":  "Analyze the selected project files and report the architecture, risks, and next steps.",
+-    "agents.factory.action":  "Use Analyze this project",
+-    "agents.confirmDisclosure":  "After confirmation, selected file content can be sent to {{provider}} / {{model}} to generate the report.",
+-    "agents.confirm":  "Confirm plan",
+-    "agents.pause":  "Pause",
+-    "agents.resume":  "Resume",
+-    "agents.cancel":  "Cancel",
+-    "agents.limits":  "Limit: {{steps}} steps ├é┬À ${{budget}} ├é┬À {{seconds}}s",
+-    "agents.error.paths":  "Add at least one relative project file path.",
+-    "agents.error.prepare":  "Could not prepare the agent run. Choose a project root and an active model key.",
+-    "agents.error.control":  "Could not update the agent run.",
+-    "agents.status.awaiting_confirmation":  "awaiting confirmation",
+-    "agents.status.running":  "running",
+-    "agents.status.paused":  "paused",
+-    "agents.status.cancelled":  "cancelled",
+-    "agents.status.completed":  "completed",
+-    "agents.status.completed_with_errors":  "completed with errors",
+-    "agents.status.stopped_budget":  "stopped by budget",
+-    "agents.status.stopped_timeout":  "stopped by time limit",
+-    "agents.status.interrupted":  "interrupted",
+-    "agents.status.failed":  "failed",
+-    "agents.step.pending":  "pending",
+-    "agents.step.running":  "running",
+-    "agents.step.completed":  "completed",
+-    "agents.step.failed":  "failed",
+-    "agents.step.skipped":  "skipped",
+-    "agents.step.cancelled":  "cancelled",
+-    "agents.step.interrupted":  "interrupted",
+-    "agents.step.tokens":  "tokens {{input}}/{{output}}",
+-    "agents.step.cost":  "cost ${{usd}}",
+-    "orchestration.title":  "Orchestration",
+-    "orchestration.mode":  "Orchestrate",
+-    "orchestration.empty":  "Select project files above, then send a goal to prepare the graph.",
+-    "orchestration.disclosure":  "Supervisor and all specialists use {{provider}} / {{model}}; shared graph cap: ${{budget}}. Any different model requires a new explicit confirmation.",
+-    "orchestration.usage":  "tokens {{input}}/{{output}} ├é┬À ${{cost}}",
+-    "orchestration.confirm":  "Confirm graph",
+-    "orchestration.error.prepare":  "Could not prepare the orchestration. Choose a project root and an active model key.",
+-    "orchestration.error.control":  "Could not update the orchestration.",
+-    "orchestration.role.explorer":  "Explorer",
+-    "orchestration.role.reviewer":  "Reviewer",
+-    "orchestration.role.writer":  "Writer",
+-    "orchestration.handoff.pending":  "pending",
+-    "orchestration.handoff.ready":  "ready",
+-    "orchestration.handoff.consumed":  "consumed",
+-    "orchestration.handoff.cancelled":  "cancelled",
+-    "orchestration.handoff.interrupted":  "interrupted",
+-    "developer.title":  "Developer Mode",
+-    "developer.tree":  "Explorer",
+-    "developer.status":  "Git status",
+-    "developer.diff":  "Git diff",
+-    "developer.terminal":  "Terminal diagnostic",
+-    "developer.review":  "Review diff",
+-    "developer.tests":  "Generate tests",
+-    "developer.architecture":  "Explain architecture",
+-    "developer.hint":  "Read-only project and Git tools; each use asks for permission.",
+-    "developer.error":  "Developer tool could not run.",
+-    "offline.localMode":  "Local mode ├é┬À Ollama and PDF RAG in maximum mode work without internet; cloud needs internet",
+-    "offline.cloudMode":  "Cloud selected ├é┬À Ollama and PDF RAG in maximum mode available locally",
+-    "offline.noModels":  "Ollama running without installed models ├é┬À PDF RAG in maximum mode remains local",
+-    "offline.localUnavailable":  "Ollama unavailable ├é┬À PDF RAG in maximum mode remains local; cloud needs internet",
+-    "notes.saveAsNote":  "Save as note",
+-    "notes.error.save":  "Could not save the note.",
+-    "tasks.saveAsChecklist":  "Turn into tasks",
+-    "tasks.error.save":  "Could not create the checklist.",
+-    "workspace.panel.notes":  "Notes",
+-    "research.mode":  "Research",
+-    "research.error.prepare":  "Could not prepare research. Choose a project and an active model key.",
+-    "command.research":  "Research mode",
+-    "command.hit.note":  "Note ┬À {{title}}",
+-    "command.hit.task":  "Task ┬À {{title}}",
+-    "skills.factory.study-professor":  "Study: Professor",
+-    "skills.factory.study-examiner":  "Study: Examiner",
+-    "skills.factory.study-tutor":  "Study: Tutor",
+-    "skills.factory.study-evaluator":  "Study: Evaluator"
++    "app.name": "AI Hub",
++    "nav.home": "Home",
++    "nav.prompts": "Prompts",
++    "nav.skills": "Skills",
++    "nav.settings": "Settings",
++    "nav.debug": "Debug",
++    "nav.import": "Import",
++    "status.ready": "Ready",
++    "status.theme": "Theme: {{theme}}",
++    "status.health.empty": "No provider health yet",
++    "status.health.ok": "ok",
++    "status.health.down": "down",
++    "status.health.unknown": "idle",
++    "status.health.item": "{{provider}} {{state}}{{latency}}{{errors}}",
++    "status.health.latency": " ├é┬À {{ms}}ms",
++    "status.health.errors": " ├é┬À {{pct}}% err",
++    "theme.light": "Light",
++    "theme.dark": "Dark",
++    "theme.system": "System",
++    "theme.label": "Theme",
++    "locale.label": "Language",
++    "locale.ptBR": "Portugu├â┬¬s",
++    "locale.en": "English",
++    "window.minimize": "Minimize",
++    "window.maximize": "Maximize",
++    "window.close": "Close",
++    "empty.title": "No projects yet",
++    "empty.body": "Create a project in the sidebar, or start an unfiled chat in Inbox.",
++    "empty.action": "Open settings",
++    "settings.title": "Appearance and keys",
++    "settings.hint": "Theme and language live in the local database. API keys go to Credential Manager, never SQLite.",
++    "workspace.projects": "Projects",
++    "workspace.inbox": "Inbox",
++    "workspace.inboxHint": "Unfiled chats",
++    "workspace.importedInbox": "Imported",
++    "workspace.importedInboxHint": "Chats brought from ChatGPT, Claude, or Gemini",
++    "workspace.noConversationsImported": "No imported chats here. Open Import Hub to bring an export.",
++    "workspace.moveTo": "Move to project",
++    "workspace.moveInbox": "Keep in Imported",
++    "workspace.projectPlaceholder": "Project name",
++    "workspace.newProject": "New project",
++    "workspace.projectColor": "Color",
++    "workspace.projectInstructions": "Project instructions",
++    "workspace.projectInstructionsHint": "Always included in the compiled packet.",
++    "workspace.preferredProvider": "Preferred provider",
++    "workspace.preferredModel": "Preferred model",
++    "workspace.preferredNone": "None",
++    "workspace.saveProject": "Save project",
++    "workspace.deleteProject": "Delete project",
++    "workspace.deleteProjectConfirm": "Delete {{name}}? Chats move to Inbox. The message tree stays.",
++    "workspace.search": "Search chats",
++    "workspace.searchEmpty": "No matches",
++    "workspace.tags": "Tags",
++    "workspace.tagPlaceholder": "Add tag",
++    "workspace.tagAdd": "Add",
++    "workspace.tagRemove": "Remove tag {{tag}}",
++    "workspace.conversations": "Conversations",
++    "workspace.conversationPlaceholder": "Conversation title",
++    "workspace.newConversation": "New conversation",
++    "workspace.untitledChat": "New chat",
++    "workspace.noConversations": "No conversations in this project. {{modifier}}+N starts one.",
++    "workspace.noConversationsInbox": "Inbox is empty. {{modifier}}+N starts an unfiled chat.",
++    "workspace.noMessages": "No messages yet. Type below and press Enter to send.",
++    "workspace.pickConversation": "Pick or create a conversation.",
++    "workspace.packet.badge": "~{{n}} tokens",
++    "workspace.packet.open": "Packet",
++    "workspace.packet.title": "Portable context packet",
++    "workspace.packet.destination": "{{provider}} ├é┬À {{model}} ├é┬À window {{window}} ├é┬À ~{{n}} tokens",
++    "workspace.packet.privacy": "Privacy",
++    "workspace.packet.privacy.standard": "Standard (project + inactive branches)",
++    "workspace.packet.privacy.strict": "Strict (active path only; no memories or retrieved files)",
++    "workspace.packet.privacy.private": "Private",
++    "workspace.packet.privacy.normal": "Normal",
++    "workspace.packet.privacy.maximum": "Maximum sharing",
++    "workspace.packet.included": "Included",
++    "workspace.packet.omitted": "Left out",
++    "workspace.packet.empty": "None",
++    "workspace.packet.save": "Save packet",
++    "workspace.packet.export": "Export file",
++    "workspace.packet.import": "Import file",
++    "workspace.packet.apply": "Use in this chat",
++    "workspace.packet.using": "In use",
++    "workspace.packet.clear": "Stop using packet",
++    "workspace.packet.saved": "Saved packets",
++    "workspace.packet.none": "No packets in this project yet.",
++    "workspace.packet.untitled": "Untitled packet",
++    "workspace.packet.needPreview": "Open a conversation with a key to preview the packet.",
++    "workspace.packet.applied": "This chat sends the applied packet plus new turns.",
++    "workspace.packet.savedNotice": "Packet saved in this project.",
++    "workspace.packet.exported": "Packet file saved.",
++    "workspace.packet.imported": "Packet imported into this project.",
++    "workspace.packet.appliedNotice": "This chat now uses the imported packet.",
++    "workspace.packet.cleared": "This chat compiles from the local tree again.",
++    "workspace.packet.cancelled": "Packet file dialog cancelled.",
++    "workspace.packet.kind.project-instructions": "Project instructions",
++    "workspace.packet.kind.extra-system": "Extra system",
++    "workspace.packet.kind.inactive-branch": "Inactive branch",
++    "workspace.packet.kind.message": "Message",
++    "workspace.packet.kind.old-message": "Old message",
++    "workspace.packet.kind.privacy": "Privacy",
++    "workspace.packet.kind.file": "File",
++    "workspace.packet.kind.conversation": "Conversation",
++    "workspace.packet.kind.packet": "Packet",
++    "workspace.packet.kind.memory": "Memory",
++    "workspace.packet.kind.rag": "Retrieved chunk",
++    "workspace.packet.kind.prompt": "Library prompt",
++    "workspace.packet.kind.skill": "Applied skill",
++    "memory.title": "Memory",
++    "memory.add": "Add memory",
++    "memory.update": "Update memory",
++    "memory.save": "Save",
++    "memory.edit": "Edit",
++    "memory.delete": "Delete",
++    "memory.empty": "No memories in this project yet.",
++    "memory.suggest": "Save to project memory?",
++    "memory.ignore": "Ignore",
++    "memory.optOut": "Don't auto-inject",
++    "memory.optIn": "Auto-inject on",
++    "memory.titlePlaceholder": "Short title",
++    "memory.bodyPlaceholder": "we use PostgreSQL",
++    "workspace.panel.title": "Workspace",
++    "workspace.panel.refresh": "Refresh",
++    "workspace.panel.summary": "Summary",
++    "workspace.panel.decisions": "Decisions",
++    "workspace.panel.pins": "Pins",
++    "workspace.panel.pinCount": "{{n}} pinned messages",
++    "workspace.panel.artifacts": "Artifacts",
++    "workspace.panel.tasks": "Tasks",
++    "workspace.panel.taskPlaceholder": "New task",
++    "workspace.panel.add": "Add",
++    "workspace.panel.remove": "Remove",
++    "workspace.panel.empty": "Nothing extracted yet.",
++    "workspace.duplicate": "Duplicate",
++    "workspace.toProject": "To project",
++    "mentions.remove": "Remove",
++    "mentions.tokens": "~{{n}} tokens",
++    "mentions.preview": "Will inject",
++    "mentions.tokenWarning": "Mentions add ~{{n}} tokens (cap {{cap}}).",
++    "mentions.tokenOver": "Mentions exceed the {{cap}} token cap. Oldest extra context will be dropped.",
++    "mentions.stub": "Available in a later wave",
++    "mentions.type.file": "File in this project",
++    "mentions.type.conversation": "Another conversation",
++    "mentions.type.memory": "Project memory",
++    "mentions.type.prompt": "Prompt library",
++    "mentions.type.skill": "Skill",
++    "mentions.type.packet": "Saved packet",
++    "mentions.empty": "No matches",
++    "mentions.error.unavailable": "That mention type is not available yet.",
++    "mentions.error.notFound": "That mention could not be resolved in this project.",
++    "mentions.error.limit": "You can mention up to 8 items per send.",
++    "workspace.pin": "Pin",
++    "workspace.unpin": "Unpin",
++    "workspace.overflow": "This thread is over the {{window}} token window (~{{estimate}} estimated). Compact drops oldest turns from the next packet; the tree stays.",
++    "workspace.compact": "Compact history",
++    "workspace.compact.on": "Next send will drop oldest turns to fit the window.",
++    "workspace.compact.off": "Send full compiled history",
++    "workspace.modelSwitch": "Next reply uses {{model}}. History is compiled ├óÔé¼ÔÇØ you do not need to paste a summary.",
++    "workspace.error.generic": "That action could not be completed. Try again.",
++    "workspace.error.chat": "The model request failed ({{code}}).",
++    "workspace.error.cap": "Spend cap reached ({{scope}}). This send was not started.",
++    "workspace.error.unknownModel": "That model is not in the local catalog for this provider.",
++    "files.attach": "Attach file",
++    "files.attachFolder": "Attach folder",
++    "files.remove": "Remove",
++    "files.tokens": "~{{n}} tokens",
++    "files.visionHint": "Needs a vision model",
++    "files.tokenWarning": "These files add ~{{n}} tokens before the message is sent.",
++    "files.truncated": "Preview is truncated",
++    "files.error.vision": "This model cannot read images. Pick one marked Vision or remove the image.",
++    "files.error.tooLarge": "That file is over the 8 MB limit.",
++    "files.error.unsupported": "That file type is not supported.",
++    "files.error.projectMismatch": "That file belongs to another project.",
++    "files.error.limit": "You can attach up to 8 files per send.",
++    "workspace.error.timeout": "The provider timed out. Retry or try another model.",
++    "workspace.error.rate_limit": "The provider is rate-limiting this key. Wait and retry.",
++    "workspace.error.auth": "The provider rejected this key. Check it in Settings.",
++    "workspace.error.context_overflow": "This thread exceeds the model window. Turn on Compact history and send again.",
++    "workspace.error.quota": "The provider reports no remaining credit on this key.",
++    "workspace.error.network": "The network is unreachable. Check the connection and retry.",
++    "workspace.error.unknown": "The provider returned an unexpected error.",
++    "workspace.model": "Model",
++    "workspace.customModel": "Custom model id",
++    "workspace.model.vision": "Vision",
++    "workspace.model.tools": "Tools",
++    "workspace.model.price": "${{input}} / ${{output}} per 1M tokens",
++    "workspace.temperature": "Temp",
++    "workspace.maxTokens": "Max tokens",
++    "workspace.maxTokensDefault": "default",
++    "workspace.extraSystem": "Extra system instructions",
++    "workspace.key": "Key",
++    "workspace.noKey": "Save a provider key in Settings first.",
++    "workspace.composer.placeholder": "Message",
++    "workspace.composer.send": "Send",
++    "workspace.composer.stop": "Stop",
++    "workspace.composer.hint": "Enter to send ├é┬À Shift+Enter for a new line ├é┬À Esc to stop",
++    "workspace.composer.secretWarning": "This looks like an API key. Do not send secrets to a model.",
++    "workspace.composer.secretRedact": "Remove secrets",
++    "workspace.placeholder": "├óÔé¼┬ª",
++    "workspace.copy": "Copy",
++    "workspace.copyCode": "Copy",
++    "workspace.copied": "Copied",
++    "workspace.regenerate": "Regenerate",
++    "workspace.continue": "Continue",
++    "workspace.edit": "Edit",
++    "workspace.saveEdit": "Save and send",
++    "workspace.cancelEdit": "Cancel",
++    "workspace.role.user": "You",
++    "workspace.role.assistant": "Assistant",
++    "workspace.role.system": "System",
++    "workspace.status.streaming": "streaming",
++    "workspace.status.interrupted": "interrupted",
++    "workspace.status.aborted": "aborted",
++    "workspace.status.complete": "complete",
++    "workspace.receipt": "{{provider}} ├é┬À {{model}} ├é┬À in {{tokensIn}} / out {{tokensOut}} ├é┬À {{cost}} ├é┬À {{latency}}ms ├é┬À {{at}}",
++    "workspace.receipt.error": "error {{code}}",
++    "workspace.receipt.open": "Receipt details",
++    "workspace.receipt.title": "Receipt",
++    "workspace.receipt.created": "Recorded {{at}}",
++    "workspace.receipt.tokens": "in / out",
++    "workspace.receipt.latency": "Latency",
++    "workspace.receipt.source": "Source",
++    "workspace.receipt.source.import": "Imported",
++    "workspace.receipt.source.chat": "Chat",
++    "workspace.cost.conversation": "Thread ${{usd}}",
++    "workspace.cost.project": "Project ${{usd}}",
++    "workspace.estimate": "Est. ${{usd}} this send",
++    "workspace.estimate.none": "No catalog price for a pre-send estimate",
++    "workspace.cap.warn": "Spend is at 80% of the {{scope}} cap.",
++    "workspace.cap.block": "Spend cap would block this send ({{scope}}).",
++    "workspace.cap.allowOnce": "Allow this once",
++    "caps.title": "Spend caps",
++    "caps.hint": "Hard-stops in USD. Empty means unlimited. 80% warns; 100% blocks until you allow once.",
++    "caps.scope.request": "per request",
++    "caps.scope.day": "per day",
++    "caps.scope.global": "global",
++    "caps.unlimited": "Unlimited",
++    "caps.save": "Save caps",
++    "caps.saved": "Caps saved",
++    "debug.title": "Debug / observability",
++    "debug.hint": "Last request metadata only. No Authorization headers, keys, or conversation body.",
++    "debug.empty": "No request has been compiled yet this session.",
++    "debug.refresh": "Refresh",
++    "debug.provider": "Provider",
++    "debug.model": "Model",
++    "debug.retries": "Retries",
++    "debug.error": "Last error",
++    "debug.tokens": "Token estimate",
++    "debug.cost": "Estimated USD",
++    "debug.cap": "Cap decision",
++    "debug.overflow": "Window overflow",
++    "debug.at": "Captured",
++    "fallback.title": "Try another provider?",
++    "fallback.body": "{{failed}} failed ({{code}}). {{suggested}} looks healthier. Confirm to regenerate on that key ├óÔé¼ÔÇØ this is not automatic.",
++    "fallback.confirm": "Try {{suggested}}",
++    "fallback.dismiss": "Keep this provider",
++    "fallback.estimate": "Estimated ${{usd}} on {{suggested}}",
++    "command.debug": "Open debug",
++    "command.import": "Open Import Hub",
++    "command.prompts": "Open prompt library",
++    "command.skills": "Open skill library",
++    "command.runSkill": "Run skill: {{name}}",
++    "command.exportActive": "Export active branch",
++    "command.exportTree": "Export tree JSON",
++    "command.providers": "Manage providers",
++    "command.settings": "Open settings",
++    "command.shortcuts": "View keyboard shortcuts",
++    "command.unavailable": "unavailable now",
++    "command.searching": "Searching conversations├óÔé¼┬ª",
++    "command.group.actions": "Actions",
++    "command.group.projects": "Projects",
++    "command.group.models": "Models",
++    "command.group.conversations": "Conversations and messages",
++    "shortcuts.title": "Keyboard shortcuts",
++    "shortcuts.status": "Shortcuts ├é┬À {{modifier}}+/",
++    "shortcuts.palette": "Open the Command Palette",
++    "shortcuts.newChat": "Create a conversation",
++    "shortcuts.newProject": "Focus project creation",
++    "shortcuts.skills": "Open the skill library",
++    "shortcuts.cheatsheet": "Open this guide",
++    "shortcuts.send": "Send a message or run a slash command",
++    "shortcuts.newline": "Insert a new line",
++    "shortcuts.stop": "Stop the stream or close a dialog",
++    "shortcuts.slashTitle": "Composer slash commands",
++    "slash.model.description": "Focus the model selector",
++    "slash.clear.description": "Open a clean conversation without deleting this one",
++    "slash.compact.description": "Toggle compaction for the next send",
++    "slash.packet.description": "Open the context packet",
++    "slash.cap.description": "Open spend caps",
++    "slash.skill.description": "Open the skill library, or /skill Name to run one",
++    "workspace.sibling.prev": "Previous alternative",
++    "workspace.sibling.next": "Next alternative",
++    "workspace.sibling.count": "{{current}} / {{total}}",
++    "workspace.tree.title": "Tree",
++    "workspace.tree.hint": "Jump to a node. The other branch stays.",
++    "workspace.tree.show": "Tree",
++    "workspace.tree.hide": "Hide tree",
++    "workspace.tree.empty": "No nodes yet.",
++    "workspace.tree.forks": "{{count}} children",
++    "workspace.tree.rename": "Branch name",
++    "workspace.tree.saveName": "Save name",
++    "workspace.export.active": "Export branch",
++    "workspace.export.tree": "Export tree JSON",
++    "workspace.export.saved": "Saved to {{path}}",
++    "secrets.title": "Provider keys",
++    "secrets.hint": "The full key crosses IPC only on this save, then leaves the screen. After that you only see a mask.",
++    "secrets.provider": "Provider",
++    "secrets.labelField": "Label",
++    "secrets.secret": "Key",
++    "secrets.save": "Save key",
++    "secrets.test": "Test connection",
++    "secrets.testing": "Testing├óÔé¼┬ª",
++    "secrets.testOk": "Connection ok ├é┬À {{ms}}ms",
++    "secrets.testFail": "Connection failed ({{code}}) ├é┬À {{ms}}ms",
++    "secrets.baseUrl": "Base URL",
++    "secrets.remove": "Remove",
++    "secrets.error.save": "Could not save the key. Check the value and try again.",
++    "command.placeholder": "Search commands├óÔé¼┬ª",
++    "command.empty": "No commands",
++    "dialog.close": "Close dialog",
++    "command.theme": "Change theme",
++    "command.newProject": "New project",
++    "command.newChat": "New chat",
++    "command.inbox": "Open Inbox",
++    "command.importedInbox": "Open Imported",
++    "command.search": "Search conversations",
++    "about.title": "About",
++    "about.body": "AI Hub Desktop ├óÔé¼ÔÇØ the control layer between you and AI providers. BYOK, local-first.",
++    "onboarding.title": "Get to your first answer",
++    "onboarding.hint": "Language, one provider, a connection test ├óÔé¼ÔÇØ then ask. No cloud account.",
++    "onboarding.next": "Continue",
++    "onboarding.provider": "Connect one provider",
++    "onboarding.providerHint": "OpenRouter is recommended. Native providers sit beside it. The key stays in Credential Manager.",
++    "onboarding.openrouter": "{{name}} (recommended)",
++    "onboarding.saveTest": "Save and test",
++    "onboarding.ask": "Ask your first question",
++    "privacy.title": "Crash reports",
++    "privacy.hint": "Off by default. Opt-in writes local Crashpad dumps with no upload. Annotations are only app version and platform ├óÔé¼ÔÇØ dump files can still contain process memory.",
++    "privacy.crashOptIn": "Enable local crash dumps",
++    "privacy.crashDetail": "Turning this off takes effect the next time the app starts if dumps were already enabled this session.",
++    "privacy.center.title": "Privacy Center",
++    "privacy.center.hint": "The selected policy is enforced in the main process before a request is persisted or sent.",
++    "privacy.center.mode": "Context sharing mode",
++    "privacy.mode.private": "Private",
++    "privacy.mode.normal": "Normal",
++    "privacy.mode.maximum": "Maximum sharing",
++    "privacy.modeDetail.private": "Only this conversation's active history and your message are sent.",
++    "privacy.modeDetail.normal": "Project instructions and context you explicitly choose are sent.",
++    "privacy.modeDetail.maximum": "Includes project memories and retrieved file context.",
++    "privacy.firewall": "Context Firewall",
++    "privacy.kind.secret": "API keys and secrets",
++    "privacy.kind.token": "Tokens and passwords",
++    "privacy.kind.email": "Email addresses",
++    "privacy.kind.cpf": "Brazilian CPF",
++    "privacy.kind.prompt_injection": "Potential prompt injection",
++    "privacy.action.block": "Block",
++    "privacy.action.mask": "Mask",
++    "privacy.action.allow": "Allow",
++    "privacy.crash.title": "Crash reports",
++    "costTracker.title": "Cost tracker",
++    "costTracker.summary": "{{month}} ├é┬À {{requests}} requests ├é┬À {{tokens}} tokens ├é┬À ${{usd}}",
++    "costTracker.models": "By model",
++    "costTracker.projects": "By project",
++    "costTracker.loading": "Loading monthly receipts├óÔé¼┬ª",
++    "caps.scoped.title": "Project and provider caps",
++    "caps.scoped.hint": "These limits are hard stops in addition to the global caps.",
++    "caps.scoped.project": "Project",
++    "caps.scoped.provider": "Provider",
++    "updates.title": "Updates",
++    "updates.hint": "Checks GitHub Releases. A missing feed must not break the app.",
++    "updates.check": "Check for updates",
++    "updates.checking": "Checking├óÔé¼┬ª",
++    "updates.status.idle": "No check yet",
++    "updates.status.skipped": "Skipped (development build)",
++    "updates.status.uptodate": "Up to date",
++    "updates.status.available": "Update available ({{version}})",
++    "updates.status.unavailable": "Update feed unavailable ├óÔé¼ÔÇØ the app keeps running",
++    "import.title": "Import Hub",
++    "import.hint": "Bring official ChatGPT, Claude, or Gemini exports. Re-importing the same chat is skipped. Binary files stay out.",
++    "import.source": "Export source",
++    "import.source.chatgpt": "ChatGPT (ZIP or conversations.json)",
++    "import.source.claude": "Claude (conversations.json)",
++    "import.source.gemini": "Gemini (MyActivity.json, best effort)",
++    "import.geminiLimits": "Gemini Takeout is an activity log, not a full archive. Use JSON (not HTML). Threads are grouped by chat URL; images are skipped. Some turns may be missing.",
++    "import.destination": "Destination",
++    "import.destination.inbox": "Imported inbox",
++    "import.pickFile": "Choose export file",
++    "import.start": "Start import",
++    "import.cancel": "Cancel",
++    "import.fileName": "Selected: {{name}}",
++    "import.empty": "No file selected yet.",
++    "import.progress": "Importing {{current}} / {{total}}",
++    "import.report.title": "Import report",
++    "import.report.ok": "{{count}} conversations imported",
++    "import.report.skipped": "{{count}} skipped (already imported)",
++    "import.report.errors": "{{count}} errors",
++    "import.report.error.empty": "A conversation had no messages and was skipped.",
++    "import.report.error.failed": "A conversation could not be saved.",
++    "import.report.attachments": "{{count}} file placeholders (binaries not imported)",
++    "import.openDestination": "Open imported chats",
++    "import.error.generic": "The import could not be completed.",
++    "import.error.invalid_json": "That file is not valid JSON.",
++    "import.error.unrecognized": "No conversations were recognized in that file.",
++    "import.error.gemini_html": "HTML Takeout is not supported. Export Gemini Apps activity as JSON.",
++    "import.error.empty": "No conversations were found in that export.",
++    "prompts.library": "Prompt library",
++    "prompts.editor": "Prompt",
++    "prompts.playground": "Playground",
++    "prompts.new": "New",
++    "prompts.save": "Save",
++    "prompts.insert": "Insert in composer",
++    "prompts.delete": "Delete",
++    "prompts.run": "Run",
++    "prompts.running": "Running├óÔé¼┬ª",
++    "prompts.saveWinner": "Save winner",
++    "prompts.slot": "Model {{n}}",
++    "prompts.titlePlaceholder": "Title",
++    "prompts.bodyPlaceholder": "Template using project, language, and goal variables",
++    "prompts.playgroundPlaceholder": "Optional extra instructions for this run",
++    "prompts.winnerPlaceholder": "Winner title",
++    "prompts.winnerDefault": "Playground winner",
++    "prompts.playgroundEmpty": "Run two models to compare.",
++    "prompts.folder.development": "Development",
++    "prompts.folder.studies": "Studies",
++    "prompts.folder.work": "Work",
++    "prompts.factory.code-review": "Code review",
++    "prompts.factory.debug": "Debug",
++    "prompts.factory.summary": "Summary",
++    "prompts.factory.teacher": "Teacher",
++    "prompts.error.generic": "Could not load the prompt library.",
++    "prompts.error.save": "Could not save that prompt.",
++    "prompts.error.resolve": "Could not resolve variables for the active project.",
++    "prompts.error.run": "Playground run failed. Each model stays on the slot you picked.",
++    "prompts.error.slots": "Pick two different models to run the playground.",
++    "prompts.error.content": "Write a prompt or select one from the library.",
++    "artifacts.canvas": "Canvas",
++    "artifacts.open": "Open canvas",
++    "artifacts.close": "Close",
++    "artifacts.saveVersion": "Save version",
++    "artifacts.pin": "Pin to project",
++    "artifacts.unpin": "Unpin",
++    "artifacts.pinned": "Pinned",
++    "artifacts.version": "v{{n}}",
++    "artifacts.exportMd": "Export MD",
++    "artifacts.exportHtml": "Export HTML",
++    "artifacts.exportSvg": "Export SVG",
++    "artifacts.htmlSaveToPreview": "Save a version to refresh the sandboxed preview.",
++    "artifacts.mermaidError": "Mermaid could not render this diagram.",
++    "artifacts.kind.mermaid": "Mermaid",
++    "artifacts.kind.html": "HTML",
++    "artifacts.kind.markdown": "Markdown",
++    "artifacts.kind.code": "Code",
++    "artifacts.error": "Could not update that artifact.",
++    "skills.library": "Skill library",
++    "skills.editor": "Skill",
++    "skills.new": "New",
++    "skills.save": "Save",
++    "skills.delete": "Delete",
++    "skills.run": "Run",
++    "skills.steps": "Steps",
++    "skills.addStep": "Add step",
++    "skills.titlePlaceholder": "Name",
++    "skills.descriptionPlaceholder": "What this skill does",
++    "skills.promptPlaceholder": "Skill prompt using project, language, and goal variables",
++    "skills.modelPlaceholder": "Preferred model id (optional)",
++    "skills.stepTitlePlaceholder": "Step title",
++    "skills.stepSectionPlaceholder": "Instructions for this step",
++    "skills.run.title": "Running {{name}}",
++    "skills.folder.development": "Development",
++    "skills.folder.studies": "Studies",
++    "skills.folder.work": "Work",
++    "skills.factory.code-review": "Code Review",
++    "skills.factory.summarize-pdf": "Summarize PDF",
++    "skills.factory.meeting-prep": "Prepare meeting",
++    "skills.factory.explain-error": "Explain error",
++    "skills.factory.write-rfc": "Write RFC",
++    "skills.error.generic": "Could not load the skill library.",
++    "skills.error.save": "Could not save that skill.",
++    "hud.mode": "Mode",
++    "hud.effort": "Effort",
++    "hud.context": "Context tokens/window",
++    "hud.tokens": "Tokens in/out",
++    "hud.thinking": "Thinking",
++    "hud.cache": "Cache read/write",
++    "hud.turnCost": "Turn cost",
++    "hud.thinkingUnavailable": "Thinking unavailable for this provider",
++    "runMode.label": "Mode",
++    "effort.label": "Effort",
++    "council.router.model": "Recommended model",
++    "council.router.auto": "Automatic",
++    "council.router.confirmed": "Route confirmed",
++    "council.router.recommended": "recommended",
++    "council.router.cost": "Estimated first-model cost: ${{usd}}",
++    "council.router.latency": "Latency: {{ms}} ms",
++    "council.router.speed.fast": "Speed: fast",
++    "council.router.speed.balanced": "Speed: balanced",
++    "council.router.speed.frontier": "Speed: frontier",
++    "council.router.confirm": "Confirm route",
++    "council.router.reject": "Reject route",
++    "quickAi.title": "Quick AI",
++    "quickAi.close": "Close",
++    "quickAi.placeholder": "Ask something or paste content├óÔé¼┬ª",
++    "quickAi.clipboard": "Read clipboard",
++    "quickAi.formatJson": "Format JSON",
++    "quickAi.toInterface": "TS interface",
++    "quickAi.explainJson": "Explain JSON",
++    "quickAi.diagnoseStack": "Diagnose stack",
++    "quickAi.sendToProject": "Send to current project",
++    "quickAi.model": "Model",
++    "quickAi.estimate": "Estimate: ${{usd}}",
++    "quickAi.estimateUnavailable": "Estimate available on send",
++    "quickAi.send": "Send",
++    "quickAi.cancel": "Cancel",
++    "quickAi.sending": "Sending├óÔé¼┬ª",
++    "quickAi.error.setup": "Configure a provider key before sending.",
++    "quickAi.error.send": "Could not send the question.",
++    "quickAi.conversationTitle": "Quick AI",
++    "quickAi.explainPrefix": "Explain this JSON clearly:",
++    "quickAi.diagnosePrefix": "Diagnose this stack trace and suggest a fix:",
++    "council.title": "AI Council",
++    "council.placeholder": "Question for the council├óÔé¼┬ª",
++    "council.run": "Start debate",
++    "council.running": "Debating├óÔé¼┬ª",
++    "council.synthesis": "Synthesis",
++    "council.divergences": "Divergences (heuristic)",
++    "council.none": "None highlighted",
++    "council.error.setup": "Open a conversation and configure at least two models.",
++    "council.error.run": "Could not complete the Council.",
++    "council.router.simple": "Router: simple question ├óÔÇáÔÇÖ fast route; confirm before sending.",
++    "council.router.code": "Router: code ├óÔÇáÔÇÖ balanced route; confirm before sending.",
++    "council.router.complex": "Router: complex task ├óÔÇáÔÇÖ frontier route; confirm before sending.",
++    "tools.pathPlaceholder": "Relative project path (for example, src/app.ts)",
++    "tools.readFile": "Read file",
++    "tools.chooseRoot": "Choose root",
++    "tools.permission": "Allow {{tool}} to read this file?",
++    "tools.allowOnce": "Allow once",
++    "tools.allowProject": "Always in this project",
++    "tools.deny": "Deny",
++    "tools.activity": "Tool",
++    "tools.untrustedContext": "Untrusted tool content",
++    "tools.status.permission_required": "awaiting permission",
++    "tools.status.denied": "denied",
++    "tools.status.running": "running",
++    "tools.status.completed": "completed",
++    "tools.status.failed": "failed",
++    "tools.error.denied": "The read was denied.",
++    "tools.error.read": "Could not read that project file.",
++    "agents.title": "Single agent",
++    "agents.mode": "Agent",
++    "agents.pathsLabel": "Project files to analyze",
++    "agents.pathsPlaceholder": "One relative project path per line (up to 3)",
++    "agents.factory.goal": "Analyze the selected project files and report the architecture, risks, and next steps.",
++    "agents.factory.action": "Use Analyze this project",
++    "agents.confirmDisclosure": "After confirmation, selected file content can be sent to {{provider}} / {{model}} to generate the report.",
++    "agents.confirm": "Confirm plan",
++    "agents.pause": "Pause",
++    "agents.resume": "Resume",
++    "agents.cancel": "Cancel",
++    "agents.limits": "Limit: {{steps}} steps ├é┬À ${{budget}} ├é┬À {{seconds}}s",
++    "agents.error.paths": "Add at least one relative project file path.",
++    "agents.error.prepare": "Could not prepare the agent run. Choose a project root and an active model key.",
++    "agents.error.control": "Could not update the agent run.",
++    "agents.status.awaiting_confirmation": "awaiting confirmation",
++    "agents.status.running": "running",
++    "agents.status.paused": "paused",
++    "agents.status.cancelled": "cancelled",
++    "agents.status.completed": "completed",
++    "agents.status.completed_with_errors": "completed with errors",
++    "agents.status.stopped_budget": "stopped by budget",
++    "agents.status.stopped_timeout": "stopped by time limit",
++    "agents.status.interrupted": "interrupted",
++    "agents.status.failed": "failed",
++    "agents.step.pending": "pending",
++    "agents.step.running": "running",
++    "agents.step.completed": "completed",
++    "agents.step.failed": "failed",
++    "agents.step.skipped": "skipped",
++    "agents.step.cancelled": "cancelled",
++    "agents.step.interrupted": "interrupted",
++    "agents.step.tokens": "tokens {{input}}/{{output}}",
++    "agents.step.cost": "cost ${{usd}}",
++    "orchestration.title": "Orchestration",
++    "orchestration.mode": "Orchestrate",
++    "orchestration.empty": "Select project files above, then send a goal to prepare the graph.",
++    "orchestration.disclosure": "Supervisor and all specialists use {{provider}} / {{model}}; shared graph cap: ${{budget}}. Any different model requires a new explicit confirmation.",
++    "orchestration.usage": "tokens {{input}}/{{output}} ├é┬À ${{cost}}",
++    "orchestration.confirm": "Confirm graph",
++    "orchestration.error.prepare": "Could not prepare the orchestration. Choose a project root and an active model key.",
++    "orchestration.error.control": "Could not update the orchestration.",
++    "orchestration.role.explorer": "Explorer",
++    "orchestration.role.reviewer": "Reviewer",
++    "orchestration.role.writer": "Writer",
++    "orchestration.handoff.pending": "pending",
++    "orchestration.handoff.ready": "ready",
++    "orchestration.handoff.consumed": "consumed",
++    "orchestration.handoff.cancelled": "cancelled",
++    "orchestration.handoff.interrupted": "interrupted",
++    "developer.title": "Developer Mode",
++    "developer.tree": "Explorer",
++    "developer.status": "Git status",
++    "developer.diff": "Git diff",
++    "developer.terminal": "Terminal diagnostic",
++    "developer.review": "Review diff",
++    "developer.tests": "Generate tests",
++    "developer.architecture": "Explain architecture",
++    "developer.hint": "Read-only project and Git tools; each use asks for permission.",
++    "developer.error": "Developer tool could not run.",
++    "offline.localMode": "Local mode ├é┬À Ollama and PDF RAG in maximum mode work without internet; cloud needs internet",
++    "offline.cloudMode": "Cloud selected ├é┬À Ollama and PDF RAG in maximum mode available locally",
++    "offline.noModels": "Ollama running without installed models ├é┬À PDF RAG in maximum mode remains local",
++    "offline.localUnavailable": "Ollama unavailable ├é┬À PDF RAG in maximum mode remains local; cloud needs internet",
++    "notes.saveAsNote": "Save as note",
++    "notes.error.save": "Could not save the note.",
++    "tasks.saveAsChecklist": "Turn into tasks",
++    "tasks.error.save": "Could not create the checklist.",
++    "workspace.panel.notes": "Notes",
++    "research.mode": "Research",
++    "research.error.prepare": "Could not prepare research. Choose a project and an active model key.",
++    "command.research": "Research mode",
++    "command.hit.note": "Note ┬À {{title}}",
++    "command.hit.task": "Task ┬À {{title}}",
++    "skills.factory.study-professor": "Study: Professor",
++    "skills.factory.study-examiner": "Study: Examiner",
++    "skills.factory.study-tutor": "Study: Tutor",
++    "skills.factory.study-evaluator": "Study: Evaluator",
++    "voice.title": "Voice",
++    "voice.show": "Show voice",
++    "voice.hide": "Hide voice",
++    "voice.listen": "Listen",
++    "voice.stopListen": "Stop listening",
++    "voice.interrupt": "Interrupt",
++    "voice.transcript": "Transcript",
++    "voice.hint": "Press Listen, speak one question, then watch the reply and its receipt in the thread.",
++    "voice.continuous": "Continuous conversation",
++    "voice.voice": "TTS voice",
++    "voice.voiceDefault": "System default",
++    "voice.cloudWarning": "Speech recognition/synthesis may use OS or cloud services. Audio is not saved to disk by AI Hub unless you opt in below.",
++    "voice.cloudAck": "I understand STT/TTS may leave this device",
++    "voice.audioDiskOptIn": "Allow saving voice audio to disk (future features)",
++    "voice.audioDiskDetail": "Disabled in Private mode. Wave 28 does not write audio files even when enabled.",
++    "voice.settings.title": "Voice Mode",
++    "voice.settings.hint": "Hands-free ask via microphone. Replies use the same chat path, caps, and receipts.",
++    "voice.phase.idle": "Idle",
++    "voice.phase.listening": "ListeningÔÇª",
++    "voice.phase.sending": "Sending transcriptÔÇª",
++    "voice.phase.speaking": "Speaking replyÔÇª",
++    "voice.error.unsupported": "Speech recognition is not available in this runtime.",
++    "voice.error.cloudAck": "Acknowledge the cloud/OS speech privacy warning first.",
++    "voice.error.ready": "Open a conversation and select a provider key first.",
++    "voice.error.send": "Could not send the transcript.",
++    "voice.error.stt": "Speech error: {{code}}"
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index 5eac8fd..9a2486d 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -1,626 +1,652 @@
+ {
+-    "app.name":  "AI Hub",
+-    "nav.home":  "In├â┬¡cio",
+-    "nav.prompts":  "Prompts",
+-    "nav.skills":  "Skills",
+-    "nav.settings":  "Configura├â┬º├â┬Áes",
+-    "nav.debug":  "Debug",
+-    "nav.import":  "Importar",
+-    "status.ready":  "Pronto",
+-    "status.theme":  "Tema: {{theme}}",
+-    "status.health.empty":  "Ainda sem pulso de provedor",
+-    "status.health.ok":  "ok",
+-    "status.health.down":  "fora",
+-    "status.health.unknown":  "idle",
+-    "status.health.item":  "{{provider}} {{state}}{{latency}}{{errors}}",
+-    "status.health.latency":  " ├é┬À {{ms}}ms",
+-    "status.health.errors":  " ├é┬À {{pct}}% err",
+-    "theme.light":  "Claro",
+-    "theme.dark":  "Escuro",
+-    "theme.system":  "Sistema",
+-    "theme.label":  "Tema",
+-    "locale.label":  "Idioma",
+-    "locale.ptBR":  "Portugu├â┬¬s",
+-    "locale.en":  "English",
+-    "window.minimize":  "Minimizar",
+-    "window.maximize":  "Maximizar",
+-    "window.close":  "Fechar",
+-    "empty.title":  "Nenhum projeto ainda",
+-    "empty.body":  "Crie um projeto na barra lateral, ou comece um chat avulso na inbox.",
+-    "empty.action":  "Abrir configura├â┬º├â┬Áes",
+-    "settings.title":  "Apar├â┬¬ncia e chaves",
+-    "settings.hint":  "Tema e idioma ficam no banco local. Chaves de API v├â┬úo para o Credential Manager, nunca para o SQLite.",
+-    "workspace.projects":  "Projetos",
+-    "workspace.inbox":  "Avulsas",
+-    "workspace.inboxHint":  "Chats sem projeto",
+-    "workspace.importedInbox":  "Importadas",
+-    "workspace.importedInboxHint":  "Chats trazidos do ChatGPT, Claude ou Gemini",
+-    "workspace.noConversationsImported":  "Nenhum chat importado aqui. Abra o Import Hub para trazer um export.",
+-    "workspace.moveTo":  "Mover para projeto",
+-    "workspace.moveInbox":  "Manter em Importadas",
+-    "workspace.projectPlaceholder":  "Nome do projeto",
+-    "workspace.newProject":  "Novo projeto",
+-    "workspace.projectColor":  "Cor",
+-    "workspace.projectInstructions":  "Instru├â┬º├â┬Áes do projeto",
+-    "workspace.projectInstructionsHint":  "Entram sempre no packet compilado.",
+-    "workspace.preferredProvider":  "Provider preferido",
+-    "workspace.preferredModel":  "Modelo preferido",
+-    "workspace.preferredNone":  "Nenhum",
+-    "workspace.saveProject":  "Salvar projeto",
+-    "workspace.deleteProject":  "Excluir projeto",
+-    "workspace.deleteProjectConfirm":  "Excluir {{name}}? Os chats v├â┬úo para Avulsas. A ├â┬írvore de mensagens permanece.",
+-    "workspace.search":  "Buscar conversas",
+-    "workspace.searchEmpty":  "Nenhum resultado",
+-    "workspace.tags":  "Tags",
+-    "workspace.tagPlaceholder":  "Nova tag",
+-    "workspace.tagAdd":  "Adicionar",
+-    "workspace.tagRemove":  "Remover tag {{tag}}",
+-    "workspace.conversations":  "Conversas",
+-    "workspace.conversationPlaceholder":  "T├â┬¡tulo da conversa",
+-    "workspace.newConversation":  "Nova conversa",
+-    "workspace.untitledChat":  "Nova conversa",
+-    "workspace.noConversations":  "Nenhuma conversa neste projeto. {{modifier}}+N cria uma.",
+-    "workspace.noConversationsInbox":  "Inbox vazia. {{modifier}}+N cria um chat avulso.",
+-    "workspace.noMessages":  "Nenhuma mensagem ainda. Escreva abaixo e pressione Enter para enviar.",
+-    "workspace.pickConversation":  "Escolha ou crie uma conversa.",
+-    "workspace.packet.badge":  "~{{n}} tokens",
+-    "workspace.packet.open":  "Packet",
+-    "workspace.packet.title":  "Packet de contexto port├â┬ítil",
+-    "workspace.packet.destination":  "{{provider}} ├é┬À {{model}} ├é┬À janela {{window}} ├é┬À ~{{n}} tokens",
+-    "workspace.packet.privacy":  "Privacidade",
+-    "workspace.packet.privacy.standard":  "Padr├â┬úo (projeto + ramos inativos)",
+-    "workspace.packet.privacy.strict":  "Restrito (s├â┬│ o fio ativo; sem mem├â┬│rias nem ficheiros recuperados)",
+-    "workspace.packet.privacy.private":  "Privado",
+-    "workspace.packet.privacy.normal":  "Normal",
+-    "workspace.packet.privacy.maximum":  "Compartilhamento m├â┬íximo",
+-    "workspace.packet.included":  "Entra",
+-    "workspace.packet.omitted":  "Fica de fora",
+-    "workspace.packet.empty":  "Nada",
+-    "workspace.packet.save":  "Guardar packet",
+-    "workspace.packet.export":  "Exportar arquivo",
+-    "workspace.packet.import":  "Importar arquivo",
+-    "workspace.packet.apply":  "Usar neste chat",
+-    "workspace.packet.using":  "Em uso",
+-    "workspace.packet.clear":  "Parar de usar o packet",
+-    "workspace.packet.saved":  "Packets salvos",
+-    "workspace.packet.none":  "Ainda n├â┬úo h├â┬í packets neste projeto.",
+-    "workspace.packet.untitled":  "Packet sem t├â┬¡tulo",
+-    "workspace.packet.needPreview":  "Abra uma conversa com chave para pr├â┬®-visualizar o packet.",
+-    "workspace.packet.applied":  "Este chat envia o packet aplicado mais os turnos novos.",
+-    "workspace.packet.savedNotice":  "Packet guardado neste projeto.",
+-    "workspace.packet.exported":  "Arquivo do packet salvo.",
+-    "workspace.packet.imported":  "Packet importado neste projeto.",
+-    "workspace.packet.appliedNotice":  "Este chat agora usa o packet importado.",
+-    "workspace.packet.cleared":  "Este chat volta a compilar a ├â┬írvore local.",
+-    "workspace.packet.cancelled":  "Di├â┬ílogo do arquivo de packet cancelado.",
+-    "workspace.packet.kind.project-instructions":  "Instru├â┬º├â┬Áes do projeto",
+-    "workspace.packet.kind.extra-system":  "Sistema extra",
+-    "workspace.packet.kind.inactive-branch":  "Ramo inativo",
+-    "workspace.packet.kind.message":  "Mensagem",
+-    "workspace.packet.kind.old-message":  "Mensagem antiga",
+-    "workspace.packet.kind.privacy":  "Privacidade",
+-    "workspace.packet.kind.file":  "Arquivo",
+-    "workspace.packet.kind.conversation":  "Conversa",
+-    "workspace.packet.kind.packet":  "Pacote",
+-    "workspace.packet.kind.memory":  "Mem├â┬│ria",
+-    "workspace.packet.kind.rag":  "Trecho recuperado",
+-    "workspace.packet.kind.prompt":  "Prompt da library",
+-    "workspace.packet.kind.skill":  "Skill aplicada",
+-    "memory.title":  "Mem├â┬│ria",
+-    "memory.add":  "Adicionar mem├â┬│ria",
+-    "memory.update":  "Atualizar mem├â┬│ria",
+-    "memory.save":  "Salvar",
+-    "memory.edit":  "Editar",
+-    "memory.delete":  "Apagar",
+-    "memory.empty":  "Ainda n├â┬úo h├â┬í mem├â┬│rias neste projeto.",
+-    "memory.suggest":  "Salvar na mem├â┬│ria do projeto?",
+-    "memory.ignore":  "Ignorar",
+-    "memory.optOut":  "N├â┬úo injetar autom├â┬ítico",
+-    "memory.optIn":  "Inje├â┬º├â┬úo autom├â┬ítica ligada",
+-    "memory.titlePlaceholder":  "T├â┬¡tulo curto",
+-    "memory.bodyPlaceholder":  "usamos PostgreSQL",
+-    "workspace.panel.title":  "Workspace",
+-    "workspace.panel.refresh":  "Atualizar",
+-    "workspace.panel.summary":  "Resumo",
+-    "workspace.panel.decisions":  "Decis├â┬Áes",
+-    "workspace.panel.pins":  "Pins",
+-    "workspace.panel.pinCount":  "{{n}} mensagens fixadas",
+-    "workspace.panel.artifacts":  "Artefactos",
+-    "workspace.panel.tasks":  "Tarefas",
+-    "workspace.panel.taskPlaceholder":  "Nova tarefa",
+-    "workspace.panel.add":  "Adicionar",
+-    "workspace.panel.remove":  "Remover",
+-    "workspace.panel.empty":  "Nada extra├â┬¡do ainda.",
+-    "workspace.duplicate":  "Duplicar",
+-    "workspace.toProject":  "Virar projeto",
+-    "mentions.remove":  "Remover",
+-    "mentions.tokens":  "~{{n}} tokens",
+-    "mentions.preview":  "Vai injetar",
+-    "mentions.tokenWarning":  "As men├â┬º├â┬Áes somam ~{{n}} tokens (teto {{cap}}).",
+-    "mentions.tokenOver":  "As men├â┬º├â┬Áes passam do teto de {{cap}} tokens. O contexto extra mais antigo ser├â┬í cortado.",
+-    "mentions.stub":  "Dispon├â┬¡vel numa onda posterior",
+-    "mentions.type.file":  "Arquivo deste projeto",
+-    "mentions.type.conversation":  "Outra conversa",
+-    "mentions.type.memory":  "Mem├â┬│ria do projeto",
+-    "mentions.type.prompt":  "Biblioteca de prompts",
+-    "mentions.type.skill":  "Skill",
+-    "mentions.type.packet":  "Pacote salvo",
+-    "mentions.empty":  "Nada encontrado",
+-    "mentions.error.unavailable":  "Esse tipo de men├â┬º├â┬úo ainda n├â┬úo est├â┬í dispon├â┬¡vel.",
+-    "mentions.error.notFound":  "Essa men├â┬º├â┬úo n├â┬úo existe neste projeto.",
+-    "mentions.error.limit":  "D├â┬í para mencionar no m├â┬íximo 8 itens por envio.",
+-    "workspace.pin":  "Fixar",
+-    "workspace.unpin":  "Desafixar",
+-    "workspace.overflow":  "Este fio passa da janela de {{window}} tokens (~{{estimate}} estimados). Compactar tira os turnos antigos do pr├â┬│ximo packet; a ├â┬írvore permanece.",
+-    "workspace.compact":  "Compactar hist├â┬│rico",
+-    "workspace.compact.on":  "O pr├â┬│ximo envio descarta turnos antigos para caber na janela.",
+-    "workspace.compact.off":  "Enviar o hist├â┬│rico compilado completo",
+-    "workspace.modelSwitch":  "A pr├â┬│xima resposta usa {{model}}. O hist├â┬│rico ├â┬® compilado ├óÔé¼ÔÇØ voc├â┬¬ n├â┬úo precisa colar um resumo.",
+-    "workspace.error.generic":  "N├â┬úo foi poss├â┬¡vel concluir a a├â┬º├â┬úo. Tente de novo.",
+-    "workspace.error.chat":  "A chamada ao modelo falhou ({{code}}).",
+-    "workspace.error.cap":  "Teto de gasto atingido ({{scope}}). Este envio n├â┬úo come├â┬ºou.",
+-    "workspace.error.unknownModel":  "Este modelo n├â┬úo est├â┬í no cat├â┬ílogo local deste provedor.",
+-    "files.attach":  "Anexar arquivo",
+-    "files.attachFolder":  "Anexar pasta",
+-    "files.remove":  "Remover",
+-    "files.tokens":  "~{{n}} tokens",
+-    "files.visionHint":  "Precisa de modelo com vision",
+-    "files.tokenWarning":  "Estes arquivos somam ~{{n}} tokens antes do envio.",
+-    "files.truncated":  "Pr├â┬®via truncada",
+-    "files.error.vision":  "Este modelo n├â┬úo l├â┬¬ imagens. Escolha um marcado Vision ou remova a imagem.",
+-    "files.error.tooLarge":  "Esse arquivo passa do limite de 8 MB.",
+-    "files.error.unsupported":  "Esse tipo de arquivo n├â┬úo ├â┬® suportado.",
+-    "files.error.projectMismatch":  "Esse arquivo pertence a outro projeto.",
+-    "files.error.limit":  "D├â┬í para anexar no m├â┬íximo 8 arquivos por envio.",
+-    "workspace.error.timeout":  "O provedor estourou o tempo. Tente de novo ou troque o modelo.",
+-    "workspace.error.rate_limit":  "O provedor est├â┬í limitando esta chave. Espere e tente de novo.",
+-    "workspace.error.auth":  "O provedor recusou esta chave. Verifique em Configura├â┬º├â┬Áes.",
+-    "workspace.error.context_overflow":  "Este fio passa da janela do modelo. Ligue Compactar hist├â┬│rico e envie de novo.",
+-    "workspace.error.quota":  "O provedor informa que n├â┬úo h├â┬í cr├â┬®dito nesta chave.",
+-    "workspace.error.network":  "A rede est├â┬í inacess├â┬¡vel. Verifique a conex├â┬úo e tente de novo.",
+-    "workspace.error.unknown":  "O provedor devolveu um erro inesperado.",
+-    "workspace.model":  "Modelo",
+-    "workspace.customModel":  "Id do modelo custom",
+-    "workspace.model.vision":  "Vis├â┬úo",
+-    "workspace.model.tools":  "Ferramentas",
+-    "workspace.model.price":  "${{input}} / ${{output}} por 1M tokens",
+-    "workspace.temperature":  "Temp",
+-    "workspace.maxTokens":  "M├â┬íx. tokens",
+-    "workspace.maxTokensDefault":  "padr├â┬úo",
+-    "workspace.extraSystem":  "Instru├â┬º├â┬Áes de sistema extras",
+-    "workspace.key":  "Chave",
+-    "workspace.noKey":  "Guarde uma chave de provedor em Configura├â┬º├â┬Áes primeiro.",
+-    "workspace.composer.placeholder":  "Mensagem",
+-    "workspace.composer.send":  "Enviar",
+-    "workspace.composer.stop":  "Parar",
+-    "workspace.composer.hint":  "Enter envia ├é┬À Shift+Enter quebra linha ├é┬À Esc interrompe",
+-    "workspace.composer.secretWarning":  "Isso parece uma chave de API. N├â┬úo envie segredos para o modelo.",
+-    "workspace.composer.secretRedact":  "Remover segredos",
+-    "workspace.placeholder":  "├óÔé¼┬ª",
+-    "workspace.copy":  "Copiar",
+-    "workspace.copyCode":  "Copiar",
+-    "workspace.copied":  "Copiado",
+-    "workspace.regenerate":  "Regenerar",
+-    "workspace.continue":  "Continuar",
+-    "workspace.edit":  "Editar",
+-    "workspace.saveEdit":  "Salvar e enviar",
+-    "workspace.cancelEdit":  "Cancelar",
+-    "workspace.role.user":  "Voc├â┬¬",
+-    "workspace.role.assistant":  "Assistente",
+-    "workspace.role.system":  "Sistema",
+-    "workspace.status.streaming":  "em stream",
+-    "workspace.status.interrupted":  "interrompida",
+-    "workspace.status.aborted":  "abortada",
+-    "workspace.status.complete":  "completa",
+-    "workspace.receipt":  "{{provider}} ├é┬À {{model}} ├é┬À entrada {{tokensIn}} / sa├â┬¡da {{tokensOut}} ├é┬À {{cost}} ├é┬À {{latency}}ms ├é┬À {{at}}",
+-    "workspace.receipt.error":  "erro {{code}}",
+-    "workspace.receipt.open":  "Detalhe do recibo",
+-    "workspace.receipt.title":  "Recibo",
+-    "workspace.receipt.created":  "Registado {{at}}",
+-    "workspace.receipt.tokens":  "entrada / sa├â┬¡da",
+-    "workspace.receipt.latency":  "Lat├â┬¬ncia",
+-    "workspace.receipt.source":  "Origem",
+-    "workspace.receipt.source.import":  "Importado",
+-    "workspace.receipt.source.chat":  "Chat",
+-    "workspace.cost.conversation":  "Fio ${{usd}}",
+-    "workspace.cost.project":  "Projeto ${{usd}}",
+-    "workspace.estimate":  "Est. ${{usd}} neste envio",
+-    "workspace.estimate.none":  "Sem pre├â┬ºo no cat├â┬ílogo para estimar antes do envio",
+-    "workspace.cap.warn":  "O gasto est├â┬í em 80% do teto {{scope}}.",
+-    "workspace.cap.block":  "O teto de gasto bloquearia este envio ({{scope}}).",
+-    "workspace.cap.allowOnce":  "Permitir esta vez",
+-    "caps.title":  "Tetos de gasto",
+-    "caps.hint":  "Hard-stop em USD. Vazio = ilimitado. 80% avisa; 100% bloqueia at├â┬® voc├â┬¬ permitir uma vez.",
+-    "caps.scope.request":  "por request",
+-    "caps.scope.day":  "por dia",
+-    "caps.scope.global":  "global",
+-    "caps.unlimited":  "Ilimitado",
+-    "caps.save":  "Guardar tetos",
+-    "caps.saved":  "Tetos guardados",
+-    "debug.title":  "Debug / observabilidade",
+-    "debug.hint":  "S├â┬│ meta do ├â┬║ltimo request. Sem headers de Authorization, chaves ou corpo da conversa.",
+-    "debug.empty":  "Nenhum request compilado nesta sess├â┬úo ainda.",
+-    "debug.refresh":  "Atualizar",
+-    "debug.provider":  "Provedor",
+-    "debug.model":  "Modelo",
+-    "debug.retries":  "Retries",
+-    "debug.error":  "├â┼íltimo erro",
+-    "debug.tokens":  "Estimativa de tokens",
+-    "debug.cost":  "USD estimado",
+-    "debug.cap":  "Decis├â┬úo de cap",
+-    "debug.overflow":  "Estouro de janela",
+-    "debug.at":  "Capturado",
+-    "fallback.title":  "Tentar outro provedor?",
+-    "fallback.body":  "{{failed}} falhou ({{code}}). {{suggested}} parece mais saud├â┬ível. Confirme para regenerar nessa chave ├óÔé¼ÔÇØ isso n├â┬úo ├â┬® autom├â┬ítico.",
+-    "fallback.confirm":  "Tentar {{suggested}}",
+-    "fallback.dismiss":  "Manter este provedor",
+-    "fallback.estimate":  "Estimado ${{usd}} em {{suggested}}",
+-    "command.debug":  "Abrir debug",
+-    "command.import":  "Abrir Import Hub",
+-    "command.prompts":  "Abrir biblioteca de prompts",
+-    "command.skills":  "Abrir biblioteca de skills",
+-    "command.runSkill":  "Rodar skill: {{name}}",
+-    "command.exportActive":  "Exportar ramo ativo",
+-    "command.exportTree":  "Exportar ├â┬írvore JSON",
+-    "command.providers":  "Gerenciar providers",
+-    "command.settings":  "Abrir configura├â┬º├â┬Áes",
+-    "command.shortcuts":  "Ver atalhos de teclado",
+-    "command.unavailable":  "indispon├â┬¡vel agora",
+-    "command.searching":  "Buscando conversas├óÔé¼┬ª",
+-    "command.group.actions":  "A├â┬º├â┬Áes",
+-    "command.group.projects":  "Projetos",
+-    "command.group.models":  "Modelos",
+-    "command.group.conversations":  "Conversas e mensagens",
+-    "shortcuts.title":  "Atalhos de teclado",
+-    "shortcuts.status":  "Atalhos ├é┬À {{modifier}}+/",
+-    "shortcuts.palette":  "Abrir a Command Palette",
+-    "shortcuts.newChat":  "Criar uma conversa",
+-    "shortcuts.newProject":  "Focar a cria├â┬º├â┬úo de projeto",
+-    "shortcuts.skills":  "Abrir a biblioteca de skills",
+-    "shortcuts.cheatsheet":  "Abrir este guia",
+-    "shortcuts.send":  "Enviar mensagem ou executar slash command",
+-    "shortcuts.newline":  "Inserir nova linha",
+-    "shortcuts.stop":  "Interromper o stream ou fechar di├â┬ílogo",
+-    "shortcuts.slashTitle":  "Slash commands do composer",
+-    "slash.model.description":  "Focar o seletor de modelo",
+-    "slash.clear.description":  "Abrir uma conversa limpa sem apagar esta",
+-    "slash.compact.description":  "Alternar compacta├â┬º├â┬úo no pr├â┬│ximo envio",
+-    "slash.packet.description":  "Abrir o packet de contexto",
+-    "slash.cap.description":  "Abrir os tetos de gasto",
+-    "slash.skill.description":  "Abrir a biblioteca de skills, ou /skill Nome para correr uma",
+-    "workspace.sibling.prev":  "Alternativa anterior",
+-    "workspace.sibling.next":  "Pr├â┬│xima alternativa",
+-    "workspace.sibling.count":  "{{current}} / {{total}}",
+-    "workspace.tree.title":  "├â┬ürvore",
+-    "workspace.tree.hint":  "Salte para um n├â┬│. O outro ramo fica.",
+-    "workspace.tree.show":  "├â┬ürvore",
+-    "workspace.tree.hide":  "Ocultar ├â┬írvore",
+-    "workspace.tree.empty":  "Nenhum n├â┬│ ainda.",
+-    "workspace.tree.forks":  "{{count}} filhos",
+-    "workspace.tree.rename":  "Nome do ramo",
+-    "workspace.tree.saveName":  "Guardar nome",
+-    "workspace.export.active":  "Exportar ramo",
+-    "workspace.export.tree":  "Exportar ├â┬írvore JSON",
+-    "workspace.export.saved":  "Guardado em {{path}}",
+-    "secrets.title":  "Chaves de provedor",
+-    "secrets.hint":  "A chave completa atravessa o IPC s├â┬│ neste save e some da tela. Depois voc├â┬¬ v├â┬¬ s├â┬│ a m├â┬íscara.",
+-    "secrets.provider":  "Provedor",
+-    "secrets.labelField":  "R├â┬│tulo",
+-    "secrets.secret":  "Chave",
+-    "secrets.save":  "Guardar chave",
+-    "secrets.test":  "Testar conex├â┬úo",
+-    "secrets.testing":  "A testar├óÔé¼┬ª",
+-    "secrets.testOk":  "Conex├â┬úo ok ├é┬À {{ms}}ms",
+-    "secrets.testFail":  "Conex├â┬úo falhou ({{code}}) ├é┬À {{ms}}ms",
+-    "secrets.baseUrl":  "URL base",
+-    "secrets.remove":  "Remover",
+-    "secrets.error.save":  "N├â┬úo foi poss├â┬¡vel guardar a chave. Verifique o valor e tente de novo.",
+-    "command.placeholder":  "Buscar comando├óÔé¼┬ª",
+-    "command.empty":  "Nenhum comando",
+-    "dialog.close":  "Fechar di├â┬ílogo",
+-    "command.theme":  "Alterar tema",
+-    "command.newProject":  "Novo projeto",
+-    "command.newChat":  "Nova conversa",
+-    "command.inbox":  "Abrir Inbox",
+-    "command.importedInbox":  "Abrir Importadas",
+-    "command.search":  "Buscar conversas",
+-    "about.title":  "Sobre",
+-    "about.body":  "AI Hub Desktop ├óÔé¼ÔÇØ camada de controle entre voc├â┬¬ e os provedores de IA. BYOK, local-first.",
+-    "onboarding.title":  "Chegue ├â┬á primeira resposta",
+-    "onboarding.hint":  "Idioma, um provider, um teste de conex├â┬úo ├óÔé¼ÔÇØ depois pergunte. Sem conta na nuvem.",
+-    "onboarding.next":  "Continuar",
+-    "onboarding.provider":  "Conecte um provider",
+-    "onboarding.providerHint":  "OpenRouter ├â┬® o recomendado. Os nativos ficam ao lado. A chave fica no Credential Manager.",
+-    "onboarding.openrouter":  "{{name}} (recomendado)",
+-    "onboarding.saveTest":  "Salvar e testar",
+-    "onboarding.ask":  "Fazer a primeira pergunta",
+-    "privacy.title":  "Relat├â┬│rios de crash",
+-    "privacy.hint":  "Desligado por padr├â┬úo. O opt-in grava dumps locais do Crashpad, sem upload. Anota├â┬º├â┬Áes s├â┬│ t├â┬¬m vers├â┬úo e plataforma ├óÔé¼ÔÇØ o ficheiro ainda pode incluir mem├â┬│ria do processo.",
+-    "privacy.crashOptIn":  "Ativar dumps locais de crash",
+-    "privacy.crashDetail":  "Desligar s├â┬│ vale no pr├â┬│ximo start se os dumps j├â┬í foram ligados nesta sess├â┬úo.",
+-    "privacy.center.title":  "Central de privacidade",
+-    "privacy.center.hint":  "A pol├â┬¡tica escolhida ├â┬® aplicada no processo principal antes de persistir ou enviar a requisi├â┬º├â┬úo.",
+-    "privacy.center.mode":  "Modo de compartilhamento de contexto",
+-    "privacy.mode.private":  "Privado",
+-    "privacy.mode.normal":  "Normal",
+-    "privacy.mode.maximum":  "Compartilhamento m├â┬íximo",
+-    "privacy.modeDetail.private":  "S├â┬│ o hist├â┬│rico ativo desta conversa e sua mensagem s├â┬úo enviados.",
+-    "privacy.modeDetail.normal":  "Instru├â┬º├â┬Áes do projeto e contexto escolhido explicitamente s├â┬úo enviados.",
+-    "privacy.modeDetail.maximum":  "Inclui mem├â┬│rias do projeto e contexto recuperado de arquivos.",
+-    "privacy.firewall":  "Firewall de contexto",
+-    "privacy.kind.secret":  "Chaves de API e segredos",
+-    "privacy.kind.token":  "Tokens e senhas",
+-    "privacy.kind.email":  "Endere├â┬ºos de e-mail",
+-    "privacy.kind.cpf":  "CPF brasileiro",
+-    "privacy.kind.prompt_injection":  "Poss├â┬¡vel inje├â┬º├â┬úo de prompt",
+-    "privacy.action.block":  "Bloquear",
+-    "privacy.action.mask":  "Mascarar",
+-    "privacy.action.allow":  "Permitir",
+-    "privacy.crash.title":  "Relat├â┬│rios de crash",
+-    "costTracker.title":  "Controle de custos",
+-    "costTracker.summary":  "{{month}} ├é┬À {{requests}} requisi├â┬º├â┬Áes ├é┬À {{tokens}} tokens ├é┬À ${{usd}}",
+-    "costTracker.models":  "Por modelo",
+-    "costTracker.projects":  "Por projeto",
+-    "costTracker.loading":  "Carregando recibos mensais├óÔé¼┬ª",
+-    "caps.scoped.title":  "Caps por projeto e provider",
+-    "caps.scoped.hint":  "Estes limites s├â┬úo bloqueios r├â┬¡gidos al├â┬®m dos caps globais.",
+-    "caps.scoped.project":  "Projeto",
+-    "caps.scoped.provider":  "Provider",
+-    "updates.title":  "Atualiza├â┬º├â┬Áes",
+-    "updates.hint":  "Consulta o GitHub Releases. Feed fora n├â┬úo pode derrubar o app.",
+-    "updates.check":  "Verificar atualiza├â┬º├â┬Áes",
+-    "updates.checking":  "Verificando├óÔé¼┬ª",
+-    "updates.status.idle":  "Nenhuma verifica├â┬º├â┬úo ainda",
+-    "updates.status.skipped":  "Ignorado (build de desenvolvimento)",
+-    "updates.status.uptodate":  "J├â┬í est├â┬í atualizado",
+-    "updates.status.available":  "Atualiza├â┬º├â┬úo dispon├â┬¡vel ({{version}})",
+-    "updates.status.unavailable":  "Feed de update indispon├â┬¡vel ├óÔé¼ÔÇØ o app continua",
+-    "import.title":  "Import Hub",
+-    "import.hint":  "Traga exports oficiais do ChatGPT, Claude ou Gemini. Reimportar o mesmo chat ├â┬® ignorado. Ficheiros bin├â┬írios ficam de fora.",
+-    "import.source":  "Origem do export",
+-    "import.source.chatgpt":  "ChatGPT (ZIP ou conversations.json)",
+-    "import.source.claude":  "Claude (conversations.json)",
+-    "import.source.gemini":  "Gemini (MyActivity.json, melhor esfor├â┬ºo)",
+-    "import.geminiLimits":  "O Takeout do Gemini ├â┬® um log de atividade, n├â┬úo um arquivo completo. Use JSON (n├â┬úo HTML). Conversas agrupam-se pelo URL; imagens s├â┬úo ignoradas. Alguns turnos podem faltar.",
+-    "import.destination":  "Destino",
+-    "import.destination.inbox":  "Inbox Importadas",
+-    "import.pickFile":  "Escolher ficheiro",
+-    "import.start":  "Iniciar importa├â┬º├â┬úo",
+-    "import.cancel":  "Cancelar",
+-    "import.fileName":  "Selecionado: {{name}}",
+-    "import.empty":  "Ainda sem ficheiro.",
+-    "import.progress":  "A importar {{current}} / {{total}}",
+-    "import.report.title":  "Relat├â┬│rio de importa├â┬º├â┬úo",
+-    "import.report.ok":  "{{count}} conversas importadas",
+-    "import.report.skipped":  "{{count}} ignoradas (j├â┬í importadas)",
+-    "import.report.errors":  "{{count}} erros",
+-    "import.report.error.empty":  "Uma conversa n├â┬úo tinha mensagens e foi ignorada.",
+-    "import.report.error.failed":  "Uma conversa n├â┬úo p├â┬┤de ser gravada.",
+-    "import.report.attachments":  "{{count}} placeholders de ficheiro (bin├â┬írios n├â┬úo importados)",
+-    "import.openDestination":  "Abrir chats importados",
+-    "import.error.generic":  "A importa├â┬º├â┬úo n├â┬úo p├â┬┤de ser conclu├â┬¡da.",
+-    "import.error.invalid_json":  "Esse ficheiro n├â┬úo ├â┬® JSON v├â┬ílido.",
+-    "import.error.unrecognized":  "Nenhuma conversa foi reconhecida nesse ficheiro.",
+-    "import.error.gemini_html":  "Takeout em HTML n├â┬úo ├â┬® suportado. Exporte a atividade do Gemini Apps em JSON.",
+-    "import.error.empty":  "Nenhuma conversa foi encontrada nesse export.",
+-    "prompts.library":  "Biblioteca de prompts",
+-    "prompts.editor":  "Prompt",
+-    "prompts.playground":  "Playground",
+-    "prompts.new":  "Novo",
+-    "prompts.save":  "Guardar",
+-    "prompts.insert":  "Inserir no composer",
+-    "prompts.delete":  "Apagar",
+-    "prompts.run":  "Correr",
+-    "prompts.running":  "A correr├óÔé¼┬ª",
+-    "prompts.saveWinner":  "Guardar vencedor",
+-    "prompts.slot":  "Modelo {{n}}",
+-    "prompts.titlePlaceholder":  "T├â┬¡tulo",
+-    "prompts.bodyPlaceholder":  "Template com vari├â┬íveis de projeto, idioma e objetivo",
+-    "prompts.playgroundPlaceholder":  "Instru├â┬º├â┬Áes extra opcionais para esta corrida",
+-    "prompts.winnerPlaceholder":  "T├â┬¡tulo do vencedor",
+-    "prompts.winnerDefault":  "Vencedor do playground",
+-    "prompts.playgroundEmpty":  "Corra dois modelos para comparar.",
+-    "prompts.folder.development":  "Desenvolvimento",
+-    "prompts.folder.studies":  "Estudos",
+-    "prompts.folder.work":  "Trabalho",
+-    "prompts.factory.code-review":  "Code review",
+-    "prompts.factory.debug":  "Debug",
+-    "prompts.factory.summary":  "Resumo",
+-    "prompts.factory.teacher":  "Professor",
+-    "prompts.error.generic":  "N├â┬úo foi poss├â┬¡vel carregar a biblioteca de prompts.",
+-    "prompts.error.save":  "N├â┬úo foi poss├â┬¡vel guardar esse prompt.",
+-    "prompts.error.resolve":  "N├â┬úo foi poss├â┬¡vel resolver as vari├â┬íveis no projeto ativo.",
+-    "prompts.error.run":  "A corrida do playground falhou. Cada modelo fica no slot que escolheu.",
+-    "prompts.error.slots":  "Escolha dois modelos para correr o playground.",
+-    "prompts.error.content":  "Escreva um prompt ou escolha um da library.",
+-    "artifacts.canvas":  "Canvas",
+-    "artifacts.open":  "Abrir canvas",
+-    "artifacts.close":  "Fechar",
+-    "artifacts.saveVersion":  "Guardar vers├â┬úo",
+-    "artifacts.pin":  "Fixar no projeto",
+-    "artifacts.unpin":  "Desafixar",
+-    "artifacts.pinned":  "Fixado",
+-    "artifacts.version":  "v{{n}}",
+-    "artifacts.exportMd":  "Exportar MD",
+-    "artifacts.exportHtml":  "Exportar HTML",
+-    "artifacts.exportSvg":  "Exportar SVG",
+-    "artifacts.htmlSaveToPreview":  "Guarde uma vers├â┬úo para atualizar o preview em sandbox.",
+-    "artifacts.mermaidError":  "O Mermaid n├â┬úo conseguiu desenhar este diagrama.",
+-    "artifacts.kind.mermaid":  "Mermaid",
+-    "artifacts.kind.html":  "HTML",
+-    "artifacts.kind.markdown":  "Markdown",
+-    "artifacts.kind.code":  "C├â┬│digo",
+-    "artifacts.error":  "N├â┬úo foi poss├â┬¡vel atualizar esse artifact.",
+-    "skills.library":  "Biblioteca de skills",
+-    "skills.editor":  "Skill",
+-    "skills.new":  "Nova",
+-    "skills.save":  "Guardar",
+-    "skills.delete":  "Apagar",
+-    "skills.run":  "Correr",
+-    "skills.steps":  "Passos",
+-    "skills.addStep":  "Adicionar passo",
+-    "skills.titlePlaceholder":  "Nome",
+-    "skills.descriptionPlaceholder":  "O que esta skill faz",
+-    "skills.promptPlaceholder":  "Prompt da skill com as vari├â┬íveis de projeto, idioma e objetivo",
+-    "skills.modelPlaceholder":  "Id do modelo preferido (opcional)",
+-    "skills.stepTitlePlaceholder":  "T├â┬¡tulo do passo",
+-    "skills.stepSectionPlaceholder":  "Instru├â┬º├â┬Áes deste passo",
+-    "skills.run.title":  "A correr {{name}}",
+-    "skills.folder.development":  "Desenvolvimento",
+-    "skills.folder.studies":  "Estudos",
+-    "skills.folder.work":  "Trabalho",
+-    "skills.factory.code-review":  "Code Review",
+-    "skills.factory.summarize-pdf":  "Resumir PDF",
+-    "skills.factory.meeting-prep":  "Preparar reuni├â┬úo",
+-    "skills.factory.explain-error":  "Explicar erro",
+-    "skills.factory.write-rfc":  "Escrever RFC",
+-    "skills.error.generic":  "N├â┬úo foi poss├â┬¡vel carregar a biblioteca de skills.",
+-    "skills.error.save":  "N├â┬úo foi poss├â┬¡vel guardar essa skill.",
+-    "hud.mode":  "Modo",
+-    "hud.effort":  "Esfor├â┬ºo",
+-    "hud.context":  "Tokens de contexto/janela",
+-    "hud.tokens":  "Tokens entrada/sa├â┬¡da",
+-    "hud.thinking":  "Thinking",
+-    "hud.cache":  "Cache leitura/escrita",
+-    "hud.turnCost":  "Custo do turno",
+-    "hud.thinkingUnavailable":  "Thinking indispon├â┬¡vel neste provedor",
+-    "runMode.label":  "Modo",
+-    "effort.label":  "Esfor├â┬ºo",
+-    "council.router.model":  "Modelo recomendado",
+-    "council.router.auto":  "Autom├â┬ítico",
+-    "council.router.confirmed":  "Rota confirmada",
+-    "council.router.recommended":  "recomendado",
+-    "council.router.cost":  "Custo estimado do primeiro modelo: US$ {{usd}}",
+-    "council.router.latency":  "Lat├â┬¬ncia: {{ms}} ms",
+-    "council.router.speed.fast":  "Velocidade: r├â┬ípida",
+-    "council.router.speed.balanced":  "Velocidade: equilibrada",
+-    "council.router.speed.frontier":  "Velocidade: frontier",
+-    "council.router.confirm":  "Confirmar rota",
+-    "council.router.reject":  "Recusar rota",
+-    "quickAi.title":  "Quick AI",
+-    "quickAi.close":  "Fechar",
+-    "quickAi.placeholder":  "Pergunte algo ou cole conte├â┬║do├óÔé¼┬ª",
+-    "quickAi.clipboard":  "Ler clipboard",
+-    "quickAi.formatJson":  "Formatar JSON",
+-    "quickAi.toInterface":  "Interface TS",
+-    "quickAi.explainJson":  "Explicar JSON",
+-    "quickAi.diagnoseStack":  "Diagnosticar stack",
+-    "quickAi.sendToProject":  "Mandar ao projeto atual",
+-    "quickAi.model":  "Modelo",
+-    "quickAi.estimate":  "Estimativa: US$ {{usd}}",
+-    "quickAi.estimateUnavailable":  "Estimativa dispon├â┬¡vel ao enviar",
+-    "quickAi.send":  "Enviar",
+-    "quickAi.cancel":  "Cancelar",
+-    "quickAi.sending":  "Enviando├óÔé¼┬ª",
+-    "quickAi.error.setup":  "Configure uma chave de provider antes de enviar.",
+-    "quickAi.error.send":  "N├â┬úo foi poss├â┬¡vel enviar a pergunta.",
+-    "quickAi.conversationTitle":  "Quick AI",
+-    "quickAi.explainPrefix":  "Explique este JSON de forma clara:",
+-    "quickAi.diagnosePrefix":  "Diagnostique este stack trace e sugira uma corre├â┬º├â┬úo:",
+-    "council.title":  "AI Council",
+-    "council.placeholder":  "Pergunta para o conselho├óÔé¼┬ª",
+-    "council.run":  "Iniciar debate",
+-    "council.running":  "Debatendo├óÔé¼┬ª",
+-    "council.synthesis":  "S├â┬¡ntese",
+-    "council.divergences":  "Diverg├â┬¬ncias (heur├â┬¡stica)",
+-    "council.none":  "Nenhuma destacada",
+-    "council.error.setup":  "Abra uma conversa e configure ao menos dois modelos.",
+-    "council.error.run":  "N├â┬úo foi poss├â┬¡vel concluir o Council.",
+-    "council.router.simple":  "Router: pergunta simples ├óÔÇáÔÇÖ rota r├â┬ípida; confirme antes de enviar.",
+-    "council.router.code":  "Router: c├â┬│digo ├óÔÇáÔÇÖ rota equilibrada; confirme antes de enviar.",
+-    "council.router.complex":  "Router: tarefa complexa ├óÔÇáÔÇÖ rota frontier; confirme antes de enviar.",
+-    "tools.pathPlaceholder":  "Caminho relativo no projeto (ex.: src/app.ts)",
+-    "tools.readFile":  "Ler arquivo",
+-    "tools.chooseRoot":  "Escolher raiz",
+-    "tools.permission":  "Permitir {{tool}} ler este arquivo?",
+-    "tools.allowOnce":  "Permitir uma vez",
+-    "tools.allowProject":  "Sempre neste projeto",
+-    "tools.deny":  "Negar",
+-    "tools.activity":  "Tool",
+-    "tools.untrustedContext":  "Conte├â┬║do de tool n├â┬úo confi├â┬ível",
+-    "tools.status.permission_required":  "aguarda permiss├â┬úo",
+-    "tools.status.denied":  "negada",
+-    "tools.status.running":  "em execu├â┬º├â┬úo",
+-    "tools.status.completed":  "conclu├â┬¡da",
+-    "tools.status.failed":  "falhou",
+-    "tools.error.denied":  "A leitura foi negada.",
+-    "tools.error.read":  "N├â┬úo foi poss├â┬¡vel ler esse arquivo do projeto.",
+-    "agents.title":  "Agente ├â┬║nico",
+-    "agents.mode":  "Agente",
+-    "agents.pathsLabel":  "Arquivos do projeto para analisar",
+-    "agents.pathsPlaceholder":  "Um caminho relativo do projeto por linha (at├â┬® 3)",
+-    "agents.factory.goal":  "Analise os arquivos selecionados do projeto e reporte a arquitetura, os riscos e os pr├â┬│ximos passos.",
+-    "agents.factory.action":  "Usar Analisar este projeto",
+-    "agents.confirmDisclosure":  "Ap├â┬│s sua confirma├â┬º├â┬úo, o conte├â┬║do dos arquivos selecionados poder├â┬í ser enviado para {{provider}} / {{model}} para gerar o relat├â┬│rio.",
+-    "agents.confirm":  "Confirmar plano",
+-    "agents.pause":  "Pausar",
+-    "agents.resume":  "Retomar",
+-    "agents.cancel":  "Cancelar",
+-    "agents.limits":  "Limite: {{steps}} passos ├é┬À US$ {{budget}} ├é┬À {{seconds}}s",
+-    "agents.error.paths":  "Adicione ao menos um caminho relativo de arquivo do projeto.",
+-    "agents.error.prepare":  "N├â┬úo foi poss├â┬¡vel preparar a execu├â┬º├â┬úo do agente. Escolha uma raiz do projeto e uma chave de modelo ativa.",
+-    "agents.error.control":  "N├â┬úo foi poss├â┬¡vel atualizar a execu├â┬º├â┬úo do agente.",
+-    "agents.status.awaiting_confirmation":  "aguarda confirma├â┬º├â┬úo",
+-    "agents.status.running":  "em execu├â┬º├â┬úo",
+-    "agents.status.paused":  "pausado",
+-    "agents.status.cancelled":  "cancelado",
+-    "agents.status.completed":  "conclu├â┬¡do",
+-    "agents.status.completed_with_errors":  "conclu├â┬¡do com erros",
+-    "agents.status.stopped_budget":  "interrompido pelo or├â┬ºamento",
+-    "agents.status.stopped_timeout":  "interrompido pelo limite de tempo",
+-    "agents.status.interrupted":  "interrompido",
+-    "agents.status.failed":  "falhou",
+-    "agents.step.pending":  "pendente",
+-    "agents.step.running":  "em execu├â┬º├â┬úo",
+-    "agents.step.completed":  "conclu├â┬¡do",
+-    "agents.step.failed":  "falhou",
+-    "agents.step.skipped":  "ignorado",
+-    "agents.step.cancelled":  "cancelado",
+-    "agents.step.interrupted":  "interrompido",
+-    "agents.step.tokens":  "tokens {{input}}/{{output}}",
+-    "agents.step.cost":  "custo US$ {{usd}}",
+-    "orchestration.title":  "Orquestra├â┬º├â┬úo",
+-    "orchestration.mode":  "Orquestrar",
+-    "orchestration.empty":  "Selecione os arquivos do projeto acima e envie um objetivo para preparar o grafo.",
+-    "orchestration.disclosure":  "Supervisor e todos os especialistas usam {{provider}} / {{model}}; cap compartilhado do grafo: US$ {{budget}}. Um modelo diferente exige nova confirma├â┬º├â┬úo expl├â┬¡cita.",
+-    "orchestration.usage":  "tokens {{input}}/{{output}} ├é┬À US$ {{cost}}",
+-    "orchestration.confirm":  "Confirmar grafo",
+-    "orchestration.error.prepare":  "N├â┬úo foi poss├â┬¡vel preparar a orquestra├â┬º├â┬úo. Escolha uma raiz do projeto e uma chave de modelo ativa.",
+-    "orchestration.error.control":  "N├â┬úo foi poss├â┬¡vel atualizar a orquestra├â┬º├â┬úo.",
+-    "orchestration.role.explorer":  "Explorador",
+-    "orchestration.role.reviewer":  "Revisor",
+-    "orchestration.role.writer":  "Redator",
+-    "orchestration.handoff.pending":  "pendente",
+-    "orchestration.handoff.ready":  "pronto",
+-    "orchestration.handoff.consumed":  "consumido",
+-    "orchestration.handoff.cancelled":  "cancelado",
+-    "orchestration.handoff.interrupted":  "interrompido",
+-    "developer.title":  "Modo Desenvolvedor",
+-    "developer.tree":  "Explorer",
+-    "developer.status":  "Status do Git",
+-    "developer.diff":  "Diff do Git",
+-    "developer.terminal":  "Diagn├â┬│stico do terminal",
+-    "developer.review":  "Revisar diff",
+-    "developer.tests":  "Gerar testes",
+-    "developer.architecture":  "Explicar arquitetura",
+-    "developer.hint":  "Ferramentas somente-leitura do projeto e Git; cada uso pede permiss├â┬úo.",
+-    "developer.error":  "N├â┬úo foi poss├â┬¡vel executar a ferramenta de desenvolvimento.",
+-    "offline.localMode":  "Modo local ├é┬À Ollama e RAG dos PDFs no modo m├â┬íximo funcionam sem internet; cloud precisa de internet",
+-    "offline.cloudMode":  "Cloud selecionada ├é┬À Ollama e RAG dos PDFs no modo m├â┬íximo dispon├â┬¡veis localmente",
+-    "offline.noModels":  "Ollama ativo, sem modelos instalados ├é┬À RAG dos PDFs no modo m├â┬íximo segue local",
+-    "offline.localUnavailable":  "Ollama indispon├â┬¡vel ├é┬À RAG dos PDFs no modo m├â┬íximo segue local; cloud precisa de internet",
+-    "notes.saveAsNote":  "Salvar como nota",
+-    "notes.error.save":  "N├úo foi poss├¡vel salvar a nota.",
+-    "tasks.saveAsChecklist":  "Virar tarefas",
+-    "tasks.error.save":  "N├úo foi poss├¡vel criar o checklist.",
+-    "workspace.panel.notes":  "Notas",
+-    "research.mode":  "Pesquisa",
+-    "research.error.prepare":  "N├úo foi poss├¡vel preparar a pesquisa. Escolha um projeto e uma chave de modelo ativa.",
+-    "command.research":  "Modo pesquisa",
+-    "command.hit.note":  "Nota ┬À {{title}}",
+-    "command.hit.task":  "Tarefa ┬À {{title}}",
+-    "skills.factory.study-professor":  "Estudo: Professor",
+-    "skills.factory.study-examiner":  "Estudo: Examinador",
+-    "skills.factory.study-tutor":  "Estudo: Tutor",
+-    "skills.factory.study-evaluator":  "Estudo: Avaliador"
++    "app.name": "AI Hub",
++    "nav.home": "In├â┬¡cio",
++    "nav.prompts": "Prompts",
++    "nav.skills": "Skills",
++    "nav.settings": "Configura├â┬º├â┬Áes",
++    "nav.debug": "Debug",
++    "nav.import": "Importar",
++    "status.ready": "Pronto",
++    "status.theme": "Tema: {{theme}}",
++    "status.health.empty": "Ainda sem pulso de provedor",
++    "status.health.ok": "ok",
++    "status.health.down": "fora",
++    "status.health.unknown": "idle",
++    "status.health.item": "{{provider}} {{state}}{{latency}}{{errors}}",
++    "status.health.latency": " ├é┬À {{ms}}ms",
++    "status.health.errors": " ├é┬À {{pct}}% err",
++    "theme.light": "Claro",
++    "theme.dark": "Escuro",
++    "theme.system": "Sistema",
++    "theme.label": "Tema",
++    "locale.label": "Idioma",
++    "locale.ptBR": "Portugu├â┬¬s",
++    "locale.en": "English",
++    "window.minimize": "Minimizar",
++    "window.maximize": "Maximizar",
++    "window.close": "Fechar",
++    "empty.title": "Nenhum projeto ainda",
++    "empty.body": "Crie um projeto na barra lateral, ou comece um chat avulso na inbox.",
++    "empty.action": "Abrir configura├â┬º├â┬Áes",
++    "settings.title": "Apar├â┬¬ncia e chaves",
++    "settings.hint": "Tema e idioma ficam no banco local. Chaves de API v├â┬úo para o Credential Manager, nunca para o SQLite.",
++    "workspace.projects": "Projetos",
++    "workspace.inbox": "Avulsas",
++    "workspace.inboxHint": "Chats sem projeto",
++    "workspace.importedInbox": "Importadas",
++    "workspace.importedInboxHint": "Chats trazidos do ChatGPT, Claude ou Gemini",
++    "workspace.noConversationsImported": "Nenhum chat importado aqui. Abra o Import Hub para trazer um export.",
++    "workspace.moveTo": "Mover para projeto",
++    "workspace.moveInbox": "Manter em Importadas",
++    "workspace.projectPlaceholder": "Nome do projeto",
++    "workspace.newProject": "Novo projeto",
++    "workspace.projectColor": "Cor",
++    "workspace.projectInstructions": "Instru├â┬º├â┬Áes do projeto",
++    "workspace.projectInstructionsHint": "Entram sempre no packet compilado.",
++    "workspace.preferredProvider": "Provider preferido",
++    "workspace.preferredModel": "Modelo preferido",
++    "workspace.preferredNone": "Nenhum",
++    "workspace.saveProject": "Salvar projeto",
++    "workspace.deleteProject": "Excluir projeto",
++    "workspace.deleteProjectConfirm": "Excluir {{name}}? Os chats v├â┬úo para Avulsas. A ├â┬írvore de mensagens permanece.",
++    "workspace.search": "Buscar conversas",
++    "workspace.searchEmpty": "Nenhum resultado",
++    "workspace.tags": "Tags",
++    "workspace.tagPlaceholder": "Nova tag",
++    "workspace.tagAdd": "Adicionar",
++    "workspace.tagRemove": "Remover tag {{tag}}",
++    "workspace.conversations": "Conversas",
++    "workspace.conversationPlaceholder": "T├â┬¡tulo da conversa",
++    "workspace.newConversation": "Nova conversa",
++    "workspace.untitledChat": "Nova conversa",
++    "workspace.noConversations": "Nenhuma conversa neste projeto. {{modifier}}+N cria uma.",
++    "workspace.noConversationsInbox": "Inbox vazia. {{modifier}}+N cria um chat avulso.",
++    "workspace.noMessages": "Nenhuma mensagem ainda. Escreva abaixo e pressione Enter para enviar.",
++    "workspace.pickConversation": "Escolha ou crie uma conversa.",
++    "workspace.packet.badge": "~{{n}} tokens",
++    "workspace.packet.open": "Packet",
++    "workspace.packet.title": "Packet de contexto port├â┬ítil",
++    "workspace.packet.destination": "{{provider}} ├é┬À {{model}} ├é┬À janela {{window}} ├é┬À ~{{n}} tokens",
++    "workspace.packet.privacy": "Privacidade",
++    "workspace.packet.privacy.standard": "Padr├â┬úo (projeto + ramos inativos)",
++    "workspace.packet.privacy.strict": "Restrito (s├â┬│ o fio ativo; sem mem├â┬│rias nem ficheiros recuperados)",
++    "workspace.packet.privacy.private": "Privado",
++    "workspace.packet.privacy.normal": "Normal",
++    "workspace.packet.privacy.maximum": "Compartilhamento m├â┬íximo",
++    "workspace.packet.included": "Entra",
++    "workspace.packet.omitted": "Fica de fora",
++    "workspace.packet.empty": "Nada",
++    "workspace.packet.save": "Guardar packet",
++    "workspace.packet.export": "Exportar arquivo",
++    "workspace.packet.import": "Importar arquivo",
++    "workspace.packet.apply": "Usar neste chat",
++    "workspace.packet.using": "Em uso",
++    "workspace.packet.clear": "Parar de usar o packet",
++    "workspace.packet.saved": "Packets salvos",
++    "workspace.packet.none": "Ainda n├â┬úo h├â┬í packets neste projeto.",
++    "workspace.packet.untitled": "Packet sem t├â┬¡tulo",
++    "workspace.packet.needPreview": "Abra uma conversa com chave para pr├â┬®-visualizar o packet.",
++    "workspace.packet.applied": "Este chat envia o packet aplicado mais os turnos novos.",
++    "workspace.packet.savedNotice": "Packet guardado neste projeto.",
++    "workspace.packet.exported": "Arquivo do packet salvo.",
++    "workspace.packet.imported": "Packet importado neste projeto.",
++    "workspace.packet.appliedNotice": "Este chat agora usa o packet importado.",
++    "workspace.packet.cleared": "Este chat volta a compilar a ├â┬írvore local.",
++    "workspace.packet.cancelled": "Di├â┬ílogo do arquivo de packet cancelado.",
++    "workspace.packet.kind.project-instructions": "Instru├â┬º├â┬Áes do projeto",
++    "workspace.packet.kind.extra-system": "Sistema extra",
++    "workspace.packet.kind.inactive-branch": "Ramo inativo",
++    "workspace.packet.kind.message": "Mensagem",
++    "workspace.packet.kind.old-message": "Mensagem antiga",
++    "workspace.packet.kind.privacy": "Privacidade",
++    "workspace.packet.kind.file": "Arquivo",
++    "workspace.packet.kind.conversation": "Conversa",
++    "workspace.packet.kind.packet": "Pacote",
++    "workspace.packet.kind.memory": "Mem├â┬│ria",
++    "workspace.packet.kind.rag": "Trecho recuperado",
++    "workspace.packet.kind.prompt": "Prompt da library",
++    "workspace.packet.kind.skill": "Skill aplicada",
++    "memory.title": "Mem├â┬│ria",
++    "memory.add": "Adicionar mem├â┬│ria",
++    "memory.update": "Atualizar mem├â┬│ria",
++    "memory.save": "Salvar",
++    "memory.edit": "Editar",
++    "memory.delete": "Apagar",
++    "memory.empty": "Ainda n├â┬úo h├â┬í mem├â┬│rias neste projeto.",
++    "memory.suggest": "Salvar na mem├â┬│ria do projeto?",
++    "memory.ignore": "Ignorar",
++    "memory.optOut": "N├â┬úo injetar autom├â┬ítico",
++    "memory.optIn": "Inje├â┬º├â┬úo autom├â┬ítica ligada",
++    "memory.titlePlaceholder": "T├â┬¡tulo curto",
++    "memory.bodyPlaceholder": "usamos PostgreSQL",
++    "workspace.panel.title": "Workspace",
++    "workspace.panel.refresh": "Atualizar",
++    "workspace.panel.summary": "Resumo",
++    "workspace.panel.decisions": "Decis├â┬Áes",
++    "workspace.panel.pins": "Pins",
++    "workspace.panel.pinCount": "{{n}} mensagens fixadas",
++    "workspace.panel.artifacts": "Artefactos",
++    "workspace.panel.tasks": "Tarefas",
++    "workspace.panel.taskPlaceholder": "Nova tarefa",
++    "workspace.panel.add": "Adicionar",
++    "workspace.panel.remove": "Remover",
++    "workspace.panel.empty": "Nada extra├â┬¡do ainda.",
++    "workspace.duplicate": "Duplicar",
++    "workspace.toProject": "Virar projeto",
++    "mentions.remove": "Remover",
++    "mentions.tokens": "~{{n}} tokens",
++    "mentions.preview": "Vai injetar",
++    "mentions.tokenWarning": "As men├â┬º├â┬Áes somam ~{{n}} tokens (teto {{cap}}).",
++    "mentions.tokenOver": "As men├â┬º├â┬Áes passam do teto de {{cap}} tokens. O contexto extra mais antigo ser├â┬í cortado.",
++    "mentions.stub": "Dispon├â┬¡vel numa onda posterior",
++    "mentions.type.file": "Arquivo deste projeto",
++    "mentions.type.conversation": "Outra conversa",
++    "mentions.type.memory": "Mem├â┬│ria do projeto",
++    "mentions.type.prompt": "Biblioteca de prompts",
++    "mentions.type.skill": "Skill",
++    "mentions.type.packet": "Pacote salvo",
++    "mentions.empty": "Nada encontrado",
++    "mentions.error.unavailable": "Esse tipo de men├â┬º├â┬úo ainda n├â┬úo est├â┬í dispon├â┬¡vel.",
++    "mentions.error.notFound": "Essa men├â┬º├â┬úo n├â┬úo existe neste projeto.",
++    "mentions.error.limit": "D├â┬í para mencionar no m├â┬íximo 8 itens por envio.",
++    "workspace.pin": "Fixar",
++    "workspace.unpin": "Desafixar",
++    "workspace.overflow": "Este fio passa da janela de {{window}} tokens (~{{estimate}} estimados). Compactar tira os turnos antigos do pr├â┬│ximo packet; a ├â┬írvore permanece.",
++    "workspace.compact": "Compactar hist├â┬│rico",
++    "workspace.compact.on": "O pr├â┬│ximo envio descarta turnos antigos para caber na janela.",
++    "workspace.compact.off": "Enviar o hist├â┬│rico compilado completo",
++    "workspace.modelSwitch": "A pr├â┬│xima resposta usa {{model}}. O hist├â┬│rico ├â┬® compilado ├óÔé¼ÔÇØ voc├â┬¬ n├â┬úo precisa colar um resumo.",
++    "workspace.error.generic": "N├â┬úo foi poss├â┬¡vel concluir a a├â┬º├â┬úo. Tente de novo.",
++    "workspace.error.chat": "A chamada ao modelo falhou ({{code}}).",
++    "workspace.error.cap": "Teto de gasto atingido ({{scope}}). Este envio n├â┬úo come├â┬ºou.",
++    "workspace.error.unknownModel": "Este modelo n├â┬úo est├â┬í no cat├â┬ílogo local deste provedor.",
++    "files.attach": "Anexar arquivo",
++    "files.attachFolder": "Anexar pasta",
++    "files.remove": "Remover",
++    "files.tokens": "~{{n}} tokens",
++    "files.visionHint": "Precisa de modelo com vision",
++    "files.tokenWarning": "Estes arquivos somam ~{{n}} tokens antes do envio.",
++    "files.truncated": "Pr├â┬®via truncada",
++    "files.error.vision": "Este modelo n├â┬úo l├â┬¬ imagens. Escolha um marcado Vision ou remova a imagem.",
++    "files.error.tooLarge": "Esse arquivo passa do limite de 8 MB.",
++    "files.error.unsupported": "Esse tipo de arquivo n├â┬úo ├â┬® suportado.",
++    "files.error.projectMismatch": "Esse arquivo pertence a outro projeto.",
++    "files.error.limit": "D├â┬í para anexar no m├â┬íximo 8 arquivos por envio.",
++    "workspace.error.timeout": "O provedor estourou o tempo. Tente de novo ou troque o modelo.",
++    "workspace.error.rate_limit": "O provedor est├â┬í limitando esta chave. Espere e tente de novo.",
++    "workspace.error.auth": "O provedor recusou esta chave. Verifique em Configura├â┬º├â┬Áes.",
++    "workspace.error.context_overflow": "Este fio passa da janela do modelo. Ligue Compactar hist├â┬│rico e envie de novo.",
++    "workspace.error.quota": "O provedor informa que n├â┬úo h├â┬í cr├â┬®dito nesta chave.",
++    "workspace.error.network": "A rede est├â┬í inacess├â┬¡vel. Verifique a conex├â┬úo e tente de novo.",
++    "workspace.error.unknown": "O provedor devolveu um erro inesperado.",
++    "workspace.model": "Modelo",
++    "workspace.customModel": "Id do modelo custom",
++    "workspace.model.vision": "Vis├â┬úo",
++    "workspace.model.tools": "Ferramentas",
++    "workspace.model.price": "${{input}} / ${{output}} por 1M tokens",
++    "workspace.temperature": "Temp",
++    "workspace.maxTokens": "M├â┬íx. tokens",
++    "workspace.maxTokensDefault": "padr├â┬úo",
++    "workspace.extraSystem": "Instru├â┬º├â┬Áes de sistema extras",
++    "workspace.key": "Chave",
++    "workspace.noKey": "Guarde uma chave de provedor em Configura├â┬º├â┬Áes primeiro.",
++    "workspace.composer.placeholder": "Mensagem",
++    "workspace.composer.send": "Enviar",
++    "workspace.composer.stop": "Parar",
++    "workspace.composer.hint": "Enter envia ├é┬À Shift+Enter quebra linha ├é┬À Esc interrompe",
++    "workspace.composer.secretWarning": "Isso parece uma chave de API. N├â┬úo envie segredos para o modelo.",
++    "workspace.composer.secretRedact": "Remover segredos",
++    "workspace.placeholder": "├óÔé¼┬ª",
++    "workspace.copy": "Copiar",
++    "workspace.copyCode": "Copiar",
++    "workspace.copied": "Copiado",
++    "workspace.regenerate": "Regenerar",
++    "workspace.continue": "Continuar",
++    "workspace.edit": "Editar",
++    "workspace.saveEdit": "Salvar e enviar",
++    "workspace.cancelEdit": "Cancelar",
++    "workspace.role.user": "Voc├â┬¬",
++    "workspace.role.assistant": "Assistente",
++    "workspace.role.system": "Sistema",
++    "workspace.status.streaming": "em stream",
++    "workspace.status.interrupted": "interrompida",
++    "workspace.status.aborted": "abortada",
++    "workspace.status.complete": "completa",
++    "workspace.receipt": "{{provider}} ├é┬À {{model}} ├é┬À entrada {{tokensIn}} / sa├â┬¡da {{tokensOut}} ├é┬À {{cost}} ├é┬À {{latency}}ms ├é┬À {{at}}",
++    "workspace.receipt.error": "erro {{code}}",
++    "workspace.receipt.open": "Detalhe do recibo",
++    "workspace.receipt.title": "Recibo",
++    "workspace.receipt.created": "Registado {{at}}",
++    "workspace.receipt.tokens": "entrada / sa├â┬¡da",
++    "workspace.receipt.latency": "Lat├â┬¬ncia",
++    "workspace.receipt.source": "Origem",
++    "workspace.receipt.source.import": "Importado",
++    "workspace.receipt.source.chat": "Chat",
++    "workspace.cost.conversation": "Fio ${{usd}}",
++    "workspace.cost.project": "Projeto ${{usd}}",
++    "workspace.estimate": "Est. ${{usd}} neste envio",
++    "workspace.estimate.none": "Sem pre├â┬ºo no cat├â┬ílogo para estimar antes do envio",
++    "workspace.cap.warn": "O gasto est├â┬í em 80% do teto {{scope}}.",
++    "workspace.cap.block": "O teto de gasto bloquearia este envio ({{scope}}).",
++    "workspace.cap.allowOnce": "Permitir esta vez",
++    "caps.title": "Tetos de gasto",
++    "caps.hint": "Hard-stop em USD. Vazio = ilimitado. 80% avisa; 100% bloqueia at├â┬® voc├â┬¬ permitir uma vez.",
++    "caps.scope.request": "por request",
++    "caps.scope.day": "por dia",
++    "caps.scope.global": "global",
++    "caps.unlimited": "Ilimitado",
++    "caps.save": "Guardar tetos",
++    "caps.saved": "Tetos guardados",
++    "debug.title": "Debug / observabilidade",
++    "debug.hint": "S├â┬│ meta do ├â┬║ltimo request. Sem headers de Authorization, chaves ou corpo da conversa.",
++    "debug.empty": "Nenhum request compilado nesta sess├â┬úo ainda.",
++    "debug.refresh": "Atualizar",
++    "debug.provider": "Provedor",
++    "debug.model": "Modelo",
++    "debug.retries": "Retries",
++    "debug.error": "├â┼íltimo erro",
++    "debug.tokens": "Estimativa de tokens",
++    "debug.cost": "USD estimado",
++    "debug.cap": "Decis├â┬úo de cap",
++    "debug.overflow": "Estouro de janela",
++    "debug.at": "Capturado",
++    "fallback.title": "Tentar outro provedor?",
++    "fallback.body": "{{failed}} falhou ({{code}}). {{suggested}} parece mais saud├â┬ível. Confirme para regenerar nessa chave ├óÔé¼ÔÇØ isso n├â┬úo ├â┬® autom├â┬ítico.",
++    "fallback.confirm": "Tentar {{suggested}}",
++    "fallback.dismiss": "Manter este provedor",
++    "fallback.estimate": "Estimado ${{usd}} em {{suggested}}",
++    "command.debug": "Abrir debug",
++    "command.import": "Abrir Import Hub",
++    "command.prompts": "Abrir biblioteca de prompts",
++    "command.skills": "Abrir biblioteca de skills",
++    "command.runSkill": "Rodar skill: {{name}}",
++    "command.exportActive": "Exportar ramo ativo",
++    "command.exportTree": "Exportar ├â┬írvore JSON",
++    "command.providers": "Gerenciar providers",
++    "command.settings": "Abrir configura├â┬º├â┬Áes",
++    "command.shortcuts": "Ver atalhos de teclado",
++    "command.unavailable": "indispon├â┬¡vel agora",
++    "command.searching": "Buscando conversas├óÔé¼┬ª",
++    "command.group.actions": "A├â┬º├â┬Áes",
++    "command.group.projects": "Projetos",
++    "command.group.models": "Modelos",
++    "command.group.conversations": "Conversas e mensagens",
++    "shortcuts.title": "Atalhos de teclado",
++    "shortcuts.status": "Atalhos ├é┬À {{modifier}}+/",
++    "shortcuts.palette": "Abrir a Command Palette",
++    "shortcuts.newChat": "Criar uma conversa",
++    "shortcuts.newProject": "Focar a cria├â┬º├â┬úo de projeto",
++    "shortcuts.skills": "Abrir a biblioteca de skills",
++    "shortcuts.cheatsheet": "Abrir este guia",
++    "shortcuts.send": "Enviar mensagem ou executar slash command",
++    "shortcuts.newline": "Inserir nova linha",
++    "shortcuts.stop": "Interromper o stream ou fechar di├â┬ílogo",
++    "shortcuts.slashTitle": "Slash commands do composer",
++    "slash.model.description": "Focar o seletor de modelo",
++    "slash.clear.description": "Abrir uma conversa limpa sem apagar esta",
++    "slash.compact.description": "Alternar compacta├â┬º├â┬úo no pr├â┬│ximo envio",
++    "slash.packet.description": "Abrir o packet de contexto",
++    "slash.cap.description": "Abrir os tetos de gasto",
++    "slash.skill.description": "Abrir a biblioteca de skills, ou /skill Nome para correr uma",
++    "workspace.sibling.prev": "Alternativa anterior",
++    "workspace.sibling.next": "Pr├â┬│xima alternativa",
++    "workspace.sibling.count": "{{current}} / {{total}}",
++    "workspace.tree.title": "├â┬ürvore",
++    "workspace.tree.hint": "Salte para um n├â┬│. O outro ramo fica.",
++    "workspace.tree.show": "├â┬ürvore",
++    "workspace.tree.hide": "Ocultar ├â┬írvore",
++    "workspace.tree.empty": "Nenhum n├â┬│ ainda.",
++    "workspace.tree.forks": "{{count}} filhos",
++    "workspace.tree.rename": "Nome do ramo",
++    "workspace.tree.saveName": "Guardar nome",
++    "workspace.export.active": "Exportar ramo",
++    "workspace.export.tree": "Exportar ├â┬írvore JSON",
++    "workspace.export.saved": "Guardado em {{path}}",
++    "secrets.title": "Chaves de provedor",
++    "secrets.hint": "A chave completa atravessa o IPC s├â┬│ neste save e some da tela. Depois voc├â┬¬ v├â┬¬ s├â┬│ a m├â┬íscara.",
++    "secrets.provider": "Provedor",
++    "secrets.labelField": "R├â┬│tulo",
++    "secrets.secret": "Chave",
++    "secrets.save": "Guardar chave",
++    "secrets.test": "Testar conex├â┬úo",
++    "secrets.testing": "A testar├óÔé¼┬ª",
++    "secrets.testOk": "Conex├â┬úo ok ├é┬À {{ms}}ms",
++    "secrets.testFail": "Conex├â┬úo falhou ({{code}}) ├é┬À {{ms}}ms",
++    "secrets.baseUrl": "URL base",
++    "secrets.remove": "Remover",
++    "secrets.error.save": "N├â┬úo foi poss├â┬¡vel guardar a chave. Verifique o valor e tente de novo.",
++    "command.placeholder": "Buscar comando├óÔé¼┬ª",
++    "command.empty": "Nenhum comando",
++    "dialog.close": "Fechar di├â┬ílogo",
++    "command.theme": "Alterar tema",
++    "command.newProject": "Novo projeto",
++    "command.newChat": "Nova conversa",
++    "command.inbox": "Abrir Inbox",
++    "command.importedInbox": "Abrir Importadas",
++    "command.search": "Buscar conversas",
++    "about.title": "Sobre",
++    "about.body": "AI Hub Desktop ├óÔé¼ÔÇØ camada de controle entre voc├â┬¬ e os provedores de IA. BYOK, local-first.",
++    "onboarding.title": "Chegue ├â┬á primeira resposta",
++    "onboarding.hint": "Idioma, um provider, um teste de conex├â┬úo ├óÔé¼ÔÇØ depois pergunte. Sem conta na nuvem.",
++    "onboarding.next": "Continuar",
++    "onboarding.provider": "Conecte um provider",
++    "onboarding.providerHint": "OpenRouter ├â┬® o recomendado. Os nativos ficam ao lado. A chave fica no Credential Manager.",
++    "onboarding.openrouter": "{{name}} (recomendado)",
++    "onboarding.saveTest": "Salvar e testar",
++    "onboarding.ask": "Fazer a primeira pergunta",
++    "privacy.title": "Relat├â┬│rios de crash",
++    "privacy.hint": "Desligado por padr├â┬úo. O opt-in grava dumps locais do Crashpad, sem upload. Anota├â┬º├â┬Áes s├â┬│ t├â┬¬m vers├â┬úo e plataforma ├óÔé¼ÔÇØ o ficheiro ainda pode incluir mem├â┬│ria do processo.",
++    "privacy.crashOptIn": "Ativar dumps locais de crash",
++    "privacy.crashDetail": "Desligar s├â┬│ vale no pr├â┬│ximo start se os dumps j├â┬í foram ligados nesta sess├â┬úo.",
++    "privacy.center.title": "Central de privacidade",
++    "privacy.center.hint": "A pol├â┬¡tica escolhida ├â┬® aplicada no processo principal antes de persistir ou enviar a requisi├â┬º├â┬úo.",
++    "privacy.center.mode": "Modo de compartilhamento de contexto",
++    "privacy.mode.private": "Privado",
++    "privacy.mode.normal": "Normal",
++    "privacy.mode.maximum": "Compartilhamento m├â┬íximo",
++    "privacy.modeDetail.private": "S├â┬│ o hist├â┬│rico ativo desta conversa e sua mensagem s├â┬úo enviados.",
++    "privacy.modeDetail.normal": "Instru├â┬º├â┬Áes do projeto e contexto escolhido explicitamente s├â┬úo enviados.",
++    "privacy.modeDetail.maximum": "Inclui mem├â┬│rias do projeto e contexto recuperado de arquivos.",
++    "privacy.firewall": "Firewall de contexto",
++    "privacy.kind.secret": "Chaves de API e segredos",
++    "privacy.kind.token": "Tokens e senhas",
++    "privacy.kind.email": "Endere├â┬ºos de e-mail",
++    "privacy.kind.cpf": "CPF brasileiro",
++    "privacy.kind.prompt_injection": "Poss├â┬¡vel inje├â┬º├â┬úo de prompt",
++    "privacy.action.block": "Bloquear",
++    "privacy.action.mask": "Mascarar",
++    "privacy.action.allow": "Permitir",
++    "privacy.crash.title": "Relat├â┬│rios de crash",
++    "costTracker.title": "Controle de custos",
++    "costTracker.summary": "{{month}} ├é┬À {{requests}} requisi├â┬º├â┬Áes ├é┬À {{tokens}} tokens ├é┬À ${{usd}}",
++    "costTracker.models": "Por modelo",
++    "costTracker.projects": "Por projeto",
++    "costTracker.loading": "Carregando recibos mensais├óÔé¼┬ª",
++    "caps.scoped.title": "Caps por projeto e provider",
++    "caps.scoped.hint": "Estes limites s├â┬úo bloqueios r├â┬¡gidos al├â┬®m dos caps globais.",
++    "caps.scoped.project": "Projeto",
++    "caps.scoped.provider": "Provider",
++    "updates.title": "Atualiza├â┬º├â┬Áes",
++    "updates.hint": "Consulta o GitHub Releases. Feed fora n├â┬úo pode derrubar o app.",
++    "updates.check": "Verificar atualiza├â┬º├â┬Áes",
++    "updates.checking": "Verificando├óÔé¼┬ª",
++    "updates.status.idle": "Nenhuma verifica├â┬º├â┬úo ainda",
++    "updates.status.skipped": "Ignorado (build de desenvolvimento)",
++    "updates.status.uptodate": "J├â┬í est├â┬í atualizado",
++    "updates.status.available": "Atualiza├â┬º├â┬úo dispon├â┬¡vel ({{version}})",
++    "updates.status.unavailable": "Feed de update indispon├â┬¡vel ├óÔé¼ÔÇØ o app continua",
++    "import.title": "Import Hub",
++    "import.hint": "Traga exports oficiais do ChatGPT, Claude ou Gemini. Reimportar o mesmo chat ├â┬® ignorado. Ficheiros bin├â┬írios ficam de fora.",
++    "import.source": "Origem do export",
++    "import.source.chatgpt": "ChatGPT (ZIP ou conversations.json)",
++    "import.source.claude": "Claude (conversations.json)",
++    "import.source.gemini": "Gemini (MyActivity.json, melhor esfor├â┬ºo)",
++    "import.geminiLimits": "O Takeout do Gemini ├â┬® um log de atividade, n├â┬úo um arquivo completo. Use JSON (n├â┬úo HTML). Conversas agrupam-se pelo URL; imagens s├â┬úo ignoradas. Alguns turnos podem faltar.",
++    "import.destination": "Destino",
++    "import.destination.inbox": "Inbox Importadas",
++    "import.pickFile": "Escolher ficheiro",
++    "import.start": "Iniciar importa├â┬º├â┬úo",
++    "import.cancel": "Cancelar",
++    "import.fileName": "Selecionado: {{name}}",
++    "import.empty": "Ainda sem ficheiro.",
++    "import.progress": "A importar {{current}} / {{total}}",
++    "import.report.title": "Relat├â┬│rio de importa├â┬º├â┬úo",
++    "import.report.ok": "{{count}} conversas importadas",
++    "import.report.skipped": "{{count}} ignoradas (j├â┬í importadas)",
++    "import.report.errors": "{{count}} erros",
++    "import.report.error.empty": "Uma conversa n├â┬úo tinha mensagens e foi ignorada.",
++    "import.report.error.failed": "Uma conversa n├â┬úo p├â┬┤de ser gravada.",
++    "import.report.attachments": "{{count}} placeholders de ficheiro (bin├â┬írios n├â┬úo importados)",
++    "import.openDestination": "Abrir chats importados",
++    "import.error.generic": "A importa├â┬º├â┬úo n├â┬úo p├â┬┤de ser conclu├â┬¡da.",
++    "import.error.invalid_json": "Esse ficheiro n├â┬úo ├â┬® JSON v├â┬ílido.",
++    "import.error.unrecognized": "Nenhuma conversa foi reconhecida nesse ficheiro.",
++    "import.error.gemini_html": "Takeout em HTML n├â┬úo ├â┬® suportado. Exporte a atividade do Gemini Apps em JSON.",
++    "import.error.empty": "Nenhuma conversa foi encontrada nesse export.",
++    "prompts.library": "Biblioteca de prompts",
++    "prompts.editor": "Prompt",
++    "prompts.playground": "Playground",
++    "prompts.new": "Novo",
++    "prompts.save": "Guardar",
++    "prompts.insert": "Inserir no composer",
++    "prompts.delete": "Apagar",
++    "prompts.run": "Correr",
++    "prompts.running": "A correr├óÔé¼┬ª",
++    "prompts.saveWinner": "Guardar vencedor",
++    "prompts.slot": "Modelo {{n}}",
++    "prompts.titlePlaceholder": "T├â┬¡tulo",
++    "prompts.bodyPlaceholder": "Template com vari├â┬íveis de projeto, idioma e objetivo",
++    "prompts.playgroundPlaceholder": "Instru├â┬º├â┬Áes extra opcionais para esta corrida",
++    "prompts.winnerPlaceholder": "T├â┬¡tulo do vencedor",
++    "prompts.winnerDefault": "Vencedor do playground",
++    "prompts.playgroundEmpty": "Corra dois modelos para comparar.",
++    "prompts.folder.development": "Desenvolvimento",
++    "prompts.folder.studies": "Estudos",
++    "prompts.folder.work": "Trabalho",
++    "prompts.factory.code-review": "Code review",
++    "prompts.factory.debug": "Debug",
++    "prompts.factory.summary": "Resumo",
++    "prompts.factory.teacher": "Professor",
++    "prompts.error.generic": "N├â┬úo foi poss├â┬¡vel carregar a biblioteca de prompts.",
++    "prompts.error.save": "N├â┬úo foi poss├â┬¡vel guardar esse prompt.",
++    "prompts.error.resolve": "N├â┬úo foi poss├â┬¡vel resolver as vari├â┬íveis no projeto ativo.",
++    "prompts.error.run": "A corrida do playground falhou. Cada modelo fica no slot que escolheu.",
++    "prompts.error.slots": "Escolha dois modelos para correr o playground.",
++    "prompts.error.content": "Escreva um prompt ou escolha um da library.",
++    "artifacts.canvas": "Canvas",
++    "artifacts.open": "Abrir canvas",
++    "artifacts.close": "Fechar",
++    "artifacts.saveVersion": "Guardar vers├â┬úo",
++    "artifacts.pin": "Fixar no projeto",
++    "artifacts.unpin": "Desafixar",
++    "artifacts.pinned": "Fixado",
++    "artifacts.version": "v{{n}}",
++    "artifacts.exportMd": "Exportar MD",
++    "artifacts.exportHtml": "Exportar HTML",
++    "artifacts.exportSvg": "Exportar SVG",
++    "artifacts.htmlSaveToPreview": "Guarde uma vers├â┬úo para atualizar o preview em sandbox.",
++    "artifacts.mermaidError": "O Mermaid n├â┬úo conseguiu desenhar este diagrama.",
++    "artifacts.kind.mermaid": "Mermaid",
++    "artifacts.kind.html": "HTML",
++    "artifacts.kind.markdown": "Markdown",
++    "artifacts.kind.code": "C├â┬│digo",
++    "artifacts.error": "N├â┬úo foi poss├â┬¡vel atualizar esse artifact.",
++    "skills.library": "Biblioteca de skills",
++    "skills.editor": "Skill",
++    "skills.new": "Nova",
++    "skills.save": "Guardar",
++    "skills.delete": "Apagar",
++    "skills.run": "Correr",
++    "skills.steps": "Passos",
++    "skills.addStep": "Adicionar passo",
++    "skills.titlePlaceholder": "Nome",
++    "skills.descriptionPlaceholder": "O que esta skill faz",
++    "skills.promptPlaceholder": "Prompt da skill com as vari├â┬íveis de projeto, idioma e objetivo",
++    "skills.modelPlaceholder": "Id do modelo preferido (opcional)",
++    "skills.stepTitlePlaceholder": "T├â┬¡tulo do passo",
++    "skills.stepSectionPlaceholder": "Instru├â┬º├â┬Áes deste passo",
++    "skills.run.title": "A correr {{name}}",
++    "skills.folder.development": "Desenvolvimento",
++    "skills.folder.studies": "Estudos",
++    "skills.folder.work": "Trabalho",
++    "skills.factory.code-review": "Code Review",
++    "skills.factory.summarize-pdf": "Resumir PDF",
++    "skills.factory.meeting-prep": "Preparar reuni├â┬úo",
++    "skills.factory.explain-error": "Explicar erro",
++    "skills.factory.write-rfc": "Escrever RFC",
++    "skills.error.generic": "N├â┬úo foi poss├â┬¡vel carregar a biblioteca de skills.",
++    "skills.error.save": "N├â┬úo foi poss├â┬¡vel guardar essa skill.",
++    "hud.mode": "Modo",
++    "hud.effort": "Esfor├â┬ºo",
++    "hud.context": "Tokens de contexto/janela",
++    "hud.tokens": "Tokens entrada/sa├â┬¡da",
++    "hud.thinking": "Thinking",
++    "hud.cache": "Cache leitura/escrita",
++    "hud.turnCost": "Custo do turno",
++    "hud.thinkingUnavailable": "Thinking indispon├â┬¡vel neste provedor",
++    "runMode.label": "Modo",
++    "effort.label": "Esfor├â┬ºo",
++    "council.router.model": "Modelo recomendado",
++    "council.router.auto": "Autom├â┬ítico",
++    "council.router.confirmed": "Rota confirmada",
++    "council.router.recommended": "recomendado",
++    "council.router.cost": "Custo estimado do primeiro modelo: US$ {{usd}}",
++    "council.router.latency": "Lat├â┬¬ncia: {{ms}} ms",
++    "council.router.speed.fast": "Velocidade: r├â┬ípida",
++    "council.router.speed.balanced": "Velocidade: equilibrada",
++    "council.router.speed.frontier": "Velocidade: frontier",
++    "council.router.confirm": "Confirmar rota",
++    "council.router.reject": "Recusar rota",
++    "quickAi.title": "Quick AI",
++    "quickAi.close": "Fechar",
++    "quickAi.placeholder": "Pergunte algo ou cole conte├â┬║do├óÔé¼┬ª",
++    "quickAi.clipboard": "Ler clipboard",
++    "quickAi.formatJson": "Formatar JSON",
++    "quickAi.toInterface": "Interface TS",
++    "quickAi.explainJson": "Explicar JSON",
++    "quickAi.diagnoseStack": "Diagnosticar stack",
++    "quickAi.sendToProject": "Mandar ao projeto atual",
++    "quickAi.model": "Modelo",
++    "quickAi.estimate": "Estimativa: US$ {{usd}}",
++    "quickAi.estimateUnavailable": "Estimativa dispon├â┬¡vel ao enviar",
++    "quickAi.send": "Enviar",
++    "quickAi.cancel": "Cancelar",
++    "quickAi.sending": "Enviando├óÔé¼┬ª",
++    "quickAi.error.setup": "Configure uma chave de provider antes de enviar.",
++    "quickAi.error.send": "N├â┬úo foi poss├â┬¡vel enviar a pergunta.",
++    "quickAi.conversationTitle": "Quick AI",
++    "quickAi.explainPrefix": "Explique este JSON de forma clara:",
++    "quickAi.diagnosePrefix": "Diagnostique este stack trace e sugira uma corre├â┬º├â┬úo:",
++    "council.title": "AI Council",
++    "council.placeholder": "Pergunta para o conselho├óÔé¼┬ª",
++    "council.run": "Iniciar debate",
++    "council.running": "Debatendo├óÔé¼┬ª",
++    "council.synthesis": "S├â┬¡ntese",
++    "council.divergences": "Diverg├â┬¬ncias (heur├â┬¡stica)",
++    "council.none": "Nenhuma destacada",
++    "council.error.setup": "Abra uma conversa e configure ao menos dois modelos.",
++    "council.error.run": "N├â┬úo foi poss├â┬¡vel concluir o Council.",
++    "council.router.simple": "Router: pergunta simples ├óÔÇáÔÇÖ rota r├â┬ípida; confirme antes de enviar.",
++    "council.router.code": "Router: c├â┬│digo ├óÔÇáÔÇÖ rota equilibrada; confirme antes de enviar.",
++    "council.router.complex": "Router: tarefa complexa ├óÔÇáÔÇÖ rota frontier; confirme antes de enviar.",
++    "tools.pathPlaceholder": "Caminho relativo no projeto (ex.: src/app.ts)",
++    "tools.readFile": "Ler arquivo",
++    "tools.chooseRoot": "Escolher raiz",
++    "tools.permission": "Permitir {{tool}} ler este arquivo?",
++    "tools.allowOnce": "Permitir uma vez",
++    "tools.allowProject": "Sempre neste projeto",
++    "tools.deny": "Negar",
++    "tools.activity": "Tool",
++    "tools.untrustedContext": "Conte├â┬║do de tool n├â┬úo confi├â┬ível",
++    "tools.status.permission_required": "aguarda permiss├â┬úo",
++    "tools.status.denied": "negada",
++    "tools.status.running": "em execu├â┬º├â┬úo",
++    "tools.status.completed": "conclu├â┬¡da",
++    "tools.status.failed": "falhou",
++    "tools.error.denied": "A leitura foi negada.",
++    "tools.error.read": "N├â┬úo foi poss├â┬¡vel ler esse arquivo do projeto.",
++    "agents.title": "Agente ├â┬║nico",
++    "agents.mode": "Agente",
++    "agents.pathsLabel": "Arquivos do projeto para analisar",
++    "agents.pathsPlaceholder": "Um caminho relativo do projeto por linha (at├â┬® 3)",
++    "agents.factory.goal": "Analise os arquivos selecionados do projeto e reporte a arquitetura, os riscos e os pr├â┬│ximos passos.",
++    "agents.factory.action": "Usar Analisar este projeto",
++    "agents.confirmDisclosure": "Ap├â┬│s sua confirma├â┬º├â┬úo, o conte├â┬║do dos arquivos selecionados poder├â┬í ser enviado para {{provider}} / {{model}} para gerar o relat├â┬│rio.",
++    "agents.confirm": "Confirmar plano",
++    "agents.pause": "Pausar",
++    "agents.resume": "Retomar",
++    "agents.cancel": "Cancelar",
++    "agents.limits": "Limite: {{steps}} passos ├é┬À US$ {{budget}} ├é┬À {{seconds}}s",
++    "agents.error.paths": "Adicione ao menos um caminho relativo de arquivo do projeto.",
++    "agents.error.prepare": "N├â┬úo foi poss├â┬¡vel preparar a execu├â┬º├â┬úo do agente. Escolha uma raiz do projeto e uma chave de modelo ativa.",
++    "agents.error.control": "N├â┬úo foi poss├â┬¡vel atualizar a execu├â┬º├â┬úo do agente.",
++    "agents.status.awaiting_confirmation": "aguarda confirma├â┬º├â┬úo",
++    "agents.status.running": "em execu├â┬º├â┬úo",
++    "agents.status.paused": "pausado",
++    "agents.status.cancelled": "cancelado",
++    "agents.status.completed": "conclu├â┬¡do",
++    "agents.status.completed_with_errors": "conclu├â┬¡do com erros",
++    "agents.status.stopped_budget": "interrompido pelo or├â┬ºamento",
++    "agents.status.stopped_timeout": "interrompido pelo limite de tempo",
++    "agents.status.interrupted": "interrompido",
++    "agents.status.failed": "falhou",
++    "agents.step.pending": "pendente",
++    "agents.step.running": "em execu├â┬º├â┬úo",
++    "agents.step.completed": "conclu├â┬¡do",
++    "agents.step.failed": "falhou",
++    "agents.step.skipped": "ignorado",
++    "agents.step.cancelled": "cancelado",
++    "agents.step.interrupted": "interrompido",
++    "agents.step.tokens": "tokens {{input}}/{{output}}",
++    "agents.step.cost": "custo US$ {{usd}}",
++    "orchestration.title": "Orquestra├â┬º├â┬úo",
++    "orchestration.mode": "Orquestrar",
++    "orchestration.empty": "Selecione os arquivos do projeto acima e envie um objetivo para preparar o grafo.",
++    "orchestration.disclosure": "Supervisor e todos os especialistas usam {{provider}} / {{model}}; cap compartilhado do grafo: US$ {{budget}}. Um modelo diferente exige nova confirma├â┬º├â┬úo expl├â┬¡cita.",
++    "orchestration.usage": "tokens {{input}}/{{output}} ├é┬À US$ {{cost}}",
++    "orchestration.confirm": "Confirmar grafo",
++    "orchestration.error.prepare": "N├â┬úo foi poss├â┬¡vel preparar a orquestra├â┬º├â┬úo. Escolha uma raiz do projeto e uma chave de modelo ativa.",
++    "orchestration.error.control": "N├â┬úo foi poss├â┬¡vel atualizar a orquestra├â┬º├â┬úo.",
++    "orchestration.role.explorer": "Explorador",
++    "orchestration.role.reviewer": "Revisor",
++    "orchestration.role.writer": "Redator",
++    "orchestration.handoff.pending": "pendente",
++    "orchestration.handoff.ready": "pronto",
++    "orchestration.handoff.consumed": "consumido",
++    "orchestration.handoff.cancelled": "cancelado",
++    "orchestration.handoff.interrupted": "interrompido",
++    "developer.title": "Modo Desenvolvedor",
++    "developer.tree": "Explorer",
++    "developer.status": "Status do Git",
++    "developer.diff": "Diff do Git",
++    "developer.terminal": "Diagn├â┬│stico do terminal",
++    "developer.review": "Revisar diff",
++    "developer.tests": "Gerar testes",
++    "developer.architecture": "Explicar arquitetura",
++    "developer.hint": "Ferramentas somente-leitura do projeto e Git; cada uso pede permiss├â┬úo.",
++    "developer.error": "N├â┬úo foi poss├â┬¡vel executar a ferramenta de desenvolvimento.",
++    "offline.localMode": "Modo local ├é┬À Ollama e RAG dos PDFs no modo m├â┬íximo funcionam sem internet; cloud precisa de internet",
++    "offline.cloudMode": "Cloud selecionada ├é┬À Ollama e RAG dos PDFs no modo m├â┬íximo dispon├â┬¡veis localmente",
++    "offline.noModels": "Ollama ativo, sem modelos instalados ├é┬À RAG dos PDFs no modo m├â┬íximo segue local",
++    "offline.localUnavailable": "Ollama indispon├â┬¡vel ├é┬À RAG dos PDFs no modo m├â┬íximo segue local; cloud precisa de internet",
++    "notes.saveAsNote": "Salvar como nota",
++    "notes.error.save": "N├úo foi poss├¡vel salvar a nota.",
++    "tasks.saveAsChecklist": "Virar tarefas",
++    "tasks.error.save": "N├úo foi poss├¡vel criar o checklist.",
++    "workspace.panel.notes": "Notas",
++    "research.mode": "Pesquisa",
++    "research.error.prepare": "N├úo foi poss├¡vel preparar a pesquisa. Escolha um projeto e uma chave de modelo ativa.",
++    "command.research": "Modo pesquisa",
++    "command.hit.note": "Nota ┬À {{title}}",
++    "command.hit.task": "Tarefa ┬À {{title}}",
++    "skills.factory.study-professor": "Estudo: Professor",
++    "skills.factory.study-examiner": "Estudo: Examinador",
++    "skills.factory.study-tutor": "Estudo: Tutor",
++    "skills.factory.study-evaluator": "Estudo: Avaliador",
++    "voice.title": "Voz",
++    "voice.show": "Mostrar voz",
++    "voice.hide": "Ocultar voz",
++    "voice.listen": "Ouvir",
++    "voice.stopListen": "Parar de ouvir",
++    "voice.interrupt": "Interromper",
++    "voice.transcript": "Transcri├º├úo",
++    "voice.hint": "Pressione Ouvir, fa├ºa uma pergunta, e veja a resposta e o receipt no fio.",
++    "voice.continuous": "Conversa cont├¡nua",
++    "voice.voice": "Voz TTS",
++    "voice.voiceDefault": "Padr├úo do sistema",
++    "voice.cloudWarning": "O reconhecimento/s├¡ntese de fala pode usar servi├ºos do SO ou da nuvem. O AI Hub n├úo grava ├íudio em disco sem o opt-in abaixo.",
++    "voice.cloudAck": "Entendo que STT/TTS podem sair deste dispositivo",
++    "voice.audioDiskOptIn": "Permitir gravar ├íudio de voz em disco (recursos futuros)",
++    "voice.audioDiskDetail": "Desativado no modo Privado. A Wave 28 n├úo grava ficheiros de ├íudio mesmo com isto ligado.",
++    "voice.settings.title": "Modo Voz",
++    "voice.settings.hint": "Pergunte hands-free pelo microfone. Respostas usam o mesmo caminho de chat, caps e receipts.",
++    "voice.phase.idle": "Inativo",
++    "voice.phase.listening": "A ouvirÔÇª",
++    "voice.phase.sending": "A enviar transcri├º├úoÔÇª",
++    "voice.phase.speaking": "A falar a respostaÔÇª",
++    "voice.error.unsupported": "Reconhecimento de fala indispon├¡vel neste runtime.",
++    "voice.error.cloudAck": "Aceite primeiro o aviso de privacidade de fala (nuvem/SO).",
++    "voice.error.ready": "Abra uma conversa e escolha uma chave de provider primeiro.",
++    "voice.error.send": "N├úo foi poss├¡vel enviar a transcri├º├úo.",
++    "voice.error.stt": "Erro de fala: {{code}}"
+ }
+diff --git a/docs/ADR/ADR-W28-001-web-speech-voice-mode.md b/docs/ADR/ADR-W28-001-web-speech-voice-mode.md
+new file mode 100644
+index 0000000..449a8d8
+--- /dev/null
++++ b/docs/ADR/ADR-W28-001-web-speech-voice-mode.md
+@@ -0,0 +1,40 @@
++# ADR-W28-001-web-speech-voice-mode
++
++- **Status:** accepted
++- **Onda:** W28
++- **Data:** 2026-09-23
++- **Deciders:** Cursor / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++Wave 28 exige Voice Mode (STT ÔåÆ LLM ÔåÆ TTS), conversa cont├¡nua com interrup├º├úo, escolha de voz, aviso se STT/TTS for cloud, e respeito ao modo Privado (n├úo gravar ├íudio em disco sem opt-in). O DoD ├® hands-free de uma pergunta com transcript e receipt vis├¡veis. N├úo h├í pacote `voice` no MVP; a trust boundary pro├¡be keys/Provider HTTP no renderer.
++
++## Decis├úo
++
++1. **STT/TTS** usam a **Web Speech API** no renderer (Chromium do Electron): `SpeechRecognition` / `SpeechSynthesis`. Sem novo npm package e sem HTTP de provider de voz no main nesta onda.
++2. **LLM** continua exclusivamente via `chat:send` / `sendChat` (caps, firewall, receipts, abort, privacy efetiva no main). O transcript vira o `content` da mensagem do usu├írio.
++3. **├üudio em disco:** W28 **n├úo** grava wav/webm. Pref `audioDiskOptIn` (default `false`) reserva o contrato; em `privacyMode === "private"` a grava├º├úo ├® sempre recusada mesmo com opt-in. Transcripts vivem como mensagens cifradas da conversa.
++4. **Cloud / OS:** Web Speech pode usar servi├ºos do SO/navegador. Exigimos `voiceCloudAck` antes do primeiro listen e mostramos aviso de privacidade na Settings e no painel de voz.
++5. **Voz TTS:** `ttsVoiceURI` em app prefs; lista vem de `speechSynthesis.getVoices()` no renderer.
++6. **Cont├¡nuo / interrupt:** ap├│s TTS da resposta, se `voiceContinuous` e o utilizador ainda est├í em modo voz, reinicia STT; interrupt para reconhecimento, s├¡ntese e `chat.abort`.
++
++## Alternativas consideradas
++
++- **Whisper/ffmpeg local no main:** rejeitado nesta onda ÔÇö pesado, novo bin├írio, fora do DoD m├¡nimo.
++- **Cloud STT/TTS via ai-gateway:** rejeitado ÔÇö nova superf├¡cie de keys e custo; aviso cloud basta para Web Speech.
++- **Pacote `packages/voice`:** rejeitado ÔÇö plano n├úo cria pacote; l├│gica cabe em desktop + prefs shared/db.
++
++## Consequ├¬ncias
++
++- Qualidade STT/TTS depende do SO/Chromium; CI deve mockar transcript (sem microfone real).
++- Hist├│rico de voz = hist├│rico da conversa (sem tabela separada).
++- Ondas futuras podem trocar o backend de STT/TTS sem mudar o caminho LLM se mantiverem o contrato transcript ÔåÆ `chat:send`.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 28)
++- `docs/AI_Hub_Desktop_Escopo.md` (┬º38)
++- `docs/ADR/ADR-W18-001-effective-privacy-policy.md`
++- `docs/reviews/W28/REVIEW.md` (quando existir)
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index faf2f4f..b5ca9de 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -115,3 +115,4 @@ N├úo escrever ADR de detalhe cosm├®tica. Se mexe em seguran├ºa, custo, provider
+ | [ADR-W25-001](./ADR-W25-001-main-owned-read-only-developer-tools.md) | W25 | Ferramentas de desenvolvimento somente-leitura no main | accepted |
+ | [ADR-W26-001](./ADR-W26-001-local-ollama-provider-and-offline-embeddings.md) | W26 | Provider Ollama local e embeddings offline | accepted |
+ | [ADR-W27-001](./ADR-W27-001-project-notes-and-research-graph.md) | W27 | Notes de projeto e Research no grafo W24 | accepted |
++| [ADR-W28-001](./ADR-W28-001-web-speech-voice-mode.md) | W28 | Voice Mode via Web Speech; LLM s├│ por chat:send | accepted |
+diff --git a/docs/IMPLEMENTATION_PLAN.md b/docs/IMPLEMENTATION_PLAN.md
+index ee59293..a7de7d0 100644
+--- a/docs/IMPLEMENTATION_PLAN.md
++++ b/docs/IMPLEMENTATION_PLAN.md
+@@ -936,10 +936,10 @@ Council **n├úo** ├® orquestra├º├úo de agentes: N modelos, um packet, sem tools.
+ 
+ **Sub-tasks:**
+ 
+-- [ ] STT ÔåÆ LLM ÔåÆ TTS
+-- [ ] Conversa cont├¡nua, interrup├º├úo, hist├│rico
+-- [ ] Escolha de voz; fallback se STT/TTS for cloud (aviso de privacidade)
+-- [ ] Respeita modo Privado (n├úo gravar ├íudio em disco sem opt-in)
++- [x] STT ÔåÆ LLM ÔåÆ TTS
++- [x] Conversa cont├¡nua, interrup├º├úo, hist├│rico
++- [x] Escolha de voz; fallback se STT/TTS for cloud (aviso de privacidade)
++- [x] Respeita modo Privado (n├úo gravar ├íudio em disco sem opt-in)
+ 
+ **DoD:** hands-free de uma pergunta; usu├írio v├¬ o transcript e o receipt.
+ 
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 0d95fce..c2ca39a 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave
+ |---|---|
+ | Wave | **W28** |
+ | Marco | E ÔÇö V3 ecosystem |
+-| State | `pending` |
++| State | `review` |
+ | Last completed | **W27** |
+-| Next action | Iniciar Wave 28 (Voice Mode) com skill `wave-start`. |
++| Next action | Freeze + revis├úo independente W28; persistir `docs/reviews/W28/`. |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -43,16 +43,13 @@ None.
+ - W17: stepper n├úo segue headings do stream; palette s├│ corre Code Review por atalho; factory t├¡tulos EN na DB; `skills:list` devolve prompt no renderer (como prompts W15).
+ - W23: n├úo h├í teste isolado do runner para cancelamento durante di├ílogo nativo/timeout; `skill.steps[]` orienta a s├¡ntese e a allowlist executa a leitura, mas ainda n├úo h├í grafo de tool por etapa.
+ - W26: nesta m├íquina Ollama CUDA falhou (`device kernel image is invalid`); prova f├¡sica usou CPU. Caps batch (council/playground) ainda podem hard-stopar Ollama com teto USD esgotado; chat path isenta.
+-- W27: UI de Notes n├úo coleta tags no save nem mostra timestamps; hit de busca `kind=note` n├úo abre o painel; sem teste isolado de `prepareResearch`; Research sem fontes indexadas usa placeholder; tags de notes em plaintext (W06).
++- W27: UI de Notes n├úo coleta tags no save nem mostra timestamps; hit de busca `kind=note` n├úo abre painel; sem teste isolado de `prepareResearch`; Research sem fontes indexadas usa placeholder; tags de notes em plaintext (W06).
+ 
+ ## Notes for the next session
+ 
++- W28 em curso: Voice Mode (STTÔåÆLLMÔåÆTTS), Web Speech no renderer; LLM s├│ via `chat:send`.
+ - W27 fechada: Notes cifradas por projeto; Tasks from message; Study (4 factory skills); Research via orquestra├º├úo `graphVersion: 2` + artifact cit├ível. Gate em `docs/reviews/W27/`.
+-- W26 fechada: Ollama first-class sem keytar; fallback local com confirma├º├úo; receipts custo 0; badge offline; embeddings hashed continuam offline. Prova f├¡sica em `docs/reviews/W26/PHYSICAL-DOD.md`.
+-- W17 fechada. Skills cifradas; `/skill` + `@skill`; contrato `tools: []` para W23.
+-- W18 fechada: Privacy Center, Context Firewall, Cost Tracker e caps por projeto/provider.
+-- W19 fechada: Quick AI, clipboard intelligence, sele├º├úo via copy + atalho e tray/background.
+-- W22 fechada: MCP scoped ao projeto, Permission Center no main, HUD redigido e allowlist declarativa para skills.
++- W26 fechada: Ollama first-class sem keytar; fallback local com confirma├º├úo; receipts custo 0; badge offline.
+ 
+ ## Last review / ADR
+ 
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index 675fc5c..9536b06 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -148,6 +148,16 @@ describe("hub database", () => {
+     expect(next.onboardingComplete).toBe(true);
+     expect(next.crashReporterOptIn).toBe(true);
+     expect(next.lastUpdateStatus).toBe("idle");
++    expect(next.voiceCloudAck).toBe(false);
++    expect(next.audioDiskOptIn).toBe(false);
++    const voiced = hub.repos.setAppPrefs({
++      voiceCloudAck: true,
++      voiceContinuous: true,
++      ttsVoiceURI: "uri:test",
++    });
++    expect(voiced.voiceCloudAck).toBe(true);
++    expect(voiced.voiceContinuous).toBe(true);
++    expect(voiced.ttsVoiceURI).toBe("uri:test");
+     hub.close();
+   });
+ 
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index de8e958..f06de12 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -416,6 +416,10 @@ export interface AppPrefsRecord {
+     cpf: "block" | "mask" | "allow";
+     prompt_injection: "block" | "mask" | "allow";
+   };
++  ttsVoiceURI: string | null;
++  voiceCloudAck: boolean;
++  audioDiskOptIn: boolean;
++  voiceContinuous: boolean;
+ }
+ 
+ const DEFAULT_APP_PREFS: AppPrefsRecord = {
+@@ -426,6 +430,10 @@ const DEFAULT_APP_PREFS: AppPrefsRecord = {
+   lastWizardTtftMs: null,
+   privacyMode: "normal",
+   firewallPolicy: { secret: "mask", token: "mask", email: "mask", cpf: "mask", prompt_injection: "block" },
++  ttsVoiceURI: null,
++  voiceCloudAck: false,
++  audioDiskOptIn: false,
++  voiceContinuous: false,
+ };
+ 
+ const UPDATE_STATUSES: readonly AppPrefsRecord["lastUpdateStatus"][] = [
+@@ -1664,6 +1672,10 @@ export class HubRepos {
+           ? record.privacyMode
+           : DEFAULT_APP_PREFS.privacyMode,
+       firewallPolicy: isFirewallPolicy(record.firewallPolicy) ? record.firewallPolicy : DEFAULT_APP_PREFS.firewallPolicy,
++      ttsVoiceURI: typeof record.ttsVoiceURI === "string" ? record.ttsVoiceURI.slice(0, 200) : null,
++      voiceCloudAck: record.voiceCloudAck === true,
++      audioDiskOptIn: record.audioDiskOptIn === true,
++      voiceContinuous: record.voiceContinuous === true,
+     };
+   }
+ 
+@@ -1675,6 +1687,10 @@ export class HubRepos {
+     lastWizardTtftMs?: number | null | undefined;
+     privacyMode?: AppPrefsRecord["privacyMode"] | undefined;
+     firewallPolicy?: AppPrefsRecord["firewallPolicy"] | undefined;
++    ttsVoiceURI?: string | null | undefined;
++    voiceCloudAck?: boolean | undefined;
++    audioDiskOptIn?: boolean | undefined;
++    voiceContinuous?: boolean | undefined;
+   }): AppPrefsRecord {
+     const current = this.getAppPrefs();
+     const next: AppPrefsRecord = {
+@@ -1685,6 +1701,10 @@ export class HubRepos {
+       lastWizardTtftMs: patch.lastWizardTtftMs === undefined ? current.lastWizardTtftMs : patch.lastWizardTtftMs,
+       privacyMode: patch.privacyMode ?? current.privacyMode,
+       firewallPolicy: patch.firewallPolicy ?? current.firewallPolicy,
++      ttsVoiceURI: patch.ttsVoiceURI === undefined ? current.ttsVoiceURI : patch.ttsVoiceURI,
++      voiceCloudAck: patch.voiceCloudAck ?? current.voiceCloudAck,
++      audioDiskOptIn: patch.audioDiskOptIn ?? current.audioDiskOptIn,
++      voiceContinuous: patch.voiceContinuous ?? current.voiceContinuous,
+     };
+     const now = Date.now();
+     this.db
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 2538729..51a8edb 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -523,3 +523,4 @@ export {
+   type PortablePacketOrigin,
+   type PortablePacketV1,
+ } from "./portable-packet";
++export { canPersistVoiceAudio, type VoicePrivacyPrefs } from "./voice";
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index 298873a..c1b7680 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -1,6 +1,7 @@
+ import { describe, expect, it } from "vitest";
+ import {
+   appPrefsSchema,
++  appPrefsPatchSchema,
+   conversationExportDocumentSchema,
+   debugSnapshotSchema,
+   emptyIpcPayloadSchema,
+@@ -438,12 +439,44 @@ describe("wave 8 contracts", () => {
+         cpf: "mask",
+         prompt_injection: "block",
+       },
++      ttsVoiceURI: null,
++      voiceCloudAck: false,
++      audioDiskOptIn: false,
++      voiceContinuous: false,
+     };
+     expect(appPrefsSchema.parse(prefs).crashReporterOptIn).toBe(false);
++    expect(appPrefsSchema.parse(prefs).audioDiskOptIn).toBe(false);
+     expect(() => appPrefsSchema.parse({ ...prefs, apiKey: "sk-test" })).toThrow();
+   });
+ });
+ 
++describe("wave 28 voice prefs", () => {
++  it("accepts voice prefs and rejects secrets", () => {
++    const prefs = {
++      onboardingComplete: true,
++      crashReporterOptIn: false,
++      lastUpdateCheckAt: null,
++      lastUpdateStatus: "idle" as const,
++      lastWizardTtftMs: null,
++      privacyMode: "normal" as const,
++      firewallPolicy: {
++        secret: "mask" as const,
++        token: "mask" as const,
++        email: "mask" as const,
++        cpf: "mask" as const,
++        prompt_injection: "block" as const,
++      },
++      ttsVoiceURI: "Microsoft Zira",
++      voiceCloudAck: true,
++      audioDiskOptIn: false,
++      voiceContinuous: true,
++    };
++    expect(appPrefsSchema.parse(prefs).voiceContinuous).toBe(true);
++    expect(appPrefsPatchSchema.parse({ ttsVoiceURI: null, voiceCloudAck: true }).voiceCloudAck).toBe(true);
++    expect(() => appPrefsSchema.parse({ ...prefs, apiKey: "sk-leak" })).toThrow();
++  });
++});
++
+ describe("wave 12 file contracts", () => {
+   it("rejects extra keys on ingest paths and remove", () => {
+     const ingest = {
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index 1289df9..00ecd79 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -804,6 +804,10 @@ export const appPrefsSchema = z
+         prompt_injection: z.enum(["block", "mask", "allow"]),
+       })
+       .strict(),
++    ttsVoiceURI: z.string().max(200).nullable(),
++    voiceCloudAck: z.boolean(),
++    audioDiskOptIn: z.boolean(),
++    voiceContinuous: z.boolean(),
+   })
+   .strict();
+ 
+diff --git a/packages/shared/src/voice.test.ts b/packages/shared/src/voice.test.ts
+new file mode 100644
+index 0000000..be167e8
+--- /dev/null
++++ b/packages/shared/src/voice.test.ts
+@@ -0,0 +1,18 @@
++import { describe, expect, it } from "vitest";
++import { canPersistVoiceAudio } from "./voice";
++
++describe("canPersistVoiceAudio", () => {
++  it("refuses Private mode even with opt-in", () => {
++    expect(canPersistVoiceAudio({ privacyMode: "private", audioDiskOptIn: true })).toBe(false);
++  });
++
++  it("refuses normal/maximum without opt-in", () => {
++    expect(canPersistVoiceAudio({ privacyMode: "normal", audioDiskOptIn: false })).toBe(false);
++    expect(canPersistVoiceAudio({ privacyMode: "maximum", audioDiskOptIn: false })).toBe(false);
++  });
++
++  it("allows normal/maximum only with opt-in", () => {
++    expect(canPersistVoiceAudio({ privacyMode: "normal", audioDiskOptIn: true })).toBe(true);
++    expect(canPersistVoiceAudio({ privacyMode: "maximum", audioDiskOptIn: true })).toBe(true);
++  });
++});
+diff --git a/packages/shared/src/voice.ts b/packages/shared/src/voice.ts
+new file mode 100644
+index 0000000..adc0e61
+--- /dev/null
++++ b/packages/shared/src/voice.ts
+@@ -0,0 +1,16 @@
++/**
++ * Voice Mode (W28) helpers ÔÇö disk gate for audio. STT/TTS live in the renderer (Web Speech).
++ */
++
++export type VoicePrivacyPrefs = {
++  privacyMode: "private" | "normal" | "maximum";
++  audioDiskOptIn: boolean;
++};
++
++/** Audio must never hit disk in Private mode, nor without explicit opt-in. */
++export function canPersistVoiceAudio(prefs: VoicePrivacyPrefs): boolean {
++  if (prefs.privacyMode === "private") {
++    return false;
++  }
++  return prefs.audioDiskOptIn === true;
++}
