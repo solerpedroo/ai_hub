@@ -523,3 +523,4 @@ export {
   type PortablePacketOrigin,
   type PortablePacketV1,
 } from "./portable-packet";
+export { canPersistVoiceAudio, type VoicePrivacyPrefs } from "./voice";
