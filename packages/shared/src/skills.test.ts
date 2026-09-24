@@ -20,9 +20,13 @@ describe("skills contract", () => {
       "meeting-prep",
       "explain-error",
       "write-rfc",
+      "study-professor",
+      "study-examiner",
+      "study-tutor",
+      "study-evaluator",
     ]);
     expect(new Set(FACTORY_SKILLS.map((item) => item.folder))).toEqual(
-      new Set(["development", "work"]),
+      new Set(["development", "work", "studies"]),
     );
     for (const skill of FACTORY_SKILLS) {
       const contract = factorySkillContract(skill);
