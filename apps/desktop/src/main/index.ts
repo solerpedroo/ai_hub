@@ -267,6 +267,39 @@ function createTray(): void {
 app.whenReady().then(async () => {
   electronApp.setAppUserModelId("com.aihub.desktop");
   applyContentSecurityPolicy();
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    if (permission !== "media") {
+      callback(false);
+      return;
+    }
+    const url = webContents.getURL();
+    const allowedOrigin =
+      url.startsWith("file:") ||
+      url.startsWith("http://localhost") ||
+      url.startsWith("http://127.0.0.1") ||
+      url.startsWith("app:") ||
+      url.includes("localhost");
+    if (!allowedOrigin) {
+      callback(false);
+      return;
+    }
+    const mediaTypes =
+      "mediaTypes" in details && Array.isArray(details.mediaTypes) ? details.mediaTypes : [];
+    if (mediaTypes.includes("video")) {
+      callback(false);
+      return;
+    }
+    callback(true);
+  });
+  session.defaultSession.setPermissionCheckHandler((_webContents, permission, _requestingOrigin, details) => {
+    if (permission !== "media") {
+      return false;
+    }
+    if (details.mediaType === "video") {
+      return false;
+    }
+    return true;
+  });
   registerWindowIpc(targetWindow, (event) => BrowserWindow.fromWebContents(event.sender) === quickAiWindow);
   try {
     await bootPersistence();
