@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   appPrefsSchema,
+  appPrefsPatchSchema,
   conversationExportDocumentSchema,
   debugSnapshotSchema,
   emptyIpcPayloadSchema,
@@ -438,9 +439,41 @@ describe("wave 8 contracts", () => {
         cpf: "mask",
         prompt_injection: "block",
       },
+      ttsVoiceURI: null,
+      voiceCloudAck: false,
+      audioDiskOptIn: false,
+      voiceContinuous: false,
     };
     expect(appPrefsSchema.parse(prefs).crashReporterOptIn).toBe(false);
+    expect(appPrefsSchema.parse(prefs).audioDiskOptIn).toBe(false);
     expect(() => appPrefsSchema.parse({ ...prefs, apiKey: "sk-test" })).toThrow();
+  });
+});
+
+describe("wave 28 voice prefs", () => {
+  it("accepts voice prefs and rejects secrets", () => {
+    const prefs = {
+      onboardingComplete: true,
+      crashReporterOptIn: false,
+      lastUpdateCheckAt: null,
+      lastUpdateStatus: "idle" as const,
+      lastWizardTtftMs: null,
+      privacyMode: "normal" as const,
+      firewallPolicy: {
+        secret: "mask" as const,
+        token: "mask" as const,
+        email: "mask" as const,
+        cpf: "mask" as const,
+        prompt_injection: "block" as const,
+      },
+      ttsVoiceURI: "Microsoft Zira",
+      voiceCloudAck: true,
+      audioDiskOptIn: false,
+      voiceContinuous: true,
+    };
+    expect(appPrefsSchema.parse(prefs).voiceContinuous).toBe(true);
+    expect(appPrefsPatchSchema.parse({ ttsVoiceURI: null, voiceCloudAck: true }).voiceCloudAck).toBe(true);
+    expect(() => appPrefsSchema.parse({ ...prefs, apiKey: "sk-leak" })).toThrow();
   });
 });
 
