@@ -19,6 +19,8 @@ export function MessageBubble({
   onActivateSibling,
   onPin,
   onOpenArtifact,
+  onSaveNote,
+  onSaveTasks,
 }: {
   message: MessageDto;
   messages: MessageDto[];
@@ -32,6 +34,8 @@ export function MessageBubble({
   onActivateSibling: (id: string) => void;
   onPin: (pinned: boolean) => void;
   onOpenArtifact?: (messageId: string) => void;
+  onSaveNote?: (messageId: string) => void;
+  onSaveTasks?: (messageId: string) => void;
 }): JSX.Element {
   const { t } = useTranslation();
   const [editing, setEditing] = useState(false);
@@ -118,6 +122,30 @@ export function MessageBubble({
               onClick={() => onOpenArtifact(message.id)}
             >
               {t("artifacts.open")}
+            </Button>
+          ) : null}
+          {message.role === "assistant" && message.status === "complete" && onSaveNote ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              data-testid="message-save-note"
+              disabled={busy}
+              onClick={() => onSaveNote(message.id)}
+            >
+              {t("notes.saveAsNote")}
+            </Button>
+          ) : null}
+          {message.role === "assistant" && message.status === "complete" && onSaveTasks ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              data-testid="message-save-tasks"
+              disabled={busy}
+              onClick={() => onSaveTasks(message.id)}
+            >
+              {t("tasks.saveAsChecklist")}
             </Button>
           ) : null}
           {message.role !== "system" && message.status !== "streaming" ? (
