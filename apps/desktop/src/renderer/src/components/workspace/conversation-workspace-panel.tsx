@@ -18,21 +18,25 @@ function latestArtifacts(items: ArtifactDto[]): ArtifactDto[] {
 export function ConversationWorkspacePanel({
   workspace,
   artifacts,
+  notes,
   busy,
   onRefresh,
   onAddTask,
   onSetTaskDone,
   onRemoveTask,
   onOpenArtifact,
+  onRemoveNote,
 }: {
   workspace: ConversationWorkspaceDto | null;
   artifacts: ArtifactDto[];
+  notes: import("@ai-hub/shared").ProjectNoteDto[];
   busy: boolean;
   onRefresh: () => Promise<void>;
   onAddTask: (title: string) => Promise<void>;
   onSetTaskDone: (id: string, done: boolean) => Promise<void>;
   onRemoveTask: (id: string) => Promise<void>;
   onOpenArtifact: (id: string) => void;
+  onRemoveNote: (id: string) => Promise<void>;
 }): JSX.Element {
   const { t } = useTranslation();
   const [taskTitle, setTaskTitle] = useState("");
@@ -135,6 +139,31 @@ export function ConversationWorkspacePanel({
               </li>
             ))}
           </ul>
+        </section>
+        <section>
+          <p className="text-[11px] font-medium">{t("workspace.panel.notes")}</p>
+          {notes.length === 0 ? (
+            <p className="text-[12px] text-muted-foreground">{t("workspace.panel.empty")}</p>
+          ) : (
+            <ul>
+              {notes.map((note) => (
+                <li key={note.id} className="mb-1 rounded border p-1" data-testid="workspace-note">
+                  <div className="flex items-start justify-between gap-1">
+                    <div className="min-w-0">
+                      <p className="truncate text-[12px] font-medium">{note.title}</p>
+                      <p className="line-clamp-2 text-[11px] text-muted-foreground">{note.body}</p>
+                      {note.tags.length > 0 ? (
+                        <p className="text-[10px] text-muted-foreground">{note.tags.join(", ")}</p>
+                      ) : null}
+                    </div>
+                    <Button type="button" size="sm" variant="ghost" onClick={() => void onRemoveNote(note.id)}>
+                      {t("workspace.panel.remove")}
+                    </Button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
         </section>
       </div>
     </aside>
