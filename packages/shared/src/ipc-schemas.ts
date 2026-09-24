@@ -804,6 +804,10 @@ export const appPrefsSchema = z
         prompt_injection: z.enum(["block", "mask", "allow"]),
       })
       .strict(),
+    ttsVoiceURI: z.string().max(200).nullable(),
+    voiceCloudAck: z.boolean(),
+    audioDiskOptIn: z.boolean(),
+    voiceContinuous: z.boolean(),
   })
   .strict();
 
