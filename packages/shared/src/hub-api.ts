@@ -72,7 +72,12 @@ import type {
   WorkspaceConversationInput,
   WorkspaceAddTaskInput,
   WorkspaceSetTaskDoneInput,
+  WorkspaceTasksFromMessageInput,
   ConversationTaskDto,
+  ProjectNoteDto,
+  NotesListInput,
+  NotesCreateFromMessageInput,
+  NotesUpdateInput,
   ConversationToProjectResult,
   PromptDto,
   PromptCreateInput,
@@ -116,6 +121,7 @@ import type {
   AgentRunDto,
   AgentRunDetail,
   OrchestrationPrepareInput,
+  ResearchPrepareInput,
   OrchestrationRunDetail,
   ProviderKeyDto,
   LocalProviderStatusDto,
@@ -260,6 +266,14 @@ export interface HubWorkspaceApi {
   addTask: (input: WorkspaceAddTaskInput) => Promise<ConversationTaskDto>;
   setTaskDone: (input: WorkspaceSetTaskDoneInput) => Promise<ConversationTaskDto>;
   removeTask: (input: IdInput) => Promise<void>;
+  tasksFromMessage: (input: WorkspaceTasksFromMessageInput) => Promise<ConversationTaskDto[]>;
+}
+
+export interface HubNotesApi {
+  list: (input: NotesListInput) => Promise<ProjectNoteDto[]>;
+  createFromMessage: (input: NotesCreateFromMessageInput) => Promise<ProjectNoteDto>;
+  update: (input: NotesUpdateInput) => Promise<ProjectNoteDto>;
+  remove: (input: IdInput) => Promise<void>;
 }
 
 export interface HubPromptsApi {
@@ -315,6 +329,7 @@ export interface HubAgentsApi {
 
 export interface HubOrchestrationsApi {
   prepare: (input: OrchestrationPrepareInput) => Promise<OrchestrationRunDetail>;
+  prepareResearch: (input: ResearchPrepareInput) => Promise<OrchestrationRunDetail>;
   get: (input: AgentIdInput) => Promise<OrchestrationRunDetail>;
   list: (input: AgentListInput) => Promise<OrchestrationRunDetail[]>;
   start: (input: AgentIdInput) => Promise<OrchestrationRunDetail>;
@@ -354,6 +369,7 @@ export interface HubApi {
   files: HubFilesApi;
   memory: HubMemoryApi;
   workspace: HubWorkspaceApi;
+  notes: HubNotesApi;
   prompts: HubPromptsApi;
   playground: HubPlaygroundApi;
   council: HubCouncilApi;
