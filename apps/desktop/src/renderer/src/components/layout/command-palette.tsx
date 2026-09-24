@@ -186,6 +186,37 @@ export function ChromeCommandPalette({
       run: () => onRunSkill("Code Review"),
     },
     {
+      id: "run-research",
+      label: t("command.research"),
+      keywords: "research pesquisa relatório report sources fontes",
+      disabled: selectedConversationId === null || busy,
+      run: () => onRunSkill("research:"),
+    },
+    {
+      id: "study-professor",
+      label: t("command.runSkill", { name: t("skills.factory.study-professor") }),
+      keywords: "study professor estudo professor",
+      run: () => onRunSkill("Study: Professor"),
+    },
+    {
+      id: "study-examiner",
+      label: t("command.runSkill", { name: t("skills.factory.study-examiner") }),
+      keywords: "study examiner estudo examinador quiz",
+      run: () => onRunSkill("Study: Examiner"),
+    },
+    {
+      id: "study-tutor",
+      label: t("command.runSkill", { name: t("skills.factory.study-tutor") }),
+      keywords: "study tutor estudo tutor socratic",
+      run: () => onRunSkill("Study: Tutor"),
+    },
+    {
+      id: "study-evaluator",
+      label: t("command.runSkill", { name: t("skills.factory.study-evaluator") }),
+      keywords: "study evaluator estudo avaliador",
+      run: () => onRunSkill("Study: Evaluator"),
+    },
+    {
       id: "imported",
       label: t("command.importedInbox"),
       keywords: "imported importadas",
@@ -393,14 +424,18 @@ export function ChromeCommandPalette({
                 </p>
                 {searchHits.map((hit) => (
                   <CommandItem
-                    key={`${hit.conversationId}:${hit.messageId ?? "title"}`}
-                    value={`conversation:${hit.conversationId}:${hit.messageId ?? "title"}`}
+                    key={`${hit.kind}:${hit.noteId ?? hit.taskId ?? hit.conversationId}:${hit.messageId ?? "title"}`}
+                    value={`${hit.kind}:${hit.noteId ?? hit.taskId ?? hit.conversationId}:${hit.messageId ?? "title"}`}
                     data-testid="command-search-hit"
                     onSelect={() => closeAndRun(() => onOpenSearchHit(hit))}
                   >
                     <span className="min-w-0">
                       <span className="block truncate font-medium">
-                        {hit.conversationTitle}
+                        {hit.kind === "note"
+                          ? t("command.hit.note", { title: hit.conversationTitle })
+                          : hit.kind === "task"
+                            ? t("command.hit.task", { title: hit.conversationTitle })
+                            : hit.conversationTitle}
                       </span>
                       <span className="block truncate text-[11px] text-muted-foreground">
                         {hit.snippet}
