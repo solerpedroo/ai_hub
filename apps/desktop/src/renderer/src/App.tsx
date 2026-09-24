@@ -19,6 +19,7 @@ import type {
   ProjectFileDto,
   ProviderKeyDto,
   SearchHit,
+  AppPrefs,
 } from "@ai-hub/shared";
 import {
   catalogModelsForProvider,
@@ -160,6 +161,7 @@ export function App(): JSX.Element {
   const [packetPreview, setPacketPreview] = useState<PacketPreviewResult | null>(null);
   const [packets, setPackets] = useState<ContextPacketDto[]>([]);
   const [privacyMode, setPrivacyMode] = useState<PacketPrivacyMode>("normal");
+  const [appPrefs, setAppPrefs] = useState<AppPrefs | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchHits, setSearchHits] = useState<SearchHit[]>([]);
   const [threadStartModel, setThreadStartModel] = useState<string | null>(null);
@@ -297,6 +299,7 @@ export function App(): JSX.Element {
           setExtraSystem(session.extraSystem);
         }
         setPrivacyMode(prefs.privacyMode);
+        setAppPrefs(prefs);
         const showWizard = shouldShowOnboarding({
           hasProviderKey: keys.length > 0,
           onboardingComplete: prefs.onboardingComplete,
@@ -379,6 +382,21 @@ export function App(): JSX.Element {
   useEffect(() => {
     void loadPackets(selectedProjectId);
   }, [loadPackets, selectedProjectId]);
+
+  useEffect(() => {
+    if (view !== "home" && view !== "settings") {
+      return;
+    }
+    void window.hub.prefs
+      .get()
+      .then((prefs) => {
+        setAppPrefs(prefs);
+        setPrivacyMode(prefs.privacyMode);
+      })
+      .catch(() => {
+        /* prefs refresh is best-effort */
+      });
+  }, [view]);
 
   useEffect(() => {
     if (!sessionReady) {
@@ -1040,6 +1058,16 @@ export function App(): JSX.Element {
                 }
                 try {
                   await window.hub.chat.abort({ runId: run.runId });
+                } catch {
+                  fail();
+                }
+              }}
+              appPrefs={appPrefs}
+              onAppPrefsPatch={async (patch) => {
+                try {
+                  const next = await window.hub.prefs.set(patch);
+                  setAppPrefs(next);
+                  setPrivacyMode(next.privacyMode);
                 } catch {
                   fail();
                 }
