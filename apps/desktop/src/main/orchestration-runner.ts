@@ -24,7 +24,7 @@ function handoffDto(handoff: AgentHandoffRecord) { return { id: handoff.id, root
 function detail(root: AgentRunRecord): OrchestrationRunDetail {
   const repos = getHubDatabase().repos;
   const nodes = repos.listAgentRuns(root.conversationId).filter((run) => run.parentRunId === root.id);
-  return { ...runDto(root), kind: "orchestrated", role: "supervisor", graphVersion: 1, budgetMode: "shared", nodes: nodes.map(nodeDto), handoffs: repos.listAgentHandoffs(root.id).map(handoffDto) };
+  return { ...runDto(root), kind: "orchestrated", role: "supervisor", graphVersion: root.graphVersion === 2 ? 2 : 1, budgetMode: "shared", nodes: nodes.map(nodeDto), handoffs: repos.listAgentHandoffs(root.id).map(handoffDto) };
 }
 function requireRoot(input: AgentIdInput): AgentRunRecord {
   const root = getHubDatabase().repos.getAgentRun(input.id);
