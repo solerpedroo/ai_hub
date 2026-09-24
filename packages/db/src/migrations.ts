@@ -380,6 +380,25 @@ CREATE UNIQUE INDEX agent_handoffs_root_ordinal_idx ON agent_handoffs(root_run_i
 CREATE INDEX agent_handoffs_to_idx ON agent_handoffs(to_run_id);
 `;
 
+export const MIGRATION_0019_SQL = `
+CREATE TABLE project_notes (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  source_message_id TEXT,
+  title_cipher TEXT NOT NULL,
+  body_cipher TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX project_notes_project_idx ON project_notes(project_id);
+CREATE TABLE note_tags (
+  note_id TEXT NOT NULL REFERENCES project_notes(id) ON DELETE CASCADE,
+  tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+  PRIMARY KEY (note_id, tag_id)
+);
+ALTER TABLE conversation_tasks ADD COLUMN source_message_id TEXT;
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
@@ -399,4 +418,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 16, sql: MIGRATION_0016_SQL },
   { version: 17, sql: MIGRATION_0017_SQL },
   { version: 18, sql: MIGRATION_0018_SQL },
+  { version: 19, sql: MIGRATION_0019_SQL },
 ];
