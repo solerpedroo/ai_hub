@@ -89,7 +89,18 @@ export function parseSkillSlashDraft(draft: string): { query: string | null; rem
 }
 
 export const FACTORY_SKILLS: readonly {
-  factoryId: "code-review" | "generate-tests" | "explain-architecture" | "summarize-pdf" | "meeting-prep" | "explain-error" | "write-rfc";
+  factoryId:
+    | "code-review"
+    | "generate-tests"
+    | "explain-architecture"
+    | "summarize-pdf"
+    | "meeting-prep"
+    | "explain-error"
+    | "write-rfc"
+    | "study-professor"
+    | "study-examiner"
+    | "study-tutor"
+    | "study-evaluator";
   folder: SkillFolder;
   title: string;
   description: string;
@@ -275,6 +286,74 @@ Follow every step heading below.`,
         title: "Rollout",
         section: "List rollout, rollback, and open questions.",
       },
+    ],
+    defaultMentions: [],
+  },
+  {
+    factoryId: "study-professor",
+    folder: "studies",
+    title: "Study: Professor",
+    description: "Explain a topic like a patient professor with examples.",
+    preferredModel: null,
+    prompt: `You are a professor teaching {{project}}.
+Topic focus: {{goal}}
+Respond in {{language}}.
+Explain clearly, then check understanding. Follow every step heading below.`,
+    steps: [
+      { id: "explain", title: "Explain", section: "Teach the core idea with one concrete example and one analogy." },
+      { id: "check", title: "Check", section: "Ask 2 short questions that verify understanding." },
+      { id: "next", title: "Next", section: "Suggest what to study next and why." },
+    ],
+    defaultMentions: [],
+  },
+  {
+    factoryId: "study-examiner",
+    folder: "studies",
+    title: "Study: Examiner",
+    description: "Quiz the learner with graded questions.",
+    preferredModel: null,
+    prompt: `You are an examiner for {{project}}.
+Assess mastery of: {{goal}}
+Respond in {{language}}.
+Follow every step heading below.`,
+    steps: [
+      { id: "exam", title: "Exam", section: "Ask 5 questions of rising difficulty. Wait for answers if the user has not answered yet." },
+      { id: "grade", title: "Grade", section: "When answers are present, grade each item and give a short rubric." },
+      { id: "gaps", title: "Gaps", section: "List the weakest areas and how to repair them." },
+    ],
+    defaultMentions: [],
+  },
+  {
+    factoryId: "study-tutor",
+    folder: "studies",
+    title: "Study: Tutor",
+    description: "Socratic tutoring that guides without giving the full answer first.",
+    preferredModel: null,
+    prompt: `You are a Socratic tutor for {{project}}.
+Learning goal: {{goal}}
+Respond in {{language}}.
+Guide with questions before revealing answers. Follow every step heading below.`,
+    steps: [
+      { id: "probe", title: "Probe", section: "Ask what the learner already knows and where they are stuck." },
+      { id: "guide", title: "Guide", section: "Give a hint or smaller sub-problem; do not dump the full solution yet." },
+      { id: "confirm", title: "Confirm", section: "Once they attempt, confirm or correct and summarize the method." },
+    ],
+    defaultMentions: [],
+  },
+  {
+    factoryId: "study-evaluator",
+    folder: "studies",
+    title: "Study: Evaluator",
+    description: "Score a written answer and suggest exercises.",
+    preferredModel: null,
+    prompt: `You are an evaluator for {{project}}.
+Evaluate work related to: {{goal}}
+Respond in {{language}}.
+Follow every step heading below.`,
+    steps: [
+      { id: "rubric", title: "Rubric", section: "State a short rubric (clarity, correctness, depth)." },
+      { id: "score", title: "Score", section: "Score the learner's answer against the rubric with evidence." },
+      { id: "exercises", title: "Exercises", section: "Assign 3 practice exercises of increasing difficulty." },
     ],
     defaultMentions: [],
   },
