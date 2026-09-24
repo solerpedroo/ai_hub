@@ -266,12 +266,25 @@ export const agentHandoffDtoSchema = z.object({
 export type AgentHandoffDto = z.infer<typeof agentHandoffDtoSchema>;
 
 export const orchestrationRunDetailSchema = agentRunDtoSchema.extend({
-  kind: z.literal("orchestrated"), role: z.literal("supervisor"), graphVersion: z.literal(1), budgetMode: z.literal("shared"),
+  kind: z.literal("orchestrated"), role: z.literal("supervisor"), graphVersion: z.union([z.literal(1), z.literal(2)]), budgetMode: z.literal("shared"),
   nodes: z.array(agentNodeDtoSchema).min(3).max(4), handoffs: z.array(agentHandoffDtoSchema).max(8),
 }).strict();
 export type OrchestrationRunDetail = z.infer<typeof orchestrationRunDetailSchema>;
 export const orchestrationListResultSchema = z.array(orchestrationRunDetailSchema).max(20);
 export type OrchestrationListResult = z.infer<typeof orchestrationListResultSchema>;
+
+export const researchPrepareInputSchema = z
+  .object({
+    projectId: z.string().uuid(),
+    conversationId: z.string().uuid(),
+    providerKeyId: z.string().uuid(),
+    model: z.string().trim().min(1).max(128),
+    goal: z.string().trim().min(1).max(4_000),
+    budgetUsd: agentBudgetUsdSchema.default("1.000000"),
+    timeoutSeconds: z.number().int().min(30).max(600).default(300),
+  })
+  .strict();
+export type ResearchPrepareInput = z.infer<typeof researchPrepareInputSchema>;
 
 export const projectListResultSchema = z.array(projectDtoSchema);
 
@@ -370,10 +383,13 @@ export type SearchInput = z.infer<typeof searchInputSchema>;
 
 export const searchHitSchema = z
   .object({
-    conversationId: z.string().uuid(),
+    kind: z.enum(["conversation", "note", "task"]),
+    conversationId: z.string().uuid().nullable(),
     projectId: z.string().uuid().nullable(),
     conversationTitle: z.string().max(200),
     messageId: z.string().uuid().nullable(),
+    noteId: z.string().uuid().nullable().optional(),
+    taskId: z.string().uuid().nullable().optional(),
     snippet: z.string().max(400),
   })
   .strict();
@@ -1169,10 +1185,56 @@ export const conversationTaskDtoSchema = z
     title: z.string().min(1).max(240),
     done: z.boolean(),
     createdAt: isoTimestampSchema,
+    sourceMessageId: z.string().uuid().nullable().optional(),
   })
   .strict();
 
 export type ConversationTaskDto = z.infer<typeof conversationTaskDtoSchema>;
+
+export const projectNoteDtoSchema = z
+  .object({
+    id: z.string().uuid(),
+    projectId: z.string().uuid(),
+    sourceMessageId: z.string().uuid().nullable(),
+    title: z.string().min(1).max(160),
+    body: z.string().max(32_000),
+    tags: z.array(z.string().min(1).max(40)).max(12),
+    createdAt: isoTimestampSchema,
+    updatedAt: isoTimestampSchema,
+  })
+  .strict();
+export type ProjectNoteDto = z.infer<typeof projectNoteDtoSchema>;
+
+export const notesListInputSchema = z.object({ projectId: z.string().uuid() }).strict();
+export type NotesListInput = z.infer<typeof notesListInputSchema>;
+
+export const notesCreateFromMessageInputSchema = z
+  .object({
+    projectId: z.string().uuid(),
+    messageId: z.string().uuid(),
+    title: z.string().trim().min(1).max(160).optional(),
+    tags: z.array(z.string().trim().min(1).max(40)).max(12).optional(),
+  })
+  .strict();
+export type NotesCreateFromMessageInput = z.infer<typeof notesCreateFromMessageInputSchema>;
+
+export const notesUpdateInputSchema = z
+  .object({
+    id: z.string().uuid(),
+    title: z.string().trim().min(1).max(160).optional(),
+    body: z.string().max(32_000).optional(),
+    tags: z.array(z.string().trim().min(1).max(40)).max(12).optional(),
+  })
+  .strict();
+export type NotesUpdateInput = z.infer<typeof notesUpdateInputSchema>;
+
+export const workspaceTasksFromMessageInputSchema = z
+  .object({
+    conversationId: z.string().uuid(),
+    messageId: z.string().uuid(),
+  })
+  .strict();
+export type WorkspaceTasksFromMessageInput = z.infer<typeof workspaceTasksFromMessageInputSchema>;
 
 export const conversationWorkspaceDtoSchema = z
   .object({
