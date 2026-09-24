@@ -20,8 +20,10 @@ import {
   contextPackets,
   fileChunks,
   importJobs,
+  noteTags,
   projectFiles,
   projectMemories,
+  projectNotes,
   projectToolPermissions,
   projectToolRoots,
   prompts,
@@ -157,15 +159,18 @@ export interface ConversationRecord {
   activePacketId: string | null;
   packetAppliedAt: string | null;
   kind: "chat" | "playground";
-  runMode: "plan" | "assist" | "agent" | "orchestrate";
+  runMode: "plan" | "assist" | "agent" | "orchestrate" | "research";
   effortLevel: "low" | "medium" | "high" | "max";
 }
 
 export interface SearchHitRecord {
-  conversationId: string;
+  kind: "conversation" | "note" | "task";
+  conversationId: string | null;
   projectId: string | null;
   conversationTitle: string;
   messageId: string | null;
+  noteId: string | null;
+  taskId: string | null;
   snippet: string;
 }
 
@@ -306,6 +311,18 @@ export interface ConversationTaskRecord {
   title: string;
   done: boolean;
   createdAt: string;
+  sourceMessageId: string | null;
+}
+
+export interface ProjectNoteRecord {
+  id: string;
+  projectId: string;
+  sourceMessageId: string | null;
+  title: string;
+  body: string;
+  tags: string[];
+  createdAt: string;
+  updatedAt: string;
 }
 
 export type PromptFolder = "development" | "studies" | "work";
@@ -575,17 +592,23 @@ function asAgentStepKind(value: string): AgentStepKind {
 }
 
 function toSearchHit(input: {
-  conversationId: string;
+  kind?: SearchHitRecord["kind"];
+  conversationId: string | null;
   projectId: string | null;
   title: string;
   messageId: string | null;
+  noteId?: string | null;
+  taskId?: string | null;
   snippet: string;
 }): SearchHitRecord {
   return {
+    kind: input.kind ?? "conversation",
     conversationId: input.conversationId,
     projectId: input.projectId,
     conversationTitle: clip(redactSecrets(input.title), 200),
     messageId: input.messageId,
+    noteId: input.noteId ?? null,
+    taskId: input.taskId ?? null,
     snippet: clip(redactSecrets(input.snippet), 400),
   };
 }
@@ -663,7 +686,13 @@ export class HubRepos {
       activePacketId: row.activePacketId ?? null,
       packetAppliedAt: row.packetAppliedAt !== null && row.packetAppliedAt !== undefined ? iso(row.packetAppliedAt) : null,
       kind: row.kind === "playground" ? "playground" : "chat",
-      runMode: row.runMode === "plan" || row.runMode === "agent" || row.runMode === "orchestrate" ? row.runMode : "assist",
+      runMode:
+        row.runMode === "plan" ||
+        row.runMode === "agent" ||
+        row.runMode === "orchestrate" ||
+        row.runMode === "research"
+          ? row.runMode
+          : "assist",
       effortLevel: row.effortLevel === "low" || row.effortLevel === "high" || row.effortLevel === "max" ? row.effortLevel : "medium",
     };
   }
@@ -1162,6 +1191,7 @@ export class HubRepos {
         messageMatched = true;
         hits.push(
           toSearchHit({
+            kind: "conversation",
             conversationId: row.id,
             projectId: row.projectId,
             title,
@@ -1173,6 +1203,7 @@ export class HubRepos {
       if (titleMatched && !messageMatched && hits.length < limit) {
         hits.push(
           toSearchHit({
+            kind: "conversation",
             conversationId: row.id,
             projectId: row.projectId,
             title,
@@ -1181,6 +1212,40 @@ export class HubRepos {
           }),
         );
       }
+    }
+    for (const note of this.db.select().from(projectNotes).all().sort((a, b) => b.updatedAt - a.updatedAt)) {
+      if (hits.length >= limit) break;
+      const title = decryptUtf8(note.titleCipher, this.masterKey);
+      const body = decryptUtf8(note.bodyCipher, this.masterKey);
+      if (!matchesAllTokens(`${title}\n${body}`, tokens)) continue;
+      hits.push(
+        toSearchHit({
+          kind: "note",
+          conversationId: null,
+          projectId: note.projectId,
+          title,
+          messageId: null,
+          noteId: note.id,
+          snippet: matchesAllTokens(title, tokens) ? title : snippetAround(body, tokens[0] ?? ""),
+        }),
+      );
+    }
+    for (const task of this.db.select().from(conversationTasks).all().sort((a, b) => b.createdAt - a.createdAt)) {
+      if (hits.length >= limit) break;
+      const title = decryptUtf8(task.titleCipher, this.masterKey);
+      if (!matchesAllTokens(title, tokens)) continue;
+      const conversation = this.getConversation(task.conversationId);
+      hits.push(
+        toSearchHit({
+          kind: "task",
+          conversationId: task.conversationId,
+          projectId: conversation?.projectId ?? null,
+          title,
+          messageId: task.sourceMessageId ?? null,
+          taskId: task.id,
+          snippet: title,
+        }),
+      );
     }
     return hits;
   }
@@ -2724,7 +2789,7 @@ export class HubRepos {
         providerKeyId: input.providerKeyId,
         model: input.model,
         goalCipher: encryptUtf8(input.goal.slice(0, 4_000), this.masterKey),
-        planCipher: encryptUtf8(input.plan.slice(0, 8_000), this.masterKey),
+        planCipher: encryptUtf8(input.plan.slice(0, 32_000), this.masterKey),
         sourceSkillId: input.sourceSkillId ?? null,
         maxSteps: input.maxSteps,
         budgetUsd: input.budgetUsd,
@@ -2916,8 +2981,8 @@ export class HubRepos {
         familyId,
         sourceMessageId: input.sourceMessageId ?? null,
         kind: input.kind,
-        titleCipher: encryptUtf8(input.title.slice(0, 120), this.masterKey),
-        bodyCipher: encryptUtf8(input.body.slice(0, 100_000), this.masterKey),
+        titleCipher: encryptUtf8(redactSecrets(input.title).slice(0, 120), this.masterKey),
+        bodyCipher: encryptUtf8(redactSecrets(input.body).slice(0, 100_000), this.masterKey),
         language: input.language ?? null,
         version,
         pinned: pinned ? 1 : 0,
@@ -3073,9 +3138,19 @@ export class HubRepos {
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
-  createConversationTask(conversationId: string, title: string): ConversationTaskRecord {
+  createConversationTask(
+    conversationId: string,
+    title: string,
+    sourceMessageId: string | null = null,
+  ): ConversationTaskRecord {
     if (!this.getConversation(conversationId)) {
       throw new Error("Conversation not found");
+    }
+    if (sourceMessageId) {
+      const message = this.getMessage(sourceMessageId);
+      if (!message || message.conversationId !== conversationId) {
+        throw new Error("Message not found");
+      }
     }
     const id = randomUUID();
     const now = Date.now();
@@ -3084,17 +3159,177 @@ export class HubRepos {
       .values({
         id,
         conversationId,
-        titleCipher: encryptUtf8(title.slice(0, 240), this.masterKey),
+        titleCipher: encryptUtf8(redactSecrets(title).slice(0, 240), this.masterKey),
         done: 0,
         createdAt: now,
+        sourceMessageId,
       })
       .run();
     return {
       id,
       conversationId,
-      title: title.slice(0, 240),
+      title: redactSecrets(title).slice(0, 240),
       done: false,
       createdAt: iso(now),
+      sourceMessageId,
+    };
+  }
+
+  createConversationTasksFromTitles(
+    conversationId: string,
+    titles: readonly string[],
+    sourceMessageId: string | null = null,
+  ): ConversationTaskRecord[] {
+    return titles.slice(0, 40).map((title) => this.createConversationTask(conversationId, title, sourceMessageId));
+  }
+
+  listProjectNotes(projectId: string): ProjectNoteRecord[] {
+    return this.db
+      .select()
+      .from(projectNotes)
+      .where(eq(projectNotes.projectId, projectId))
+      .all()
+      .map((row) => this.toProjectNote(row))
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  getProjectNote(id: string): ProjectNoteRecord | null {
+    const row = this.db.select().from(projectNotes).where(eq(projectNotes.id, id)).get();
+    return row ? this.toProjectNote(row) : null;
+  }
+
+  createProjectNote(input: {
+    projectId: string;
+    title: string;
+    body: string;
+    sourceMessageId?: string | null;
+    tags?: readonly string[];
+  }): ProjectNoteRecord {
+    if (!this.getProject(input.projectId)) {
+      throw new Error("Project not found");
+    }
+    if (input.sourceMessageId) {
+      const message = this.getMessage(input.sourceMessageId);
+      if (!message) throw new Error("Message not found");
+      const conversation = this.getConversation(message.conversationId);
+      if (!conversation || conversation.projectId !== input.projectId) {
+        throw new Error("Message project mismatch");
+      }
+    }
+    const id = randomUUID();
+    const now = Date.now();
+    const title = redactSecrets(input.title).slice(0, 160);
+    const body = redactSecrets(input.body).slice(0, 32_000);
+    this.db
+      .insert(projectNotes)
+      .values({
+        id,
+        projectId: input.projectId,
+        sourceMessageId: input.sourceMessageId ?? null,
+        titleCipher: encryptUtf8(title, this.masterKey),
+        bodyCipher: encryptUtf8(body, this.masterKey),
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+    this.setNoteTags(id, input.tags ?? []);
+    const note = this.getProjectNote(id);
+    if (!note) throw new Error("Note not found");
+    return note;
+  }
+
+  updateProjectNote(
+    id: string,
+    patch: { title?: string; body?: string; tags?: readonly string[] },
+  ): ProjectNoteRecord {
+    const existing = this.getProjectNote(id);
+    if (!existing) throw new Error("Note not found");
+    const title = redactSecrets(patch.title ?? existing.title).slice(0, 160);
+    const body = redactSecrets(patch.body ?? existing.body).slice(0, 32_000);
+    this.db
+      .update(projectNotes)
+      .set({
+        titleCipher: encryptUtf8(title, this.masterKey),
+        bodyCipher: encryptUtf8(body, this.masterKey),
+        updatedAt: Date.now(),
+      })
+      .where(eq(projectNotes.id, id))
+      .run();
+    if (patch.tags) this.setNoteTags(id, patch.tags);
+    const updated = this.getProjectNote(id);
+    if (!updated) throw new Error("Note not found");
+    return updated;
+  }
+
+  removeProjectNote(id: string): void {
+    this.db.delete(noteTags).where(eq(noteTags.noteId, id)).run();
+    this.db.delete(projectNotes).where(eq(projectNotes.id, id)).run();
+  }
+
+  /** Local research sources: memories + PDF chunks for a project (redacted, capped). */
+  gatherResearchSources(projectId: string, goal: string, maxChars = 24_000): string {
+    const tokens = searchTokens(goal);
+    const parts: string[] = [];
+    let used = 0;
+    const push = (label: string, text: string): void => {
+      const safe = redactSecrets(text).replace(/\s+/g, " ").trim();
+      if (!safe) return;
+      const block = `[${label}]\n${safe.slice(0, 2_400)}`;
+      if (used + block.length > maxChars) return;
+      parts.push(block);
+      used += block.length;
+    };
+    for (const memory of this.listProjectMemories(projectId)) {
+      if (tokens.length > 0 && !matchesAllTokens(`${memory.title}\n${memory.body}`, tokens) && parts.length > 2) {
+        continue;
+      }
+      push(`memory:${memory.title}`, memory.body);
+      if (used >= maxChars) break;
+    }
+    for (const chunk of this.listFileChunks(projectId)) {
+      if (tokens.length > 0 && !matchesAllTokens(chunk.text, tokens) && parts.length > 4) {
+        continue;
+      }
+      push(`pdf:${chunk.fileName}#${chunk.chunkIndex + 1}`, chunk.text);
+      if (used >= maxChars) break;
+    }
+    if (parts.length === 0) {
+      return "No local memories or indexed PDF chunks were available for this project.";
+    }
+    return parts.map((part, index) => `### Source ${index + 1}\n${part}`).join("\n\n");
+  }
+
+  private setNoteTags(noteId: string, names: readonly string[]): void {
+    this.db.delete(noteTags).where(eq(noteTags.noteId, noteId)).run();
+    const unique: string[] = [];
+    for (const raw of names) {
+      const name = raw.trim().toLowerCase().slice(0, 40);
+      if (!name || unique.includes(name)) continue;
+      unique.push(name);
+      if (unique.length >= 12) break;
+    }
+    for (const name of unique) {
+      const tag = this.getOrCreateTag(name);
+      this.db.insert(noteTags).values({ noteId, tagId: tag.id }).run();
+    }
+  }
+
+  private toProjectNote(row: typeof projectNotes.$inferSelect): ProjectNoteRecord {
+    const tagRows = this.db
+      .select({ name: tags.name })
+      .from(noteTags)
+      .innerJoin(tags, eq(noteTags.tagId, tags.id))
+      .where(eq(noteTags.noteId, row.id))
+      .all();
+    return {
+      id: row.id,
+      projectId: row.projectId,
+      sourceMessageId: row.sourceMessageId,
+      title: decryptUtf8(row.titleCipher, this.masterKey),
+      body: decryptUtf8(row.bodyCipher, this.masterKey),
+      tags: tagRows.map((tag) => tag.name),
+      createdAt: iso(row.createdAt),
+      updatedAt: iso(row.updatedAt),
     };
   }
 
@@ -3239,6 +3474,7 @@ export class HubRepos {
       title: decryptUtf8(row.titleCipher, this.masterKey),
       done: row.done === 1,
       createdAt: iso(row.createdAt),
+      sourceMessageId: row.sourceMessageId ?? null,
     };
   }
 
