@@ -909,4 +909,76 @@ describe("hub database", () => {
     expect(hub.repos.listArtifacts(conversation.id)).toHaveLength(0);
     hub.close();
   });
+
+  it("stores project notes and builds checklists from message titles", async () => {
+    const { hub } = openTestDb();
+    const project = hub.repos.createProject("Notes Lab");
+    const conversation = hub.repos.createConversation(project.id, "Chat");
+    const key = await hub.repos.saveProviderKey({
+      providerSlug: "openai",
+      label: "research",
+      secret: "sk-researchfixtureNEVERSQLITE0001",
+    });
+    const user = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "user",
+      content: "Need JWT auth",
+    });
+    const assistant = hub.repos.createMessage({
+      conversationId: conversation.id,
+      role: "assistant",
+      content: "Checklist:\n- [ ] Create User model\n- [ ] Login endpoint\n- [ ] Tests",
+      parentId: user.id,
+      branchId: user.branchId,
+    });
+    const note = hub.repos.createProjectNote({
+      projectId: project.id,
+      title: "JWT plan",
+      body: assistant.content,
+      sourceMessageId: assistant.id,
+      tags: ["auth", "backend"],
+    });
+    expect(note.tags).toEqual(["auth", "backend"]);
+    expect(dumpAllText(hub.sqlite)).not.toContain("JWT plan");
+    expect(hub.repos.getProjectNote(note.id)?.body).toContain("Login endpoint");
+    hub.repos.createProjectMemory({
+      projectId: project.id,
+      title: "Auth decision",
+      body: "We store refresh tokens hashed; access tokens are short-lived JWT.",
+      source: "manual",
+    });
+    const tasks = hub.repos.createConversationTasksFromTitles(
+      conversation.id,
+      ["Create User model", "Login endpoint", "Tests"],
+      assistant.id,
+    );
+    expect(tasks).toHaveLength(3);
+    expect(tasks[0]?.sourceMessageId).toBe(assistant.id);
+    const hits = hub.repos.searchWorkspace("Login endpoint");
+    expect(hits.some((hit) => hit.kind === "task")).toBe(true);
+    expect(hits.some((hit) => hit.kind === "note" || hit.kind === "conversation")).toBe(true);
+    const sources = hub.repos.gatherResearchSources(project.id, "JWT");
+    expect(sources).toContain("### Source");
+    expect(sources).toContain("refresh tokens");
+    const researchRoot = hub.repos.createAgentRun({
+      projectId: project.id,
+      conversationId: conversation.id,
+      provider: "openai",
+      providerKeyId: key.id,
+      model: "gpt-4o-mini",
+      goal: "Research JWT",
+      plan: `LOCAL SOURCES\n${"x".repeat(12_000)}`,
+      maxSteps: 3,
+      budgetUsd: "1.000000",
+      timeoutSeconds: 300,
+      kind: "orchestrated",
+      role: "supervisor",
+      graphVersion: 2,
+      budgetMode: "shared",
+      steps: [{ kind: "plan", title: "Confirm" }],
+    });
+    expect(researchRoot.graphVersion).toBe(2);
+    expect(researchRoot.plan.length).toBeGreaterThan(8_000);
+    hub.close();
+  });
 });
