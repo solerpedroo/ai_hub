@@ -19,6 +19,7 @@ export function toWorkspaceDto(
       title: task.title,
       done: task.done,
       createdAt: task.createdAt,
+      sourceMessageId: task.sourceMessageId,
     })),
     pins: pinIds,
   };
