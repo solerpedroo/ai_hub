@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave 
 
 | Field | Value |
 |---|---|
-| Wave | **W28** |
+| Wave | **W29** |
 | Marco | E — V3 ecosystem |
 | State | `pending` |
-| Last completed | **W27** |
-| Next action | Iniciar Wave 28 (Voice Mode) com skill `wave-start`. |
+| Last completed | **W28** |
+| Next action | Iniciar Wave 29 (Plugins + marketplace) com skill `wave-start`. |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
@@ -43,20 +43,18 @@ None.
 - W17: stepper não segue headings do stream; palette só corre Code Review por atalho; factory títulos EN na DB; `skills:list` devolve prompt no renderer (como prompts W15).
 - W23: não há teste isolado do runner para cancelamento durante diálogo nativo/timeout; `skill.steps[]` orienta a síntese e a allowlist executa a leitura, mas ainda não há grafo de tool por etapa.
 - W26: nesta máquina Ollama CUDA falhou (`device kernel image is invalid`); prova física usou CPU. Caps batch (council/playground) ainda podem hard-stopar Ollama com teto USD esgotado; chat path isenta.
-- W27: UI de Notes não coleta tags no save nem mostra timestamps; hit de busca `kind=note` não abre o painel; sem teste isolado de `prepareResearch`; Research sem fontes indexadas usa placeholder; tags de notes em plaintext (W06).
+- W27: UI de Notes não coleta tags no save nem mostra timestamps; hit de busca `kind=note` não abre painel; sem teste isolado de `prepareResearch`; Research sem fontes indexadas usa placeholder; tags de notes em plaintext (W06).
+- W28: STT/TTS dependem do Chromium/SO; sem e2e hands-free com mic real; race de abort na janela `sending` antes do `runId` no estado; `audioDiskOptIn` é hook (W28 não grava wav).
 
 ## Notes for the next session
 
-- W27 fechada: Notes cifradas por projeto; Tasks from message; Study (4 factory skills); Research via orquestração `graphVersion: 2` + artifact citável. Gate em `docs/reviews/W27/`.
-- W26 fechada: Ollama first-class sem keytar; fallback local com confirmação; receipts custo 0; badge offline; embeddings hashed continuam offline. Prova física em `docs/reviews/W26/PHYSICAL-DOD.md`.
-- W17 fechada. Skills cifradas; `/skill` + `@skill`; contrato `tools: []` para W23.
-- W18 fechada: Privacy Center, Context Firewall, Cost Tracker e caps por projeto/provider.
-- W19 fechada: Quick AI, clipboard intelligence, seleção via copy + atalho e tray/background.
-- W22 fechada: MCP scoped ao projeto, Permission Center no main, HUD redigido e allowlist declarativa para skills.
+- W28 fechada: Voice Mode (Web Speech → `chat:send` → TTS); aviso cloud; Private bloqueia disk opt-in. Gate em `docs/reviews/W28/`.
+- W27 fechada: Notes cifradas; Tasks from message; Study; Research `graphVersion: 2`. Gate em `docs/reviews/W27/`.
+- W26 fechada: Ollama + offline. Prova física em `docs/reviews/W26/PHYSICAL-DOD.md`.
 
 ## Last review / ADR
 
 | Kind | Path |
 |---|---|
-| Review | `docs/reviews/W27/REVIEW.md` |
-| Latest ADR | `docs/ADR/ADR-W27-001-project-notes-and-research-graph.md` |
+| Review | `docs/reviews/W28/REVIEW.md` |
+| Latest ADR | `docs/ADR/ADR-W28-001-web-speech-voice-mode.md` |
