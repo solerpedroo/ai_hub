@@ -170,7 +170,7 @@ export function HomeView({
   onSelectTemperature: (value: number) => void;
   onSelectMaxTokens: (value: number | null) => void;
   onSelectExtraSystem: (value: string) => void;
-  onSend: (content: string, mentions: MentionRef[], route?: { keyId: string; model: string; runMode: "plan" | "assist" | "agent" | "orchestrate"; effortLevel: "low" | "medium" | "high" | "max" }) => Promise<boolean>;
+  onSend: (content: string, mentions: MentionRef[], route?: { keyId: string; model: string; runMode: "plan" | "assist" | "agent" | "orchestrate" | "research"; effortLevel: "low" | "medium" | "high" | "max" }) => Promise<boolean>;
   onMentionsChange: (mentions: MentionRef[]) => void;
   onAbort: () => Promise<void>;
   onRegenerate: (messageId: string) => Promise<void>;
@@ -219,7 +219,7 @@ export function HomeView({
   const modifier = window.hub.platform === "darwin" ? "⌘" : "Ctrl";
   const [title, setTitle] = useState("");
   const [draft, setDraft] = useState("");
-  const [runMode, setRunMode] = useState<"plan" | "assist" | "agent" | "orchestrate">("assist");
+  const [runMode, setRunMode] = useState<"plan" | "assist" | "agent" | "orchestrate" | "research">("assist");
   const [effortLevel, setEffortLevel] = useState<"low" | "medium" | "high" | "max">("medium");
   const [autoRouter, setAutoRouter] = useState(false);
   const [autoRouteConfirmed, setAutoRouteConfirmed] = useState(false);
@@ -236,6 +236,7 @@ export function HomeView({
   const [canvasId, setCanvasId] = useState<string | null>(null);
   const [canvasError, setCanvasError] = useState<string | null>(null);
   const autoOpenedArtifactRef = useRef<string | null>(null);
+  const [projectNotes, setProjectNotes] = useState<import("@ai-hub/shared").ProjectNoteDto[]>([]);
   const [projectMemories, setProjectMemories] = useState<ProjectMemoryDto[]>([]);
   const [libraryPrompts, setLibraryPrompts] = useState<PromptDto[]>([]);
   const [librarySkills, setLibrarySkills] = useState<SkillDto[]>([]);
@@ -492,6 +493,11 @@ export function HomeView({
     if (!pendingSkill) {
       return;
     }
+    if (pendingSkill.query === "research:") {
+      onPendingSkillConsumed();
+      void saveRunSettings("research", effortLevel);
+      return;
+    }
     const remainder = draft;
     const mentions: MentionRef[] = [
       pendingSkill.id
@@ -537,6 +543,7 @@ export function HomeView({
   useEffect(() => {
     if (!project) {
       setProjectMemories([]);
+      setProjectNotes([]);
       setMemoryOptedOut(false);
       return;
     }
@@ -544,6 +551,10 @@ export function HomeView({
       .list({ projectId: project.id })
       .then(setProjectMemories)
       .catch(() => setProjectMemories([]));
+    void window.hub.notes
+      .list({ projectId: project.id })
+      .then(setProjectNotes)
+      .catch(() => setProjectNotes([]));
     void window.hub.memory
       .getOptOut({ projectId: project.id })
       .then((row) => setMemoryOptedOut(row.optedOut))
@@ -665,6 +676,7 @@ export function HomeView({
       return;
     }
     if (runMode === "orchestrate") { void prepareOrchestration(content); return; }
+    if (runMode === "research") { void prepareResearch(content); return; }
     const route = autoRouter && routedModel ? { keyId: routedModel.key.id, model: routedModel.model.id, runMode, effortLevel } : { keyId: selectedKeyId ?? "", model: selectedModel, runMode, effortLevel };
     void onSend(content, mentions, route).then((ok) => {
       if (ok) {
@@ -765,6 +777,28 @@ export function HomeView({
       setOrchestrationRun(prepared); setDraft("");
     } catch { setToolError(t("orchestration.error.prepare")); }
     finally { setAgentBusy(false); }
+  };
+
+  const prepareResearch = async (goal: string): Promise<void> => {
+    if (!project || !selectedConversationId || !selectedKeyId || goal.trim().length === 0) return;
+    setAgentBusy(true); setToolError(null);
+    try {
+      const prepared = await window.hub.orchestrations.prepareResearch({
+        projectId: project.id,
+        conversationId: selectedConversationId,
+        providerKeyId: selectedKeyId,
+        model: selectedModel,
+        goal,
+        budgetUsd: "1.000000",
+        timeoutSeconds: 300,
+      });
+      setOrchestrationRun(prepared);
+      setDraft("");
+    } catch {
+      setToolError(t("research.error.prepare"));
+    } finally {
+      setAgentBusy(false);
+    }
   };
 
   const controlOrchestration = async (action: "start" | "pause" | "resume" | "cancel"): Promise<void> => {
@@ -1051,7 +1085,7 @@ export function HomeView({
                       ))}
                     </select>
                   </label>
-                  <label className="flex items-center gap-1 text-[11px]"><span>{t("runMode.label")}</span><select className="h-8 rounded border bg-background px-1" value={runMode} onChange={(event) => void saveRunSettings(event.target.value as typeof runMode, effortLevel)}><option value="assist">Assist</option><option value="plan">Plan</option><option value="agent">{t("agents.mode")}</option><option value="orchestrate">{t("orchestration.mode")}</option></select></label>
+                  <label className="flex items-center gap-1 text-[11px]"><span>{t("runMode.label")}</span><select className="h-8 rounded border bg-background px-1" value={runMode} onChange={(event) => void saveRunSettings(event.target.value as typeof runMode, effortLevel)}><option value="assist">Assist</option><option value="plan">Plan</option><option value="agent">{t("agents.mode")}</option><option value="orchestrate">{t("orchestration.mode")}</option><option value="research">{t("research.mode")}</option></select></label>
                   <label className="flex items-center gap-1 text-[11px"><span>{t("effort.label")}</span><select className="h-8 rounded border bg-background px-1" value={effortLevel} onChange={(event) => void saveRunSettings(runMode, event.target.value as typeof effortLevel)}>{["low", "medium", "high", "max"].map((level) => <option key={level} value={level}>{level}</option>)}</select></label>
                   <label className="flex items-center gap-1">
                     <span className="text-muted-foreground">{t("workspace.model")}</span>
@@ -1423,6 +1457,36 @@ export function HomeView({
                               setCanvasId(match.id);
                             }
                           }}
+                          {...(project
+                            ? {
+                                onSaveNote: (messageId: string) => {
+                                  void window.hub.notes
+                                    .createFromMessage({ projectId: project.id, messageId })
+                                    .then((note) => setProjectNotes((current) => [note, ...current]))
+                                    .catch(() => setToolError(t("notes.error.save")));
+                                },
+                              }
+                            : {})}
+                          onSaveTasks={(messageId) => {
+                            if (!selectedConversationId) return;
+                            void window.hub.workspace
+                              .tasksFromMessage({ conversationId: selectedConversationId, messageId })
+                              .then((tasks) => {
+                                setConversationWorkspace((current) =>
+                                  current
+                                    ? { ...current, tasks: [...current.tasks, ...tasks] }
+                                    : {
+                                        conversationId: selectedConversationId,
+                                        summary: "",
+                                        decisions: [],
+                                        tasks,
+                                        pins: [],
+                                      },
+                                );
+                                setWorkspaceOpen(true);
+                              })
+                              .catch(() => setToolError(t("tasks.error.save")));
+                          }}
                         />
                       ))}
                     </ol>
@@ -1680,7 +1744,7 @@ export function HomeView({
                     )}
                   </section>
                 ) : null}
-                {runMode === "orchestrate" || orchestrationRun ? (
+                {runMode === "orchestrate" || runMode === "research" || orchestrationRun ? (
                   <section className="border-t px-2 py-2" data-testid="orchestration-run">
                     <div className="flex items-center justify-between gap-2"><p className="text-[12px] font-medium">{t("orchestration.title")}</p>{orchestrationRun ? <span className="text-[11px] text-muted-foreground">{t(`agents.status.${orchestrationRun.status}`)}</span> : null}</div>
                     {!orchestrationRun ? <p className="mt-1 text-[11px] text-muted-foreground">{t("orchestration.empty")}</p> : <>
@@ -2021,6 +2085,7 @@ export function HomeView({
                 <ConversationWorkspacePanel
                   workspace={conversationWorkspace}
                   artifacts={artifacts}
+                  notes={projectNotes}
                   busy={busy}
                   onRefresh={async () => {
                     if (!selectedConversationId) {
@@ -2030,8 +2095,15 @@ export function HomeView({
                       await window.hub.workspace.refresh({ conversationId: selectedConversationId }),
                     );
                     setArtifacts(await window.hub.artifacts.list({ conversationId: selectedConversationId }));
+                    if (project) {
+                      setProjectNotes(await window.hub.notes.list({ projectId: project.id }));
+                    }
                   }}
                   onOpenArtifact={(id) => setCanvasId(id)}
+                  onRemoveNote={async (id) => {
+                    await window.hub.notes.remove({ id });
+                    setProjectNotes((current) => current.filter((note) => note.id !== id));
+                  }}
                   onAddTask={async (title) => {
                     if (!selectedConversationId) {
                       return;
