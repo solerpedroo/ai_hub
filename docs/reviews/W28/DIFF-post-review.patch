@@ -1,0 +1,600 @@
+﻿diff --git a/apps/desktop/src/main/index.ts b/apps/desktop/src/main/index.ts
+index fcd177a..16efac4 100644
+--- a/apps/desktop/src/main/index.ts
++++ b/apps/desktop/src/main/index.ts
+@@ -267,6 +267,39 @@ function createTray(): void {
+ app.whenReady().then(async () => {
+   electronApp.setAppUserModelId("com.aihub.desktop");
+   applyContentSecurityPolicy();
++  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
++    if (permission !== "media") {
++      callback(false);
++      return;
++    }
++    const url = webContents.getURL();
++    const allowedOrigin =
++      url.startsWith("file:") ||
++      url.startsWith("http://localhost") ||
++      url.startsWith("http://127.0.0.1") ||
++      url.startsWith("app:") ||
++      url.includes("localhost");
++    if (!allowedOrigin) {
++      callback(false);
++      return;
++    }
++    const mediaTypes =
++      "mediaTypes" in details && Array.isArray(details.mediaTypes) ? details.mediaTypes : [];
++    if (mediaTypes.includes("video")) {
++      callback(false);
++      return;
++    }
++    callback(true);
++  });
++  session.defaultSession.setPermissionCheckHandler((_webContents, permission, _requestingOrigin, details) => {
++    if (permission !== "media") {
++      return false;
++    }
++    if (details.mediaType === "video") {
++      return false;
++    }
++    return true;
++  });
+   registerWindowIpc(targetWindow, (event) => BrowserWindow.fromWebContents(event.sender) === quickAiWindow);
+   try {
+     await bootPersistence();
+diff --git a/apps/desktop/src/renderer/src/components/chat/voice-panel.tsx b/apps/desktop/src/renderer/src/components/chat/voice-panel.tsx
+new file mode 100644
+index 0000000..9854dfa
+--- /dev/null
++++ b/apps/desktop/src/renderer/src/components/chat/voice-panel.tsx
+@@ -0,0 +1,344 @@
++import { type JSX, useEffect, useRef, useState } from "react";
++import { useTranslation } from "react-i18next";
++import type { AppPrefs, MessageDto } from "@ai-hub/shared";
++import { Button } from "@/components/ui/button";
++import {
++  createSpeechRecognition,
++  isSpeechRecognitionAvailable,
++  isSpeechSynthesisAvailable,
++  listTtsVoices,
++  speakText,
++  stopSpeaking,
++  type HubSpeechRecognition,
++} from "@/lib/voice-session";
++
++type VoicePhase = "idle" | "listening" | "sending" | "speaking";
++
++export function VoicePanel({
++  enabled,
++  conversationId,
++  prefs,
++  messages,
++  streaming,
++  sending,
++  hasKey,
++  hasConversation,
++  locale,
++  onSendTranscript,
++  onAbortChat,
++  onPrefsChange,
++}: {
++  enabled: boolean;
++  conversationId: string | null;
++  prefs: AppPrefs | null;
++  messages: MessageDto[];
++  streaming: boolean;
++  sending: boolean;
++  hasKey: boolean;
++  hasConversation: boolean;
++  locale: string;
++  onSendTranscript: (text: string) => Promise<boolean>;
++  onAbortChat: () => void;
++  onPrefsChange: (patch: Partial<AppPrefs>) => Promise<void>;
++}): JSX.Element | null {
++  const { t } = useTranslation();
++  const [open, setOpen] = useState(false);
++  const [phase, setPhase] = useState<VoicePhase>("idle");
++  const [interim, setInterim] = useState("");
++  const [lastTranscript, setLastTranscript] = useState("");
++  const [error, setError] = useState<string | null>(null);
++  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
++  const recognitionRef = useRef<HubSpeechRecognition | null>(null);
++  const spokenMessageIdRef = useRef<string | null>(null);
++  const awaitingVoiceReplyRef = useRef(false);
++  const continuousRef = useRef(false);
++  const listeningDesiredRef = useRef(false);
++  const startListeningRef = useRef<() => void>(() => undefined);
++
++  const cloudAck = prefs?.voiceCloudAck === true;
++  const continuous = prefs?.voiceContinuous === true;
++  const voiceURI = prefs?.ttsVoiceURI ?? null;
++  const sttOk = isSpeechRecognitionAvailable();
++  const ttsOk = isSpeechSynthesisAvailable();
++  const speechLang = locale.toLowerCase().startsWith("pt") ? "pt-BR" : "en-US";
++
++  continuousRef.current = continuous;
++
++  const markExistingAssistantSpoken = (): void => {
++    const last = [...messages]
++      .reverse()
++      .find((item) => item.role === "assistant" && item.status === "complete");
++    spokenMessageIdRef.current = last?.id ?? null;
++  };
++
++  const stopListening = (): void => {
++    listeningDesiredRef.current = false;
++    recognitionRef.current?.stop();
++    recognitionRef.current = null;
++    setInterim("");
++    setPhase((current) => (current === "listening" ? "idle" : current));
++  };
++
++  const interrupt = (): void => {
++    listeningDesiredRef.current = false;
++    awaitingVoiceReplyRef.current = false;
++    recognitionRef.current?.abort();
++    recognitionRef.current = null;
++    stopSpeaking();
++    onAbortChat();
++    setInterim("");
++    setPhase("idle");
++  };
++
++  const startListening = (): void => {
++    setError(null);
++    if (!sttOk) {
++      setError(t("voice.error.unsupported"));
++      return;
++    }
++    if (!cloudAck) {
++      setError(t("voice.error.cloudAck"));
++      return;
++    }
++    if (!hasConversation || !hasKey) {
++      setError(t("voice.error.ready"));
++      return;
++    }
++    recognitionRef.current?.abort();
++    stopSpeaking();
++    listeningDesiredRef.current = true;
++    const recognition = createSpeechRecognition({
++      lang: speechLang,
++      continuous: false,
++      onInterim: (text) => setInterim(text),
++      onFinal: (text) => {
++        setInterim("");
++        setLastTranscript(text);
++        setPhase("sending");
++        recognitionRef.current = null;
++        awaitingVoiceReplyRef.current = true;
++        void onSendTranscript(text).then((ok) => {
++          if (!ok) {
++            awaitingVoiceReplyRef.current = false;
++            setPhase("idle");
++            setError(t("voice.error.send"));
++            return;
++          }
++          setPhase("idle");
++        });
++      },
++      onError: (code) => {
++        if (code === "aborted" || code === "no-speech") {
++          setPhase("idle");
++          return;
++        }
++        setError(t("voice.error.stt", { code }));
++        setPhase("idle");
++      },
++      onEnd: () => {
++        setPhase((current) => (current === "listening" ? "idle" : current));
++      },
++    });
++    if (!recognition) {
++      setError(t("voice.error.unsupported"));
++      return;
++    }
++    recognitionRef.current = recognition;
++    setPhase("listening");
++    try {
++      recognition.start();
++    } catch {
++      setError(t("voice.error.unsupported"));
++      setPhase("idle");
++    }
++  };
++
++  startListeningRef.current = startListening;
++
++  useEffect(() => {
++    if (!ttsOk) return;
++    const refresh = (): void => setVoices(listTtsVoices());
++    refresh();
++    window.speechSynthesis.addEventListener("voiceschanged", refresh);
++    return () => window.speechSynthesis.removeEventListener("voiceschanged", refresh);
++  }, [ttsOk]);
++
++  useEffect(() => {
++    listeningDesiredRef.current = false;
++    awaitingVoiceReplyRef.current = false;
++    recognitionRef.current?.abort();
++    recognitionRef.current = null;
++    stopSpeaking();
++    markExistingAssistantSpoken();
++    setInterim("");
++    setLastTranscript("");
++    setPhase("idle");
++    // eslint-disable-next-line react-hooks/exhaustive-deps -- reset only on conversation change
++  }, [conversationId]);
++
++  useEffect(() => {
++    return () => {
++      listeningDesiredRef.current = false;
++      awaitingVoiceReplyRef.current = false;
++      recognitionRef.current?.abort();
++      recognitionRef.current = null;
++      stopSpeaking();
++    };
++  }, []);
++
++  useEffect(() => {
++    if (!open || !awaitingVoiceReplyRef.current) return;
++    if (phase === "listening" || phase === "sending") return;
++    if (streaming || sending) return;
++    const last = [...messages].reverse().find((item) => item.role === "assistant" && item.status === "complete");
++    if (!last || !last.content.trim()) return;
++    if (spokenMessageIdRef.current === last.id) return;
++    if (!ttsOk) return;
++    spokenMessageIdRef.current = last.id;
++    awaitingVoiceReplyRef.current = false;
++    setPhase("speaking");
++    speakText({
++      text: last.content,
++      voiceURI,
++      lang: speechLang,
++      onEnd: () => {
++        setPhase("idle");
++        if (continuousRef.current && listeningDesiredRef.current && cloudAck) {
++          startListeningRef.current();
++        }
++      },
++    });
++  }, [messages, streaming, sending, open, phase, ttsOk, voiceURI, speechLang, cloudAck]);
++
++  if (!enabled) {
++    return null;
++  }
++
++  return (
++    <section className="border-t px-2 py-2" data-testid="voice-panel">
++      <div className="flex flex-wrap items-center gap-2">
++        <p className="text-[12px] font-medium">{t("voice.title")}</p>
++        <Button
++          type="button"
++          size="sm"
++          variant={open ? "default" : "outline"}
++          aria-pressed={open}
++          data-testid="voice-toggle"
++          onClick={() => {
++            setOpen((value) => {
++              const next = !value;
++              if (next) {
++                markExistingAssistantSpoken();
++              } else {
++                listeningDesiredRef.current = false;
++                awaitingVoiceReplyRef.current = false;
++                recognitionRef.current?.abort();
++                recognitionRef.current = null;
++                stopSpeaking();
++                setPhase("idle");
++              }
++              return next;
++            });
++          }}
++        >
++          {open ? t("voice.hide") : t("voice.show")}
++        </Button>
++        {open ? (
++          <>
++            <Button
++              type="button"
++              size="sm"
++              disabled={phase === "sending" || streaming || sending}
++              data-testid="voice-listen"
++              onClick={() => {
++                if (phase === "listening") {
++                  stopListening();
++                  return;
++                }
++                startListening();
++              }}
++            >
++              {phase === "listening" ? t("voice.stopListen") : t("voice.listen")}
++            </Button>
++            <Button type="button" size="sm" variant="ghost" data-testid="voice-interrupt" onClick={interrupt}>
++              {t("voice.interrupt")}
++            </Button>
++          </>
++        ) : null}
++      </div>
++      {open ? (
++        <div className="mt-2 flex flex-col gap-2">
++          {!cloudAck ? (
++            <div className="rounded border border-amber-600/40 bg-amber-500/10 p-2 text-[11px]" role="status">
++              <p>{t("voice.cloudWarning")}</p>
++              <Button
++                type="button"
++                size="sm"
++                className="mt-2"
++                data-testid="voice-cloud-ack"
++                onClick={() => {
++                  void onPrefsChange({ voiceCloudAck: true });
++                }}
++              >
++                {t("voice.cloudAck")}
++              </Button>
++            </div>
++          ) : null}
++          <p className="text-[11px] text-muted-foreground" data-testid="voice-phase" data-phase={phase}>
++            {t(`voice.phase.${phase}`)}
++          </p>
++          {interim ? (
++            <p className="text-[12px] italic text-muted-foreground" data-testid="voice-interim">
++              {interim}
++            </p>
++          ) : null}
++          {lastTranscript ? (
++            <p className="text-[12px]" data-testid="voice-transcript">
++              <span className="text-muted-foreground">{t("voice.transcript")}: </span>
++              {lastTranscript}
++            </p>
++          ) : (
++            <p className="text-[11px] text-muted-foreground">{t("voice.hint")}</p>
++          )}
++          <label className="flex items-center gap-2 text-[12px]">
++            <input
++              type="checkbox"
++              checked={continuous}
++              onChange={(event) => {
++                void onPrefsChange({ voiceContinuous: event.target.checked });
++              }}
++              data-testid="voice-continuous"
++            />
++            {t("voice.continuous")}
++          </label>
++          {ttsOk && voices.length > 0 ? (
++            <label className="flex flex-col gap-1 text-[12px]">
++              {t("voice.voice")}
++              <select
++                className="h-8 rounded border bg-background px-2 text-xs"
++                value={voiceURI ?? ""}
++                onChange={(event) => {
++                  const next = event.target.value || null;
++                  void onPrefsChange({ ttsVoiceURI: next });
++                }}
++                data-testid="voice-select"
++              >
++                <option value="">{t("voice.voiceDefault")}</option>
++                {voices.map((voice) => (
++                  <option key={voice.voiceURI} value={voice.voiceURI}>
++                    {voice.name} ({voice.lang})
++                  </option>
++                ))}
++              </select>
++            </label>
++          ) : null}
++          {error ? (
++            <p className="text-[11px] text-destructive" role="alert">
++              {error}
++            </p>
++          ) : null}
++        </div>
++      ) : null}
++    </section>
++  );
++}
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index 8927146..035c276 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -32,12 +32,14 @@ import {
+   type LocalProviderStatusDto,
+   type HealthSummaryDto,
+   type ToolActivityDto,
++  type AppPrefs,
+ } from "@ai-hub/shared";
+ import {
+   ChatComposer,
+   type MentionSuggestion,
+   type SlashCommandId,
+ } from "@/components/chat/chat-composer";
++import { VoicePanel } from "@/components/chat/voice-panel";
+ import { ConversationTree } from "@/components/chat/conversation-tree";
+ import { MessageBubble } from "@/components/chat/message-bubble";
+ import { ArtifactCanvas } from "@/components/chat/artifact-canvas";
+@@ -143,6 +145,8 @@ export function HomeView({
+   pendingSkill,
+   onPendingSkillConsumed,
+   onOpenSkills,
++  appPrefs,
++  onAppPrefsPatch,
+ }: {
+   project: ProjectDto | null;
+   importedInbox: boolean;
+@@ -214,8 +218,10 @@ export function HomeView({
+   pendingSkill: { id?: string; query: string } | null;
+   onPendingSkillConsumed: () => void;
+   onOpenSkills: () => void;
++  appPrefs: AppPrefs | null;
++  onAppPrefsPatch: (patch: Partial<AppPrefs>) => Promise<void>;
+ }): JSX.Element {
+-  const { t } = useTranslation();
++  const { t, i18n } = useTranslation();
+   const modifier = window.hub.platform === "darwin" ? "Ôîÿ" : "Ctrl";
+   const [title, setTitle] = useState("");
+   const [draft, setDraft] = useState("");
+@@ -1771,6 +1777,30 @@ export function HomeView({
+                     {developerOutput ? <pre className="mt-2 max-h-40 overflow-auto rounded bg-muted p-2 text-[11px]" data-testid="developer-output">{developerOutput}</pre> : <p className="mt-1 text-[11px] text-muted-foreground">{t("developer.hint")}</p>}
+                   </section>
+                 ) : null}
++                <VoicePanel
++                  enabled={Boolean(selectedConversationId)}
++                  conversationId={selectedConversationId}
++                  prefs={appPrefs}
++                  messages={messages}
++                  streaming={streaming}
++                  sending={sending}
++                  hasKey={hasKey}
++                  hasConversation={Boolean(selectedConversationId)}
++                  locale={i18n.language}
++                  onSendTranscript={async (text) => {
++                    const voiceMode = runMode === "plan" || runMode === "assist" ? runMode : "assist";
++                    return onSend(text, [], {
++                      keyId: selectedKeyId ?? "",
++                      model: selectedModel,
++                      runMode: voiceMode,
++                      effortLevel,
++                    });
++                  }}
++                  onAbortChat={() => {
++                    void onAbort();
++                  }}
++                  onPrefsChange={onAppPrefsPatch}
++                />
+                 <ChatComposer
+                   key={selectedConversationId}
+                   value={draft}
+diff --git a/docs/ADR/ADR-W28-001-web-speech-voice-mode.md b/docs/ADR/ADR-W28-001-web-speech-voice-mode.md
+new file mode 100644
+index 0000000..6e6b471
+--- /dev/null
++++ b/docs/ADR/ADR-W28-001-web-speech-voice-mode.md
+@@ -0,0 +1,40 @@
++# ADR-W28-001-web-speech-voice-mode
++
++- **Status:** accepted
++- **Onda:** W28
++- **Data:** 2026-09-23
++- **Deciders:** Cursor / Pedro
++- **Supersedes:** ÔÇö
++- **Superseded by:** ÔÇö
++
++## Contexto
++
++Wave 28 exige Voice Mode (STT ÔåÆ LLM ÔåÆ TTS), conversa cont├¡nua com interrup├º├úo, escolha de voz, aviso se STT/TTS for cloud, e respeito ao modo Privado (n├úo gravar ├íudio em disco sem opt-in). O DoD ├® hands-free de uma pergunta com transcript e receipt vis├¡veis. N├úo h├í pacote `voice` no MVP; a trust boundary pro├¡be keys/Provider HTTP no renderer.
++
++## Decis├úo
++
++1. **STT/TTS** usam a **Web Speech API** no renderer (Chromium do Electron): `SpeechRecognition` / `SpeechSynthesis`. Sem novo npm package e sem HTTP de provider de voz no main nesta onda.
++2. **LLM** continua exclusivamente via `chat:send` / `sendChat` (caps, firewall, receipts, abort, privacy efetiva no main). O transcript vira o `content` da mensagem do usu├írio.
++3. **├üudio em disco:** W28 **n├úo** grava wav/webm. Pref `audioDiskOptIn` (default `false`) reserva o contrato; em `privacyMode === "private"` a grava├º├úo ├® sempre recusada mesmo com opt-in (`setAppPrefs` for├ºa `audioDiskOptIn=false`; `canPersistVoiceAudio` ├® o gate para qualquer writer futuro). Transcripts vivem como mensagens cifradas da conversa.
++4. **Cloud / OS:** Web Speech pode usar servi├ºos do SO/navegador. Exigimos `voiceCloudAck` antes do primeiro listen e mostramos aviso de privacidade na Settings e no painel de voz.
++5. **Voz TTS:** `ttsVoiceURI` em app prefs; lista vem de `speechSynthesis.getVoices()` no renderer.
++6. **Cont├¡nuo / interrupt:** ap├│s TTS da resposta, se `voiceContinuous` e o utilizador ainda est├í em modo voz, reinicia STT; interrupt para reconhecimento, s├¡ntese e `chat.abort`.
++
++## Alternativas consideradas
++
++- **Whisper/ffmpeg local no main:** rejeitado nesta onda ÔÇö pesado, novo bin├írio, fora do DoD m├¡nimo.
++- **Cloud STT/TTS via ai-gateway:** rejeitado ÔÇö nova superf├¡cie de keys e custo; aviso cloud basta para Web Speech.
++- **Pacote `packages/voice`:** rejeitado ÔÇö plano n├úo cria pacote; l├│gica cabe em desktop + prefs shared/db.
++
++## Consequ├¬ncias
++
++- Qualidade STT/TTS depende do SO/Chromium; CI deve mockar transcript (sem microfone real).
++- Hist├│rico de voz = hist├│rico da conversa (sem tabela separada).
++- Ondas futuras podem trocar o backend de STT/TTS sem mudar o caminho LLM se mantiverem o contrato transcript ÔåÆ `chat:send`.
++
++## Refer├¬ncias
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 28)
++- `docs/AI_Hub_Desktop_Escopo.md` (┬º38)
++- `docs/ADR/ADR-W18-001-effective-privacy-policy.md`
++- `docs/reviews/W28/REVIEW.md` (quando existir)
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index 675fc5c..103d2cc 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -148,6 +148,21 @@ describe("hub database", () => {
+     expect(next.onboardingComplete).toBe(true);
+     expect(next.crashReporterOptIn).toBe(true);
+     expect(next.lastUpdateStatus).toBe("idle");
++    expect(next.voiceCloudAck).toBe(false);
++    expect(next.audioDiskOptIn).toBe(false);
++    const voiced = hub.repos.setAppPrefs({
++      voiceCloudAck: true,
++      voiceContinuous: true,
++      ttsVoiceURI: "uri:test",
++    });
++    expect(voiced.voiceCloudAck).toBe(true);
++    expect(voiced.voiceContinuous).toBe(true);
++    expect(voiced.ttsVoiceURI).toBe("uri:test");
++    const withDisk = hub.repos.setAppPrefs({ audioDiskOptIn: true });
++    expect(withDisk.audioDiskOptIn).toBe(true);
++    const privatized = hub.repos.setAppPrefs({ privacyMode: "private" });
++    expect(privatized.privacyMode).toBe("private");
++    expect(privatized.audioDiskOptIn).toBe(false);
+     hub.close();
+   });
+ 
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index de8e958..f18e247 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -416,6 +416,10 @@ export interface AppPrefsRecord {
+     cpf: "block" | "mask" | "allow";
+     prompt_injection: "block" | "mask" | "allow";
+   };
++  ttsVoiceURI: string | null;
++  voiceCloudAck: boolean;
++  audioDiskOptIn: boolean;
++  voiceContinuous: boolean;
+ }
+ 
+ const DEFAULT_APP_PREFS: AppPrefsRecord = {
+@@ -426,6 +430,10 @@ const DEFAULT_APP_PREFS: AppPrefsRecord = {
+   lastWizardTtftMs: null,
+   privacyMode: "normal",
+   firewallPolicy: { secret: "mask", token: "mask", email: "mask", cpf: "mask", prompt_injection: "block" },
++  ttsVoiceURI: null,
++  voiceCloudAck: false,
++  audioDiskOptIn: false,
++  voiceContinuous: false,
+ };
+ 
+ const UPDATE_STATUSES: readonly AppPrefsRecord["lastUpdateStatus"][] = [
+@@ -1664,6 +1672,10 @@ export class HubRepos {
+           ? record.privacyMode
+           : DEFAULT_APP_PREFS.privacyMode,
+       firewallPolicy: isFirewallPolicy(record.firewallPolicy) ? record.firewallPolicy : DEFAULT_APP_PREFS.firewallPolicy,
++      ttsVoiceURI: typeof record.ttsVoiceURI === "string" ? record.ttsVoiceURI.slice(0, 200) : null,
++      voiceCloudAck: record.voiceCloudAck === true,
++      audioDiskOptIn: record.audioDiskOptIn === true,
++      voiceContinuous: record.voiceContinuous === true,
+     };
+   }
+ 
+@@ -1675,6 +1687,10 @@ export class HubRepos {
+     lastWizardTtftMs?: number | null | undefined;
+     privacyMode?: AppPrefsRecord["privacyMode"] | undefined;
+     firewallPolicy?: AppPrefsRecord["firewallPolicy"] | undefined;
++    ttsVoiceURI?: string | null | undefined;
++    voiceCloudAck?: boolean | undefined;
++    audioDiskOptIn?: boolean | undefined;
++    voiceContinuous?: boolean | undefined;
+   }): AppPrefsRecord {
+     const current = this.getAppPrefs();
+     const next: AppPrefsRecord = {
+@@ -1685,7 +1701,14 @@ export class HubRepos {
+       lastWizardTtftMs: patch.lastWizardTtftMs === undefined ? current.lastWizardTtftMs : patch.lastWizardTtftMs,
+       privacyMode: patch.privacyMode ?? current.privacyMode,
+       firewallPolicy: patch.firewallPolicy ?? current.firewallPolicy,
++      ttsVoiceURI: patch.ttsVoiceURI === undefined ? current.ttsVoiceURI : patch.ttsVoiceURI,
++      voiceCloudAck: patch.voiceCloudAck ?? current.voiceCloudAck,
++      audioDiskOptIn: patch.audioDiskOptIn ?? current.audioDiskOptIn,
++      voiceContinuous: patch.voiceContinuous ?? current.voiceContinuous,
+     };
++    if (next.privacyMode === "private") {
++      next.audioDiskOptIn = false;
++    }
+     const now = Date.now();
+     this.db
+       .insert(settings)
