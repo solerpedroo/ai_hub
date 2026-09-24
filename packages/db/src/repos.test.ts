@@ -148,6 +148,21 @@ describe("hub database", () => {
     expect(next.onboardingComplete).toBe(true);
     expect(next.crashReporterOptIn).toBe(true);
     expect(next.lastUpdateStatus).toBe("idle");
+    expect(next.voiceCloudAck).toBe(false);
+    expect(next.audioDiskOptIn).toBe(false);
+    const voiced = hub.repos.setAppPrefs({
+      voiceCloudAck: true,
+      voiceContinuous: true,
+      ttsVoiceURI: "uri:test",
+    });
+    expect(voiced.voiceCloudAck).toBe(true);
+    expect(voiced.voiceContinuous).toBe(true);
+    expect(voiced.ttsVoiceURI).toBe("uri:test");
+    const withDisk = hub.repos.setAppPrefs({ audioDiskOptIn: true });
+    expect(withDisk.audioDiskOptIn).toBe(true);
+    const privatized = hub.repos.setAppPrefs({ privacyMode: "private" });
+    expect(privatized.privacyMode).toBe("private");
+    expect(privatized.audioDiskOptIn).toBe(false);
     hub.close();
   });
 
