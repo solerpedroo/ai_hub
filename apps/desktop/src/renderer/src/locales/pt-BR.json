@@ -648,5 +648,20 @@
     "voice.error.cloudAck": "Aceite primeiro o aviso de privacidade de fala (nuvem/SO).",
     "voice.error.ready": "Abra uma conversa e escolha uma chave de provider primeiro.",
     "voice.error.send": "Não foi possível enviar a transcrição.",
-    "voice.error.stt": "Erro de fala: {{code}}"
+    "voice.error.stt": "Erro de fala: {{code}}",
+    "secrets.customEndpointHint": "Endpoint compatível com OpenAI: URL base /v1, GET /models e streaming POST /chat/completions com Bearer.",
+    "marketplace.title": "Marketplace interno",
+    "marketplace.hint": "Packs internos usam somente APIs do core; a permissão continua sendo pedida por projeto.",
+    "marketplace.install": "Instalar",
+    "marketplace.uninstall": "Remover",
+    "marketplace.available": "Disponível",
+    "marketplace.coreIntegrated": "Nativo",
+    "marketplace.permission": "{{count}} permissão de leitura declarada",
+    "marketplace.pack.project-files.title": "Arquivos do projeto",
+    "marketplace.pack.project-files.description": "Lê arquivos somente dentro da raiz do projeto pelo Centro de permissões.",
+    "marketplace.pack.openai-compatible.title": "Endpoint compatível com OpenAI",
+    "marketplace.pack.openai-compatible.description": "Configure qualquer endpoint compatível com /v1 nas configurações de provedores.",
+    "marketplace.pack.code-review-skill.title": "Skill de revisão de código",
+    "marketplace.pack.code-review-skill.description": "Use a skill nativa de revisão de código em Skills.",
+    "tools.error.packRequired": "Instale o pack Project Files no Marketplace interno antes de ler arquivos do projeto."
 }
