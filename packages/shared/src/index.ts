@@ -1,4 +1,5 @@
 export { type AppLocale, type ThemeMode, localeSchema, themeModeSchema } from "./appearance";
+export { EXTENSION_API_VERSION, extensionManifestSchema, extensionPermissionSchema, type ExtensionManifest } from "./extensions";
 export {
   type HubApi,
   type HubChatApi,
@@ -6,6 +7,7 @@ export {
   type HubMessagesApi,
   type HubProjectsApi,
   type HubProvidersApi,
+  type HubMarketplaceApi,
   type HubSearchApi,
   type HubSecretsApi,
   type HubSettingsApi,
@@ -329,6 +331,9 @@ export {
   providerKeyDtoSchema,
   providerKeyListResultSchema,
   localProviderStatusSchema,
+  marketplacePackDtoSchema,
+  marketplacePackIdInputSchema,
+  marketplacePackListSchema,
   providerListResultSchema,
   secretsSaveInputSchema,
   secretsTestInputSchema,
@@ -478,6 +483,8 @@ export {
   type WorkspaceSetTaskDoneInput,
   type ProviderKeyDto,
   type LocalProviderStatusDto,
+  type MarketplacePackDto,
+  type MarketplacePackIdInput,
   type SecretsSaveInput,
   type SecretsTestInput,
   type SecretsTestResult,
