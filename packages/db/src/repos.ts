@@ -25,6 +25,7 @@ import {
   projectMemories,
   projectNotes,
   projectToolPermissions,
+  installedPacks,
   projectToolRoots,
   prompts,
   skills,
@@ -71,6 +72,15 @@ export interface ProjectToolPermissionRecord {
   toolId: string;
   operation: string;
   createdAt: string;
+  updatedAt: string;
+}
+
+export interface InstalledPackRecord {
+  packId: string;
+  version: string;
+  kind: string;
+  enabled: boolean;
+  installedAt: string;
   updatedAt: string;
 }
 
@@ -907,6 +917,34 @@ export class HubRepos {
       .delete(projectToolPermissions)
       .where(and(eq(projectToolPermissions.projectId, projectId), eq(projectToolPermissions.toolId, toolId), eq(projectToolPermissions.operation, operation)))
       .run();
+  }
+
+  listInstalledPacks(): InstalledPackRecord[] {
+    return this.db.select().from(installedPacks).all().map((row) => ({
+      packId: row.packId,
+      version: row.version,
+      kind: row.kind,
+      enabled: row.enabled === 1,
+      installedAt: iso(row.installedAt),
+      updatedAt: iso(row.updatedAt),
+    }));
+  }
+
+  installPack(input: { packId: string; version: string; kind: string }): InstalledPackRecord {
+    const now = Date.now();
+    const existing = this.db.select().from(installedPacks).where(eq(installedPacks.packId, input.packId)).get();
+    this.db.insert(installedPacks).values({ packId: input.packId, version: input.version, kind: input.kind, enabled: 1, installedAt: existing?.installedAt ?? now, updatedAt: now }).onConflictDoUpdate({ target: installedPacks.packId, set: { version: input.version, kind: input.kind, enabled: 1, updatedAt: now } }).run();
+    const installed = this.listInstalledPacks().find((row) => row.packId === input.packId);
+    if (!installed) throw new Error("Installed pack not found");
+    return installed;
+  }
+
+  uninstallPack(packId: string): void {
+    this.db.delete(installedPacks).where(eq(installedPacks.packId, packId)).run();
+  }
+
+  isPackInstalled(packId: string): boolean {
+    return this.db.select().from(installedPacks).where(and(eq(installedPacks.packId, packId), eq(installedPacks.enabled, 1))).get() !== undefined;
   }
 
   listConversations(projectId: string | null, inbox: "avulsas" | "imported" = "avulsas"): ConversationRecord[] {
