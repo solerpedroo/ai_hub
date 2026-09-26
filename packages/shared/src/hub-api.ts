@@ -125,6 +125,8 @@ import type {
   OrchestrationRunDetail,
   ProviderKeyDto,
   LocalProviderStatusDto,
+  MarketplacePackDto,
+  MarketplacePackIdInput,
   SecretsSaveInput,
   SecretsTestInput,
   SecretsTestResult,
@@ -191,6 +193,12 @@ export interface HubUpdatesApi {
 export interface HubProvidersApi {
   list: () => Promise<ProviderDto[]>;
   localStatus: () => Promise<LocalProviderStatusDto>;
+}
+
+export interface HubMarketplaceApi {
+  list: () => Promise<MarketplacePackDto[]>;
+  install: (input: MarketplacePackIdInput) => Promise<MarketplacePackDto>;
+  uninstall: (input: MarketplacePackIdInput) => Promise<void>;
 }
 
 export interface HubSecretsApi {
@@ -356,6 +364,7 @@ export interface HubApi {
   prefs: HubPrefsApi;
   updates: HubUpdatesApi;
   providers: HubProvidersApi;
+  marketplace: HubMarketplaceApi;
   secrets: HubSecretsApi;
   search: HubSearchApi;
   spendCaps: HubSpendCapsApi;
