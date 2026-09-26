@@ -108,6 +108,9 @@ import {
   providerKeyDtoSchema,
   providerKeyListResultSchema,
   localProviderStatusSchema,
+  marketplacePackDtoSchema,
+  marketplacePackIdInputSchema,
+  marketplacePackListSchema,
   providerListResultSchema,
   searchInputSchema,
   searchResultSchema,
@@ -172,6 +175,7 @@ import { cancelOrchestration, getOrchestration, listOrchestrations, pauseOrchest
 import { prepareResearch } from "./research-runner";
 import { developerDiff, developerReview, developerStatus, developerTerminal, developerTree } from "./developer-tools";
 import { getLocalProviderStatus, localProviderKey } from "./local-provider";
+import { installMarketplacePack, listMarketplacePacks, uninstallMarketplacePack } from "./marketplace-packs";
 
 function registerHandler<TIn, TOut>(
   channel: string,
@@ -487,6 +491,12 @@ export function registerWorkspaceIpc(): void {
   registerHandler(IpcChannel.localProviderStatus, emptyIpcPayloadSchema, localProviderStatusSchema, () =>
     getLocalProviderStatus(true),
   );
+
+  registerHandler(IpcChannel.marketplaceList, emptyIpcPayloadSchema, marketplacePackListSchema, () => listMarketplacePacks());
+  registerHandler(IpcChannel.marketplaceInstall, marketplacePackIdInputSchema, marketplacePackDtoSchema, (input) => installMarketplacePack(input.packId));
+  registerHandler(IpcChannel.marketplaceUninstall, marketplacePackIdInputSchema, ipcAckResultSchema, (input) => {
+    uninstallMarketplacePack(input.packId);
+  });
 
   registerHandler(IpcChannel.secretsList, emptyIpcPayloadSchema, providerKeyListResultSchema, async () => {
     const keys = await getHubDatabase().repos.listProviderKeys();
