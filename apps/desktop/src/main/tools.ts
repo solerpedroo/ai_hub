@@ -12,6 +12,7 @@ import {
   type ToolReadRequestResult,
 } from "@ai-hub/shared";
 import { getHubDatabase } from "./persistence";
+import { projectFilesPackInstalled } from "./marketplace-packs";
 
 const router = new ToolRouter({
   getProjectToolRoot: (projectId) => getHubDatabase().repos.getProjectToolRoot(projectId),
@@ -35,7 +36,11 @@ function projectState(projectId: string): ToolProjectState {
   return {
     projectId,
     rootLabel: root ? basename(root.rootPath) : null,
-    allowedTools: [TOOL_ID_PROJECT_FILESYSTEM_READ, TOOL_ID_DEVELOPER_EXPLORER, TOOL_ID_DEVELOPER_GIT]
+    allowedTools: [
+      ...(projectFilesPackInstalled() ? [TOOL_ID_PROJECT_FILESYSTEM_READ] : []),
+      TOOL_ID_DEVELOPER_EXPLORER,
+      TOOL_ID_DEVELOPER_GIT,
+    ]
       .filter((toolId) => getHubDatabase().repos.hasProjectToolPermission(projectId, toolId, "read")),
   };
 }
@@ -108,6 +113,7 @@ export async function requestDeveloperPermission(projectId: string, sender: WebC
 }
 
 export async function requestToolRead(input: ToolReadRequestInput, sender: WebContents): Promise<ToolReadRequestResult> {
+  if (!projectFilesPackInstalled()) throw new Error("marketplace:pack_not_installed");
   const result = await router.request({ projectId: input.projectId, toolId: TOOL_ID_PROJECT_FILESYSTEM_READ, relativePath: input.relativePath }, sender.id);
   if (!isPermission(result)) { record(result); return completed(result); }
   const parent = BrowserWindow.fromWebContents(sender);
