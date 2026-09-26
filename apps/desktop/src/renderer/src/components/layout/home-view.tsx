@@ -710,7 +710,10 @@ export function HomeView({
       setToolActivity(result.activity);
       if (result.kind === "completed") { appendToolOutput(result.content, result.activity); setToolPath(""); }
       if (result.kind === "denied") setToolError(t("tools.error.denied"));
-    } catch { setToolError(t("tools.error.read")); }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      setToolError(message.includes("marketplace:pack_not_installed") ? t("tools.error.packRequired") : t("tools.error.read"));
+    }
     finally { setToolBusy(false); }
   };
 
