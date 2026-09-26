@@ -1,0 +1,350 @@
+diff --git a/apps/desktop/src/main/tools.ts b/apps/desktop/src/main/tools.ts
+index 27dc099..f149a16 100644
+--- a/apps/desktop/src/main/tools.ts
++++ b/apps/desktop/src/main/tools.ts
+@@ -12,6 +12,7 @@ import {
+   type ToolReadRequestResult,
+ } from "@ai-hub/shared";
+ import { getHubDatabase } from "./persistence";
++import { projectFilesPackInstalled } from "./marketplace-packs";
+ 
+ const router = new ToolRouter({
+   getProjectToolRoot: (projectId) => getHubDatabase().repos.getProjectToolRoot(projectId),
+@@ -35,7 +36,11 @@ function projectState(projectId: string): ToolProjectState {
+   return {
+     projectId,
+     rootLabel: root ? basename(root.rootPath) : null,
+-    allowedTools: [TOOL_ID_PROJECT_FILESYSTEM_READ, TOOL_ID_DEVELOPER_EXPLORER, TOOL_ID_DEVELOPER_GIT]
++    allowedTools: [
++      ...(projectFilesPackInstalled() ? [TOOL_ID_PROJECT_FILESYSTEM_READ] : []),
++      TOOL_ID_DEVELOPER_EXPLORER,
++      TOOL_ID_DEVELOPER_GIT,
++    ]
+       .filter((toolId) => getHubDatabase().repos.hasProjectToolPermission(projectId, toolId, "read")),
+   };
+ }
+@@ -108,6 +113,7 @@ export async function requestDeveloperPermission(projectId: string, sender: WebC
+ }
+ 
+ export async function requestToolRead(input: ToolReadRequestInput, sender: WebContents): Promise<ToolReadRequestResult> {
++  if (!projectFilesPackInstalled()) throw new Error("marketplace:pack_not_installed");
+   const result = await router.request({ projectId: input.projectId, toolId: TOOL_ID_PROJECT_FILESYSTEM_READ, relativePath: input.relativePath }, sender.id);
+   if (!isPermission(result)) { record(result); return completed(result); }
+   const parent = BrowserWindow.fromWebContents(sender);
+diff --git a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+index 777eb82..226fcae 100644
+--- a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+@@ -4,6 +4,7 @@ import type {
+   AppLocale,
+   AppPrefs,
+   MonthlyCostsResult,
++  MarketplacePackDto,
+   ProviderDto,
+   ProviderKeyDto,
+   ProjectDto,
+@@ -50,6 +51,7 @@ export function SettingsView({
+   const [capDimension, setCapDimension] = useState<"project" | "provider">("project");
+   const [capSubject, setCapSubject] = useState("");
+   const [scopedCapLimit, setScopedCapLimit] = useState("");
++  const [marketplacePacks, setMarketplacePacks] = useState<MarketplacePackDto[]>([]);
+   const generalRef = useRef<HTMLHeadingElement>(null);
+   const providerRef = useRef<HTMLSelectElement>(null);
+   const capRef = useRef<HTMLInputElement>(null);
+@@ -96,6 +98,11 @@ export function SettingsView({
+           setError(t("workspace.error.generic"));
+         }
+       });
++    void window.hub.marketplace.list().then((list) => {
++      if (!cancelled) setMarketplacePacks(list);
++    }).catch(() => {
++      if (!cancelled) setError(t("workspace.error.generic"));
++    });
+     void window.hub.projects.list().then((list) => {
+       if (!cancelled) {
+         setProjects(list);
+@@ -245,6 +252,27 @@ export function SettingsView({
+           </Button>
+         </div>
+       </section>
++      <section className="flex flex-col gap-2">
++        <h2 className="text-[12px] font-medium">{t("marketplace.title")}</h2>
++        <p className="text-muted-foreground">{t("marketplace.hint")}</p>
++        <ul className="flex flex-col gap-2" data-testid="marketplace-packs">
++          {marketplacePacks.map((pack) => (
++            <li key={pack.id} className="flex items-center justify-between gap-3 rounded-md border px-3 py-2">
++              <div>
++                <p className="text-[13px] font-medium">{t(pack.titleKey)}</p>
++                <p className="text-[11px] text-muted-foreground">{t(pack.descriptionKey)}</p>
++                <p className="text-[11px] text-muted-foreground">{t("marketplace.permission", { count: pack.permissions.length })}</p>
++              </div>
++              <Button type="button" size="sm" variant={pack.installed ? "outline" : "default"} disabled={!pack.installable} data-testid={`marketplace-pack-${pack.id}`} onClick={() => {
++                const action = pack.installed ? window.hub.marketplace.uninstall({ packId: pack.id }) : window.hub.marketplace.install({ packId: pack.id });
++                void action.then(() => window.hub.marketplace.list()).then(setMarketplacePacks).catch(() => setError(t("workspace.error.generic")));
++              }}>
++                {pack.installable ? (pack.installed ? t("marketplace.uninstall") : t("marketplace.install")) : t("marketplace.coreIntegrated")}
++              </Button>
++            </li>
++          ))}
++        </ul>
++      </section>
+       <section className="flex flex-col gap-2">
+         <h2 className="text-[12px] font-medium">{t("secrets.title")}</h2>
+         <p className="text-muted-foreground">{t("secrets.hint")}</p>
+@@ -279,6 +307,7 @@ export function SettingsView({
+                 autoComplete="off"
+                 data-testid="secrets-base-url"
+               />
++              <span className="text-[11px] text-muted-foreground">{t("secrets.customEndpointHint")}</span>
+             </label>
+           ) : null}
+           <label className="flex flex-col gap-1 text-[12px]">
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 89443a0..566e989 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -648,5 +648,20 @@
+     "voice.error.cloudAck": "Acknowledge the cloud/OS speech privacy warning first.",
+     "voice.error.ready": "Open a conversation and select a provider key first.",
+     "voice.error.send": "Could not send the transcript.",
+-    "voice.error.stt": "Speech error: {{code}}"
++    "voice.error.stt": "Speech error: {{code}}",
++    "secrets.customEndpointHint": "OpenAI-compatible endpoint: base /v1 URL, GET /models, and streaming POST /chat/completions with Bearer auth.",
++    "marketplace.title": "Internal marketplace",
++    "marketplace.hint": "Internal packs use core APIs only; permission is still requested per project.",
++    "marketplace.install": "Install",
++    "marketplace.uninstall": "Remove",
++    "marketplace.available": "Available",
++    "marketplace.coreIntegrated": "Built in",
++    "marketplace.permission": "{{count}} declared read permission",
++    "marketplace.pack.project-files.title": "Project Files",
++    "marketplace.pack.project-files.description": "Read files only inside the project root through the Permission Center.",
++    "marketplace.pack.openai-compatible.title": "OpenAI-compatible endpoint",
++    "marketplace.pack.openai-compatible.description": "Configure any compatible /v1 endpoint in Provider settings.",
++    "marketplace.pack.code-review-skill.title": "Code Review skill",
++    "marketplace.pack.code-review-skill.description": "Use the built-in Code Review skill from Skills.",
++    "tools.error.packRequired": "Install the Project Files pack in the internal marketplace before reading project files."
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index 9a2486d..b3b7889 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -648,5 +648,20 @@
+     "voice.error.cloudAck": "Aceite primeiro o aviso de privacidade de fala (nuvem/SO).",
+     "voice.error.ready": "Abra uma conversa e escolha uma chave de provider primeiro.",
+     "voice.error.send": "Não foi possível enviar a transcrição.",
+-    "voice.error.stt": "Erro de fala: {{code}}"
++    "voice.error.stt": "Erro de fala: {{code}}",
++    "secrets.customEndpointHint": "Endpoint compatível com OpenAI: URL base /v1, GET /models e streaming POST /chat/completions com Bearer.",
++    "marketplace.title": "Marketplace interno",
++    "marketplace.hint": "Packs internos usam somente APIs do core; a permissão continua sendo pedida por projeto.",
++    "marketplace.install": "Instalar",
++    "marketplace.uninstall": "Remover",
++    "marketplace.available": "Disponível",
++    "marketplace.coreIntegrated": "Nativo",
++    "marketplace.permission": "{{count}} permissão de leitura declarada",
++    "marketplace.pack.project-files.title": "Arquivos do projeto",
++    "marketplace.pack.project-files.description": "Lê arquivos somente dentro da raiz do projeto pelo Centro de permissões.",
++    "marketplace.pack.openai-compatible.title": "Endpoint compatível com OpenAI",
++    "marketplace.pack.openai-compatible.description": "Configure qualquer endpoint compatível com /v1 nas configurações de provedores.",
++    "marketplace.pack.code-review-skill.title": "Skill de revisão de código",
++    "marketplace.pack.code-review-skill.description": "Use a skill nativa de revisão de código em Skills.",
++    "tools.error.packRequired": "Instale o pack Project Files no Marketplace interno antes de ler arquivos do projeto."
+ }
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index c1b7680..7467f0d 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -47,8 +47,18 @@ import {
+   developerReviewInputSchema,
+   developerTerminalInputSchema,
+   localProviderStatusSchema,
++  marketplacePackDtoSchema,
++  marketplacePackIdInputSchema,
+ } from "./ipc-schemas";
+ 
++describe("wave 29 marketplace contracts", () => {
++  it("accepts only strict internal pack metadata", () => {
++    expect(marketplacePackDtoSchema.parse({ id: "ai-hub.project-files", version: "1.0.0", kind: "mcp", name: "Project Files", description: "Read project files", permissions: [{ toolId: "project-filesystem.read-file", operation: "read", effect: "read" }], titleKey: "marketplace.pack.project-files.title", descriptionKey: "marketplace.pack.project-files.description", availability: "installable", installable: true, installed: false }).id).toBe("ai-hub.project-files");
++    expect(() => marketplacePackIdInputSchema.parse({ packId: "not a pack" })).toThrow();
++    expect(() => marketplacePackDtoSchema.parse({ id: "ai-hub.project-files", version: "1", kind: "mcp", name: "Files", description: "Read", permissions: [], titleKey: "marketplace.pack.project-files.title", descriptionKey: "marketplace.pack.project-files.description", availability: "installable", installable: true, installed: false, executable: "evil" })).toThrow();
++  });
++});
++
+ describe("emptyIpcPayloadSchema", () => {
+   it("accepts an empty object", () => {
+     expect(emptyIpcPayloadSchema.parse({})).toEqual({});
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index 00ecd79..93543e3 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -552,6 +552,25 @@ export const localProviderStatusSchema = z.object({
+ }).strict();
+ export type LocalProviderStatusDto = z.infer<typeof localProviderStatusSchema>;
+ 
++const marketplacePackKindSchema = z.enum(["provider", "mcp", "skill"]);
++export const marketplacePackDtoSchema = z.object({
++  id: z.string().regex(/^[a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+$/).max(128),
++  version: z.string().min(1).max(32),
++  kind: marketplacePackKindSchema,
++  name: z.string().min(1).max(100),
++  description: z.string().min(1).max(400),
++  permissions: z.array(z.object({ toolId: z.string().min(1).max(128), operation: z.literal("read"), effect: z.literal("read") }).strict()).max(16),
++  titleKey: z.string().regex(/^marketplace\.pack\.[a-z0-9-]+\.title$/).max(128),
++  descriptionKey: z.string().regex(/^marketplace\.pack\.[a-z0-9-]+\.description$/).max(128),
++  availability: z.enum(["installable", "core_integrated"]),
++  installable: z.boolean(),
++  installed: z.boolean(),
++}).strict();
++export type MarketplacePackDto = z.infer<typeof marketplacePackDtoSchema>;
++export const marketplacePackListSchema = z.array(marketplacePackDtoSchema).max(64);
++export const marketplacePackIdInputSchema = z.object({ packId: z.string().regex(/^[a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+$/).max(128) }).strict();
++export type MarketplacePackIdInput = z.infer<typeof marketplacePackIdInputSchema>;
++
+ export const secretsSaveInputSchema = z
+   .object({
+     providerSlug: z.string().min(1).max(64),
+diff --git a/apps/desktop/src/main/marketplace-packs.ts b/apps/desktop/src/main/marketplace-packs.ts
+new file mode 100644
+index 0000000..9a86a1e
+--- /dev/null
++++ b/apps/desktop/src/main/marketplace-packs.ts
+@@ -0,0 +1,73 @@
++import { extensionManifestSchema, type ExtensionManifest, type MarketplacePackDto } from "@ai-hub/shared";
++import { getHubDatabase } from "./persistence";
++
++export const PROJECT_FILES_PACK_ID = "ai-hub.project-files";
++
++interface MarketplaceCatalogEntry {
++  manifest: ExtensionManifest;
++  titleKey: `marketplace.pack.${string}.title`;
++  descriptionKey: `marketplace.pack.${string}.description`;
++  availability: "installable" | "core_integrated";
++}
++
++const manifests: readonly ExtensionManifest[] = extensionManifestSchema.array().parse([{
++  apiVersion: 1,
++  id: PROJECT_FILES_PACK_ID,
++  version: "1.0.0",
++  kind: "mcp" as const,
++  name: "Project Files",
++  description: "Read files only inside the project root through the Permission Center.",
++  permissions: [{ toolId: "project-filesystem.read-file", operation: "read" as const, effect: "read" as const }],
++  sandbox: "core",
++}, {
++  apiVersion: 1,
++  id: "ai-hub.openai-compatible",
++  version: "1.0.0",
++  kind: "provider" as const,
++  name: "OpenAI-compatible endpoint",
++  description: "Connect any OpenAI-compatible /v1 endpoint from Provider settings.",
++  permissions: [],
++  sandbox: "core",
++}, {
++  apiVersion: 1,
++  id: "ai-hub.code-review-skill",
++  version: "1.0.0",
++  kind: "skill" as const,
++  name: "Code Review skill",
++  description: "Use the built-in Code Review skill from Skills.",
++  permissions: [],
++  sandbox: "core",
++}]);
++
++const catalog: readonly MarketplaceCatalogEntry[] = [
++  { manifest: manifests[0]!, titleKey: "marketplace.pack.project-files.title", descriptionKey: "marketplace.pack.project-files.description", availability: "installable" },
++  { manifest: manifests[1]!, titleKey: "marketplace.pack.openai-compatible.title", descriptionKey: "marketplace.pack.openai-compatible.description", availability: "core_integrated" },
++  { manifest: manifests[2]!, titleKey: "marketplace.pack.code-review-skill.title", descriptionKey: "marketplace.pack.code-review-skill.description", availability: "core_integrated" },
++];
++
++export function listMarketplacePacks(): MarketplacePackDto[] {
++  const installed = new Set(getHubDatabase().repos.listInstalledPacks().filter((pack) => pack.enabled).map((pack) => pack.packId));
++  return catalog.map(({ manifest, titleKey, descriptionKey, availability }) => {
++    const { apiVersion: _apiVersion, sandbox: _sandbox, ...pack } = manifest;
++    return { ...pack, permissions: [...pack.permissions], titleKey, descriptionKey, availability, installable: availability === "installable", installed: installed.has(pack.id) };
++  });
++}
++
++export function installMarketplacePack(packId: string): MarketplacePackDto {
++  const pack = catalog.find((item) => item.manifest.id === packId)?.manifest;
++  if (!pack) throw new Error("marketplace:pack_not_found");
++  if (pack.kind !== "mcp") throw new Error("marketplace:pack_not_installable");
++  getHubDatabase().repos.installPack({ packId: pack.id, version: pack.version, kind: pack.kind });
++  return listMarketplacePacks().find((item) => item.id === packId) ?? (() => { throw new Error("marketplace:pack_not_found"); })();
++}
++
++export function uninstallMarketplacePack(packId: string): void {
++  const pack = catalog.find((item) => item.manifest.id === packId)?.manifest;
++  if (!pack) throw new Error("marketplace:pack_not_found");
++  if (pack.kind !== "mcp") throw new Error("marketplace:pack_not_installable");
++  getHubDatabase().repos.uninstallPack(packId);
++}
++
++export function projectFilesPackInstalled(): boolean {
++  return getHubDatabase().repos.isPackInstalled(PROJECT_FILES_PACK_ID);
++}
+diff --git a/apps/desktop/src/main/tools.marketplace.test.ts b/apps/desktop/src/main/tools.marketplace.test.ts
+new file mode 100644
+index 0000000..f4b7bbe
+--- /dev/null
++++ b/apps/desktop/src/main/tools.marketplace.test.ts
+@@ -0,0 +1,58 @@
++import { mkdtemp, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++const fixture = vi.hoisted(() => ({
++  installed: false,
++  rootPath: "",
++  grants: new Set<string>(),
++  showMessageBox: vi.fn(),
++}));
++
++vi.mock("electron", () => ({
++  BrowserWindow: { fromWebContents: () => null },
++  dialog: { showMessageBox: fixture.showMessageBox },
++}));
++vi.mock("./marketplace-packs", () => ({ projectFilesPackInstalled: () => fixture.installed }));
++vi.mock("./persistence", () => ({
++  getHubDatabase: () => ({
++    repos: {
++      getProjectToolRoot: () => ({ rootPath: fixture.rootPath }),
++      hasProjectToolPermission: (projectId: string, toolId: string, operation: string) => fixture.grants.has(`${projectId}:${toolId}:${operation}`),
++      grantProjectToolPermission: (projectId: string, toolId: string, operation: string) => fixture.grants.add(`${projectId}:${toolId}:${operation}`),
++      getAppearance: () => ({ locale: "en" }),
++    },
++  }),
++}));
++
++import { requestToolRead } from "./tools";
++
++describe("marketplace Project Files pack", () => {
++  beforeEach(() => {
++    fixture.installed = false;
++    fixture.grants.clear();
++    fixture.showMessageBox.mockReset();
++  });
++
++  it("blocks reads until installed, then keeps the Permission Center in the read path", async () => {
++    const root = await mkdtemp(join(tmpdir(), "ai-hub-marketplace-"));
++    fixture.rootPath = root;
++    try {
++      await writeFile(join(root, "README.md"), "only scoped project content");
++      const sender = { id: 41 } as Electron.WebContents;
++      await expect(requestToolRead({ projectId: "project-a", relativePath: "README.md" }, sender)).rejects.toThrow("marketplace:pack_not_installed");
++
++      fixture.installed = true;
++      fixture.showMessageBox.mockResolvedValue({ response: 0 });
++      await expect(requestToolRead({ projectId: "project-a", relativePath: "README.md" }, sender)).resolves.toMatchObject({
++        kind: "completed",
++        content: "only scoped project content",
++      });
++      expect(fixture.showMessageBox).toHaveBeenCalledOnce();
++      expect(fixture.grants).toHaveLength(0);
++    } finally {
++      await rm(root, { recursive: true, force: true });
++    }
++  });
++});
+
