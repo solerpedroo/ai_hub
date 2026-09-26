@@ -108,6 +108,9 @@ import {
   providerKeyDtoSchema,
   providerKeyListResultSchema,
   localProviderStatusSchema,
+  marketplacePackDtoSchema,
+  marketplacePackIdInputSchema,
+  marketplacePackListSchema,
   providerListResultSchema,
   searchInputSchema,
   searchResultSchema,
@@ -308,6 +311,11 @@ const hub: HubApi = {
   providers: {
     list: () => invokeParsed(IpcChannel.providersList, empty, emptyIpcPayloadSchema, providerListResultSchema),
     localStatus: () => invokeParsed(IpcChannel.localProviderStatus, empty, emptyIpcPayloadSchema, localProviderStatusSchema),
+  },
+  marketplace: {
+    list: () => invokeParsed(IpcChannel.marketplaceList, empty, emptyIpcPayloadSchema, marketplacePackListSchema),
+    install: (input) => invokeParsed(IpcChannel.marketplaceInstall, input, marketplacePackIdInputSchema, marketplacePackDtoSchema),
+    uninstall: (input) => invokeAckWith(IpcChannel.marketplaceUninstall, input, marketplacePackIdInputSchema),
   },
   secrets: {
     list: () => invokeParsed(IpcChannel.secretsList, empty, emptyIpcPayloadSchema, providerKeyListResultSchema),
