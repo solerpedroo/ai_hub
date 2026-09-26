@@ -34,6 +34,7 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 
 | ID | Onda | Título | Status |
 |---|---|---|---|
+| [ADR-W29-001](./ADR-W29-001-declarative-internal-marketplace.md) | W29 | Declarative internal marketplace | accepted |
 | [ADR-W00-001](./ADR-W00-001-electron-vite-monorepo.md) | W00 | Electron-vite + pnpm + Turborepo | accepted |
 | [ADR-W00-002](./ADR-W00-002-shadcn-tailwind-i18n.md) | W00 | shadcn, Tailwind v3, i18n, tema no renderer | accepted |
 | [ADR-W00-003](./ADR-W00-003-csp-and-window-ipc.md) | W00 | CSP, sandbox, IPC de janela com Zod | accepted |
