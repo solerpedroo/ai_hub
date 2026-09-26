@@ -4,6 +4,7 @@ import type {
   AppLocale,
   AppPrefs,
   MonthlyCostsResult,
+  MarketplacePackDto,
   ProviderDto,
   ProviderKeyDto,
   ProjectDto,
@@ -50,6 +51,7 @@ export function SettingsView({
   const [capDimension, setCapDimension] = useState<"project" | "provider">("project");
   const [capSubject, setCapSubject] = useState("");
   const [scopedCapLimit, setScopedCapLimit] = useState("");
+  const [marketplacePacks, setMarketplacePacks] = useState<MarketplacePackDto[]>([]);
   const generalRef = useRef<HTMLHeadingElement>(null);
   const providerRef = useRef<HTMLSelectElement>(null);
   const capRef = useRef<HTMLInputElement>(null);
@@ -96,6 +98,11 @@ export function SettingsView({
           setError(t("workspace.error.generic"));
         }
       });
+    void window.hub.marketplace.list().then((list) => {
+      if (!cancelled) setMarketplacePacks(list);
+    }).catch(() => {
+      if (!cancelled) setError(t("workspace.error.generic"));
+    });
     void window.hub.projects.list().then((list) => {
       if (!cancelled) {
         setProjects(list);
@@ -246,6 +253,27 @@ export function SettingsView({
         </div>
       </section>
       <section className="flex flex-col gap-2">
+        <h2 className="text-[12px] font-medium">{t("marketplace.title")}</h2>
+        <p className="text-muted-foreground">{t("marketplace.hint")}</p>
+        <ul className="flex flex-col gap-2" data-testid="marketplace-packs">
+          {marketplacePacks.map((pack) => (
+            <li key={pack.id} className="flex items-center justify-between gap-3 rounded-md border px-3 py-2">
+              <div>
+                <p className="text-[13px] font-medium">{t(pack.titleKey)}</p>
+                <p className="text-[11px] text-muted-foreground">{t(pack.descriptionKey)}</p>
+                <p className="text-[11px] text-muted-foreground">{t("marketplace.permission", { count: pack.permissions.length })}</p>
+              </div>
+              <Button type="button" size="sm" variant={pack.installed ? "outline" : "default"} disabled={!pack.installable} data-testid={`marketplace-pack-${pack.id}`} onClick={() => {
+                const action = pack.installed ? window.hub.marketplace.uninstall({ packId: pack.id }) : window.hub.marketplace.install({ packId: pack.id });
+                void action.then(() => window.hub.marketplace.list()).then(setMarketplacePacks).catch(() => setError(t("workspace.error.generic")));
+              }}>
+                {pack.installable ? (pack.installed ? t("marketplace.uninstall") : t("marketplace.install")) : t("marketplace.coreIntegrated")}
+              </Button>
+            </li>
+          ))}
+        </ul>
+      </section>
+      <section className="flex flex-col gap-2">
         <h2 className="text-[12px] font-medium">{t("secrets.title")}</h2>
         <p className="text-muted-foreground">{t("secrets.hint")}</p>
         <form className="flex flex-col gap-2" onSubmit={onSaveKey}>
@@ -279,6 +307,7 @@ export function SettingsView({
                 autoComplete="off"
                 data-testid="secrets-base-url"
               />
+              <span className="text-[11px] text-muted-foreground">{t("secrets.customEndpointHint")}</span>
             </label>
           ) : null}
           <label className="flex flex-col gap-1 text-[12px]">
