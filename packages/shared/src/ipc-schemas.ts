@@ -552,6 +552,25 @@ export const localProviderStatusSchema = z.object({
 }).strict();
 export type LocalProviderStatusDto = z.infer<typeof localProviderStatusSchema>;
 
+const marketplacePackKindSchema = z.enum(["provider", "mcp", "skill"]);
+export const marketplacePackDtoSchema = z.object({
+  id: z.string().regex(/^[a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+$/).max(128),
+  version: z.string().min(1).max(32),
+  kind: marketplacePackKindSchema,
+  name: z.string().min(1).max(100),
+  description: z.string().min(1).max(400),
+  permissions: z.array(z.object({ toolId: z.string().min(1).max(128), operation: z.literal("read"), effect: z.literal("read") }).strict()).max(16),
+  titleKey: z.string().regex(/^marketplace\.pack\.[a-z0-9-]+\.title$/).max(128),
+  descriptionKey: z.string().regex(/^marketplace\.pack\.[a-z0-9-]+\.description$/).max(128),
+  availability: z.enum(["installable", "core_integrated"]),
+  installable: z.boolean(),
+  installed: z.boolean(),
+}).strict();
+export type MarketplacePackDto = z.infer<typeof marketplacePackDtoSchema>;
+export const marketplacePackListSchema = z.array(marketplacePackDtoSchema).max(64);
+export const marketplacePackIdInputSchema = z.object({ packId: z.string().regex(/^[a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+$/).max(128) }).strict();
+export type MarketplacePackIdInput = z.infer<typeof marketplacePackIdInputSchema>;
+
 export const secretsSaveInputSchema = z
   .object({
     providerSlug: z.string().min(1).max(64),
