@@ -34,6 +34,18 @@ describe("hub database", () => {
     expect(dumpAllText(hub.sqlite)).not.toContain(OLLAMA_LOCAL_KEY_ID);
     hub.close();
   });
+  it("installs an internal pack idempotently without storing pack configuration", () => {
+    const { hub } = openTestDb();
+    const first = hub.repos.installPack({ packId: "ai-hub.project-files", version: "1.0.0", kind: "mcp" });
+    const second = hub.repos.installPack({ packId: "ai-hub.project-files", version: "1.0.1", kind: "mcp" });
+    expect(first.enabled).toBe(true);
+    expect(second.version).toBe("1.0.1");
+    expect(hub.repos.listInstalledPacks()).toHaveLength(1);
+    expect(hub.repos.isPackInstalled("ai-hub.project-files")).toBe(true);
+    hub.repos.uninstallPack("ai-hub.project-files");
+    expect(hub.repos.isPackInstalled("ai-hub.project-files")).toBe(false);
+    hub.close();
+  });
   it("creates project and conversation that round-trip decrypted", () => {
     const { hub } = openTestDb();
     const project = hub.repos.createProject("Alpha");
