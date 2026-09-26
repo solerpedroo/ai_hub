@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave 
 
 | Field | Value |
 |---|---|
-| Wave | **W29** |
+| Wave | **W30** |
 | Marco | E — V3 ecosystem |
 | State | `pending` |
-| Last completed | **W28** |
-| Next action | Iniciar Wave 29 (Plugins + marketplace) com skill `wave-start`. |
+| Last completed | **W29** |
+| Next action | Iniciar Wave 30 (sync opcional) com skill `wave-start`. |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
@@ -49,6 +49,7 @@ None.
 ## Notes for the next session
 
 - W28 fechada: Voice Mode (Web Speech → `chat:send` → TTS); aviso cloud; Private bloqueia disk opt-in. Gate em `docs/reviews/W28/`.
+- W29 fechada: marketplace interno declarativo; Project Files é o pack MCP real e continua mediado pelo Permission Center. Gate em `docs/reviews/W29/`.
 - W27 fechada: Notes cifradas; Tasks from message; Study; Research `graphVersion: 2`. Gate em `docs/reviews/W27/`.
 - W26 fechada: Ollama + offline. Prova física em `docs/reviews/W26/PHYSICAL-DOD.md`.
 
@@ -56,5 +57,5 @@ None.
 
 | Kind | Path |
 |---|---|
-| Review | `docs/reviews/W28/REVIEW.md` |
-| Latest ADR | `docs/ADR/ADR-W28-001-web-speech-voice-mode.md` |
+| Review | `docs/reviews/W29/REVIEW.md` |
+| Latest ADR | `docs/ADR/ADR-W29-001-declarative-internal-marketplace.md` |
