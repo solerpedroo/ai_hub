@@ -951,12 +951,12 @@ Council **não** é orquestração de agentes: N modelos, um packet, sem tools. 
 
 **Sub-tasks:**
 
-- [ ] API de extensão estável (manifest, permissões, sandbox)
-- [ ] Marketplace interno: providers + MCP packs + skills
-- [ ] Custom OpenAI-compatible como “adicione qualquer endpoint”
-- [ ] Plugin não acessa keytar direto; só APIs do core
-- [ ] Um plugin interno real (ex.: GitHub MCP pack) antes de abrir a terceiros
-- [ ] Agentes de terceiros **não** entram antes de um pack interno real e do Permission Center
+- [x] API de extensão estável (manifest, permissões, sandbox)
+- [x] Marketplace interno: providers + MCP packs + skills
+- [x] Custom OpenAI-compatible como “adicione qualquer endpoint”
+- [x] Plugin não acessa keytar direto; só APIs do core
+- [x] Um plugin interno real (ex.: GitHub MCP pack) antes de abrir a terceiros
+- [x] Agentes de terceiros **não** entram antes de um pack interno real e do Permission Center
 
 **DoD:** instalar um pack MCP pelo marketplace interno e usar no projeto com Permission Center.
 
