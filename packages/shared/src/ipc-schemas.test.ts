@@ -47,7 +47,17 @@ import {
   developerReviewInputSchema,
   developerTerminalInputSchema,
   localProviderStatusSchema,
+  marketplacePackDtoSchema,
+  marketplacePackIdInputSchema,
 } from "./ipc-schemas";
+
+describe("wave 29 marketplace contracts", () => {
+  it("accepts only strict internal pack metadata", () => {
+    expect(marketplacePackDtoSchema.parse({ id: "ai-hub.project-files", version: "1.0.0", kind: "mcp", name: "Project Files", description: "Read project files", permissions: [{ toolId: "project-filesystem.read-file", operation: "read", effect: "read" }], titleKey: "marketplace.pack.project-files.title", descriptionKey: "marketplace.pack.project-files.description", availability: "installable", installable: true, installed: false }).id).toBe("ai-hub.project-files");
+    expect(() => marketplacePackIdInputSchema.parse({ packId: "not a pack" })).toThrow();
+    expect(() => marketplacePackDtoSchema.parse({ id: "ai-hub.project-files", version: "1", kind: "mcp", name: "Files", description: "Read", permissions: [], titleKey: "marketplace.pack.project-files.title", descriptionKey: "marketplace.pack.project-files.description", availability: "installable", installable: true, installed: false, executable: "evil" })).toThrow();
+  });
+});
 
 describe("emptyIpcPayloadSchema", () => {
   it("accepts an empty object", () => {
