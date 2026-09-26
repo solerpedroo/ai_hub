@@ -274,6 +274,15 @@ export const projectToolPermissions = sqliteTable(
   (table) => [uniqueIndex("project_tool_permissions_scope_idx").on(table.projectId, table.toolId, table.operation)],
 );
 
+export const installedPacks = sqliteTable("installed_packs", {
+  packId: text("pack_id").primaryKey(),
+  version: text("version").notNull(),
+  kind: text("kind").notNull(),
+  enabled: integer("enabled", { mode: "number" }).notNull().default(1),
+  installedAt: integer("installed_at", { mode: "number" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "number" }).notNull(),
+});
+
 export const agentRuns = sqliteTable("agent_runs", {
   id: text("id").primaryKey(),
   projectId: text("project_id").notNull(),
@@ -367,6 +376,7 @@ export const schema = {
   artifacts,
   projectToolRoots,
   projectToolPermissions,
+  installedPacks,
   agentRuns,
   agentSteps,
   agentHandoffs,
