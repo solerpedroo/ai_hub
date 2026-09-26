@@ -1,0 +1,866 @@
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index 453b6d7..f79168a 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -108,6 +108,9 @@ import {
+   providerKeyDtoSchema,
+   providerKeyListResultSchema,
+   localProviderStatusSchema,
++  marketplacePackDtoSchema,
++  marketplacePackIdInputSchema,
++  marketplacePackListSchema,
+   providerListResultSchema,
+   searchInputSchema,
+   searchResultSchema,
+@@ -172,6 +175,7 @@ import { cancelOrchestration, getOrchestration, listOrchestrations, pauseOrchest
+ import { prepareResearch } from "./research-runner";
+ import { developerDiff, developerReview, developerStatus, developerTerminal, developerTree } from "./developer-tools";
+ import { getLocalProviderStatus, localProviderKey } from "./local-provider";
++import { installMarketplacePack, listMarketplacePacks, uninstallMarketplacePack } from "./marketplace-packs";
+ 
+ function registerHandler<TIn, TOut>(
+   channel: string,
+@@ -488,6 +492,12 @@ export function registerWorkspaceIpc(): void {
+     getLocalProviderStatus(true),
+   );
+ 
++  registerHandler(IpcChannel.marketplaceList, emptyIpcPayloadSchema, marketplacePackListSchema, () => listMarketplacePacks());
++  registerHandler(IpcChannel.marketplaceInstall, marketplacePackIdInputSchema, marketplacePackDtoSchema, (input) => installMarketplacePack(input.packId));
++  registerHandler(IpcChannel.marketplaceUninstall, marketplacePackIdInputSchema, ipcAckResultSchema, (input) => {
++    uninstallMarketplacePack(input.packId);
++  });
++
+   registerHandler(IpcChannel.secretsList, emptyIpcPayloadSchema, providerKeyListResultSchema, async () => {
+     const keys = await getHubDatabase().repos.listProviderKeys();
+     const local = await getLocalProviderStatus();
+diff --git a/apps/desktop/src/main/tools.ts b/apps/desktop/src/main/tools.ts
+index 27dc099..f149a16 100644
+--- a/apps/desktop/src/main/tools.ts
++++ b/apps/desktop/src/main/tools.ts
+@@ -12,6 +12,7 @@ import {
+   type ToolReadRequestResult,
+ } from "@ai-hub/shared";
+ import { getHubDatabase } from "./persistence";
++import { projectFilesPackInstalled } from "./marketplace-packs";
+ 
+ const router = new ToolRouter({
+   getProjectToolRoot: (projectId) => getHubDatabase().repos.getProjectToolRoot(projectId),
+@@ -35,7 +36,11 @@ function projectState(projectId: string): ToolProjectState {
+   return {
+     projectId,
+     rootLabel: root ? basename(root.rootPath) : null,
+-    allowedTools: [TOOL_ID_PROJECT_FILESYSTEM_READ, TOOL_ID_DEVELOPER_EXPLORER, TOOL_ID_DEVELOPER_GIT]
++    allowedTools: [
++      ...(projectFilesPackInstalled() ? [TOOL_ID_PROJECT_FILESYSTEM_READ] : []),
++      TOOL_ID_DEVELOPER_EXPLORER,
++      TOOL_ID_DEVELOPER_GIT,
++    ]
+       .filter((toolId) => getHubDatabase().repos.hasProjectToolPermission(projectId, toolId, "read")),
+   };
+ }
+@@ -108,6 +113,7 @@ export async function requestDeveloperPermission(projectId: string, sender: WebC
+ }
+ 
+ export async function requestToolRead(input: ToolReadRequestInput, sender: WebContents): Promise<ToolReadRequestResult> {
++  if (!projectFilesPackInstalled()) throw new Error("marketplace:pack_not_installed");
+   const result = await router.request({ projectId: input.projectId, toolId: TOOL_ID_PROJECT_FILESYSTEM_READ, relativePath: input.relativePath }, sender.id);
+   if (!isPermission(result)) { record(result); return completed(result); }
+   const parent = BrowserWindow.fromWebContents(sender);
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index be6576e..5c391b7 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -108,6 +108,9 @@ import {
+   providerKeyDtoSchema,
+   providerKeyListResultSchema,
+   localProviderStatusSchema,
++  marketplacePackDtoSchema,
++  marketplacePackIdInputSchema,
++  marketplacePackListSchema,
+   providerListResultSchema,
+   searchInputSchema,
+   searchResultSchema,
+@@ -309,6 +312,11 @@ const hub: HubApi = {
+     list: () => invokeParsed(IpcChannel.providersList, empty, emptyIpcPayloadSchema, providerListResultSchema),
+     localStatus: () => invokeParsed(IpcChannel.localProviderStatus, empty, emptyIpcPayloadSchema, localProviderStatusSchema),
+   },
++  marketplace: {
++    list: () => invokeParsed(IpcChannel.marketplaceList, empty, emptyIpcPayloadSchema, marketplacePackListSchema),
++    install: (input) => invokeParsed(IpcChannel.marketplaceInstall, input, marketplacePackIdInputSchema, marketplacePackDtoSchema),
++    uninstall: (input) => invokeAckWith(IpcChannel.marketplaceUninstall, input, marketplacePackIdInputSchema),
++  },
+   secrets: {
+     list: () => invokeParsed(IpcChannel.secretsList, empty, emptyIpcPayloadSchema, providerKeyListResultSchema),
+     save: (input) => invokeParsed(IpcChannel.secretsSave, input, secretsSaveInputSchema, providerKeyDtoSchema),
+diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+index 035c276..31b286e 100644
+--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+@@ -710,7 +710,10 @@ export function HomeView({
+       setToolActivity(result.activity);
+       if (result.kind === "completed") { appendToolOutput(result.content, result.activity); setToolPath(""); }
+       if (result.kind === "denied") setToolError(t("tools.error.denied"));
+-    } catch { setToolError(t("tools.error.read")); }
++    } catch (error) {
++      const message = error instanceof Error ? error.message : "";
++      setToolError(message.includes("marketplace:pack_not_installed") ? t("tools.error.packRequired") : t("tools.error.read"));
++    }
+     finally { setToolBusy(false); }
+   };
+ 
+diff --git a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+index 777eb82..226fcae 100644
+--- a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+@@ -4,6 +4,7 @@ import type {
+   AppLocale,
+   AppPrefs,
+   MonthlyCostsResult,
++  MarketplacePackDto,
+   ProviderDto,
+   ProviderKeyDto,
+   ProjectDto,
+@@ -50,6 +51,7 @@ export function SettingsView({
+   const [capDimension, setCapDimension] = useState<"project" | "provider">("project");
+   const [capSubject, setCapSubject] = useState("");
+   const [scopedCapLimit, setScopedCapLimit] = useState("");
++  const [marketplacePacks, setMarketplacePacks] = useState<MarketplacePackDto[]>([]);
+   const generalRef = useRef<HTMLHeadingElement>(null);
+   const providerRef = useRef<HTMLSelectElement>(null);
+   const capRef = useRef<HTMLInputElement>(null);
+@@ -96,6 +98,11 @@ export function SettingsView({
+           setError(t("workspace.error.generic"));
+         }
+       });
++    void window.hub.marketplace.list().then((list) => {
++      if (!cancelled) setMarketplacePacks(list);
++    }).catch(() => {
++      if (!cancelled) setError(t("workspace.error.generic"));
++    });
+     void window.hub.projects.list().then((list) => {
+       if (!cancelled) {
+         setProjects(list);
+@@ -245,6 +252,27 @@ export function SettingsView({
+           </Button>
+         </div>
+       </section>
++      <section className="flex flex-col gap-2">
++        <h2 className="text-[12px] font-medium">{t("marketplace.title")}</h2>
++        <p className="text-muted-foreground">{t("marketplace.hint")}</p>
++        <ul className="flex flex-col gap-2" data-testid="marketplace-packs">
++          {marketplacePacks.map((pack) => (
++            <li key={pack.id} className="flex items-center justify-between gap-3 rounded-md border px-3 py-2">
++              <div>
++                <p className="text-[13px] font-medium">{t(pack.titleKey)}</p>
++                <p className="text-[11px] text-muted-foreground">{t(pack.descriptionKey)}</p>
++                <p className="text-[11px] text-muted-foreground">{t("marketplace.permission", { count: pack.permissions.length })}</p>
++              </div>
++              <Button type="button" size="sm" variant={pack.installed ? "outline" : "default"} disabled={!pack.installable} data-testid={`marketplace-pack-${pack.id}`} onClick={() => {
++                const action = pack.installed ? window.hub.marketplace.uninstall({ packId: pack.id }) : window.hub.marketplace.install({ packId: pack.id });
++                void action.then(() => window.hub.marketplace.list()).then(setMarketplacePacks).catch(() => setError(t("workspace.error.generic")));
++              }}>
++                {pack.installable ? (pack.installed ? t("marketplace.uninstall") : t("marketplace.install")) : t("marketplace.coreIntegrated")}
++              </Button>
++            </li>
++          ))}
++        </ul>
++      </section>
+       <section className="flex flex-col gap-2">
+         <h2 className="text-[12px] font-medium">{t("secrets.title")}</h2>
+         <p className="text-muted-foreground">{t("secrets.hint")}</p>
+@@ -279,6 +307,7 @@ export function SettingsView({
+                 autoComplete="off"
+                 data-testid="secrets-base-url"
+               />
++              <span className="text-[11px] text-muted-foreground">{t("secrets.customEndpointHint")}</span>
+             </label>
+           ) : null}
+           <label className="flex flex-col gap-1 text-[12px]">
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 89443a0..566e989 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -648,5 +648,20 @@
+     "voice.error.cloudAck": "Acknowledge the cloud/OS speech privacy warning first.",
+     "voice.error.ready": "Open a conversation and select a provider key first.",
+     "voice.error.send": "Could not send the transcript.",
+-    "voice.error.stt": "Speech error: {{code}}"
++    "voice.error.stt": "Speech error: {{code}}",
++    "secrets.customEndpointHint": "OpenAI-compatible endpoint: base /v1 URL, GET /models, and streaming POST /chat/completions with Bearer auth.",
++    "marketplace.title": "Internal marketplace",
++    "marketplace.hint": "Internal packs use core APIs only; permission is still requested per project.",
++    "marketplace.install": "Install",
++    "marketplace.uninstall": "Remove",
++    "marketplace.available": "Available",
++    "marketplace.coreIntegrated": "Built in",
++    "marketplace.permission": "{{count}} declared read permission",
++    "marketplace.pack.project-files.title": "Project Files",
++    "marketplace.pack.project-files.description": "Read files only inside the project root through the Permission Center.",
++    "marketplace.pack.openai-compatible.title": "OpenAI-compatible endpoint",
++    "marketplace.pack.openai-compatible.description": "Configure any compatible /v1 endpoint in Provider settings.",
++    "marketplace.pack.code-review-skill.title": "Code Review skill",
++    "marketplace.pack.code-review-skill.description": "Use the built-in Code Review skill from Skills.",
++    "tools.error.packRequired": "Install the Project Files pack in the internal marketplace before reading project files."
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index 9a2486d..b3b7889 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -648,5 +648,20 @@
+     "voice.error.cloudAck": "Aceite primeiro o aviso de privacidade de fala (nuvem/SO).",
+     "voice.error.ready": "Abra uma conversa e escolha uma chave de provider primeiro.",
+     "voice.error.send": "Não foi possível enviar a transcrição.",
+-    "voice.error.stt": "Erro de fala: {{code}}"
++    "voice.error.stt": "Erro de fala: {{code}}",
++    "secrets.customEndpointHint": "Endpoint compatível com OpenAI: URL base /v1, GET /models e streaming POST /chat/completions com Bearer.",
++    "marketplace.title": "Marketplace interno",
++    "marketplace.hint": "Packs internos usam somente APIs do core; a permissão continua sendo pedida por projeto.",
++    "marketplace.install": "Instalar",
++    "marketplace.uninstall": "Remover",
++    "marketplace.available": "Disponível",
++    "marketplace.coreIntegrated": "Nativo",
++    "marketplace.permission": "{{count}} permissão de leitura declarada",
++    "marketplace.pack.project-files.title": "Arquivos do projeto",
++    "marketplace.pack.project-files.description": "Lê arquivos somente dentro da raiz do projeto pelo Centro de permissões.",
++    "marketplace.pack.openai-compatible.title": "Endpoint compatível com OpenAI",
++    "marketplace.pack.openai-compatible.description": "Configure qualquer endpoint compatível com /v1 nas configurações de provedores.",
++    "marketplace.pack.code-review-skill.title": "Skill de revisão de código",
++    "marketplace.pack.code-review-skill.description": "Use a skill nativa de revisão de código em Skills.",
++    "tools.error.packRequired": "Instale o pack Project Files no Marketplace interno antes de ler arquivos do projeto."
+ }
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index b5ca9de..e64e9e1 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -34,6 +34,7 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider
+ 
+ | ID | Onda | Título | Status |
+ |---|---|---|---|
++| [ADR-W29-001](./ADR-W29-001-declarative-internal-marketplace.md) | W29 | Declarative internal marketplace | accepted |
+ | [ADR-W00-001](./ADR-W00-001-electron-vite-monorepo.md) | W00 | Electron-vite + pnpm + Turborepo | accepted |
+ | [ADR-W00-002](./ADR-W00-002-shadcn-tailwind-i18n.md) | W00 | shadcn, Tailwind v3, i18n, tema no renderer | accepted |
+ | [ADR-W00-003](./ADR-W00-003-csp-and-window-ipc.md) | W00 | CSP, sandbox, IPC de janela com Zod | accepted |
+diff --git a/docs/IMPLEMENTATION_PLAN.md b/docs/IMPLEMENTATION_PLAN.md
+index a7de7d0..9ead7cb 100644
+--- a/docs/IMPLEMENTATION_PLAN.md
++++ b/docs/IMPLEMENTATION_PLAN.md
+@@ -951,12 +951,12 @@ Council **não** é orquestração de agentes: N modelos, um packet, sem tools.
+ 
+ **Sub-tasks:**
+ 
+-- [ ] API de extensão estável (manifest, permissões, sandbox)
+-- [ ] Marketplace interno: providers + MCP packs + skills
+-- [ ] Custom OpenAI-compatible como “adicione qualquer endpoint”
+-- [ ] Plugin não acessa keytar direto; só APIs do core
+-- [ ] Um plugin interno real (ex.: GitHub MCP pack) antes de abrir a terceiros
+-- [ ] Agentes de terceiros **não** entram antes de um pack interno real e do Permission Center
++- [x] API de extensão estável (manifest, permissões, sandbox)
++- [x] Marketplace interno: providers + MCP packs + skills
++- [x] Custom OpenAI-compatible como “adicione qualquer endpoint”
++- [x] Plugin não acessa keytar direto; só APIs do core
++- [x] Um plugin interno real (ex.: GitHub MCP pack) antes de abrir a terceiros
++- [x] Agentes de terceiros **não** entram antes de um pack interno real e do Permission Center
+ 
+ **DoD:** instalar um pack MCP pelo marketplace interno e usar no projeto com Permission Center.
+ 
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 2503ce9..d79d1eb 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave
+ 
+ | Field | Value |
+ |---|---|
+-| Wave | **W29** |
++| Wave | **W30** |
+ | Marco | E — V3 ecosystem |
+ | State | `pending` |
+-| Last completed | **W28** |
+-| Next action | Iniciar Wave 29 (Plugins + marketplace) com skill `wave-start`. |
++| Last completed | **W29** |
++| Next action | Iniciar Wave 30 (sync opcional) com skill `wave-start`. |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -49,6 +49,7 @@ None.
+ ## Notes for the next session
+ 
+ - W28 fechada: Voice Mode (Web Speech → `chat:send` → TTS); aviso cloud; Private bloqueia disk opt-in. Gate em `docs/reviews/W28/`.
++- W29 fechada: marketplace interno declarativo; Project Files é o pack MCP real e continua mediado pelo Permission Center. Gate em `docs/reviews/W29/`.
+ - W27 fechada: Notes cifradas; Tasks from message; Study; Research `graphVersion: 2`. Gate em `docs/reviews/W27/`.
+ - W26 fechada: Ollama + offline. Prova física em `docs/reviews/W26/PHYSICAL-DOD.md`.
+ 
+@@ -56,5 +57,5 @@ None.
+ 
+ | Kind | Path |
+ |---|---|
+-| Review | `docs/reviews/W28/REVIEW.md` |
+-| Latest ADR | `docs/ADR/ADR-W28-001-web-speech-voice-mode.md` |
++| Review | `docs/reviews/W29/REVIEW.md` |
++| Latest ADR | `docs/ADR/ADR-W29-001-declarative-internal-marketplace.md` |
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index b6f7c72..4259c18 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -1,5 +1,5 @@
+ export { applyMigrations } from "./migrate";
+-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL, MIGRATION_0013_SQL, MIGRATION_0014_SQL, MIGRATION_0015_SQL, MIGRATION_0016_SQL, MIGRATION_0017_SQL, MIGRATION_0018_SQL, MIGRATION_0019_SQL } from "./migrations";
++export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL, MIGRATION_0013_SQL, MIGRATION_0014_SQL, MIGRATION_0015_SQL, MIGRATION_0016_SQL, MIGRATION_0017_SQL, MIGRATION_0018_SQL, MIGRATION_0019_SQL, MIGRATION_0020_SQL } from "./migrations";
+ export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
+ export {
+   HubRepos,
+@@ -45,5 +45,6 @@ export {
+   type AgentHandoffJoinKind,
+   type AgentHandoffStatus,
+   type AgentHandoffRecord,
++  type InstalledPackRecord,
+ } from "./repos";
+ export { schema } from "./schema";
+diff --git a/packages/db/src/migrations.ts b/packages/db/src/migrations.ts
+index 34997e0..df92cf5 100644
+--- a/packages/db/src/migrations.ts
++++ b/packages/db/src/migrations.ts
+@@ -399,6 +399,17 @@ CREATE TABLE note_tags (
+ ALTER TABLE conversation_tasks ADD COLUMN source_message_id TEXT;
+ `;
+ 
++export const MIGRATION_0020_SQL = `
++CREATE TABLE installed_packs (
++  pack_id TEXT PRIMARY KEY,
++  version TEXT NOT NULL,
++  kind TEXT NOT NULL,
++  enabled INTEGER NOT NULL DEFAULT 1,
++  installed_at INTEGER NOT NULL,
++  updated_at INTEGER NOT NULL
++);
++`;
++
+ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 1, sql: MIGRATION_0001_SQL },
+   { version: 2, sql: MIGRATION_0002_SQL },
+@@ -419,4 +430,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 17, sql: MIGRATION_0017_SQL },
+   { version: 18, sql: MIGRATION_0018_SQL },
+   { version: 19, sql: MIGRATION_0019_SQL },
++  { version: 20, sql: MIGRATION_0020_SQL },
+ ];
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index 103d2cc..0dd13ee 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -34,6 +34,18 @@ describe("hub database", () => {
+     expect(dumpAllText(hub.sqlite)).not.toContain(OLLAMA_LOCAL_KEY_ID);
+     hub.close();
+   });
++  it("installs an internal pack idempotently without storing pack configuration", () => {
++    const { hub } = openTestDb();
++    const first = hub.repos.installPack({ packId: "ai-hub.project-files", version: "1.0.0", kind: "mcp" });
++    const second = hub.repos.installPack({ packId: "ai-hub.project-files", version: "1.0.1", kind: "mcp" });
++    expect(first.enabled).toBe(true);
++    expect(second.version).toBe("1.0.1");
++    expect(hub.repos.listInstalledPacks()).toHaveLength(1);
++    expect(hub.repos.isPackInstalled("ai-hub.project-files")).toBe(true);
++    hub.repos.uninstallPack("ai-hub.project-files");
++    expect(hub.repos.isPackInstalled("ai-hub.project-files")).toBe(false);
++    hub.close();
++  });
+   it("creates project and conversation that round-trip decrypted", () => {
+     const { hub } = openTestDb();
+     const project = hub.repos.createProject("Alpha");
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index f18e247..5120508 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -25,6 +25,7 @@ import {
+   projectMemories,
+   projectNotes,
+   projectToolPermissions,
++  installedPacks,
+   projectToolRoots,
+   prompts,
+   skills,
+@@ -74,6 +75,15 @@ export interface ProjectToolPermissionRecord {
+   updatedAt: string;
+ }
+ 
++export interface InstalledPackRecord {
++  packId: string;
++  version: string;
++  kind: string;
++  enabled: boolean;
++  installedAt: string;
++  updatedAt: string;
++}
++
+ export type AgentRunStatus = "awaiting_confirmation" | "running" | "paused" | "cancelled" | "completed" | "completed_with_errors" | "stopped_budget" | "stopped_timeout" | "interrupted" | "failed";
+ export type AgentStepStatus = "pending" | "running" | "completed" | "failed" | "skipped" | "cancelled" | "interrupted";
+ export type AgentStepKind = "plan" | "tool" | "report" | "artifact";
+@@ -909,6 +919,34 @@ export class HubRepos {
+       .run();
+   }
+ 
++  listInstalledPacks(): InstalledPackRecord[] {
++    return this.db.select().from(installedPacks).all().map((row) => ({
++      packId: row.packId,
++      version: row.version,
++      kind: row.kind,
++      enabled: row.enabled === 1,
++      installedAt: iso(row.installedAt),
++      updatedAt: iso(row.updatedAt),
++    }));
++  }
++
++  installPack(input: { packId: string; version: string; kind: string }): InstalledPackRecord {
++    const now = Date.now();
++    const existing = this.db.select().from(installedPacks).where(eq(installedPacks.packId, input.packId)).get();
++    this.db.insert(installedPacks).values({ packId: input.packId, version: input.version, kind: input.kind, enabled: 1, installedAt: existing?.installedAt ?? now, updatedAt: now }).onConflictDoUpdate({ target: installedPacks.packId, set: { version: input.version, kind: input.kind, enabled: 1, updatedAt: now } }).run();
++    const installed = this.listInstalledPacks().find((row) => row.packId === input.packId);
++    if (!installed) throw new Error("Installed pack not found");
++    return installed;
++  }
++
++  uninstallPack(packId: string): void {
++    this.db.delete(installedPacks).where(eq(installedPacks.packId, packId)).run();
++  }
++
++  isPackInstalled(packId: string): boolean {
++    return this.db.select().from(installedPacks).where(and(eq(installedPacks.packId, packId), eq(installedPacks.enabled, 1))).get() !== undefined;
++  }
++
+   listConversations(projectId: string | null, inbox: "avulsas" | "imported" = "avulsas"): ConversationRecord[] {
+     const rows =
+       projectId === null
+diff --git a/packages/db/src/schema.ts b/packages/db/src/schema.ts
+index 1824c69..82d3ec4 100644
+--- a/packages/db/src/schema.ts
++++ b/packages/db/src/schema.ts
+@@ -274,6 +274,15 @@ export const projectToolPermissions = sqliteTable(
+   (table) => [uniqueIndex("project_tool_permissions_scope_idx").on(table.projectId, table.toolId, table.operation)],
+ );
+ 
++export const installedPacks = sqliteTable("installed_packs", {
++  packId: text("pack_id").primaryKey(),
++  version: text("version").notNull(),
++  kind: text("kind").notNull(),
++  enabled: integer("enabled", { mode: "number" }).notNull().default(1),
++  installedAt: integer("installed_at", { mode: "number" }).notNull(),
++  updatedAt: integer("updated_at", { mode: "number" }).notNull(),
++});
++
+ export const agentRuns = sqliteTable("agent_runs", {
+   id: text("id").primaryKey(),
+   projectId: text("project_id").notNull(),
+@@ -367,6 +376,7 @@ export const schema = {
+   artifacts,
+   projectToolRoots,
+   projectToolPermissions,
++  installedPacks,
+   agentRuns,
+   agentSteps,
+   agentHandoffs,
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index b27bd45..13ea943 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -125,6 +125,8 @@ import type {
+   OrchestrationRunDetail,
+   ProviderKeyDto,
+   LocalProviderStatusDto,
++  MarketplacePackDto,
++  MarketplacePackIdInput,
+   SecretsSaveInput,
+   SecretsTestInput,
+   SecretsTestResult,
+@@ -193,6 +195,12 @@ export interface HubProvidersApi {
+   localStatus: () => Promise<LocalProviderStatusDto>;
+ }
+ 
++export interface HubMarketplaceApi {
++  list: () => Promise<MarketplacePackDto[]>;
++  install: (input: MarketplacePackIdInput) => Promise<MarketplacePackDto>;
++  uninstall: (input: MarketplacePackIdInput) => Promise<void>;
++}
++
+ export interface HubSecretsApi {
+   list: () => Promise<ProviderKeyDto[]>;
+   save: (input: SecretsSaveInput) => Promise<ProviderKeyDto>;
+@@ -356,6 +364,7 @@ export interface HubApi {
+   prefs: HubPrefsApi;
+   updates: HubUpdatesApi;
+   providers: HubProvidersApi;
++  marketplace: HubMarketplaceApi;
+   secrets: HubSecretsApi;
+   search: HubSearchApi;
+   spendCaps: HubSpendCapsApi;
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 51a8edb..176389e 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -1,4 +1,5 @@
+ export { type AppLocale, type ThemeMode, localeSchema, themeModeSchema } from "./appearance";
++export { EXTENSION_API_VERSION, extensionManifestSchema, extensionPermissionSchema, type ExtensionManifest } from "./extensions";
+ export {
+   type HubApi,
+   type HubChatApi,
+@@ -6,6 +7,7 @@ export {
+   type HubMessagesApi,
+   type HubProjectsApi,
+   type HubProvidersApi,
++  type HubMarketplaceApi,
+   type HubSearchApi,
+   type HubSecretsApi,
+   type HubSettingsApi,
+@@ -329,6 +331,9 @@ export {
+   providerKeyDtoSchema,
+   providerKeyListResultSchema,
+   localProviderStatusSchema,
++  marketplacePackDtoSchema,
++  marketplacePackIdInputSchema,
++  marketplacePackListSchema,
+   providerListResultSchema,
+   secretsSaveInputSchema,
+   secretsTestInputSchema,
+@@ -478,6 +483,8 @@ export {
+   type WorkspaceSetTaskDoneInput,
+   type ProviderKeyDto,
+   type LocalProviderStatusDto,
++  type MarketplacePackDto,
++  type MarketplacePackIdInput,
+   type SecretsSaveInput,
+   type SecretsTestInput,
+   type SecretsTestResult,
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index 5582651..192bc55 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -44,6 +44,9 @@ export const IpcChannel = {
+   settingsSetSession: "settings:setSession",
+   providersList: "providers:list",
+   localProviderStatus: "local:status",
++  marketplaceList: "marketplace:list",
++  marketplaceInstall: "marketplace:install",
++  marketplaceUninstall: "marketplace:uninstall",
+   secretsList: "secrets:list",
+   secretsSave: "secrets:save",
+   secretsRemove: "secrets:remove",
+diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
+index c1b7680..7467f0d 100644
+--- a/packages/shared/src/ipc-schemas.test.ts
++++ b/packages/shared/src/ipc-schemas.test.ts
+@@ -47,8 +47,18 @@ import {
+   developerReviewInputSchema,
+   developerTerminalInputSchema,
+   localProviderStatusSchema,
++  marketplacePackDtoSchema,
++  marketplacePackIdInputSchema,
+ } from "./ipc-schemas";
+ 
++describe("wave 29 marketplace contracts", () => {
++  it("accepts only strict internal pack metadata", () => {
++    expect(marketplacePackDtoSchema.parse({ id: "ai-hub.project-files", version: "1.0.0", kind: "mcp", name: "Project Files", description: "Read project files", permissions: [{ toolId: "project-filesystem.read-file", operation: "read", effect: "read" }], titleKey: "marketplace.pack.project-files.title", descriptionKey: "marketplace.pack.project-files.description", availability: "installable", installable: true, installed: false }).id).toBe("ai-hub.project-files");
++    expect(() => marketplacePackIdInputSchema.parse({ packId: "not a pack" })).toThrow();
++    expect(() => marketplacePackDtoSchema.parse({ id: "ai-hub.project-files", version: "1", kind: "mcp", name: "Files", description: "Read", permissions: [], titleKey: "marketplace.pack.project-files.title", descriptionKey: "marketplace.pack.project-files.description", availability: "installable", installable: true, installed: false, executable: "evil" })).toThrow();
++  });
++});
++
+ describe("emptyIpcPayloadSchema", () => {
+   it("accepts an empty object", () => {
+     expect(emptyIpcPayloadSchema.parse({})).toEqual({});
+diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
+index 00ecd79..93543e3 100644
+--- a/packages/shared/src/ipc-schemas.ts
++++ b/packages/shared/src/ipc-schemas.ts
+@@ -552,6 +552,25 @@ export const localProviderStatusSchema = z.object({
+ }).strict();
+ export type LocalProviderStatusDto = z.infer<typeof localProviderStatusSchema>;
+ 
++const marketplacePackKindSchema = z.enum(["provider", "mcp", "skill"]);
++export const marketplacePackDtoSchema = z.object({
++  id: z.string().regex(/^[a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+$/).max(128),
++  version: z.string().min(1).max(32),
++  kind: marketplacePackKindSchema,
++  name: z.string().min(1).max(100),
++  description: z.string().min(1).max(400),
++  permissions: z.array(z.object({ toolId: z.string().min(1).max(128), operation: z.literal("read"), effect: z.literal("read") }).strict()).max(16),
++  titleKey: z.string().regex(/^marketplace\.pack\.[a-z0-9-]+\.title$/).max(128),
++  descriptionKey: z.string().regex(/^marketplace\.pack\.[a-z0-9-]+\.description$/).max(128),
++  availability: z.enum(["installable", "core_integrated"]),
++  installable: z.boolean(),
++  installed: z.boolean(),
++}).strict();
++export type MarketplacePackDto = z.infer<typeof marketplacePackDtoSchema>;
++export const marketplacePackListSchema = z.array(marketplacePackDtoSchema).max(64);
++export const marketplacePackIdInputSchema = z.object({ packId: z.string().regex(/^[a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+$/).max(128) }).strict();
++export type MarketplacePackIdInput = z.infer<typeof marketplacePackIdInputSchema>;
++
+ export const secretsSaveInputSchema = z
+   .object({
+     providerSlug: z.string().min(1).max(64),
+
+diff --git a/apps/desktop/e2e/marketplace.spec.ts b/apps/desktop/e2e/marketplace.spec.ts
+new file mode 100644
+index 0000000..833d701
+--- /dev/null
++++ b/apps/desktop/e2e/marketplace.spec.ts
+@@ -0,0 +1,29 @@
++import { createRequire } from "node:module";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { _electron as electron, expect, test } from "@playwright/test";
++
++const require = createRequire(import.meta.url);
++const electronBinary = require("electron") as string;
++const appRoot = path.join(fileURLToPath(new URL("..", import.meta.url)));
++
++test("installs and removes the internal project files MCP pack", async () => {
++  const app = await electron.launch({
++    executablePath: electronBinary,
++    args: [path.join(appRoot, "out/main/index.js")],
++    cwd: appRoot,
++    env: { ...process.env, AI_HUB_E2E: "1", NODE_ENV: "production" },
++  });
++  try {
++    const window = await app.firstWindow();
++    await window.getByTestId("nav-settings").click();
++    const pack = window.getByTestId("marketplace-pack-ai-hub.project-files");
++    await expect(pack).toHaveText(/Install|Instalar/);
++    await pack.click();
++    await expect(pack).toHaveText(/Remove|Remover/);
++    await pack.click();
++    await expect(pack).toHaveText(/Install|Instalar/);
++  } finally {
++    await app.close();
++  }
++});
+diff --git a/apps/desktop/src/main/marketplace-packs.ts b/apps/desktop/src/main/marketplace-packs.ts
+new file mode 100644
+index 0000000..9a86a1e
+--- /dev/null
++++ b/apps/desktop/src/main/marketplace-packs.ts
+@@ -0,0 +1,73 @@
++import { extensionManifestSchema, type ExtensionManifest, type MarketplacePackDto } from "@ai-hub/shared";
++import { getHubDatabase } from "./persistence";
++
++export const PROJECT_FILES_PACK_ID = "ai-hub.project-files";
++
++interface MarketplaceCatalogEntry {
++  manifest: ExtensionManifest;
++  titleKey: `marketplace.pack.${string}.title`;
++  descriptionKey: `marketplace.pack.${string}.description`;
++  availability: "installable" | "core_integrated";
++}
++
++const manifests: readonly ExtensionManifest[] = extensionManifestSchema.array().parse([{
++  apiVersion: 1,
++  id: PROJECT_FILES_PACK_ID,
++  version: "1.0.0",
++  kind: "mcp" as const,
++  name: "Project Files",
++  description: "Read files only inside the project root through the Permission Center.",
++  permissions: [{ toolId: "project-filesystem.read-file", operation: "read" as const, effect: "read" as const }],
++  sandbox: "core",
++}, {
++  apiVersion: 1,
++  id: "ai-hub.openai-compatible",
++  version: "1.0.0",
++  kind: "provider" as const,
++  name: "OpenAI-compatible endpoint",
++  description: "Connect any OpenAI-compatible /v1 endpoint from Provider settings.",
++  permissions: [],
++  sandbox: "core",
++}, {
++  apiVersion: 1,
++  id: "ai-hub.code-review-skill",
++  version: "1.0.0",
++  kind: "skill" as const,
++  name: "Code Review skill",
++  description: "Use the built-in Code Review skill from Skills.",
++  permissions: [],
++  sandbox: "core",
++}]);
++
++const catalog: readonly MarketplaceCatalogEntry[] = [
++  { manifest: manifests[0]!, titleKey: "marketplace.pack.project-files.title", descriptionKey: "marketplace.pack.project-files.description", availability: "installable" },
++  { manifest: manifests[1]!, titleKey: "marketplace.pack.openai-compatible.title", descriptionKey: "marketplace.pack.openai-compatible.description", availability: "core_integrated" },
++  { manifest: manifests[2]!, titleKey: "marketplace.pack.code-review-skill.title", descriptionKey: "marketplace.pack.code-review-skill.description", availability: "core_integrated" },
++];
++
++export function listMarketplacePacks(): MarketplacePackDto[] {
++  const installed = new Set(getHubDatabase().repos.listInstalledPacks().filter((pack) => pack.enabled).map((pack) => pack.packId));
++  return catalog.map(({ manifest, titleKey, descriptionKey, availability }) => {
++    const { apiVersion: _apiVersion, sandbox: _sandbox, ...pack } = manifest;
++    return { ...pack, permissions: [...pack.permissions], titleKey, descriptionKey, availability, installable: availability === "installable", installed: installed.has(pack.id) };
++  });
++}
++
++export function installMarketplacePack(packId: string): MarketplacePackDto {
++  const pack = catalog.find((item) => item.manifest.id === packId)?.manifest;
++  if (!pack) throw new Error("marketplace:pack_not_found");
++  if (pack.kind !== "mcp") throw new Error("marketplace:pack_not_installable");
++  getHubDatabase().repos.installPack({ packId: pack.id, version: pack.version, kind: pack.kind });
++  return listMarketplacePacks().find((item) => item.id === packId) ?? (() => { throw new Error("marketplace:pack_not_found"); })();
++}
++
++export function uninstallMarketplacePack(packId: string): void {
++  const pack = catalog.find((item) => item.manifest.id === packId)?.manifest;
++  if (!pack) throw new Error("marketplace:pack_not_found");
++  if (pack.kind !== "mcp") throw new Error("marketplace:pack_not_installable");
++  getHubDatabase().repos.uninstallPack(packId);
++}
++
++export function projectFilesPackInstalled(): boolean {
++  return getHubDatabase().repos.isPackInstalled(PROJECT_FILES_PACK_ID);
++}
+diff --git a/apps/desktop/src/main/tools.marketplace.test.ts b/apps/desktop/src/main/tools.marketplace.test.ts
+new file mode 100644
+index 0000000..f4b7bbe
+--- /dev/null
++++ b/apps/desktop/src/main/tools.marketplace.test.ts
+@@ -0,0 +1,58 @@
++import { mkdtemp, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++const fixture = vi.hoisted(() => ({
++  installed: false,
++  rootPath: "",
++  grants: new Set<string>(),
++  showMessageBox: vi.fn(),
++}));
++
++vi.mock("electron", () => ({
++  BrowserWindow: { fromWebContents: () => null },
++  dialog: { showMessageBox: fixture.showMessageBox },
++}));
++vi.mock("./marketplace-packs", () => ({ projectFilesPackInstalled: () => fixture.installed }));
++vi.mock("./persistence", () => ({
++  getHubDatabase: () => ({
++    repos: {
++      getProjectToolRoot: () => ({ rootPath: fixture.rootPath }),
++      hasProjectToolPermission: (projectId: string, toolId: string, operation: string) => fixture.grants.has(`${projectId}:${toolId}:${operation}`),
++      grantProjectToolPermission: (projectId: string, toolId: string, operation: string) => fixture.grants.add(`${projectId}:${toolId}:${operation}`),
++      getAppearance: () => ({ locale: "en" }),
++    },
++  }),
++}));
++
++import { requestToolRead } from "./tools";
++
++describe("marketplace Project Files pack", () => {
++  beforeEach(() => {
++    fixture.installed = false;
++    fixture.grants.clear();
++    fixture.showMessageBox.mockReset();
++  });
++
++  it("blocks reads until installed, then keeps the Permission Center in the read path", async () => {
++    const root = await mkdtemp(join(tmpdir(), "ai-hub-marketplace-"));
++    fixture.rootPath = root;
++    try {
++      await writeFile(join(root, "README.md"), "only scoped project content");
++      const sender = { id: 41 } as Electron.WebContents;
++      await expect(requestToolRead({ projectId: "project-a", relativePath: "README.md" }, sender)).rejects.toThrow("marketplace:pack_not_installed");
++
++      fixture.installed = true;
++      fixture.showMessageBox.mockResolvedValue({ response: 0 });
++      await expect(requestToolRead({ projectId: "project-a", relativePath: "README.md" }, sender)).resolves.toMatchObject({
++        kind: "completed",
++        content: "only scoped project content",
++      });
++      expect(fixture.showMessageBox).toHaveBeenCalledOnce();
++      expect(fixture.grants).toHaveLength(0);
++    } finally {
++      await rm(root, { recursive: true, force: true });
++    }
++  });
++});
+diff --git a/docs/ADR/ADR-W29-001-declarative-internal-marketplace.md b/docs/ADR/ADR-W29-001-declarative-internal-marketplace.md
+new file mode 100644
+index 0000000..74e876c
+--- /dev/null
++++ b/docs/ADR/ADR-W29-001-declarative-internal-marketplace.md
+@@ -0,0 +1,36 @@
++# ADR-W29-001-declarative-internal-marketplace
++
++- **Status:** accepted
++- **Onda:** W29
++- **Data:** 2026-09-26
++- **Deciders:** Codex / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++O marketplace precisa instalar packs MCP e integrá-los ao Permission Center sem conceder acesso a keytar, Node ou ao renderer. Executar código de terceiros no processo do aplicativo não oferece isolamento adequado e não é necessário para o primeiro pack interno.
++
++## Decisão
++
++O marketplace desta onda é declarativo e interno. O catálogo é empacotado no processo principal; cada manifesto tem versão, tipo, permissões declaradas e não contém JavaScript, caminho executável ou segredo. A instalação persiste somente a identidade, versão, tipo e estado do pack. A execução continua em APIs do core, no main process.
++
++O primeiro pack é `ai-hub.project-files`, que expõe a leitura MCP já limitada à raiz do projeto. A instalação não concede acesso: cada leitura segue a permissão por projeto e ferramenta já mediada pelo Permission Center. Packs de terceiros permanecem fora desta onda; requerem host isolado, verificação de assinatura e um capability broker próprios.
++
++## Alternativas consideradas
++
++- Executar JavaScript ou binários de packs: rejeitado por romper a fronteira de confiança.
++- Baixar ou invocar `npx` para um GitHub MCP: rejeitado por introduzir execução remota não verificada e dependência externa.
++- Usar o pack sem persistir a instalação: rejeitado porque não demonstraria o fluxo do marketplace.
++
++## Consequências
++
++- Não há acesso de pack a keytar, banco, rede ou preload.
++- O catálogo interno pode crescer com providers, MCP packs e skills declarativos.
++- Abertura a terceiros é trabalho futuro com uma fronteira de processo dedicada.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 29)
++- `docs/reviews/W29/REVIEW.md`
++- `docs/ADR/ADR-W22-001-project-scoped-mcp.md`
+diff --git a/packages/shared/src/extensions.test.ts b/packages/shared/src/extensions.test.ts
+new file mode 100644
+index 0000000..4530802
+--- /dev/null
++++ b/packages/shared/src/extensions.test.ts
+@@ -0,0 +1,13 @@
++import { describe, expect, it } from "vitest";
++import { extensionManifestSchema } from "./extensions";
++
++describe("extension manifest", () => {
++  it("accepts a versioned core-only read manifest", () => {
++    expect(extensionManifestSchema.parse({ apiVersion: 1, id: "ai-hub.project-files", version: "1.0.0", kind: "mcp", name: "Project Files", description: "Read scoped files", permissions: [{ toolId: "project-filesystem.read-file", operation: "read", effect: "read" }], sandbox: "core" }).id).toBe("ai-hub.project-files");
++  });
++
++  it("rejects executable and network escape hatches", () => {
++    expect(() => extensionManifestSchema.parse({ apiVersion: 1, id: "ai-hub.project-files", version: "1.0.0", kind: "mcp", name: "Project Files", description: "Read scoped files", permissions: [], sandbox: "core", command: "npx" })).toThrow();
++    expect(() => extensionManifestSchema.parse({ apiVersion: 1, id: "ai-hub.project-files", version: "1.0.0", kind: "mcp", name: "Project Files", description: "Read scoped files", permissions: [], sandbox: "renderer" })).toThrow();
++  });
++});
+diff --git a/packages/shared/src/extensions.ts b/packages/shared/src/extensions.ts
+new file mode 100644
+index 0000000..62f96c9
+--- /dev/null
++++ b/packages/shared/src/extensions.ts
+@@ -0,0 +1,21 @@
++import { z } from "zod";
++
++export const EXTENSION_API_VERSION = 1 as const;
++export const extensionPermissionSchema = z.object({
++  toolId: z.string().regex(/^[a-z][a-z0-9.-]+$/).max(128),
++  operation: z.literal("read"),
++  effect: z.literal("read"),
++}).strict();
++
++export const extensionManifestSchema = z.object({
++  apiVersion: z.literal(EXTENSION_API_VERSION),
++  id: z.string().regex(/^[a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+$/).max(128),
++  version: z.string().regex(/^\d+\.\d+\.\d+$/),
++  kind: z.enum(["provider", "mcp", "skill"]),
++  name: z.string().min(1).max(100),
++  description: z.string().min(1).max(400),
++  permissions: z.array(extensionPermissionSchema).max(16),
++  sandbox: z.literal("core"),
++}).strict();
++
++export type ExtensionManifest = z.infer<typeof extensionManifestSchema>;
+
