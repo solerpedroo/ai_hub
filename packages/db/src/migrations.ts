@@ -399,6 +399,17 @@ CREATE TABLE note_tags (
 ALTER TABLE conversation_tasks ADD COLUMN source_message_id TEXT;
 `;
 
+export const MIGRATION_0020_SQL = `
+CREATE TABLE installed_packs (
+  pack_id TEXT PRIMARY KEY,
+  version TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  installed_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
@@ -419,4 +430,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 17, sql: MIGRATION_0017_SQL },
   { version: 18, sql: MIGRATION_0018_SQL },
   { version: 19, sql: MIGRATION_0019_SQL },
+  { version: 20, sql: MIGRATION_0020_SQL },
 ];
