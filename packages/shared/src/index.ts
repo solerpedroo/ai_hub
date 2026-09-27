@@ -1,4 +1,5 @@
 export { type AppLocale, type ThemeMode, localeSchema, themeModeSchema } from "./appearance";
+export { auditLogDtoSchema, enterprisePolicySchema, enterpriseToolPolicySchema, organizationCreateInputSchema, organizationDtoSchema, organizationIdInputSchema, projectOrganizationInputSchema, type AuditLogDto, type EnterprisePolicy, type OrganizationCreateInput, type OrganizationDto, type OrganizationIdInput, type ProjectOrganizationInput } from "./enterprise";
 export { EXTENSION_API_VERSION, extensionManifestSchema, extensionPermissionSchema, type ExtensionManifest } from "./extensions";
 export { SYNC_CATEGORIES, syncCategoriesSchema, syncCategorySchema, syncConfigDtoSchema, syncConfigureInputSchema, syncPickRelayResultSchema, syncRunResultSchema, syncSnapshotSchema, type SyncCategories, type SyncCategory, type SyncConfigDto, type SyncConfigureInput, type SyncPickRelayResult, type SyncRunResult } from "./sync";
 export {
@@ -10,6 +11,7 @@ export {
   type HubProvidersApi,
   type HubMarketplaceApi,
   type HubSyncApi,
+  type HubOrganizationsApi,
   type HubSearchApi,
   type HubSecretsApi,
   type HubSettingsApi,
