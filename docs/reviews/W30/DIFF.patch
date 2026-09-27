@@ -1,0 +1,2169 @@
+diff --git a/apps/desktop/e2e/sync.spec.ts b/apps/desktop/e2e/sync.spec.ts
+new file mode 100644
+index 0000000..a4b9825
+--- /dev/null
++++ b/apps/desktop/e2e/sync.spec.ts
+@@ -0,0 +1,57 @@
++import { mkdtempSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import path from "node:path";
++import { createRequire } from "node:module";
++import { fileURLToPath } from "node:url";
++import { _electron as electron, expect, test, type ElectronApplication } from "@playwright/test";
++
++const require = createRequire(import.meta.url);
++const electronBinary = require("electron") as string;
++const appRoot = path.join(fileURLToPath(new URL("..", import.meta.url)));
++
++function launch(userData: string, relay: string): Promise<ElectronApplication> {
++  return electron.launch({ executablePath: electronBinary, args: [path.join(appRoot, "out/main/index.js")], cwd: appRoot, env: { ...process.env, AI_HUB_E2E: "1", AI_HUB_E2E_USER_DATA: userData, AI_HUB_E2E_SYNC_RELAY: relay, NODE_ENV: "production" } });
++}
++
++test("syncs a conversation between isolated device profiles without provider keys", async () => {
++  const relay = mkdtempSync(path.join(tmpdir(), "ai-hub-sync-relay-"));
++  const firstData = mkdtempSync(path.join(tmpdir(), "ai-hub-sync-first-"));
++  const secondData = mkdtempSync(path.join(tmpdir(), "ai-hub-sync-second-"));
++  const phrase = "sync pairing phrase for e2e only";
++  try {
++    const first = await launch(firstData, relay);
++    const firstWindow = await first.firstWindow();
++    const created = await firstWindow.evaluate(async ({ phrase }) => {
++      const project = await window.hub.projects.create({ name: "Cross-device project" });
++      const conversation = await window.hub.conversations.create({ projectId: project.id, title: "Cross-device conversation" });
++      await window.hub.messages.create({ conversationId: conversation.id, role: "user", content: "Message from device one", parentId: null, branchId: null });
++      await window.hub.secrets.save({ providerSlug: "openai", label: "sync-source-only", secret: "sk-syncfixtureABCDEFGH" });
++      await window.hub.sync.configure({ enabled: true, categories: { projects: true, conversations: true, settings: true, packets: true, skills: true }, pairingPhrase: phrase });
++      await window.hub.sync.run();
++      return { projectId: project.id, conversationId: conversation.id };
++    }, { phrase });
++    await first.close();
++
++    const second = await launch(secondData, relay);
++    const secondWindow = await second.firstWindow();
++    const received = await secondWindow.evaluate(async ({ phrase, projectId, conversationId }) => {
++      await window.hub.sync.configure({ enabled: true, categories: { projects: true, conversations: true, settings: true, packets: true, skills: true }, pairingPhrase: phrase });
++      const result = await window.hub.sync.run();
++      const project = (await window.hub.projects.list()).find((item) => item.id === projectId);
++      const conversation = (await window.hub.conversations.list({ projectId })).find((item) => item.id === conversationId);
++      const messages = conversation ? await window.hub.messages.list({ conversationId }) : [];
++      const keys = await window.hub.secrets.list();
++      return { result, project, conversation, messages, keys };
++    }, { phrase, ...created });
++    expect(received.result.status).toBe("synced");
++    expect(received.project?.name).toBe("Cross-device project");
++    expect(received.conversation?.title).toBe("Cross-device conversation");
++    expect(received.messages[0]?.content).toBe("Message from device one");
++    expect(received.keys.some((key) => key.label === "sync-source-only")).toBe(false);
++    await second.close();
++  } finally {
++    for (const pathToRemove of [relay, firstData, secondData]) {
++      try { rmSync(pathToRemove, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); } catch { /* Windows may release Electron SQLite handles after process exit. */ }
++    }
++  }
++});
+diff --git a/apps/desktop/src/main/index.ts b/apps/desktop/src/main/index.ts
+index 16efac4..115cdad 100644
+--- a/apps/desktop/src/main/index.ts
++++ b/apps/desktop/src/main/index.ts
+@@ -26,7 +26,7 @@ protocol.registerSchemesAsPrivileged([
+ ]);
+ 
+ if (isE2eMode()) {
+-  app.setPath("userData", mkdtempSync(join(tmpdir(), "ai-hub-e2e-")));
++  app.setPath("userData", process.env.AI_HUB_E2E_USER_DATA ?? mkdtempSync(join(tmpdir(), "ai-hub-e2e-")));
+ }
+ 
+ function applyContentSecurityPolicy(): void {
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index f79168a..f635cb7 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -111,6 +111,7 @@ import {
+   marketplacePackDtoSchema,
+   marketplacePackIdInputSchema,
+   marketplacePackListSchema,
++  syncConfigDtoSchema, syncConfigureInputSchema, syncPickRelayResultSchema, syncRunResultSchema,
+   providerListResultSchema,
+   searchInputSchema,
+   searchResultSchema,
+@@ -176,6 +177,7 @@ import { prepareResearch } from "./research-runner";
+ import { developerDiff, developerReview, developerStatus, developerTerminal, developerTree } from "./developer-tools";
+ import { getLocalProviderStatus, localProviderKey } from "./local-provider";
+ import { installMarketplacePack, listMarketplacePacks, uninstallMarketplacePack } from "./marketplace-packs";
++import { configureSync, getSyncConfig, pickSyncRelay, runSync } from "./sync-service";
+ 
+ function registerHandler<TIn, TOut>(
+   channel: string,
+@@ -497,6 +499,10 @@ export function registerWorkspaceIpc(): void {
+   registerHandler(IpcChannel.marketplaceUninstall, marketplacePackIdInputSchema, ipcAckResultSchema, (input) => {
+     uninstallMarketplacePack(input.packId);
+   });
++  registerHandler(IpcChannel.syncGetConfig, emptyIpcPayloadSchema, syncConfigDtoSchema, () => getSyncConfig());
++  registerHandler(IpcChannel.syncConfigure, syncConfigureInputSchema, syncConfigDtoSchema, (input) => configureSync(input));
++  registerHandler(IpcChannel.syncPickRelay, emptyIpcPayloadSchema, syncPickRelayResultSchema, (_input, event) => pickSyncRelay(event.sender));
++  registerHandler(IpcChannel.syncRun, emptyIpcPayloadSchema, syncRunResultSchema, () => runSync());
+ 
+   registerHandler(IpcChannel.secretsList, emptyIpcPayloadSchema, providerKeyListResultSchema, async () => {
+     const keys = await getHubDatabase().repos.listProviderKeys();
+diff --git a/apps/desktop/src/main/persistence.ts b/apps/desktop/src/main/persistence.ts
+index a283a3d..6dd6170 100644
+--- a/apps/desktop/src/main/persistence.ts
++++ b/apps/desktop/src/main/persistence.ts
+@@ -2,11 +2,12 @@ import { join } from "node:path";
+ import { app } from "electron";
+ import { openHubDatabase, type HubDatabase } from "@ai-hub/db";
+ import { FACTORY_PROMPTS, FACTORY_SKILLS } from "@ai-hub/shared";
+-import { loadOrCreateMasterKey, MemorySecretStore } from "@ai-hub/security";
++import { loadOrCreateMasterKey, MemorySecretStore, type SecretStore } from "@ai-hub/security";
+ import { KeytarSecretStore } from "@ai-hub/security/keytar";
+ import { isE2eMode } from "./e2e-mode";
+ 
+ let hub: HubDatabase | null = null;
++let secretStore: SecretStore | null = null;
+ 
+ async function seedE2eWorkspace(database: HubDatabase): Promise<void> {
+   const project = database.repos.createProject("E2E");
+@@ -37,6 +38,7 @@ export async function bootPersistence(): Promise<HubDatabase> {
+     return hub;
+   }
+   const store = isE2eMode() ? new MemorySecretStore() : new KeytarSecretStore();
++  secretStore = store;
+   const masterKey = await loadOrCreateMasterKey(store);
+   const dbPath = join(app.getPath("userData"), "ai-hub.sqlite");
+   hub = openHubDatabase({ path: dbPath, masterKey, secretStore: store });
+@@ -56,3 +58,8 @@ export function getHubDatabase(): HubDatabase {
+   }
+   return hub;
+ }
++
++export function getHubSecretStore(): SecretStore {
++  if (!secretStore) throw new Error("Secret store is not ready");
++  return secretStore;
++}
+diff --git a/apps/desktop/src/main/sync-service.ts b/apps/desktop/src/main/sync-service.ts
+new file mode 100644
+index 0000000..fea3780
+--- /dev/null
++++ b/apps/desktop/src/main/sync-service.ts
+@@ -0,0 +1,91 @@
++import { scryptSync } from "node:crypto";
++import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
++import { join } from "node:path";
++import { BrowserWindow, dialog } from "electron";
++import type { SyncConfigDto, SyncConfigureInput, SyncPickRelayResult, SyncRunResult } from "@ai-hub/shared";
++import { decryptUtf8, encryptUtf8, SYNC_KEY_ACCOUNT } from "@ai-hub/security";
++import type { SyncSnapshot } from "@ai-hub/db";
++import { getHubDatabase, getHubSecretStore } from "./persistence";
++import { isE2eMode } from "./e2e-mode";
++
++function relayPath(localPath: string | null): string | null {
++  return localPath ?? (isE2eMode() ? process.env.AI_HUB_E2E_SYNC_RELAY ?? null : null);
++}
++
++function config(): SyncConfigDto {
++  const local = getHubDatabase().repos.getSyncSettings();
++  return { enabled: local.enabled, relayConfigured: relayPath(local.relayPath) !== null, phraseConfigured: false, categories: local.categories, lastSyncAt: local.lastSyncAt, conflictCount: getHubDatabase().repos.listSyncConflicts().length };
++}
++
++export async function getSyncConfig(): Promise<SyncConfigDto> {
++  const next = config();
++  next.phraseConfigured = (await getHubSecretStore().getPassword(SYNC_KEY_ACCOUNT)) !== null;
++  return next;
++}
++
++export async function configureSync(input: SyncConfigureInput): Promise<SyncConfigDto> {
++  if (input.pairingPhrase) {
++    const key = scryptSync(input.pairingPhrase, "ai-hub-sync-v1", 32);
++    await getHubSecretStore().setPassword(SYNC_KEY_ACCOUNT, key.toString("base64"));
++  }
++  getHubDatabase().repos.setSyncSettings({ enabled: input.enabled, categories: input.categories });
++  return getSyncConfig();
++}
++
++export async function pickSyncRelay(sender: Electron.WebContents): Promise<SyncPickRelayResult> {
++  const parent = BrowserWindow.fromWebContents(sender);
++  const result = parent ? await dialog.showOpenDialog(parent, { properties: ["openDirectory", "createDirectory"] }) : await dialog.showOpenDialog({ properties: ["openDirectory", "createDirectory"] });
++  if (result.canceled || !result.filePaths[0]) return { status: "cancelled", relayConfigured: getHubDatabase().repos.getSyncSettings().relayPath !== null };
++  await mkdir(result.filePaths[0], { recursive: true });
++  getHubDatabase().repos.setSyncSettings({ relayPath: result.filePaths[0] });
++  return { status: "selected", relayConfigured: true };
++}
++
++export async function runSync(): Promise<SyncRunResult> {
++  const local = getHubDatabase().repos.getSyncSettings();
++  if (!local.enabled) return { status: "disabled", imported: 0, exported: 0, conflicts: 0, syncedAt: null };
++  const encodedKey = await getHubSecretStore().getPassword(SYNC_KEY_ACCOUNT);
++  const sharedRelay = relayPath(local.relayPath);
++  if (!sharedRelay || !encodedKey) return { status: "not_configured", imported: 0, exported: 0, conflicts: 0, syncedAt: null };
++  const key = Buffer.from(encodedKey, "base64");
++  const relayFile = join(sharedRelay, "ai-hub-sync-v1.envelope");
++  let imported = 0;
++  let conflicts = 0;
++  try {
++    const encrypted = await readFile(relayFile, "utf8");
++    const candidate: unknown = JSON.parse(decryptUtf8(encrypted, key));
++    if (!candidate || typeof candidate !== "object" || (candidate as { version?: unknown }).version !== 1 || !Array.isArray((candidate as { projects?: unknown }).projects) || !Array.isArray((candidate as { conversations?: unknown }).conversations) || !Array.isArray((candidate as { messages?: unknown }).messages)) throw new Error("sync:invalid_envelope");
++    const remote = candidate as SyncSnapshot;
++    const safeRemote: SyncSnapshot = {
++      ...remote,
++      projects: local.categories.projects ? remote.projects : [],
++      conversations: local.categories.conversations ? remote.conversations : [],
++      messages: local.categories.conversations ? remote.messages : [],
++      packets: local.categories.packets && Array.isArray(remote.packets) ? remote.packets : [],
++      skills: local.categories.skills && Array.isArray(remote.skills) ? remote.skills : [],
++      ...(local.categories.settings && remote.appearance ? { appearance: remote.appearance } : {}),
++      ...(local.categories.settings && remote.appPrefs ? { appPrefs: remote.appPrefs } : {}),
++    };
++    const outcome = getHubDatabase().repos.importSyncSnapshot(safeRemote);
++    imported = outcome.imported;
++    conflicts = outcome.conflicts;
++  } catch (error) {
++    if (!(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "ENOENT")) throw error;
++  }
++  const current = getHubDatabase().repos.exportSyncSnapshot();
++  const snapshot: SyncSnapshot = {
++    ...current,
++    projects: local.categories.projects ? current.projects : [],
++    conversations: local.categories.conversations ? current.conversations : [],
++    messages: local.categories.conversations ? current.messages : [],
++    packets: local.categories.packets ? current.packets : [],
++    skills: local.categories.skills ? current.skills : [],
++    ...(local.categories.settings ? { appearance: current.appearance, appPrefs: current.appPrefs } : {}),
++  };
++  const temporary = `${relayFile}.tmp`;
++  await writeFile(temporary, encryptUtf8(JSON.stringify(snapshot), key), { encoding: "utf8", mode: 0o600 });
++  await rename(temporary, relayFile);
++  const syncedAt = new Date().toISOString();
++  getHubDatabase().repos.setSyncSettings({ lastSyncAt: syncedAt });
++  return { status: "synced", imported, exported: snapshot.projects.length + snapshot.conversations.length + snapshot.messages.length, conflicts, syncedAt };
++}
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index 5c391b7..6cb1719 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -111,6 +111,7 @@ import {
+   marketplacePackDtoSchema,
+   marketplacePackIdInputSchema,
+   marketplacePackListSchema,
++  syncConfigDtoSchema, syncConfigureInputSchema, syncPickRelayResultSchema, syncRunResultSchema,
+   providerListResultSchema,
+   searchInputSchema,
+   searchResultSchema,
+@@ -317,6 +318,12 @@ const hub: HubApi = {
+     install: (input) => invokeParsed(IpcChannel.marketplaceInstall, input, marketplacePackIdInputSchema, marketplacePackDtoSchema),
+     uninstall: (input) => invokeAckWith(IpcChannel.marketplaceUninstall, input, marketplacePackIdInputSchema),
+   },
++  sync: {
++    getConfig: () => invokeParsed(IpcChannel.syncGetConfig, empty, emptyIpcPayloadSchema, syncConfigDtoSchema),
++    configure: (input) => invokeParsed(IpcChannel.syncConfigure, input, syncConfigureInputSchema, syncConfigDtoSchema),
++    pickRelay: () => invokeParsed(IpcChannel.syncPickRelay, empty, emptyIpcPayloadSchema, syncPickRelayResultSchema),
++    run: () => invokeParsed(IpcChannel.syncRun, empty, emptyIpcPayloadSchema, syncRunResultSchema),
++  },
+   secrets: {
+     list: () => invokeParsed(IpcChannel.secretsList, empty, emptyIpcPayloadSchema, providerKeyListResultSchema),
+     save: (input) => invokeParsed(IpcChannel.secretsSave, input, secretsSaveInputSchema, providerKeyDtoSchema),
+diff --git a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+index 226fcae..8d78484 100644
+--- a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+@@ -5,6 +5,7 @@ import type {
+   AppPrefs,
+   MonthlyCostsResult,
+   MarketplacePackDto,
++  SyncConfigDto,
+   ProviderDto,
+   ProviderKeyDto,
+   ProjectDto,
+@@ -52,6 +53,8 @@ export function SettingsView({
+   const [capSubject, setCapSubject] = useState("");
+   const [scopedCapLimit, setScopedCapLimit] = useState("");
+   const [marketplacePacks, setMarketplacePacks] = useState<MarketplacePackDto[]>([]);
++  const [syncConfig, setSyncConfig] = useState<SyncConfigDto | null>(null);
++  const [syncPhrase, setSyncPhrase] = useState("");
+   const generalRef = useRef<HTMLHeadingElement>(null);
+   const providerRef = useRef<HTMLSelectElement>(null);
+   const capRef = useRef<HTMLInputElement>(null);
+@@ -103,6 +106,7 @@ export function SettingsView({
+     }).catch(() => {
+       if (!cancelled) setError(t("workspace.error.generic"));
+     });
++    void window.hub.sync.getConfig().then((next) => { if (!cancelled) setSyncConfig(next); }).catch(() => undefined);
+     void window.hub.projects.list().then((list) => {
+       if (!cancelled) {
+         setProjects(list);
+@@ -218,6 +222,34 @@ export function SettingsView({
+           </>
+         ) : <p className="text-muted-foreground">{t("costTracker.loading")}</p>}
+       </section>
++      <section className="flex flex-col gap-2">
++        <h2 className="text-[12px] font-medium">{t("sync.title")}</h2>
++        <p className="text-muted-foreground">{t("sync.hint")}</p>
++        <label className="flex items-center gap-2 text-[12px]">
++          <input type="checkbox" checked={syncConfig?.enabled === true} onChange={(event) => { if (!syncConfig) return; void window.hub.sync.configure({ enabled: event.target.checked, categories: syncConfig.categories, ...(syncPhrase ? { pairingPhrase: syncPhrase } : {}) }).then((next) => { setSyncConfig(next); setSyncPhrase(""); }).catch(() => setError(t("sync.error"))); }} />
++          {t("sync.enable")}
++        </label>
++        <fieldset className="flex flex-wrap gap-x-3 gap-y-1 border-0 p-0">
++          <legend className="text-[11px] text-muted-foreground">{t("sync.categories")}</legend>
++          {(["projects", "conversations", "settings", "packets", "skills"] as const).map((category) => (
++            <label key={category} className="flex items-center gap-1 text-[11px]">
++              <input type="checkbox" checked={syncConfig?.categories[category] ?? false} disabled={!syncConfig} onChange={(event) => {
++                if (!syncConfig) return;
++                const categories = { ...syncConfig.categories, [category]: event.target.checked };
++                void window.hub.sync.configure({ enabled: syncConfig.enabled, categories, ...(syncPhrase ? { pairingPhrase: syncPhrase } : {}) }).then((next) => { setSyncConfig(next); setSyncPhrase(""); }).catch(() => setError(t("sync.error")));
++              }} />
++              {t(`sync.category.${category}`)}
++            </label>
++          ))}
++        </fieldset>
++        <Input type="password" value={syncPhrase} autoComplete="off" placeholder={t("sync.phrase")} onChange={(event) => setSyncPhrase(event.target.value)} />
++        <div className="flex gap-2">
++          <Button type="button" variant="outline" onClick={() => { void window.hub.sync.pickRelay().then(() => window.hub.sync.getConfig()).then(setSyncConfig).catch(() => setError(t("sync.error"))); }}>{t("sync.pickRelay")}</Button>
++          <Button type="button" disabled={!syncConfig?.enabled} onClick={() => { void window.hub.sync.run().then((next) => { if (next.status !== "synced") setError(t("sync.error")); return window.hub.sync.getConfig(); }).then(setSyncConfig).catch(() => setError(t("sync.error"))); }}>{t("sync.run")}</Button>
++        </div>
++        <p className="text-[11px] text-muted-foreground">{syncConfig?.relayConfigured ? t("sync.relayReady") : t("sync.relayMissing")}</p>
++        {syncConfig && syncConfig.conflictCount > 0 ? <p className="text-[11px] text-amber-700 dark:text-amber-400">{t("sync.conflicts", { count: syncConfig.conflictCount })}</p> : null}
++      </section>
+       <section className="flex flex-col gap-2">
+         <p className="text-[12px] font-medium">{t("theme.label")}</p>
+         <div className="flex gap-2">
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 566e989..85bc2b3 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -663,5 +663,21 @@
+     "marketplace.pack.openai-compatible.description": "Configure any compatible /v1 endpoint in Provider settings.",
+     "marketplace.pack.code-review-skill.title": "Code Review skill",
+     "marketplace.pack.code-review-skill.description": "Use the built-in Code Review skill from Skills.",
++    "sync.title": "Optional encrypted sync",
++    "sync.hint": "Choose a shared folder and use the same pairing phrase on each device. API keys never sync.",
++    "sync.enable": "Enable sync",
++    "sync.categories": "Categories to sync",
++    "sync.category.projects": "Projects",
++    "sync.category.conversations": "Conversations",
++    "sync.category.settings": "Settings",
++    "sync.category.packets": "Packets",
++    "sync.category.skills": "Skills",
++    "sync.phrase": "Pairing phrase (at least 16 characters)",
++    "sync.pickRelay": "Choose shared folder",
++    "sync.run": "Sync now",
++    "sync.relayReady": "Shared folder selected.",
++    "sync.relayMissing": "Choose a shared folder before syncing.",
++    "sync.error": "Sync could not be completed.",
++    "sync.conflicts": "{{count}} sync conflict(s) resolved by latest change.",
+     "tools.error.packRequired": "Install the Project Files pack in the internal marketplace before reading project files."
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index b3b7889..5aa95c8 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -663,5 +663,21 @@
+     "marketplace.pack.openai-compatible.description": "Configure qualquer endpoint compatível com /v1 nas configurações de provedores.",
+     "marketplace.pack.code-review-skill.title": "Skill de revisão de código",
+     "marketplace.pack.code-review-skill.description": "Use a skill nativa de revisão de código em Skills.",
++    "sync.title": "Sincronização cifrada opcional",
++    "sync.hint": "Escolha uma pasta compartilhada e use a mesma frase de pareamento em cada dispositivo. Chaves de API nunca sincronizam.",
++    "sync.enable": "Ativar sincronização",
++    "sync.categories": "Categorias para sincronizar",
++    "sync.category.projects": "Projetos",
++    "sync.category.conversations": "Conversas",
++    "sync.category.settings": "Configurações",
++    "sync.category.packets": "Packets",
++    "sync.category.skills": "Skills",
++    "sync.phrase": "Frase de pareamento (ao menos 16 caracteres)",
++    "sync.pickRelay": "Escolher pasta compartilhada",
++    "sync.run": "Sincronizar agora",
++    "sync.relayReady": "Pasta compartilhada selecionada.",
++    "sync.relayMissing": "Escolha uma pasta compartilhada antes de sincronizar.",
++    "sync.error": "Não foi possível concluir a sincronização.",
++    "sync.conflicts": "{{count}} conflito(s) de sincronização resolvido(s) pela alteração mais recente.",
+     "tools.error.packRequired": "Instale o pack Project Files no Marketplace interno antes de ler arquivos do projeto."
+ }
+diff --git a/docs/ADR/ADR-W30-001-encrypted-folder-relay-sync.md b/docs/ADR/ADR-W30-001-encrypted-folder-relay-sync.md
+new file mode 100644
+index 0000000..b8c32ef
+--- /dev/null
++++ b/docs/ADR/ADR-W30-001-encrypted-folder-relay-sync.md
+@@ -0,0 +1,36 @@
++# ADR-W30-001-encrypted-folder-relay-sync
++
++- **Status:** accepted
++- **Onda:** W30
++- **Data:** 2026-09-27
++- **Deciders:** Codex / Pedro
++- **Supersedes:** —
++- **Superseded by:** —
++
++## Contexto
++
++A sincronização deve continuar opcional e local-first, funcionar entre Windows e macOS e não pode transportar provider keys. A onda não especifica um backend de conta, e adicionar um serviço cloud próprio ou dependências novas aumentaria a superfície de confiança.
++
++## Decisão
++
++Usar um relay de pasta compartilhada escolhido pelo usuário. O Hub lê e escreve um único envelope AES-256-GCM versionado; uma frase de pareamento fornecida pelo usuário é derivada apenas no processo principal e seu resultado fica no keytar local. A pasta pode ser compartilhada pelo mecanismo que o usuário preferir, sem que o Hub exija conta cloud.
++
++O envelope contém somente as categorias selecionadas: projetos e conversas, settings, packets e skills. Provider keys, keytar accounts, roots de filesystem, permissões de tools, gastos e telemetria nunca entram no payload. O merge é LWW por entidade e registra um aviso local quando um estado local é substituído por uma versão remota mais nova.
++
++## Alternativas consideradas
++
++- Sincronizar o arquivo SQLite: rejeitado porque inclui metadados e referências a provider keys e porque cada banco usa chave local.
++- Backend cloud obrigatório: rejeitado por quebrar local-first e exigir conta.
++- Copiar a master key do banco: rejeitado porque amplia a superfície de segredo e mistura vault local com transporte.
++
++## Consequências
++
++- Dois dispositivos precisam apontar para a mesma pasta e informar a mesma frase de pareamento.
++- O relay enxerga somente ciphertext e metadados mínimos de versão do envelope.
++- Conflitos simultâneos são visíveis como aviso e resolvidos por `updatedAt`; não há CRDT nesta onda.
++
++## Referências
++
++- `docs/IMPLEMENTATION_PLAN.md` (Wave 30)
++- `docs/reviews/W30/REVIEW.md`
++- `docs/ADR/ADR-W01-001-envelope-encryption-at-rest.md`
+diff --git a/docs/ADR/README.md b/docs/ADR/README.md
+index e64e9e1..7ef3d7b 100644
+--- a/docs/ADR/README.md
++++ b/docs/ADR/README.md
+@@ -34,6 +34,7 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider
+ 
+ | ID | Onda | Título | Status |
+ |---|---|---|---|
++| [ADR-W30-001](./ADR-W30-001-encrypted-folder-relay-sync.md) | W30 | Encrypted folder relay sync | accepted |
+ | [ADR-W29-001](./ADR-W29-001-declarative-internal-marketplace.md) | W29 | Declarative internal marketplace | accepted |
+ | [ADR-W00-001](./ADR-W00-001-electron-vite-monorepo.md) | W00 | Electron-vite + pnpm + Turborepo | accepted |
+ | [ADR-W00-002](./ADR-W00-002-shadcn-tailwind-i18n.md) | W00 | shadcn, Tailwind v3, i18n, tema no renderer | accepted |
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 2503ce9..73180c6 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave
+ 
+ | Field | Value |
+ |---|---|
+-| Wave | **W29** |
++| Wave | **W30** |
+ | Marco | E — V3 ecosystem |
+-| State | `pending` |
+-| Last completed | **W28** |
+-| Next action | Iniciar Wave 29 (Plugins + marketplace) com skill `wave-start`. |
++| State | `in_progress` |
++| Last completed | **W29** |
++| Next action | Definir contrato de sync opt-in, envelope cifrado e persistência de conflitos para a W30. |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -49,6 +49,7 @@ None.
+ ## Notes for the next session
+ 
+ - W28 fechada: Voice Mode (Web Speech → `chat:send` → TTS); aviso cloud; Private bloqueia disk opt-in. Gate em `docs/reviews/W28/`.
++- W29 fechada: marketplace interno declarativo; Project Files é o pack MCP real e continua mediado pelo Permission Center. Gate em `docs/reviews/W29/`.
+ - W27 fechada: Notes cifradas; Tasks from message; Study; Research `graphVersion: 2`. Gate em `docs/reviews/W27/`.
+ - W26 fechada: Ollama + offline. Prova física em `docs/reviews/W26/PHYSICAL-DOD.md`.
+ 
+@@ -56,5 +57,5 @@ None.
+ 
+ | Kind | Path |
+ |---|---|
+-| Review | `docs/reviews/W28/REVIEW.md` |
+-| Latest ADR | `docs/ADR/ADR-W28-001-web-speech-voice-mode.md` |
++| Review | `docs/reviews/W29/REVIEW.md` |
++| Latest ADR | `docs/ADR/ADR-W29-001-declarative-internal-marketplace.md` |
+diff --git a/docs/reviews/W29/DIFF-post-review.patch b/docs/reviews/W29/DIFF-post-review.patch
+new file mode 100644
+index 0000000..0606156
+--- /dev/null
++++ b/docs/reviews/W29/DIFF-post-review.patch
+@@ -0,0 +1,350 @@
++diff --git a/apps/desktop/src/main/tools.ts b/apps/desktop/src/main/tools.ts
++index 27dc099..f149a16 100644
++--- a/apps/desktop/src/main/tools.ts
+++++ b/apps/desktop/src/main/tools.ts
++@@ -12,6 +12,7 @@ import {
++   type ToolReadRequestResult,
++ } from "@ai-hub/shared";
++ import { getHubDatabase } from "./persistence";
+++import { projectFilesPackInstalled } from "./marketplace-packs";
++ 
++ const router = new ToolRouter({
++   getProjectToolRoot: (projectId) => getHubDatabase().repos.getProjectToolRoot(projectId),
++@@ -35,7 +36,11 @@ function projectState(projectId: string): ToolProjectState {
++   return {
++     projectId,
++     rootLabel: root ? basename(root.rootPath) : null,
++-    allowedTools: [TOOL_ID_PROJECT_FILESYSTEM_READ, TOOL_ID_DEVELOPER_EXPLORER, TOOL_ID_DEVELOPER_GIT]
+++    allowedTools: [
+++      ...(projectFilesPackInstalled() ? [TOOL_ID_PROJECT_FILESYSTEM_READ] : []),
+++      TOOL_ID_DEVELOPER_EXPLORER,
+++      TOOL_ID_DEVELOPER_GIT,
+++    ]
++       .filter((toolId) => getHubDatabase().repos.hasProjectToolPermission(projectId, toolId, "read")),
++   };
++ }
++@@ -108,6 +113,7 @@ export async function requestDeveloperPermission(projectId: string, sender: WebC
++ }
++ 
++ export async function requestToolRead(input: ToolReadRequestInput, sender: WebContents): Promise<ToolReadRequestResult> {
+++  if (!projectFilesPackInstalled()) throw new Error("marketplace:pack_not_installed");
++   const result = await router.request({ projectId: input.projectId, toolId: TOOL_ID_PROJECT_FILESYSTEM_READ, relativePath: input.relativePath }, sender.id);
++   if (!isPermission(result)) { record(result); return completed(result); }
++   const parent = BrowserWindow.fromWebContents(sender);
++diff --git a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
++index 777eb82..226fcae 100644
++--- a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+++++ b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
++@@ -4,6 +4,7 @@ import type {
++   AppLocale,
++   AppPrefs,
++   MonthlyCostsResult,
+++  MarketplacePackDto,
++   ProviderDto,
++   ProviderKeyDto,
++   ProjectDto,
++@@ -50,6 +51,7 @@ export function SettingsView({
++   const [capDimension, setCapDimension] = useState<"project" | "provider">("project");
++   const [capSubject, setCapSubject] = useState("");
++   const [scopedCapLimit, setScopedCapLimit] = useState("");
+++  const [marketplacePacks, setMarketplacePacks] = useState<MarketplacePackDto[]>([]);
++   const generalRef = useRef<HTMLHeadingElement>(null);
++   const providerRef = useRef<HTMLSelectElement>(null);
++   const capRef = useRef<HTMLInputElement>(null);
++@@ -96,6 +98,11 @@ export function SettingsView({
++           setError(t("workspace.error.generic"));
++         }
++       });
+++    void window.hub.marketplace.list().then((list) => {
+++      if (!cancelled) setMarketplacePacks(list);
+++    }).catch(() => {
+++      if (!cancelled) setError(t("workspace.error.generic"));
+++    });
++     void window.hub.projects.list().then((list) => {
++       if (!cancelled) {
++         setProjects(list);
++@@ -245,6 +252,27 @@ export function SettingsView({
++           </Button>
++         </div>
++       </section>
+++      <section className="flex flex-col gap-2">
+++        <h2 className="text-[12px] font-medium">{t("marketplace.title")}</h2>
+++        <p className="text-muted-foreground">{t("marketplace.hint")}</p>
+++        <ul className="flex flex-col gap-2" data-testid="marketplace-packs">
+++          {marketplacePacks.map((pack) => (
+++            <li key={pack.id} className="flex items-center justify-between gap-3 rounded-md border px-3 py-2">
+++              <div>
+++                <p className="text-[13px] font-medium">{t(pack.titleKey)}</p>
+++                <p className="text-[11px] text-muted-foreground">{t(pack.descriptionKey)}</p>
+++                <p className="text-[11px] text-muted-foreground">{t("marketplace.permission", { count: pack.permissions.length })}</p>
+++              </div>
+++              <Button type="button" size="sm" variant={pack.installed ? "outline" : "default"} disabled={!pack.installable} data-testid={`marketplace-pack-${pack.id}`} onClick={() => {
+++                const action = pack.installed ? window.hub.marketplace.uninstall({ packId: pack.id }) : window.hub.marketplace.install({ packId: pack.id });
+++                void action.then(() => window.hub.marketplace.list()).then(setMarketplacePacks).catch(() => setError(t("workspace.error.generic")));
+++              }}>
+++                {pack.installable ? (pack.installed ? t("marketplace.uninstall") : t("marketplace.install")) : t("marketplace.coreIntegrated")}
+++              </Button>
+++            </li>
+++          ))}
+++        </ul>
+++      </section>
++       <section className="flex flex-col gap-2">
++         <h2 className="text-[12px] font-medium">{t("secrets.title")}</h2>
++         <p className="text-muted-foreground">{t("secrets.hint")}</p>
++@@ -279,6 +307,7 @@ export function SettingsView({
++                 autoComplete="off"
++                 data-testid="secrets-base-url"
++               />
+++              <span className="text-[11px] text-muted-foreground">{t("secrets.customEndpointHint")}</span>
++             </label>
++           ) : null}
++           <label className="flex flex-col gap-1 text-[12px]">
++diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
++index 89443a0..566e989 100644
++--- a/apps/desktop/src/renderer/src/locales/en.json
+++++ b/apps/desktop/src/renderer/src/locales/en.json
++@@ -648,5 +648,20 @@
++     "voice.error.cloudAck": "Acknowledge the cloud/OS speech privacy warning first.",
++     "voice.error.ready": "Open a conversation and select a provider key first.",
++     "voice.error.send": "Could not send the transcript.",
++-    "voice.error.stt": "Speech error: {{code}}"
+++    "voice.error.stt": "Speech error: {{code}}",
+++    "secrets.customEndpointHint": "OpenAI-compatible endpoint: base /v1 URL, GET /models, and streaming POST /chat/completions with Bearer auth.",
+++    "marketplace.title": "Internal marketplace",
+++    "marketplace.hint": "Internal packs use core APIs only; permission is still requested per project.",
+++    "marketplace.install": "Install",
+++    "marketplace.uninstall": "Remove",
+++    "marketplace.available": "Available",
+++    "marketplace.coreIntegrated": "Built in",
+++    "marketplace.permission": "{{count}} declared read permission",
+++    "marketplace.pack.project-files.title": "Project Files",
+++    "marketplace.pack.project-files.description": "Read files only inside the project root through the Permission Center.",
+++    "marketplace.pack.openai-compatible.title": "OpenAI-compatible endpoint",
+++    "marketplace.pack.openai-compatible.description": "Configure any compatible /v1 endpoint in Provider settings.",
+++    "marketplace.pack.code-review-skill.title": "Code Review skill",
+++    "marketplace.pack.code-review-skill.description": "Use the built-in Code Review skill from Skills.",
+++    "tools.error.packRequired": "Install the Project Files pack in the internal marketplace before reading project files."
++ }
++diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
++index 9a2486d..b3b7889 100644
++--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
+++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
++@@ -648,5 +648,20 @@
++     "voice.error.cloudAck": "Aceite primeiro o aviso de privacidade de fala (nuvem/SO).",
++     "voice.error.ready": "Abra uma conversa e escolha uma chave de provider primeiro.",
++     "voice.error.send": "Não foi possível enviar a transcrição.",
++-    "voice.error.stt": "Erro de fala: {{code}}"
+++    "voice.error.stt": "Erro de fala: {{code}}",
+++    "secrets.customEndpointHint": "Endpoint compatível com OpenAI: URL base /v1, GET /models e streaming POST /chat/completions com Bearer.",
+++    "marketplace.title": "Marketplace interno",
+++    "marketplace.hint": "Packs internos usam somente APIs do core; a permissão continua sendo pedida por projeto.",
+++    "marketplace.install": "Instalar",
+++    "marketplace.uninstall": "Remover",
+++    "marketplace.available": "Disponível",
+++    "marketplace.coreIntegrated": "Nativo",
+++    "marketplace.permission": "{{count}} permissão de leitura declarada",
+++    "marketplace.pack.project-files.title": "Arquivos do projeto",
+++    "marketplace.pack.project-files.description": "Lê arquivos somente dentro da raiz do projeto pelo Centro de permissões.",
+++    "marketplace.pack.openai-compatible.title": "Endpoint compatível com OpenAI",
+++    "marketplace.pack.openai-compatible.description": "Configure qualquer endpoint compatível com /v1 nas configurações de provedores.",
+++    "marketplace.pack.code-review-skill.title": "Skill de revisão de código",
+++    "marketplace.pack.code-review-skill.description": "Use a skill nativa de revisão de código em Skills.",
+++    "tools.error.packRequired": "Instale o pack Project Files no Marketplace interno antes de ler arquivos do projeto."
++ }
++diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
++index c1b7680..7467f0d 100644
++--- a/packages/shared/src/ipc-schemas.test.ts
+++++ b/packages/shared/src/ipc-schemas.test.ts
++@@ -47,8 +47,18 @@ import {
++   developerReviewInputSchema,
++   developerTerminalInputSchema,
++   localProviderStatusSchema,
+++  marketplacePackDtoSchema,
+++  marketplacePackIdInputSchema,
++ } from "./ipc-schemas";
++ 
+++describe("wave 29 marketplace contracts", () => {
+++  it("accepts only strict internal pack metadata", () => {
+++    expect(marketplacePackDtoSchema.parse({ id: "ai-hub.project-files", version: "1.0.0", kind: "mcp", name: "Project Files", description: "Read project files", permissions: [{ toolId: "project-filesystem.read-file", operation: "read", effect: "read" }], titleKey: "marketplace.pack.project-files.title", descriptionKey: "marketplace.pack.project-files.description", availability: "installable", installable: true, installed: false }).id).toBe("ai-hub.project-files");
+++    expect(() => marketplacePackIdInputSchema.parse({ packId: "not a pack" })).toThrow();
+++    expect(() => marketplacePackDtoSchema.parse({ id: "ai-hub.project-files", version: "1", kind: "mcp", name: "Files", description: "Read", permissions: [], titleKey: "marketplace.pack.project-files.title", descriptionKey: "marketplace.pack.project-files.description", availability: "installable", installable: true, installed: false, executable: "evil" })).toThrow();
+++  });
+++});
+++
++ describe("emptyIpcPayloadSchema", () => {
++   it("accepts an empty object", () => {
++     expect(emptyIpcPayloadSchema.parse({})).toEqual({});
++diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
++index 00ecd79..93543e3 100644
++--- a/packages/shared/src/ipc-schemas.ts
+++++ b/packages/shared/src/ipc-schemas.ts
++@@ -552,6 +552,25 @@ export const localProviderStatusSchema = z.object({
++ }).strict();
++ export type LocalProviderStatusDto = z.infer<typeof localProviderStatusSchema>;
++ 
+++const marketplacePackKindSchema = z.enum(["provider", "mcp", "skill"]);
+++export const marketplacePackDtoSchema = z.object({
+++  id: z.string().regex(/^[a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+$/).max(128),
+++  version: z.string().min(1).max(32),
+++  kind: marketplacePackKindSchema,
+++  name: z.string().min(1).max(100),
+++  description: z.string().min(1).max(400),
+++  permissions: z.array(z.object({ toolId: z.string().min(1).max(128), operation: z.literal("read"), effect: z.literal("read") }).strict()).max(16),
+++  titleKey: z.string().regex(/^marketplace\.pack\.[a-z0-9-]+\.title$/).max(128),
+++  descriptionKey: z.string().regex(/^marketplace\.pack\.[a-z0-9-]+\.description$/).max(128),
+++  availability: z.enum(["installable", "core_integrated"]),
+++  installable: z.boolean(),
+++  installed: z.boolean(),
+++}).strict();
+++export type MarketplacePackDto = z.infer<typeof marketplacePackDtoSchema>;
+++export const marketplacePackListSchema = z.array(marketplacePackDtoSchema).max(64);
+++export const marketplacePackIdInputSchema = z.object({ packId: z.string().regex(/^[a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+$/).max(128) }).strict();
+++export type MarketplacePackIdInput = z.infer<typeof marketplacePackIdInputSchema>;
+++
++ export const secretsSaveInputSchema = z
++   .object({
++     providerSlug: z.string().min(1).max(64),
++diff --git a/apps/desktop/src/main/marketplace-packs.ts b/apps/desktop/src/main/marketplace-packs.ts
++new file mode 100644
++index 0000000..9a86a1e
++--- /dev/null
+++++ b/apps/desktop/src/main/marketplace-packs.ts
++@@ -0,0 +1,73 @@
+++import { extensionManifestSchema, type ExtensionManifest, type MarketplacePackDto } from "@ai-hub/shared";
+++import { getHubDatabase } from "./persistence";
+++
+++export const PROJECT_FILES_PACK_ID = "ai-hub.project-files";
+++
+++interface MarketplaceCatalogEntry {
+++  manifest: ExtensionManifest;
+++  titleKey: `marketplace.pack.${string}.title`;
+++  descriptionKey: `marketplace.pack.${string}.description`;
+++  availability: "installable" | "core_integrated";
+++}
+++
+++const manifests: readonly ExtensionManifest[] = extensionManifestSchema.array().parse([{
+++  apiVersion: 1,
+++  id: PROJECT_FILES_PACK_ID,
+++  version: "1.0.0",
+++  kind: "mcp" as const,
+++  name: "Project Files",
+++  description: "Read files only inside the project root through the Permission Center.",
+++  permissions: [{ toolId: "project-filesystem.read-file", operation: "read" as const, effect: "read" as const }],
+++  sandbox: "core",
+++}, {
+++  apiVersion: 1,
+++  id: "ai-hub.openai-compatible",
+++  version: "1.0.0",
+++  kind: "provider" as const,
+++  name: "OpenAI-compatible endpoint",
+++  description: "Connect any OpenAI-compatible /v1 endpoint from Provider settings.",
+++  permissions: [],
+++  sandbox: "core",
+++}, {
+++  apiVersion: 1,
+++  id: "ai-hub.code-review-skill",
+++  version: "1.0.0",
+++  kind: "skill" as const,
+++  name: "Code Review skill",
+++  description: "Use the built-in Code Review skill from Skills.",
+++  permissions: [],
+++  sandbox: "core",
+++}]);
+++
+++const catalog: readonly MarketplaceCatalogEntry[] = [
+++  { manifest: manifests[0]!, titleKey: "marketplace.pack.project-files.title", descriptionKey: "marketplace.pack.project-files.description", availability: "installable" },
+++  { manifest: manifests[1]!, titleKey: "marketplace.pack.openai-compatible.title", descriptionKey: "marketplace.pack.openai-compatible.description", availability: "core_integrated" },
+++  { manifest: manifests[2]!, titleKey: "marketplace.pack.code-review-skill.title", descriptionKey: "marketplace.pack.code-review-skill.description", availability: "core_integrated" },
+++];
+++
+++export function listMarketplacePacks(): MarketplacePackDto[] {
+++  const installed = new Set(getHubDatabase().repos.listInstalledPacks().filter((pack) => pack.enabled).map((pack) => pack.packId));
+++  return catalog.map(({ manifest, titleKey, descriptionKey, availability }) => {
+++    const { apiVersion: _apiVersion, sandbox: _sandbox, ...pack } = manifest;
+++    return { ...pack, permissions: [...pack.permissions], titleKey, descriptionKey, availability, installable: availability === "installable", installed: installed.has(pack.id) };
+++  });
+++}
+++
+++export function installMarketplacePack(packId: string): MarketplacePackDto {
+++  const pack = catalog.find((item) => item.manifest.id === packId)?.manifest;
+++  if (!pack) throw new Error("marketplace:pack_not_found");
+++  if (pack.kind !== "mcp") throw new Error("marketplace:pack_not_installable");
+++  getHubDatabase().repos.installPack({ packId: pack.id, version: pack.version, kind: pack.kind });
+++  return listMarketplacePacks().find((item) => item.id === packId) ?? (() => { throw new Error("marketplace:pack_not_found"); })();
+++}
+++
+++export function uninstallMarketplacePack(packId: string): void {
+++  const pack = catalog.find((item) => item.manifest.id === packId)?.manifest;
+++  if (!pack) throw new Error("marketplace:pack_not_found");
+++  if (pack.kind !== "mcp") throw new Error("marketplace:pack_not_installable");
+++  getHubDatabase().repos.uninstallPack(packId);
+++}
+++
+++export function projectFilesPackInstalled(): boolean {
+++  return getHubDatabase().repos.isPackInstalled(PROJECT_FILES_PACK_ID);
+++}
++diff --git a/apps/desktop/src/main/tools.marketplace.test.ts b/apps/desktop/src/main/tools.marketplace.test.ts
++new file mode 100644
++index 0000000..f4b7bbe
++--- /dev/null
+++++ b/apps/desktop/src/main/tools.marketplace.test.ts
++@@ -0,0 +1,58 @@
+++import { mkdtemp, rm, writeFile } from "node:fs/promises";
+++import { tmpdir } from "node:os";
+++import { join } from "node:path";
+++import { beforeEach, describe, expect, it, vi } from "vitest";
+++
+++const fixture = vi.hoisted(() => ({
+++  installed: false,
+++  rootPath: "",
+++  grants: new Set<string>(),
+++  showMessageBox: vi.fn(),
+++}));
+++
+++vi.mock("electron", () => ({
+++  BrowserWindow: { fromWebContents: () => null },
+++  dialog: { showMessageBox: fixture.showMessageBox },
+++}));
+++vi.mock("./marketplace-packs", () => ({ projectFilesPackInstalled: () => fixture.installed }));
+++vi.mock("./persistence", () => ({
+++  getHubDatabase: () => ({
+++    repos: {
+++      getProjectToolRoot: () => ({ rootPath: fixture.rootPath }),
+++      hasProjectToolPermission: (projectId: string, toolId: string, operation: string) => fixture.grants.has(`${projectId}:${toolId}:${operation}`),
+++      grantProjectToolPermission: (projectId: string, toolId: string, operation: string) => fixture.grants.add(`${projectId}:${toolId}:${operation}`),
+++      getAppearance: () => ({ locale: "en" }),
+++    },
+++  }),
+++}));
+++
+++import { requestToolRead } from "./tools";
+++
+++describe("marketplace Project Files pack", () => {
+++  beforeEach(() => {
+++    fixture.installed = false;
+++    fixture.grants.clear();
+++    fixture.showMessageBox.mockReset();
+++  });
+++
+++  it("blocks reads until installed, then keeps the Permission Center in the read path", async () => {
+++    const root = await mkdtemp(join(tmpdir(), "ai-hub-marketplace-"));
+++    fixture.rootPath = root;
+++    try {
+++      await writeFile(join(root, "README.md"), "only scoped project content");
+++      const sender = { id: 41 } as Electron.WebContents;
+++      await expect(requestToolRead({ projectId: "project-a", relativePath: "README.md" }, sender)).rejects.toThrow("marketplace:pack_not_installed");
+++
+++      fixture.installed = true;
+++      fixture.showMessageBox.mockResolvedValue({ response: 0 });
+++      await expect(requestToolRead({ projectId: "project-a", relativePath: "README.md" }, sender)).resolves.toMatchObject({
+++        kind: "completed",
+++        content: "only scoped project content",
+++      });
+++      expect(fixture.showMessageBox).toHaveBeenCalledOnce();
+++      expect(fixture.grants).toHaveLength(0);
+++    } finally {
+++      await rm(root, { recursive: true, force: true });
+++    }
+++  });
+++});
++
+diff --git a/docs/reviews/W29/DIFF.patch b/docs/reviews/W29/DIFF.patch
+new file mode 100644
+index 0000000..ee747f4
+--- /dev/null
++++ b/docs/reviews/W29/DIFF.patch
+@@ -0,0 +1,866 @@
++diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
++index 453b6d7..f79168a 100644
++--- a/apps/desktop/src/main/ipc.ts
+++++ b/apps/desktop/src/main/ipc.ts
++@@ -108,6 +108,9 @@ import {
++   providerKeyDtoSchema,
++   providerKeyListResultSchema,
++   localProviderStatusSchema,
+++  marketplacePackDtoSchema,
+++  marketplacePackIdInputSchema,
+++  marketplacePackListSchema,
++   providerListResultSchema,
++   searchInputSchema,
++   searchResultSchema,
++@@ -172,6 +175,7 @@ import { cancelOrchestration, getOrchestration, listOrchestrations, pauseOrchest
++ import { prepareResearch } from "./research-runner";
++ import { developerDiff, developerReview, developerStatus, developerTerminal, developerTree } from "./developer-tools";
++ import { getLocalProviderStatus, localProviderKey } from "./local-provider";
+++import { installMarketplacePack, listMarketplacePacks, uninstallMarketplacePack } from "./marketplace-packs";
++ 
++ function registerHandler<TIn, TOut>(
++   channel: string,
++@@ -488,6 +492,12 @@ export function registerWorkspaceIpc(): void {
++     getLocalProviderStatus(true),
++   );
++ 
+++  registerHandler(IpcChannel.marketplaceList, emptyIpcPayloadSchema, marketplacePackListSchema, () => listMarketplacePacks());
+++  registerHandler(IpcChannel.marketplaceInstall, marketplacePackIdInputSchema, marketplacePackDtoSchema, (input) => installMarketplacePack(input.packId));
+++  registerHandler(IpcChannel.marketplaceUninstall, marketplacePackIdInputSchema, ipcAckResultSchema, (input) => {
+++    uninstallMarketplacePack(input.packId);
+++  });
+++
++   registerHandler(IpcChannel.secretsList, emptyIpcPayloadSchema, providerKeyListResultSchema, async () => {
++     const keys = await getHubDatabase().repos.listProviderKeys();
++     const local = await getLocalProviderStatus();
++diff --git a/apps/desktop/src/main/tools.ts b/apps/desktop/src/main/tools.ts
++index 27dc099..f149a16 100644
++--- a/apps/desktop/src/main/tools.ts
+++++ b/apps/desktop/src/main/tools.ts
++@@ -12,6 +12,7 @@ import {
++   type ToolReadRequestResult,
++ } from "@ai-hub/shared";
++ import { getHubDatabase } from "./persistence";
+++import { projectFilesPackInstalled } from "./marketplace-packs";
++ 
++ const router = new ToolRouter({
++   getProjectToolRoot: (projectId) => getHubDatabase().repos.getProjectToolRoot(projectId),
++@@ -35,7 +36,11 @@ function projectState(projectId: string): ToolProjectState {
++   return {
++     projectId,
++     rootLabel: root ? basename(root.rootPath) : null,
++-    allowedTools: [TOOL_ID_PROJECT_FILESYSTEM_READ, TOOL_ID_DEVELOPER_EXPLORER, TOOL_ID_DEVELOPER_GIT]
+++    allowedTools: [
+++      ...(projectFilesPackInstalled() ? [TOOL_ID_PROJECT_FILESYSTEM_READ] : []),
+++      TOOL_ID_DEVELOPER_EXPLORER,
+++      TOOL_ID_DEVELOPER_GIT,
+++    ]
++       .filter((toolId) => getHubDatabase().repos.hasProjectToolPermission(projectId, toolId, "read")),
++   };
++ }
++@@ -108,6 +113,7 @@ export async function requestDeveloperPermission(projectId: string, sender: WebC
++ }
++ 
++ export async function requestToolRead(input: ToolReadRequestInput, sender: WebContents): Promise<ToolReadRequestResult> {
+++  if (!projectFilesPackInstalled()) throw new Error("marketplace:pack_not_installed");
++   const result = await router.request({ projectId: input.projectId, toolId: TOOL_ID_PROJECT_FILESYSTEM_READ, relativePath: input.relativePath }, sender.id);
++   if (!isPermission(result)) { record(result); return completed(result); }
++   const parent = BrowserWindow.fromWebContents(sender);
++diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
++index be6576e..5c391b7 100644
++--- a/apps/desktop/src/preload/index.ts
+++++ b/apps/desktop/src/preload/index.ts
++@@ -108,6 +108,9 @@ import {
++   providerKeyDtoSchema,
++   providerKeyListResultSchema,
++   localProviderStatusSchema,
+++  marketplacePackDtoSchema,
+++  marketplacePackIdInputSchema,
+++  marketplacePackListSchema,
++   providerListResultSchema,
++   searchInputSchema,
++   searchResultSchema,
++@@ -309,6 +312,11 @@ const hub: HubApi = {
++     list: () => invokeParsed(IpcChannel.providersList, empty, emptyIpcPayloadSchema, providerListResultSchema),
++     localStatus: () => invokeParsed(IpcChannel.localProviderStatus, empty, emptyIpcPayloadSchema, localProviderStatusSchema),
++   },
+++  marketplace: {
+++    list: () => invokeParsed(IpcChannel.marketplaceList, empty, emptyIpcPayloadSchema, marketplacePackListSchema),
+++    install: (input) => invokeParsed(IpcChannel.marketplaceInstall, input, marketplacePackIdInputSchema, marketplacePackDtoSchema),
+++    uninstall: (input) => invokeAckWith(IpcChannel.marketplaceUninstall, input, marketplacePackIdInputSchema),
+++  },
++   secrets: {
++     list: () => invokeParsed(IpcChannel.secretsList, empty, emptyIpcPayloadSchema, providerKeyListResultSchema),
++     save: (input) => invokeParsed(IpcChannel.secretsSave, input, secretsSaveInputSchema, providerKeyDtoSchema),
++diff --git a/apps/desktop/src/renderer/src/components/layout/home-view.tsx b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++index 035c276..31b286e 100644
++--- a/apps/desktop/src/renderer/src/components/layout/home-view.tsx
+++++ b/apps/desktop/src/renderer/src/components/layout/home-view.tsx
++@@ -710,7 +710,10 @@ export function HomeView({
++       setToolActivity(result.activity);
++       if (result.kind === "completed") { appendToolOutput(result.content, result.activity); setToolPath(""); }
++       if (result.kind === "denied") setToolError(t("tools.error.denied"));
++-    } catch { setToolError(t("tools.error.read")); }
+++    } catch (error) {
+++      const message = error instanceof Error ? error.message : "";
+++      setToolError(message.includes("marketplace:pack_not_installed") ? t("tools.error.packRequired") : t("tools.error.read"));
+++    }
++     finally { setToolBusy(false); }
++   };
++ 
++diff --git a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
++index 777eb82..226fcae 100644
++--- a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+++++ b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
++@@ -4,6 +4,7 @@ import type {
++   AppLocale,
++   AppPrefs,
++   MonthlyCostsResult,
+++  MarketplacePackDto,
++   ProviderDto,
++   ProviderKeyDto,
++   ProjectDto,
++@@ -50,6 +51,7 @@ export function SettingsView({
++   const [capDimension, setCapDimension] = useState<"project" | "provider">("project");
++   const [capSubject, setCapSubject] = useState("");
++   const [scopedCapLimit, setScopedCapLimit] = useState("");
+++  const [marketplacePacks, setMarketplacePacks] = useState<MarketplacePackDto[]>([]);
++   const generalRef = useRef<HTMLHeadingElement>(null);
++   const providerRef = useRef<HTMLSelectElement>(null);
++   const capRef = useRef<HTMLInputElement>(null);
++@@ -96,6 +98,11 @@ export function SettingsView({
++           setError(t("workspace.error.generic"));
++         }
++       });
+++    void window.hub.marketplace.list().then((list) => {
+++      if (!cancelled) setMarketplacePacks(list);
+++    }).catch(() => {
+++      if (!cancelled) setError(t("workspace.error.generic"));
+++    });
++     void window.hub.projects.list().then((list) => {
++       if (!cancelled) {
++         setProjects(list);
++@@ -245,6 +252,27 @@ export function SettingsView({
++           </Button>
++         </div>
++       </section>
+++      <section className="flex flex-col gap-2">
+++        <h2 className="text-[12px] font-medium">{t("marketplace.title")}</h2>
+++        <p className="text-muted-foreground">{t("marketplace.hint")}</p>
+++        <ul className="flex flex-col gap-2" data-testid="marketplace-packs">
+++          {marketplacePacks.map((pack) => (
+++            <li key={pack.id} className="flex items-center justify-between gap-3 rounded-md border px-3 py-2">
+++              <div>
+++                <p className="text-[13px] font-medium">{t(pack.titleKey)}</p>
+++                <p className="text-[11px] text-muted-foreground">{t(pack.descriptionKey)}</p>
+++                <p className="text-[11px] text-muted-foreground">{t("marketplace.permission", { count: pack.permissions.length })}</p>
+++              </div>
+++              <Button type="button" size="sm" variant={pack.installed ? "outline" : "default"} disabled={!pack.installable} data-testid={`marketplace-pack-${pack.id}`} onClick={() => {
+++                const action = pack.installed ? window.hub.marketplace.uninstall({ packId: pack.id }) : window.hub.marketplace.install({ packId: pack.id });
+++                void action.then(() => window.hub.marketplace.list()).then(setMarketplacePacks).catch(() => setError(t("workspace.error.generic")));
+++              }}>
+++                {pack.installable ? (pack.installed ? t("marketplace.uninstall") : t("marketplace.install")) : t("marketplace.coreIntegrated")}
+++              </Button>
+++            </li>
+++          ))}
+++        </ul>
+++      </section>
++       <section className="flex flex-col gap-2">
++         <h2 className="text-[12px] font-medium">{t("secrets.title")}</h2>
++         <p className="text-muted-foreground">{t("secrets.hint")}</p>
++@@ -279,6 +307,7 @@ export function SettingsView({
++                 autoComplete="off"
++                 data-testid="secrets-base-url"
++               />
+++              <span className="text-[11px] text-muted-foreground">{t("secrets.customEndpointHint")}</span>
++             </label>
++           ) : null}
++           <label className="flex flex-col gap-1 text-[12px]">
++diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
++index 89443a0..566e989 100644
++--- a/apps/desktop/src/renderer/src/locales/en.json
+++++ b/apps/desktop/src/renderer/src/locales/en.json
++@@ -648,5 +648,20 @@
++     "voice.error.cloudAck": "Acknowledge the cloud/OS speech privacy warning first.",
++     "voice.error.ready": "Open a conversation and select a provider key first.",
++     "voice.error.send": "Could not send the transcript.",
++-    "voice.error.stt": "Speech error: {{code}}"
+++    "voice.error.stt": "Speech error: {{code}}",
+++    "secrets.customEndpointHint": "OpenAI-compatible endpoint: base /v1 URL, GET /models, and streaming POST /chat/completions with Bearer auth.",
+++    "marketplace.title": "Internal marketplace",
+++    "marketplace.hint": "Internal packs use core APIs only; permission is still requested per project.",
+++    "marketplace.install": "Install",
+++    "marketplace.uninstall": "Remove",
+++    "marketplace.available": "Available",
+++    "marketplace.coreIntegrated": "Built in",
+++    "marketplace.permission": "{{count}} declared read permission",
+++    "marketplace.pack.project-files.title": "Project Files",
+++    "marketplace.pack.project-files.description": "Read files only inside the project root through the Permission Center.",
+++    "marketplace.pack.openai-compatible.title": "OpenAI-compatible endpoint",
+++    "marketplace.pack.openai-compatible.description": "Configure any compatible /v1 endpoint in Provider settings.",
+++    "marketplace.pack.code-review-skill.title": "Code Review skill",
+++    "marketplace.pack.code-review-skill.description": "Use the built-in Code Review skill from Skills.",
+++    "tools.error.packRequired": "Install the Project Files pack in the internal marketplace before reading project files."
++ }
++diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
++index 9a2486d..b3b7889 100644
++--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
+++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
++@@ -648,5 +648,20 @@
++     "voice.error.cloudAck": "Aceite primeiro o aviso de privacidade de fala (nuvem/SO).",
++     "voice.error.ready": "Abra uma conversa e escolha uma chave de provider primeiro.",
++     "voice.error.send": "Não foi possível enviar a transcrição.",
++-    "voice.error.stt": "Erro de fala: {{code}}"
+++    "voice.error.stt": "Erro de fala: {{code}}",
+++    "secrets.customEndpointHint": "Endpoint compatível com OpenAI: URL base /v1, GET /models e streaming POST /chat/completions com Bearer.",
+++    "marketplace.title": "Marketplace interno",
+++    "marketplace.hint": "Packs internos usam somente APIs do core; a permissão continua sendo pedida por projeto.",
+++    "marketplace.install": "Instalar",
+++    "marketplace.uninstall": "Remover",
+++    "marketplace.available": "Disponível",
+++    "marketplace.coreIntegrated": "Nativo",
+++    "marketplace.permission": "{{count}} permissão de leitura declarada",
+++    "marketplace.pack.project-files.title": "Arquivos do projeto",
+++    "marketplace.pack.project-files.description": "Lê arquivos somente dentro da raiz do projeto pelo Centro de permissões.",
+++    "marketplace.pack.openai-compatible.title": "Endpoint compatível com OpenAI",
+++    "marketplace.pack.openai-compatible.description": "Configure qualquer endpoint compatível com /v1 nas configurações de provedores.",
+++    "marketplace.pack.code-review-skill.title": "Skill de revisão de código",
+++    "marketplace.pack.code-review-skill.description": "Use a skill nativa de revisão de código em Skills.",
+++    "tools.error.packRequired": "Instale o pack Project Files no Marketplace interno antes de ler arquivos do projeto."
++ }
++diff --git a/docs/ADR/README.md b/docs/ADR/README.md
++index b5ca9de..e64e9e1 100644
++--- a/docs/ADR/README.md
+++++ b/docs/ADR/README.md
++@@ -34,6 +34,7 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider
++ 
++ | ID | Onda | Título | Status |
++ |---|---|---|---|
+++| [ADR-W29-001](./ADR-W29-001-declarative-internal-marketplace.md) | W29 | Declarative internal marketplace | accepted |
++ | [ADR-W00-001](./ADR-W00-001-electron-vite-monorepo.md) | W00 | Electron-vite + pnpm + Turborepo | accepted |
++ | [ADR-W00-002](./ADR-W00-002-shadcn-tailwind-i18n.md) | W00 | shadcn, Tailwind v3, i18n, tema no renderer | accepted |
++ | [ADR-W00-003](./ADR-W00-003-csp-and-window-ipc.md) | W00 | CSP, sandbox, IPC de janela com Zod | accepted |
++diff --git a/docs/IMPLEMENTATION_PLAN.md b/docs/IMPLEMENTATION_PLAN.md
++index a7de7d0..9ead7cb 100644
++--- a/docs/IMPLEMENTATION_PLAN.md
+++++ b/docs/IMPLEMENTATION_PLAN.md
++@@ -951,12 +951,12 @@ Council **não** é orquestração de agentes: N modelos, um packet, sem tools.
++ 
++ **Sub-tasks:**
++ 
++-- [ ] API de extensão estável (manifest, permissões, sandbox)
++-- [ ] Marketplace interno: providers + MCP packs + skills
++-- [ ] Custom OpenAI-compatible como “adicione qualquer endpoint”
++-- [ ] Plugin não acessa keytar direto; só APIs do core
++-- [ ] Um plugin interno real (ex.: GitHub MCP pack) antes de abrir a terceiros
++-- [ ] Agentes de terceiros **não** entram antes de um pack interno real e do Permission Center
+++- [x] API de extensão estável (manifest, permissões, sandbox)
+++- [x] Marketplace interno: providers + MCP packs + skills
+++- [x] Custom OpenAI-compatible como “adicione qualquer endpoint”
+++- [x] Plugin não acessa keytar direto; só APIs do core
+++- [x] Um plugin interno real (ex.: GitHub MCP pack) antes de abrir a terceiros
+++- [x] Agentes de terceiros **não** entram antes de um pack interno real e do Permission Center
++ 
++ **DoD:** instalar um pack MCP pelo marketplace interno e usar no projeto com Permission Center.
++ 
++diff --git a/docs/STATUS.md b/docs/STATUS.md
++index 2503ce9..d79d1eb 100644
++--- a/docs/STATUS.md
+++++ b/docs/STATUS.md
++@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave
++ 
++ | Field | Value |
++ |---|---|
++-| Wave | **W29** |
+++| Wave | **W30** |
++ | Marco | E — V3 ecosystem |
++ | State | `pending` |
++-| Last completed | **W28** |
++-| Next action | Iniciar Wave 29 (Plugins + marketplace) com skill `wave-start`. |
+++| Last completed | **W29** |
+++| Next action | Iniciar Wave 30 (sync opcional) com skill `wave-start`. |
++ 
++ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
++ 
++@@ -49,6 +49,7 @@ None.
++ ## Notes for the next session
++ 
++ - W28 fechada: Voice Mode (Web Speech → `chat:send` → TTS); aviso cloud; Private bloqueia disk opt-in. Gate em `docs/reviews/W28/`.
+++- W29 fechada: marketplace interno declarativo; Project Files é o pack MCP real e continua mediado pelo Permission Center. Gate em `docs/reviews/W29/`.
++ - W27 fechada: Notes cifradas; Tasks from message; Study; Research `graphVersion: 2`. Gate em `docs/reviews/W27/`.
++ - W26 fechada: Ollama + offline. Prova física em `docs/reviews/W26/PHYSICAL-DOD.md`.
++ 
++@@ -56,5 +57,5 @@ None.
++ 
++ | Kind | Path |
++ |---|---|
++-| Review | `docs/reviews/W28/REVIEW.md` |
++-| Latest ADR | `docs/ADR/ADR-W28-001-web-speech-voice-mode.md` |
+++| Review | `docs/reviews/W29/REVIEW.md` |
+++| Latest ADR | `docs/ADR/ADR-W29-001-declarative-internal-marketplace.md` |
++diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
++index b6f7c72..4259c18 100644
++--- a/packages/db/src/index.ts
+++++ b/packages/db/src/index.ts
++@@ -1,5 +1,5 @@
++ export { applyMigrations } from "./migrate";
++-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL, MIGRATION_0013_SQL, MIGRATION_0014_SQL, MIGRATION_0015_SQL, MIGRATION_0016_SQL, MIGRATION_0017_SQL, MIGRATION_0018_SQL, MIGRATION_0019_SQL } from "./migrations";
+++export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL, MIGRATION_0013_SQL, MIGRATION_0014_SQL, MIGRATION_0015_SQL, MIGRATION_0016_SQL, MIGRATION_0017_SQL, MIGRATION_0018_SQL, MIGRATION_0019_SQL, MIGRATION_0020_SQL } from "./migrations";
++ export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
++ export {
++   HubRepos,
++@@ -45,5 +45,6 @@ export {
++   type AgentHandoffJoinKind,
++   type AgentHandoffStatus,
++   type AgentHandoffRecord,
+++  type InstalledPackRecord,
++ } from "./repos";
++ export { schema } from "./schema";
++diff --git a/packages/db/src/migrations.ts b/packages/db/src/migrations.ts
++index 34997e0..df92cf5 100644
++--- a/packages/db/src/migrations.ts
+++++ b/packages/db/src/migrations.ts
++@@ -399,6 +399,17 @@ CREATE TABLE note_tags (
++ ALTER TABLE conversation_tasks ADD COLUMN source_message_id TEXT;
++ `;
++ 
+++export const MIGRATION_0020_SQL = `
+++CREATE TABLE installed_packs (
+++  pack_id TEXT PRIMARY KEY,
+++  version TEXT NOT NULL,
+++  kind TEXT NOT NULL,
+++  enabled INTEGER NOT NULL DEFAULT 1,
+++  installed_at INTEGER NOT NULL,
+++  updated_at INTEGER NOT NULL
+++);
+++`;
+++
++ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
++   { version: 1, sql: MIGRATION_0001_SQL },
++   { version: 2, sql: MIGRATION_0002_SQL },
++@@ -419,4 +430,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
++   { version: 17, sql: MIGRATION_0017_SQL },
++   { version: 18, sql: MIGRATION_0018_SQL },
++   { version: 19, sql: MIGRATION_0019_SQL },
+++  { version: 20, sql: MIGRATION_0020_SQL },
++ ];
++diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
++index 103d2cc..0dd13ee 100644
++--- a/packages/db/src/repos.test.ts
+++++ b/packages/db/src/repos.test.ts
++@@ -34,6 +34,18 @@ describe("hub database", () => {
++     expect(dumpAllText(hub.sqlite)).not.toContain(OLLAMA_LOCAL_KEY_ID);
++     hub.close();
++   });
+++  it("installs an internal pack idempotently without storing pack configuration", () => {
+++    const { hub } = openTestDb();
+++    const first = hub.repos.installPack({ packId: "ai-hub.project-files", version: "1.0.0", kind: "mcp" });
+++    const second = hub.repos.installPack({ packId: "ai-hub.project-files", version: "1.0.1", kind: "mcp" });
+++    expect(first.enabled).toBe(true);
+++    expect(second.version).toBe("1.0.1");
+++    expect(hub.repos.listInstalledPacks()).toHaveLength(1);
+++    expect(hub.repos.isPackInstalled("ai-hub.project-files")).toBe(true);
+++    hub.repos.uninstallPack("ai-hub.project-files");
+++    expect(hub.repos.isPackInstalled("ai-hub.project-files")).toBe(false);
+++    hub.close();
+++  });
++   it("creates project and conversation that round-trip decrypted", () => {
++     const { hub } = openTestDb();
++     const project = hub.repos.createProject("Alpha");
++diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
++index f18e247..5120508 100644
++--- a/packages/db/src/repos.ts
+++++ b/packages/db/src/repos.ts
++@@ -25,6 +25,7 @@ import {
++   projectMemories,
++   projectNotes,
++   projectToolPermissions,
+++  installedPacks,
++   projectToolRoots,
++   prompts,
++   skills,
++@@ -74,6 +75,15 @@ export interface ProjectToolPermissionRecord {
++   updatedAt: string;
++ }
++ 
+++export interface InstalledPackRecord {
+++  packId: string;
+++  version: string;
+++  kind: string;
+++  enabled: boolean;
+++  installedAt: string;
+++  updatedAt: string;
+++}
+++
++ export type AgentRunStatus = "awaiting_confirmation" | "running" | "paused" | "cancelled" | "completed" | "completed_with_errors" | "stopped_budget" | "stopped_timeout" | "interrupted" | "failed";
++ export type AgentStepStatus = "pending" | "running" | "completed" | "failed" | "skipped" | "cancelled" | "interrupted";
++ export type AgentStepKind = "plan" | "tool" | "report" | "artifact";
++@@ -909,6 +919,34 @@ export class HubRepos {
++       .run();
++   }
++ 
+++  listInstalledPacks(): InstalledPackRecord[] {
+++    return this.db.select().from(installedPacks).all().map((row) => ({
+++      packId: row.packId,
+++      version: row.version,
+++      kind: row.kind,
+++      enabled: row.enabled === 1,
+++      installedAt: iso(row.installedAt),
+++      updatedAt: iso(row.updatedAt),
+++    }));
+++  }
+++
+++  installPack(input: { packId: string; version: string; kind: string }): InstalledPackRecord {
+++    const now = Date.now();
+++    const existing = this.db.select().from(installedPacks).where(eq(installedPacks.packId, input.packId)).get();
+++    this.db.insert(installedPacks).values({ packId: input.packId, version: input.version, kind: input.kind, enabled: 1, installedAt: existing?.installedAt ?? now, updatedAt: now }).onConflictDoUpdate({ target: installedPacks.packId, set: { version: input.version, kind: input.kind, enabled: 1, updatedAt: now } }).run();
+++    const installed = this.listInstalledPacks().find((row) => row.packId === input.packId);
+++    if (!installed) throw new Error("Installed pack not found");
+++    return installed;
+++  }
+++
+++  uninstallPack(packId: string): void {
+++    this.db.delete(installedPacks).where(eq(installedPacks.packId, packId)).run();
+++  }
+++
+++  isPackInstalled(packId: string): boolean {
+++    return this.db.select().from(installedPacks).where(and(eq(installedPacks.packId, packId), eq(installedPacks.enabled, 1))).get() !== undefined;
+++  }
+++
++   listConversations(projectId: string | null, inbox: "avulsas" | "imported" = "avulsas"): ConversationRecord[] {
++     const rows =
++       projectId === null
++diff --git a/packages/db/src/schema.ts b/packages/db/src/schema.ts
++index 1824c69..82d3ec4 100644
++--- a/packages/db/src/schema.ts
+++++ b/packages/db/src/schema.ts
++@@ -274,6 +274,15 @@ export const projectToolPermissions = sqliteTable(
++   (table) => [uniqueIndex("project_tool_permissions_scope_idx").on(table.projectId, table.toolId, table.operation)],
++ );
++ 
+++export const installedPacks = sqliteTable("installed_packs", {
+++  packId: text("pack_id").primaryKey(),
+++  version: text("version").notNull(),
+++  kind: text("kind").notNull(),
+++  enabled: integer("enabled", { mode: "number" }).notNull().default(1),
+++  installedAt: integer("installed_at", { mode: "number" }).notNull(),
+++  updatedAt: integer("updated_at", { mode: "number" }).notNull(),
+++});
+++
++ export const agentRuns = sqliteTable("agent_runs", {
++   id: text("id").primaryKey(),
++   projectId: text("project_id").notNull(),
++@@ -367,6 +376,7 @@ export const schema = {
++   artifacts,
++   projectToolRoots,
++   projectToolPermissions,
+++  installedPacks,
++   agentRuns,
++   agentSteps,
++   agentHandoffs,
++diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
++index b27bd45..13ea943 100644
++--- a/packages/shared/src/hub-api.ts
+++++ b/packages/shared/src/hub-api.ts
++@@ -125,6 +125,8 @@ import type {
++   OrchestrationRunDetail,
++   ProviderKeyDto,
++   LocalProviderStatusDto,
+++  MarketplacePackDto,
+++  MarketplacePackIdInput,
++   SecretsSaveInput,
++   SecretsTestInput,
++   SecretsTestResult,
++@@ -193,6 +195,12 @@ export interface HubProvidersApi {
++   localStatus: () => Promise<LocalProviderStatusDto>;
++ }
++ 
+++export interface HubMarketplaceApi {
+++  list: () => Promise<MarketplacePackDto[]>;
+++  install: (input: MarketplacePackIdInput) => Promise<MarketplacePackDto>;
+++  uninstall: (input: MarketplacePackIdInput) => Promise<void>;
+++}
+++
++ export interface HubSecretsApi {
++   list: () => Promise<ProviderKeyDto[]>;
++   save: (input: SecretsSaveInput) => Promise<ProviderKeyDto>;
++@@ -356,6 +364,7 @@ export interface HubApi {
++   prefs: HubPrefsApi;
++   updates: HubUpdatesApi;
++   providers: HubProvidersApi;
+++  marketplace: HubMarketplaceApi;
++   secrets: HubSecretsApi;
++   search: HubSearchApi;
++   spendCaps: HubSpendCapsApi;
++diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
++index 51a8edb..176389e 100644
++--- a/packages/shared/src/index.ts
+++++ b/packages/shared/src/index.ts
++@@ -1,4 +1,5 @@
++ export { type AppLocale, type ThemeMode, localeSchema, themeModeSchema } from "./appearance";
+++export { EXTENSION_API_VERSION, extensionManifestSchema, extensionPermissionSchema, type ExtensionManifest } from "./extensions";
++ export {
++   type HubApi,
++   type HubChatApi,
++@@ -6,6 +7,7 @@ export {
++   type HubMessagesApi,
++   type HubProjectsApi,
++   type HubProvidersApi,
+++  type HubMarketplaceApi,
++   type HubSearchApi,
++   type HubSecretsApi,
++   type HubSettingsApi,
++@@ -329,6 +331,9 @@ export {
++   providerKeyDtoSchema,
++   providerKeyListResultSchema,
++   localProviderStatusSchema,
+++  marketplacePackDtoSchema,
+++  marketplacePackIdInputSchema,
+++  marketplacePackListSchema,
++   providerListResultSchema,
++   secretsSaveInputSchema,
++   secretsTestInputSchema,
++@@ -478,6 +483,8 @@ export {
++   type WorkspaceSetTaskDoneInput,
++   type ProviderKeyDto,
++   type LocalProviderStatusDto,
+++  type MarketplacePackDto,
+++  type MarketplacePackIdInput,
++   type SecretsSaveInput,
++   type SecretsTestInput,
++   type SecretsTestResult,
++diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
++index 5582651..192bc55 100644
++--- a/packages/shared/src/ipc-channels.ts
+++++ b/packages/shared/src/ipc-channels.ts
++@@ -44,6 +44,9 @@ export const IpcChannel = {
++   settingsSetSession: "settings:setSession",
++   providersList: "providers:list",
++   localProviderStatus: "local:status",
+++  marketplaceList: "marketplace:list",
+++  marketplaceInstall: "marketplace:install",
+++  marketplaceUninstall: "marketplace:uninstall",
++   secretsList: "secrets:list",
++   secretsSave: "secrets:save",
++   secretsRemove: "secrets:remove",
++diff --git a/packages/shared/src/ipc-schemas.test.ts b/packages/shared/src/ipc-schemas.test.ts
++index c1b7680..7467f0d 100644
++--- a/packages/shared/src/ipc-schemas.test.ts
+++++ b/packages/shared/src/ipc-schemas.test.ts
++@@ -47,8 +47,18 @@ import {
++   developerReviewInputSchema,
++   developerTerminalInputSchema,
++   localProviderStatusSchema,
+++  marketplacePackDtoSchema,
+++  marketplacePackIdInputSchema,
++ } from "./ipc-schemas";
++ 
+++describe("wave 29 marketplace contracts", () => {
+++  it("accepts only strict internal pack metadata", () => {
+++    expect(marketplacePackDtoSchema.parse({ id: "ai-hub.project-files", version: "1.0.0", kind: "mcp", name: "Project Files", description: "Read project files", permissions: [{ toolId: "project-filesystem.read-file", operation: "read", effect: "read" }], titleKey: "marketplace.pack.project-files.title", descriptionKey: "marketplace.pack.project-files.description", availability: "installable", installable: true, installed: false }).id).toBe("ai-hub.project-files");
+++    expect(() => marketplacePackIdInputSchema.parse({ packId: "not a pack" })).toThrow();
+++    expect(() => marketplacePackDtoSchema.parse({ id: "ai-hub.project-files", version: "1", kind: "mcp", name: "Files", description: "Read", permissions: [], titleKey: "marketplace.pack.project-files.title", descriptionKey: "marketplace.pack.project-files.description", availability: "installable", installable: true, installed: false, executable: "evil" })).toThrow();
+++  });
+++});
+++
++ describe("emptyIpcPayloadSchema", () => {
++   it("accepts an empty object", () => {
++     expect(emptyIpcPayloadSchema.parse({})).toEqual({});
++diff --git a/packages/shared/src/ipc-schemas.ts b/packages/shared/src/ipc-schemas.ts
++index 00ecd79..93543e3 100644
++--- a/packages/shared/src/ipc-schemas.ts
+++++ b/packages/shared/src/ipc-schemas.ts
++@@ -552,6 +552,25 @@ export const localProviderStatusSchema = z.object({
++ }).strict();
++ export type LocalProviderStatusDto = z.infer<typeof localProviderStatusSchema>;
++ 
+++const marketplacePackKindSchema = z.enum(["provider", "mcp", "skill"]);
+++export const marketplacePackDtoSchema = z.object({
+++  id: z.string().regex(/^[a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+$/).max(128),
+++  version: z.string().min(1).max(32),
+++  kind: marketplacePackKindSchema,
+++  name: z.string().min(1).max(100),
+++  description: z.string().min(1).max(400),
+++  permissions: z.array(z.object({ toolId: z.string().min(1).max(128), operation: z.literal("read"), effect: z.literal("read") }).strict()).max(16),
+++  titleKey: z.string().regex(/^marketplace\.pack\.[a-z0-9-]+\.title$/).max(128),
+++  descriptionKey: z.string().regex(/^marketplace\.pack\.[a-z0-9-]+\.description$/).max(128),
+++  availability: z.enum(["installable", "core_integrated"]),
+++  installable: z.boolean(),
+++  installed: z.boolean(),
+++}).strict();
+++export type MarketplacePackDto = z.infer<typeof marketplacePackDtoSchema>;
+++export const marketplacePackListSchema = z.array(marketplacePackDtoSchema).max(64);
+++export const marketplacePackIdInputSchema = z.object({ packId: z.string().regex(/^[a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+$/).max(128) }).strict();
+++export type MarketplacePackIdInput = z.infer<typeof marketplacePackIdInputSchema>;
+++
++ export const secretsSaveInputSchema = z
++   .object({
++     providerSlug: z.string().min(1).max(64),
++
++diff --git a/apps/desktop/e2e/marketplace.spec.ts b/apps/desktop/e2e/marketplace.spec.ts
++new file mode 100644
++index 0000000..833d701
++--- /dev/null
+++++ b/apps/desktop/e2e/marketplace.spec.ts
++@@ -0,0 +1,29 @@
+++import { createRequire } from "node:module";
+++import path from "node:path";
+++import { fileURLToPath } from "node:url";
+++import { _electron as electron, expect, test } from "@playwright/test";
+++
+++const require = createRequire(import.meta.url);
+++const electronBinary = require("electron") as string;
+++const appRoot = path.join(fileURLToPath(new URL("..", import.meta.url)));
+++
+++test("installs and removes the internal project files MCP pack", async () => {
+++  const app = await electron.launch({
+++    executablePath: electronBinary,
+++    args: [path.join(appRoot, "out/main/index.js")],
+++    cwd: appRoot,
+++    env: { ...process.env, AI_HUB_E2E: "1", NODE_ENV: "production" },
+++  });
+++  try {
+++    const window = await app.firstWindow();
+++    await window.getByTestId("nav-settings").click();
+++    const pack = window.getByTestId("marketplace-pack-ai-hub.project-files");
+++    await expect(pack).toHaveText(/Install|Instalar/);
+++    await pack.click();
+++    await expect(pack).toHaveText(/Remove|Remover/);
+++    await pack.click();
+++    await expect(pack).toHaveText(/Install|Instalar/);
+++  } finally {
+++    await app.close();
+++  }
+++});
++diff --git a/apps/desktop/src/main/marketplace-packs.ts b/apps/desktop/src/main/marketplace-packs.ts
++new file mode 100644
++index 0000000..9a86a1e
++--- /dev/null
+++++ b/apps/desktop/src/main/marketplace-packs.ts
++@@ -0,0 +1,73 @@
+++import { extensionManifestSchema, type ExtensionManifest, type MarketplacePackDto } from "@ai-hub/shared";
+++import { getHubDatabase } from "./persistence";
+++
+++export const PROJECT_FILES_PACK_ID = "ai-hub.project-files";
+++
+++interface MarketplaceCatalogEntry {
+++  manifest: ExtensionManifest;
+++  titleKey: `marketplace.pack.${string}.title`;
+++  descriptionKey: `marketplace.pack.${string}.description`;
+++  availability: "installable" | "core_integrated";
+++}
+++
+++const manifests: readonly ExtensionManifest[] = extensionManifestSchema.array().parse([{
+++  apiVersion: 1,
+++  id: PROJECT_FILES_PACK_ID,
+++  version: "1.0.0",
+++  kind: "mcp" as const,
+++  name: "Project Files",
+++  description: "Read files only inside the project root through the Permission Center.",
+++  permissions: [{ toolId: "project-filesystem.read-file", operation: "read" as const, effect: "read" as const }],
+++  sandbox: "core",
+++}, {
+++  apiVersion: 1,
+++  id: "ai-hub.openai-compatible",
+++  version: "1.0.0",
+++  kind: "provider" as const,
+++  name: "OpenAI-compatible endpoint",
+++  description: "Connect any OpenAI-compatible /v1 endpoint from Provider settings.",
+++  permissions: [],
+++  sandbox: "core",
+++}, {
+++  apiVersion: 1,
+++  id: "ai-hub.code-review-skill",
+++  version: "1.0.0",
+++  kind: "skill" as const,
+++  name: "Code Review skill",
+++  description: "Use the built-in Code Review skill from Skills.",
+++  permissions: [],
+++  sandbox: "core",
+++}]);
+++
+++const catalog: readonly MarketplaceCatalogEntry[] = [
+++  { manifest: manifests[0]!, titleKey: "marketplace.pack.project-files.title", descriptionKey: "marketplace.pack.project-files.description", availability: "installable" },
+++  { manifest: manifests[1]!, titleKey: "marketplace.pack.openai-compatible.title", descriptionKey: "marketplace.pack.openai-compatible.description", availability: "core_integrated" },
+++  { manifest: manifests[2]!, titleKey: "marketplace.pack.code-review-skill.title", descriptionKey: "marketplace.pack.code-review-skill.description", availability: "core_integrated" },
+++];
+++
+++export function listMarketplacePacks(): MarketplacePackDto[] {
+++  const installed = new Set(getHubDatabase().repos.listInstalledPacks().filter((pack) => pack.enabled).map((pack) => pack.packId));
+++  return catalog.map(({ manifest, titleKey, descriptionKey, availability }) => {
+++    const { apiVersion: _apiVersion, sandbox: _sandbox, ...pack } = manifest;
+++    return { ...pack, permissions: [...pack.permissions], titleKey, descriptionKey, availability, installable: availability === "installable", installed: installed.has(pack.id) };
+++  });
+++}
+++
+++export function installMarketplacePack(packId: string): MarketplacePackDto {
+++  const pack = catalog.find((item) => item.manifest.id === packId)?.manifest;
+++  if (!pack) throw new Error("marketplace:pack_not_found");
+++  if (pack.kind !== "mcp") throw new Error("marketplace:pack_not_installable");
+++  getHubDatabase().repos.installPack({ packId: pack.id, version: pack.version, kind: pack.kind });
+++  return listMarketplacePacks().find((item) => item.id === packId) ?? (() => { throw new Error("marketplace:pack_not_found"); })();
+++}
+++
+++export function uninstallMarketplacePack(packId: string): void {
+++  const pack = catalog.find((item) => item.manifest.id === packId)?.manifest;
+++  if (!pack) throw new Error("marketplace:pack_not_found");
+++  if (pack.kind !== "mcp") throw new Error("marketplace:pack_not_installable");
+++  getHubDatabase().repos.uninstallPack(packId);
+++}
+++
+++export function projectFilesPackInstalled(): boolean {
+++  return getHubDatabase().repos.isPackInstalled(PROJECT_FILES_PACK_ID);
+++}
++diff --git a/apps/desktop/src/main/tools.marketplace.test.ts b/apps/desktop/src/main/tools.marketplace.test.ts
++new file mode 100644
++index 0000000..f4b7bbe
++--- /dev/null
+++++ b/apps/desktop/src/main/tools.marketplace.test.ts
++@@ -0,0 +1,58 @@
+++import { mkdtemp, rm, writeFile } from "node:fs/promises";
+++import { tmpdir } from "node:os";
+++import { join } from "node:path";
+++import { beforeEach, describe, expect, it, vi } from "vitest";
+++
+++const fixture = vi.hoisted(() => ({
+++  installed: false,
+++  rootPath: "",
+++  grants: new Set<string>(),
+++  showMessageBox: vi.fn(),
+++}));
+++
+++vi.mock("electron", () => ({
+++  BrowserWindow: { fromWebContents: () => null },
+++  dialog: { showMessageBox: fixture.showMessageBox },
+++}));
+++vi.mock("./marketplace-packs", () => ({ projectFilesPackInstalled: () => fixture.installed }));
+++vi.mock("./persistence", () => ({
+++  getHubDatabase: () => ({
+++    repos: {
+++      getProjectToolRoot: () => ({ rootPath: fixture.rootPath }),
+++      hasProjectToolPermission: (projectId: string, toolId: string, operation: string) => fixture.grants.has(`${projectId}:${toolId}:${operation}`),
+++      grantProjectToolPermission: (projectId: string, toolId: string, operation: string) => fixture.grants.add(`${projectId}:${toolId}:${operation}`),
+++      getAppearance: () => ({ locale: "en" }),
+++    },
+++  }),
+++}));
+++
+++import { requestToolRead } from "./tools";
+++
+++describe("marketplace Project Files pack", () => {
+++  beforeEach(() => {
+++    fixture.installed = false;
+++    fixture.grants.clear();
+++    fixture.showMessageBox.mockReset();
+++  });
+++
+++  it("blocks reads until installed, then keeps the Permission Center in the read path", async () => {
+++    const root = await mkdtemp(join(tmpdir(), "ai-hub-marketplace-"));
+++    fixture.rootPath = root;
+++    try {
+++      await writeFile(join(root, "README.md"), "only scoped project content");
+++      const sender = { id: 41 } as Electron.WebContents;
+++      await expect(requestToolRead({ projectId: "project-a", relativePath: "README.md" }, sender)).rejects.toThrow("marketplace:pack_not_installed");
+++
+++      fixture.installed = true;
+++      fixture.showMessageBox.mockResolvedValue({ response: 0 });
+++      await expect(requestToolRead({ projectId: "project-a", relativePath: "README.md" }, sender)).resolves.toMatchObject({
+++        kind: "completed",
+++        content: "only scoped project content",
+++      });
+++      expect(fixture.showMessageBox).toHaveBeenCalledOnce();
+++      expect(fixture.grants).toHaveLength(0);
+++    } finally {
+++      await rm(root, { recursive: true, force: true });
+++    }
+++  });
+++});
++diff --git a/docs/ADR/ADR-W29-001-declarative-internal-marketplace.md b/docs/ADR/ADR-W29-001-declarative-internal-marketplace.md
++new file mode 100644
++index 0000000..74e876c
++--- /dev/null
+++++ b/docs/ADR/ADR-W29-001-declarative-internal-marketplace.md
++@@ -0,0 +1,36 @@
+++# ADR-W29-001-declarative-internal-marketplace
+++
+++- **Status:** accepted
+++- **Onda:** W29
+++- **Data:** 2026-09-26
+++- **Deciders:** Codex / Pedro
+++- **Supersedes:** —
+++- **Superseded by:** —
+++
+++## Contexto
+++
+++O marketplace precisa instalar packs MCP e integrá-los ao Permission Center sem conceder acesso a keytar, Node ou ao renderer. Executar código de terceiros no processo do aplicativo não oferece isolamento adequado e não é necessário para o primeiro pack interno.
+++
+++## Decisão
+++
+++O marketplace desta onda é declarativo e interno. O catálogo é empacotado no processo principal; cada manifesto tem versão, tipo, permissões declaradas e não contém JavaScript, caminho executável ou segredo. A instalação persiste somente a identidade, versão, tipo e estado do pack. A execução continua em APIs do core, no main process.
+++
+++O primeiro pack é `ai-hub.project-files`, que expõe a leitura MCP já limitada à raiz do projeto. A instalação não concede acesso: cada leitura segue a permissão por projeto e ferramenta já mediada pelo Permission Center. Packs de terceiros permanecem fora desta onda; requerem host isolado, verificação de assinatura e um capability broker próprios.
+++
+++## Alternativas consideradas
+++
+++- Executar JavaScript ou binários de packs: rejeitado por romper a fronteira de confiança.
+++- Baixar ou invocar `npx` para um GitHub MCP: rejeitado por introduzir execução remota não verificada e dependência externa.
+++- Usar o pack sem persistir a instalação: rejeitado porque não demonstraria o fluxo do marketplace.
+++
+++## Consequências
+++
+++- Não há acesso de pack a keytar, banco, rede ou preload.
+++- O catálogo interno pode crescer com providers, MCP packs e skills declarativos.
+++- Abertura a terceiros é trabalho futuro com uma fronteira de processo dedicada.
+++
+++## Referências
+++
+++- `docs/IMPLEMENTATION_PLAN.md` (Wave 29)
+++- `docs/reviews/W29/REVIEW.md`
+++- `docs/ADR/ADR-W22-001-project-scoped-mcp.md`
++diff --git a/packages/shared/src/extensions.test.ts b/packages/shared/src/extensions.test.ts
++new file mode 100644
++index 0000000..4530802
++--- /dev/null
+++++ b/packages/shared/src/extensions.test.ts
++@@ -0,0 +1,13 @@
+++import { describe, expect, it } from "vitest";
+++import { extensionManifestSchema } from "./extensions";
+++
+++describe("extension manifest", () => {
+++  it("accepts a versioned core-only read manifest", () => {
+++    expect(extensionManifestSchema.parse({ apiVersion: 1, id: "ai-hub.project-files", version: "1.0.0", kind: "mcp", name: "Project Files", description: "Read scoped files", permissions: [{ toolId: "project-filesystem.read-file", operation: "read", effect: "read" }], sandbox: "core" }).id).toBe("ai-hub.project-files");
+++  });
+++
+++  it("rejects executable and network escape hatches", () => {
+++    expect(() => extensionManifestSchema.parse({ apiVersion: 1, id: "ai-hub.project-files", version: "1.0.0", kind: "mcp", name: "Project Files", description: "Read scoped files", permissions: [], sandbox: "core", command: "npx" })).toThrow();
+++    expect(() => extensionManifestSchema.parse({ apiVersion: 1, id: "ai-hub.project-files", version: "1.0.0", kind: "mcp", name: "Project Files", description: "Read scoped files", permissions: [], sandbox: "renderer" })).toThrow();
+++  });
+++});
++diff --git a/packages/shared/src/extensions.ts b/packages/shared/src/extensions.ts
++new file mode 100644
++index 0000000..62f96c9
++--- /dev/null
+++++ b/packages/shared/src/extensions.ts
++@@ -0,0 +1,21 @@
+++import { z } from "zod";
+++
+++export const EXTENSION_API_VERSION = 1 as const;
+++export const extensionPermissionSchema = z.object({
+++  toolId: z.string().regex(/^[a-z][a-z0-9.-]+$/).max(128),
+++  operation: z.literal("read"),
+++  effect: z.literal("read"),
+++}).strict();
+++
+++export const extensionManifestSchema = z.object({
+++  apiVersion: z.literal(EXTENSION_API_VERSION),
+++  id: z.string().regex(/^[a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+$/).max(128),
+++  version: z.string().regex(/^\d+\.\d+\.\d+$/),
+++  kind: z.enum(["provider", "mcp", "skill"]),
+++  name: z.string().min(1).max(100),
+++  description: z.string().min(1).max(400),
+++  permissions: z.array(extensionPermissionSchema).max(16),
+++  sandbox: z.literal("core"),
+++}).strict();
+++
+++export type ExtensionManifest = z.infer<typeof extensionManifestSchema>;
++
+diff --git a/docs/reviews/W29/REVIEW.md b/docs/reviews/W29/REVIEW.md
+new file mode 100644
+index 0000000..10cf74e
+--- /dev/null
++++ b/docs/reviews/W29/REVIEW.md
+@@ -0,0 +1,63 @@
++# Review — W29 Plugins + marketplace
++
++- **Data:** 2026-09-26
++- **Branch / HEAD:** `main` / `80e9e036b109b77bb018ca319dc40af8e8a2f44c`
++- **Revisores independentes:** `wave-reviewer`, `trust-auditor`
++- **ADR:** [ADR-W29-001](../../ADR/ADR-W29-001-declarative-internal-marketplace.md)
++
++## DoD
++
++> Instalar um pack MCP pelo marketplace interno e usar no projeto com Permission Center.
++
++| Item | Resultado | Evidência |
++|---|---|---|
++| Manifest, permissões e sandbox estáveis | Passou | `packages/shared/src/extensions.ts` e testes estritos |
++| Marketplace interno de provider, MCP e skill | Passou | catálogo declarativo; cards core-integrated são explícitos |
++| Endpoint OpenAI-compatible | Passou | fluxo existente documentado na tela de provider |
++| Sem acesso direto de plugin a keytar | Passou | catálogo sem código; apenas APIs core/main |
++| Pack interno real | Passou | `ai-hub.project-files`, persistido em `installed_packs` |
++| Sem agentes de terceiros | Passou | nenhum carregador/host de terceiros foi introduzido |
++| Instalar e usar com Permission Center | Passou | bloqueio pré-instalação + diálogo e leitura scoped cobertos em `tools.marketplace.test.ts`; instalação/remover na UI cobertos em Playwright |
++
++## Checklist do gate
++
++- [x] Subtarefas e DoD presentes em código executável.
++- [x] Renderer continua sem keytar, filesystem, rede de provider ou SQLite.
++- [x] IPC novo é explicitamente exposto e validado por Zod no preload e no main.
++- [x] Migração `installed_packs` corresponde ao schema e aos repositórios.
++- [x] Metadados visíveis possuem pt-BR e en; DTO usa chaves de tradução restritas.
++- [x] Não há novo caminho de chat/custo/fallback silencioso.
++- [x] Contratos, persistência, fluxo de autorização e UI possuem testes sem chaves reais.
++- [x] `pnpm typecheck`, lint, testes unitários e E2E selecionado passaram.
++
++## Achados
++
++| Severidade | Arquivo | Resumo | Estado |
++|---|---|---|---|
++| Medium | `apps/desktop/e2e/marketplace.spec.ts` | E2E inicial não cobria a leitura após instalar. | corrigido — teste de integração cobre pack → Permission Center → leitura scoped. |
++| Medium | `apps/desktop/src/main/marketplace-packs.ts` | Provider e skill pareciam itens instaláveis sem vínculo. | corrigido — DTO/UI declaram `core_integrated`. |
++| Medium | `apps/desktop/src/main/marketplace-packs.ts` | Copy do catálogo era inglês na UI pt-BR. | corrigido — renderer resolve chaves i18n pt-BR/en. |
++| Low | `apps/desktop/src/main/tools.ts` | Permissão persistida podia continuar visível após desinstalar. | corrigido — estado também é filtrado pela instalação. |
++
++O delta review do `wave-reviewer` e do `trust-auditor` não encontrou Blocker, High ou Medium restante.
++
++## Correlações e riscos residuais
++
++- A instalação habilita o pack, mas não concede autorização: a leitura continua no `ToolRouter` da W22, por projeto e dentro da raiz selecionada.
++- `installed_packs` preserva identidade/versionamento para atualizações futuras sem carregar código.
++- Packs de terceiros permanecem fora de escopo: exigem host isolado, assinatura e capability broker, como registra a ADR.
++- O E2E não automatiza o diálogo nativo do Electron; o teste de integração em main simula a decisão e prova o caminho de autorização. Não há risco residual de fronteira de confiança conhecido.
++
++## Evidências de verificação
++
++- `pnpm --filter @ai-hub/shared test` — 130 testes passaram.
++- `pnpm --filter @ai-hub/desktop exec vitest run src/main/tools.marketplace.test.ts` — passou.
++- `pnpm typecheck` — 8 tarefas passaram.
++- `pnpm --filter @ai-hub/desktop lint` — passou.
++- `pnpm --filter @ai-hub/desktop rebuild:native` + `build` — passou.
++- `pnpm --filter @ai-hub/desktop test:e2e -- marketplace.spec.ts developer.spec.ts` — 2 testes passaram.
++
++## Patches
++
++- `docs/reviews/W29/DIFF.patch`
++- `docs/reviews/W29/DIFF-post-review.patch`
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index 4259c18..ccd9df6 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -1,5 +1,5 @@
+ export { applyMigrations } from "./migrate";
+-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL, MIGRATION_0013_SQL, MIGRATION_0014_SQL, MIGRATION_0015_SQL, MIGRATION_0016_SQL, MIGRATION_0017_SQL, MIGRATION_0018_SQL, MIGRATION_0019_SQL, MIGRATION_0020_SQL } from "./migrations";
++export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL, MIGRATION_0013_SQL, MIGRATION_0014_SQL, MIGRATION_0015_SQL, MIGRATION_0016_SQL, MIGRATION_0017_SQL, MIGRATION_0018_SQL, MIGRATION_0019_SQL, MIGRATION_0020_SQL, MIGRATION_0021_SQL } from "./migrations";
+ export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
+ export {
+   HubRepos,
+@@ -46,5 +46,8 @@ export {
+   type AgentHandoffStatus,
+   type AgentHandoffRecord,
+   type InstalledPackRecord,
++  type SyncSettingsRecord,
++  type SyncSnapshot,
++  type SyncConflictRecord,
+ } from "./repos";
+ export { schema } from "./schema";
+diff --git a/packages/db/src/migrations.ts b/packages/db/src/migrations.ts
+index df92cf5..e2037cc 100644
+--- a/packages/db/src/migrations.ts
++++ b/packages/db/src/migrations.ts
+@@ -410,6 +410,18 @@ CREATE TABLE installed_packs (
+ );
+ `;
+ 
++export const MIGRATION_0021_SQL = `
++CREATE TABLE sync_conflicts (
++  id TEXT PRIMARY KEY,
++  entity_key TEXT NOT NULL,
++  local_updated_at INTEGER NOT NULL,
++  remote_updated_at INTEGER NOT NULL,
++  resolution TEXT NOT NULL,
++  created_at INTEGER NOT NULL
++);
++CREATE INDEX sync_conflicts_created_idx ON sync_conflicts(created_at);
++`;
++
+ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 1, sql: MIGRATION_0001_SQL },
+   { version: 2, sql: MIGRATION_0002_SQL },
+@@ -431,4 +443,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 18, sql: MIGRATION_0018_SQL },
+   { version: 19, sql: MIGRATION_0019_SQL },
+   { version: 20, sql: MIGRATION_0020_SQL },
++  { version: 21, sql: MIGRATION_0021_SQL },
+ ];
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index 0dd13ee..0b59f8f 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -56,6 +56,27 @@ describe("hub database", () => {
+     hub.close();
+   });
+ 
++  it("replicates a project conversation and messages without provider keys", async () => {
++    const first = openTestDb();
++    const second = openTestDb();
++    const project = first.hub.repos.createProject("Synced project", { instructions: "Keep this private" });
++    const conversation = first.hub.repos.createConversation(project.id, "Synced conversation");
++    first.hub.repos.createMessage({ conversationId: conversation.id, role: "user", content: "Hello from device one", parentId: null, branchId: null });
++    await first.hub.repos.saveProviderKey({ providerSlug: "openai", label: "local-only", secret: "sk-syncfixtureABCDEFGH" });
++
++    const snapshot = first.hub.repos.exportSyncSnapshot();
++    expect(JSON.stringify(snapshot)).not.toContain("sk-syncfixtureABCDEFGH");
++    expect(JSON.stringify(snapshot)).not.toContain("local-only");
++    const outcome = second.hub.repos.importSyncSnapshot(snapshot);
++    expect(outcome.imported).toBeGreaterThanOrEqual(3);
++    expect(second.hub.repos.getProject(project.id)?.name).toBe("Synced project");
++    expect(second.hub.repos.getConversation(conversation.id)?.title).toBe("Synced conversation");
++    expect(second.hub.repos.listMessages(conversation.id)[0]?.content).toBe("Hello from device one");
++    expect(await second.hub.repos.listProviderKeys()).toEqual([]);
++    first.hub.close();
++    second.hub.close();
++  });
++
+   it("persists project/provider caps independently", () => {
+     const { hub } = openTestDb();
+     const project = hub.repos.createProject("Scoped");
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 5120508..419b811 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -26,6 +26,7 @@ import {
+   projectNotes,
+   projectToolPermissions,
+   installedPacks,
++  syncConflicts,
+   projectToolRoots,
+   prompts,
+   skills,
+@@ -432,6 +433,34 @@ export interface AppPrefsRecord {
+   voiceContinuous: boolean;
+ }
+ 
++export interface SyncSettingsRecord {
++  enabled: boolean;
++  relayPath: string | null;
++  categories: { projects: boolean; conversations: boolean; settings: boolean; packets: boolean; skills: boolean };
++  lastSyncAt: string | null;
++}
++
++export interface SyncSnapshot {
++  version: 1;
++  generatedAt: string;
++  projects: ProjectRecord[];
++  conversations: ConversationRecord[];
++  messages: MessageRecord[];
++  appearance?: AppearanceRecord;
++  appPrefs?: AppPrefsRecord;
++  packets: ContextPacketStored[];
++  skills: SkillRecord[];
++}
++
++export interface SyncConflictRecord {
++  id: string;
++  entityKey: string;
++  localUpdatedAt: string;
++  remoteUpdatedAt: string;
++  resolution: "local" | "remote";
++  createdAt: string;
++}
++
+ const DEFAULT_APP_PREFS: AppPrefsRecord = {
+   onboardingComplete: false,
+   crashReporterOptIn: false,
+@@ -465,6 +494,7 @@ function isFirewallPolicy(value: unknown): value is AppPrefsRecord["firewallPoli
+ 
+ const APPEARANCE_KEY = "appearance";
+ const APP_PREFS_KEY = "app-prefs";
++const SYNC_SETTINGS_KEY = "sync-settings";
+ const SESSION_KEY = "workspace-session";
+ const BRANCH_LABELS_PREFIX = "branch-labels:";
+ const CUSTOM_BASE_URL_PREFIX = "custom-base-url:";
+@@ -1128,7 +1158,7 @@ export class HubRepos {
+         });
+       }
+       this.db.update(conversations).set({ updatedAt }).where(eq(conversations.id, id)).run();
+-    })();
++    });
+     return { outcome: "created", conversationId: id };
+   }
+ 
+@@ -1717,6 +1747,101 @@ export class HubRepos {
+     };
+   }
+ 
++  getSyncSettings(): SyncSettingsRecord {
++    const row = this.db.select().from(settings).where(eq(settings.key, SYNC_SETTINGS_KEY)).get();
++    if (!row) return { enabled: false, relayPath: null, categories: { projects: true, conversations: true, settings: true, packets: true, skills: true }, lastSyncAt: null };
++    try {
++      const parsed = JSON.parse(decryptUtf8(row.value, this.masterKey)) as Partial<SyncSettingsRecord>;
++      const categories = parsed.categories;
++      return {
++        enabled: parsed.enabled === true,
++        relayPath: typeof parsed.relayPath === "string" ? parsed.relayPath : null,
++        categories: categories && typeof categories === "object" ? { projects: categories.projects === true, conversations: categories.conversations === true, settings: categories.settings === true, packets: categories.packets === true, skills: categories.skills === true } : { projects: true, conversations: true, settings: true, packets: true, skills: true },
++        lastSyncAt: typeof parsed.lastSyncAt === "string" ? parsed.lastSyncAt : null,
++      };
++    } catch { return { enabled: false, relayPath: null, categories: { projects: true, conversations: true, settings: true, packets: true, skills: true }, lastSyncAt: null }; }
++  }
++
++  setSyncSettings(patch: Partial<SyncSettingsRecord>): SyncSettingsRecord {
++    const current = this.getSyncSettings();
++    const next = { ...current, ...patch, categories: patch.categories ?? current.categories };
++    const now = Date.now();
++    this.db.insert(settings).values({ key: SYNC_SETTINGS_KEY, value: encryptUtf8(JSON.stringify(next), this.masterKey), updatedAt: now }).onConflictDoUpdate({ target: settings.key, set: { value: encryptUtf8(JSON.stringify(next), this.masterKey), updatedAt: now } }).run();
++    return next;
++  }
++
++  exportSyncSnapshot(): SyncSnapshot {
++    const conversationRows = this.db.select().from(conversations).all().filter((row) => row.kind !== "playground");
++    const syncedConversations = conversationRows.map((row) => this.toConversation(row));
++    return {
++      version: 1,
++      generatedAt: new Date().toISOString(),
++      projects: this.listProjects(),
++      conversations: syncedConversations,
++      messages: conversationRows.flatMap((row) => this.listMessages(row.id)),
++      appearance: this.getAppearance(),
++      appPrefs: this.getAppPrefs(),
++      packets: this.db.select().from(contextPackets).all().map((row) => this.getContextPacket(row.id)).filter((packet): packet is ContextPacketStored => packet !== null),
++      skills: this.listSkills(),
++    };
++  }
++
++  importSyncSnapshot(snapshot: SyncSnapshot): { imported: number; conflicts: number } {
++    let imported = 0;
++    let conflicts = 0;
++    const toMs = (value: string): number => Date.parse(value);
++    this.db.transaction(() => {
++      for (const item of snapshot.projects) {
++        const local = this.db.select().from(projects).where(eq(projects.id, item.id)).get();
++        if (local && local.updatedAt === toMs(item.updatedAt)) continue;
++        if (local && local.updatedAt > toMs(item.updatedAt)) { this.recordSyncConflict(`project:${item.id}`, local.updatedAt, toMs(item.updatedAt), "local"); conflicts += 1; continue; }
++        if (local) { this.recordSyncConflict(`project:${item.id}`, local.updatedAt, toMs(item.updatedAt), "remote"); conflicts += 1; }
++        this.db.insert(projects).values({ id: item.id, nameCipher: encryptUtf8(item.name, this.masterKey), color: item.color, instructionsCipher: item.instructions ? encryptUtf8(item.instructions, this.masterKey) : null, preferredModel: item.preferredModel, preferredProvider: item.preferredProvider, createdAt: toMs(item.createdAt), updatedAt: toMs(item.updatedAt) }).onConflictDoUpdate({ target: projects.id, set: { nameCipher: encryptUtf8(item.name, this.masterKey), color: item.color, instructionsCipher: item.instructions ? encryptUtf8(item.instructions, this.masterKey) : null, preferredModel: item.preferredModel, preferredProvider: item.preferredProvider, updatedAt: toMs(item.updatedAt) } }).run();
++        imported += 1;
++      }
++      for (const item of snapshot.conversations) {
++        if (item.projectId && !this.db.select().from(projects).where(eq(projects.id, item.projectId)).get()) continue;
++        const local = this.db.select().from(conversations).where(eq(conversations.id, item.id)).get();
++        if (local && local.updatedAt === toMs(item.updatedAt)) continue;
++        if (local && local.updatedAt > toMs(item.updatedAt)) { this.recordSyncConflict(`conversation:${item.id}`, local.updatedAt, toMs(item.updatedAt), "local"); conflicts += 1; continue; }
++        if (local) { this.recordSyncConflict(`conversation:${item.id}`, local.updatedAt, toMs(item.updatedAt), "remote"); conflicts += 1; }
++        this.db.insert(conversations).values({ id: item.id, projectId: item.projectId, titleCipher: encryptUtf8(item.title, this.masterKey), createdAt: toMs(item.createdAt), updatedAt: toMs(item.updatedAt), importSource: item.importSource, externalId: null, activePacketId: null, packetAppliedAt: null, kind: "chat", runMode: item.runMode, effortLevel: item.effortLevel }).onConflictDoUpdate({ target: conversations.id, set: { projectId: item.projectId, titleCipher: encryptUtf8(item.title, this.masterKey), updatedAt: toMs(item.updatedAt), runMode: item.runMode, effortLevel: item.effortLevel } }).run();
++        imported += 1;
++      }
++      for (const item of snapshot.messages.sort((left, right) => left.createdAt.localeCompare(right.createdAt))) {
++        if (!this.db.select().from(conversations).where(eq(conversations.id, item.conversationId)).get()) continue;
++        const exists = this.db.select().from(messages).where(eq(messages.id, item.id)).get();
++        if (exists) continue;
++        this.db.insert(messages).values({ id: item.id, conversationId: item.conversationId, parentId: item.parentId, branchId: item.branchId, isActiveBranch: item.isActiveBranch ? 1 : 0, role: item.role, contentCipher: encryptUtf8(item.content, this.masterKey), status: item.status, createdAt: toMs(item.createdAt), pinned: item.pinned ? 1 : 0 }).run();
++        imported += 1;
++      }
++      if (snapshot.appearance) this.setAppearance(snapshot.appearance);
++      if (snapshot.appPrefs) this.setAppPrefs(snapshot.appPrefs);
++      for (const item of snapshot.packets) {
++        if (item.projectId && !this.db.select().from(projects).where(eq(projects.id, item.projectId)).get()) continue;
++        if (this.db.select().from(contextPackets).where(eq(contextPackets.id, item.id)).get()) continue;
++        this.db.insert(contextPackets).values({ id: item.id, projectId: item.projectId, payloadCipher: encryptUtf8(item.payloadJson, this.masterKey), tokenEstimate: item.tokenEstimate, createdAt: toMs(item.createdAt), privacyMode: item.privacyMode, origin: JSON.stringify(item.origin), version: item.version }).run();
++        imported += 1;
++      }
++      for (const item of snapshot.skills) {
++        const local = this.db.select().from(skills).where(eq(skills.id, item.id)).get();
++        if (local && local.updatedAt > toMs(item.updatedAt)) { conflicts += 1; continue; }
++        if (item.factoryId && this.db.select().from(skills).where(eq(skills.factoryId, item.factoryId)).get() && !local) continue;
++        this.db.insert(skills).values({ id: item.id, folder: item.folder, titleCipher: encryptUtf8(item.title, this.masterKey), descriptionCipher: encryptUtf8(item.description, this.masterKey), definitionCipher: encryptUtf8(this.skillDefinitionJson(item), this.masterKey), preferredModel: item.preferredModel, factoryId: item.factoryId, createdAt: toMs(item.createdAt), updatedAt: toMs(item.updatedAt) }).onConflictDoUpdate({ target: skills.id, set: { folder: item.folder, titleCipher: encryptUtf8(item.title, this.masterKey), descriptionCipher: encryptUtf8(item.description, this.masterKey), definitionCipher: encryptUtf8(this.skillDefinitionJson(item), this.masterKey), preferredModel: item.preferredModel, updatedAt: toMs(item.updatedAt) } }).run();
++        imported += 1;
++      }
++    });
++    return { imported, conflicts };
++  }
++
++  listSyncConflicts(limit = 100): SyncConflictRecord[] {
++    return this.db.select().from(syncConflicts).all().sort((a, b) => b.createdAt - a.createdAt).slice(0, limit).map((row) => ({ id: row.id, entityKey: row.entityKey, localUpdatedAt: iso(row.localUpdatedAt), remoteUpdatedAt: iso(row.remoteUpdatedAt), resolution: row.resolution === "local" ? "local" : "remote", createdAt: iso(row.createdAt) }));
++  }
++
++  private recordSyncConflict(entityKey: string, localUpdatedAt: number, remoteUpdatedAt: number, resolution: "local" | "remote"): void {
++    this.db.insert(syncConflicts).values({ id: randomUUID(), entityKey, localUpdatedAt, remoteUpdatedAt, resolution, createdAt: Date.now() }).run();
++  }
++
+   setAppPrefs(patch: {
+     onboardingComplete?: boolean | undefined;
+     crashReporterOptIn?: boolean | undefined;
+diff --git a/packages/db/src/schema.ts b/packages/db/src/schema.ts
+index 82d3ec4..06a58ab 100644
+--- a/packages/db/src/schema.ts
++++ b/packages/db/src/schema.ts
+@@ -283,6 +283,15 @@ export const installedPacks = sqliteTable("installed_packs", {
+   updatedAt: integer("updated_at", { mode: "number" }).notNull(),
+ });
+ 
++export const syncConflicts = sqliteTable("sync_conflicts", {
++  id: text("id").primaryKey(),
++  entityKey: text("entity_key").notNull(),
++  localUpdatedAt: integer("local_updated_at", { mode: "number" }).notNull(),
++  remoteUpdatedAt: integer("remote_updated_at", { mode: "number" }).notNull(),
++  resolution: text("resolution").notNull(),
++  createdAt: integer("created_at", { mode: "number" }).notNull(),
++});
++
+ export const agentRuns = sqliteTable("agent_runs", {
+   id: text("id").primaryKey(),
+   projectId: text("project_id").notNull(),
+@@ -377,6 +386,7 @@ export const schema = {
+   projectToolRoots,
+   projectToolPermissions,
+   installedPacks,
++  syncConflicts,
+   agentRuns,
+   agentSteps,
+   agentHandoffs,
+diff --git a/packages/security/src/index.ts b/packages/security/src/index.ts
+index 2349252..33d1abe 100644
+--- a/packages/security/src/index.ts
++++ b/packages/security/src/index.ts
+@@ -18,6 +18,7 @@ export {
+ } from "./firewall";
+ export {
+   DB_MASTER_KEY_ACCOUNT,
++  SYNC_KEY_ACCOUNT,
+   KEYTAR_SERVICE,
+   MemorySecretStore,
+   loadOrCreateMasterKey,
+diff --git a/packages/security/src/secret-store.ts b/packages/security/src/secret-store.ts
+index aa6f7e9..bb09346 100644
+--- a/packages/security/src/secret-store.ts
++++ b/packages/security/src/secret-store.ts
+@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
+ 
+ export const KEYTAR_SERVICE = "ai-hub";
+ export const DB_MASTER_KEY_ACCOUNT = "db-master-key";
++export const SYNC_KEY_ACCOUNT = "sync-envelope-key";
+ 
+ export interface SecretStore {
+   getPassword(account: string): Promise<string | null>;
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index 13ea943..d9dd6d7 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -132,6 +132,7 @@ import type {
+   SecretsTestResult,
+   WorkspaceSession,
+ } from "./ipc-schemas";
++import type { SyncConfigDto, SyncConfigureInput, SyncPickRelayResult, SyncRunResult } from "./sync";
+ 
+ export interface HubQuickAiApi {
+   readClipboard: () => Promise<string>;
+@@ -201,6 +202,13 @@ export interface HubMarketplaceApi {
+   uninstall: (input: MarketplacePackIdInput) => Promise<void>;
+ }
+ 
++export interface HubSyncApi {
++  getConfig: () => Promise<SyncConfigDto>;
++  configure: (input: SyncConfigureInput) => Promise<SyncConfigDto>;
++  pickRelay: () => Promise<SyncPickRelayResult>;
++  run: () => Promise<SyncRunResult>;
++}
++
+ export interface HubSecretsApi {
+   list: () => Promise<ProviderKeyDto[]>;
+   save: (input: SecretsSaveInput) => Promise<ProviderKeyDto>;
+@@ -365,6 +373,7 @@ export interface HubApi {
+   updates: HubUpdatesApi;
+   providers: HubProvidersApi;
+   marketplace: HubMarketplaceApi;
++  sync: HubSyncApi;
+   secrets: HubSecretsApi;
+   search: HubSearchApi;
+   spendCaps: HubSpendCapsApi;
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 176389e..d0d2bab 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -1,5 +1,6 @@
+ export { type AppLocale, type ThemeMode, localeSchema, themeModeSchema } from "./appearance";
+ export { EXTENSION_API_VERSION, extensionManifestSchema, extensionPermissionSchema, type ExtensionManifest } from "./extensions";
++export { SYNC_CATEGORIES, syncCategoriesSchema, syncCategorySchema, syncConfigDtoSchema, syncConfigureInputSchema, syncPickRelayResultSchema, syncRunResultSchema, type SyncCategories, type SyncCategory, type SyncConfigDto, type SyncConfigureInput, type SyncPickRelayResult, type SyncRunResult } from "./sync";
+ export {
+   type HubApi,
+   type HubChatApi,
+@@ -8,6 +9,7 @@ export {
+   type HubProjectsApi,
+   type HubProvidersApi,
+   type HubMarketplaceApi,
++  type HubSyncApi,
+   type HubSearchApi,
+   type HubSecretsApi,
+   type HubSettingsApi,
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index 192bc55..9fc7cb6 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -47,6 +47,10 @@ export const IpcChannel = {
+   marketplaceList: "marketplace:list",
+   marketplaceInstall: "marketplace:install",
+   marketplaceUninstall: "marketplace:uninstall",
++  syncGetConfig: "sync:getConfig",
++  syncConfigure: "sync:configure",
++  syncPickRelay: "sync:pickRelay",
++  syncRun: "sync:run",
+   secretsList: "secrets:list",
+   secretsSave: "secrets:save",
+   secretsRemove: "secrets:remove",
+diff --git a/packages/shared/src/sync.ts b/packages/shared/src/sync.ts
+new file mode 100644
+index 0000000..506a80f
+--- /dev/null
++++ b/packages/shared/src/sync.ts
+@@ -0,0 +1,29 @@
++import { z } from "zod";
++
++export const SYNC_CATEGORIES = ["projects", "conversations", "settings", "packets", "skills"] as const;
++export const syncCategorySchema = z.enum(SYNC_CATEGORIES);
++export type SyncCategory = z.infer<typeof syncCategorySchema>;
++
++export const syncCategoriesSchema = z.object({
++  projects: z.boolean(),
++  conversations: z.boolean(),
++  settings: z.boolean(),
++  packets: z.boolean(),
++  skills: z.boolean(),
++}).strict();
++export type SyncCategories = z.infer<typeof syncCategoriesSchema>;
++
++export const syncConfigDtoSchema = z.object({
++  enabled: z.boolean(), relayConfigured: z.boolean(), phraseConfigured: z.boolean(), categories: syncCategoriesSchema,
++  lastSyncAt: z.string().datetime().nullable(), conflictCount: z.number().int().nonnegative(),
++}).strict();
++export type SyncConfigDto = z.infer<typeof syncConfigDtoSchema>;
++
++export const syncConfigureInputSchema = z.object({ enabled: z.boolean(), categories: syncCategoriesSchema, pairingPhrase: z.string().min(16).max(256).optional() }).strict();
++export type SyncConfigureInput = z.infer<typeof syncConfigureInputSchema>;
++
++export const syncPickRelayResultSchema = z.object({ status: z.enum(["selected", "cancelled"]), relayConfigured: z.boolean() }).strict();
++export type SyncPickRelayResult = z.infer<typeof syncPickRelayResultSchema>;
++
++export const syncRunResultSchema = z.object({ status: z.enum(["synced", "not_configured", "disabled"]), imported: z.number().int().nonnegative(), exported: z.number().int().nonnegative(), conflicts: z.number().int().nonnegative(), syncedAt: z.string().datetime().nullable() }).strict();
++export type SyncRunResult = z.infer<typeof syncRunResultSchema>;
