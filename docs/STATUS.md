@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave 
 |---|---|
 | Wave | **W31** |
 | Marco | E — V3 ecosystem |
-| State | `complete` |
+| State | `in_progress` |
 | Last completed | **W30** |
-| Next action | Iniciar a W31 somente após decisão de escopo de Team / Enterprise. |
+| Next action | Implementar o perfil Enterprise local: organização, políticas, auditoria e limites sem backend remoto. |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
