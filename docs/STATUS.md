@@ -6,11 +6,11 @@ Living session file. Agents **read this first** and **update it** when the wave 
 
 | Field | Value |
 |---|---|
-| Wave | **W30** |
+| Wave | **W31** |
 | Marco | E — V3 ecosystem |
-| State | `in_progress` |
-| Last completed | **W29** |
-| Next action | Definir contrato de sync opt-in, envelope cifrado e persistência de conflitos para a W30. |
+| State | `complete` |
+| Last completed | **W30** |
+| Next action | Iniciar a W31 somente após decisão de escopo de Team / Enterprise. |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
@@ -57,5 +57,5 @@ None.
 
 | Kind | Path |
 |---|---|
-| Review | `docs/reviews/W29/REVIEW.md` |
+| Review | `docs/reviews/W30/REVIEW.md` |
 | Latest ADR | `docs/ADR/ADR-W29-001-declarative-internal-marketplace.md` |
