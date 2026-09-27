@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
+import { auditLogDtoSchema, organizationCreateInputSchema, organizationDtoSchema, organizationIdInputSchema, projectOrganizationInputSchema } from "@ai-hub/shared";
 import { ZodError, z, type ZodType } from "zod";
 import {
   IpcChannel,
@@ -323,6 +324,12 @@ const hub: HubApi = {
     configure: (input) => invokeParsed(IpcChannel.syncConfigure, input, syncConfigureInputSchema, syncConfigDtoSchema),
     pickRelay: () => invokeParsed(IpcChannel.syncPickRelay, empty, emptyIpcPayloadSchema, syncPickRelayResultSchema),
     run: () => invokeParsed(IpcChannel.syncRun, empty, emptyIpcPayloadSchema, syncRunResultSchema),
+  },
+  organizations: {
+    list: () => invokeParsed(IpcChannel.organizationsList, empty, emptyIpcPayloadSchema, z.array(organizationDtoSchema)),
+    create: (input) => invokeParsed(IpcChannel.organizationsCreate, input, organizationCreateInputSchema, organizationDtoSchema),
+    listAudit: (input) => invokeParsed(IpcChannel.organizationsAuditList, input, organizationIdInputSchema, z.array(auditLogDtoSchema)),
+    assignProject: (input) => invokeAckWith(IpcChannel.organizationsAssignProject, input, projectOrganizationInputSchema),
   },
   secrets: {
     list: () => invokeParsed(IpcChannel.secretsList, empty, emptyIpcPayloadSchema, providerKeyListResultSchema),
