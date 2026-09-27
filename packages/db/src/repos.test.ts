@@ -56,6 +56,16 @@ describe("hub database", () => {
     hub.close();
   });
 
+  it("creates a local organization, audits it, and assigns a project", () => {
+    const { hub } = openTestDb();
+    const project = hub.repos.createProject("Enterprise project");
+    const organization = hub.repos.createOrganization("Acme");
+    hub.repos.assignProjectOrganization(project.id, organization.id);
+    expect(hub.repos.listOrganizations().map((item) => item.name)).toEqual(["Acme"]);
+    expect(hub.repos.listAuditLogs(organization.id).map((item) => item.action)).toEqual(["organization.created", "project.assigned"]);
+    hub.close();
+  });
+
   it("replicates a project conversation and messages without provider keys", async () => {
     const first = openTestDb();
     const second = openTestDb();
