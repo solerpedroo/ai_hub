@@ -1,4 +1,5 @@
 import type { AppLocale, ThemeMode } from "./appearance";
+import type { AuditLogDto, OrganizationCreateInput, OrganizationDto, OrganizationIdInput, ProjectOrganizationInput } from "./enterprise";
 import type { ChatAbortInput, ChatSendInput } from "./gateway";
 import type {
   AppearanceSettings,
@@ -209,6 +210,13 @@ export interface HubSyncApi {
   run: () => Promise<SyncRunResult>;
 }
 
+export interface HubOrganizationsApi {
+  list: () => Promise<OrganizationDto[]>;
+  create: (input: OrganizationCreateInput) => Promise<OrganizationDto>;
+  listAudit: (input: OrganizationIdInput) => Promise<AuditLogDto[]>;
+  assignProject: (input: ProjectOrganizationInput) => Promise<void>;
+}
+
 export interface HubSecretsApi {
   list: () => Promise<ProviderKeyDto[]>;
   save: (input: SecretsSaveInput) => Promise<ProviderKeyDto>;
@@ -374,6 +382,7 @@ export interface HubApi {
   providers: HubProvidersApi;
   marketplace: HubMarketplaceApi;
   sync: HubSyncApi;
+  organizations: HubOrganizationsApi;
   secrets: HubSecretsApi;
   search: HubSearchApi;
   spendCaps: HubSpendCapsApi;
