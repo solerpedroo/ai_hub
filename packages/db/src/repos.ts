@@ -26,6 +26,7 @@ import {
   projectNotes,
   projectToolPermissions,
   installedPacks,
+  syncConflicts,
   projectToolRoots,
   prompts,
   skills,
@@ -432,6 +433,34 @@ export interface AppPrefsRecord {
   voiceContinuous: boolean;
 }
 
+export interface SyncSettingsRecord {
+  enabled: boolean;
+  relayPath: string | null;
+  categories: { projects: boolean; conversations: boolean; settings: boolean; packets: boolean; skills: boolean };
+  lastSyncAt: string | null;
+}
+
+export interface SyncSnapshot {
+  version: 1;
+  generatedAt: string;
+  projects: ProjectRecord[];
+  conversations: ConversationRecord[];
+  messages: MessageRecord[];
+  appearance?: AppearanceRecord;
+  appPrefs?: AppPrefsRecord;
+  packets: ContextPacketStored[];
+  skills: SkillRecord[];
+}
+
+export interface SyncConflictRecord {
+  id: string;
+  entityKey: string;
+  localUpdatedAt: string;
+  remoteUpdatedAt: string;
+  resolution: "local" | "remote";
+  createdAt: string;
+}
+
 const DEFAULT_APP_PREFS: AppPrefsRecord = {
   onboardingComplete: false,
   crashReporterOptIn: false,
@@ -465,6 +494,7 @@ function isFirewallPolicy(value: unknown): value is AppPrefsRecord["firewallPoli
 
 const APPEARANCE_KEY = "appearance";
 const APP_PREFS_KEY = "app-prefs";
+const SYNC_SETTINGS_KEY = "sync-settings";
 const SESSION_KEY = "workspace-session";
 const BRANCH_LABELS_PREFIX = "branch-labels:";
 const CUSTOM_BASE_URL_PREFIX = "custom-base-url:";
@@ -1128,7 +1158,7 @@ export class HubRepos {
         });
       }
       this.db.update(conversations).set({ updatedAt }).where(eq(conversations.id, id)).run();
-    })();
+    });
     return { outcome: "created", conversationId: id };
   }
 
@@ -1715,6 +1745,101 @@ export class HubRepos {
       audioDiskOptIn: record.audioDiskOptIn === true,
       voiceContinuous: record.voiceContinuous === true,
     };
+  }
+
+  getSyncSettings(): SyncSettingsRecord {
+    const row = this.db.select().from(settings).where(eq(settings.key, SYNC_SETTINGS_KEY)).get();
+    if (!row) return { enabled: false, relayPath: null, categories: { projects: true, conversations: true, settings: true, packets: true, skills: true }, lastSyncAt: null };
+    try {
+      const parsed = JSON.parse(decryptUtf8(row.value, this.masterKey)) as Partial<SyncSettingsRecord>;
+      const categories = parsed.categories;
+      return {
+        enabled: parsed.enabled === true,
+        relayPath: typeof parsed.relayPath === "string" ? parsed.relayPath : null,
+        categories: categories && typeof categories === "object" ? { projects: categories.projects === true, conversations: categories.conversations === true, settings: categories.settings === true, packets: categories.packets === true, skills: categories.skills === true } : { projects: true, conversations: true, settings: true, packets: true, skills: true },
+        lastSyncAt: typeof parsed.lastSyncAt === "string" ? parsed.lastSyncAt : null,
+      };
+    } catch { return { enabled: false, relayPath: null, categories: { projects: true, conversations: true, settings: true, packets: true, skills: true }, lastSyncAt: null }; }
+  }
+
+  setSyncSettings(patch: Partial<SyncSettingsRecord>): SyncSettingsRecord {
+    const current = this.getSyncSettings();
+    const next = { ...current, ...patch, categories: patch.categories ?? current.categories };
+    const now = Date.now();
+    this.db.insert(settings).values({ key: SYNC_SETTINGS_KEY, value: encryptUtf8(JSON.stringify(next), this.masterKey), updatedAt: now }).onConflictDoUpdate({ target: settings.key, set: { value: encryptUtf8(JSON.stringify(next), this.masterKey), updatedAt: now } }).run();
+    return next;
+  }
+
+  exportSyncSnapshot(): SyncSnapshot {
+    const conversationRows = this.db.select().from(conversations).all().filter((row) => row.kind !== "playground");
+    const syncedConversations = conversationRows.map((row) => this.toConversation(row));
+    return {
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      projects: this.listProjects(),
+      conversations: syncedConversations,
+      messages: conversationRows.flatMap((row) => this.listMessages(row.id)),
+      appearance: this.getAppearance(),
+      appPrefs: this.getAppPrefs(),
+      packets: this.db.select().from(contextPackets).all().map((row) => this.getContextPacket(row.id)).filter((packet): packet is ContextPacketStored => packet !== null),
+      skills: this.listSkills(),
+    };
+  }
+
+  importSyncSnapshot(snapshot: SyncSnapshot): { imported: number; conflicts: number } {
+    let imported = 0;
+    let conflicts = 0;
+    const toMs = (value: string): number => Date.parse(value);
+    this.db.transaction(() => {
+      for (const item of snapshot.projects) {
+        const local = this.db.select().from(projects).where(eq(projects.id, item.id)).get();
+        if (local && local.updatedAt === toMs(item.updatedAt)) continue;
+        if (local && local.updatedAt > toMs(item.updatedAt)) { this.recordSyncConflict(`project:${item.id}`, local.updatedAt, toMs(item.updatedAt), "local"); conflicts += 1; continue; }
+        if (local) { this.recordSyncConflict(`project:${item.id}`, local.updatedAt, toMs(item.updatedAt), "remote"); conflicts += 1; }
+        this.db.insert(projects).values({ id: item.id, nameCipher: encryptUtf8(item.name, this.masterKey), color: item.color, instructionsCipher: item.instructions ? encryptUtf8(item.instructions, this.masterKey) : null, preferredModel: item.preferredModel, preferredProvider: item.preferredProvider, createdAt: toMs(item.createdAt), updatedAt: toMs(item.updatedAt) }).onConflictDoUpdate({ target: projects.id, set: { nameCipher: encryptUtf8(item.name, this.masterKey), color: item.color, instructionsCipher: item.instructions ? encryptUtf8(item.instructions, this.masterKey) : null, preferredModel: item.preferredModel, preferredProvider: item.preferredProvider, updatedAt: toMs(item.updatedAt) } }).run();
+        imported += 1;
+      }
+      for (const item of snapshot.conversations) {
+        if (item.projectId && !this.db.select().from(projects).where(eq(projects.id, item.projectId)).get()) continue;
+        const local = this.db.select().from(conversations).where(eq(conversations.id, item.id)).get();
+        if (local && local.updatedAt === toMs(item.updatedAt)) continue;
+        if (local && local.updatedAt > toMs(item.updatedAt)) { this.recordSyncConflict(`conversation:${item.id}`, local.updatedAt, toMs(item.updatedAt), "local"); conflicts += 1; continue; }
+        if (local) { this.recordSyncConflict(`conversation:${item.id}`, local.updatedAt, toMs(item.updatedAt), "remote"); conflicts += 1; }
+        this.db.insert(conversations).values({ id: item.id, projectId: item.projectId, titleCipher: encryptUtf8(item.title, this.masterKey), createdAt: toMs(item.createdAt), updatedAt: toMs(item.updatedAt), importSource: item.importSource, externalId: null, activePacketId: null, packetAppliedAt: null, kind: "chat", runMode: item.runMode, effortLevel: item.effortLevel }).onConflictDoUpdate({ target: conversations.id, set: { projectId: item.projectId, titleCipher: encryptUtf8(item.title, this.masterKey), updatedAt: toMs(item.updatedAt), runMode: item.runMode, effortLevel: item.effortLevel } }).run();
+        imported += 1;
+      }
+      for (const item of snapshot.messages.sort((left, right) => left.createdAt.localeCompare(right.createdAt))) {
+        if (!this.db.select().from(conversations).where(eq(conversations.id, item.conversationId)).get()) continue;
+        const exists = this.db.select().from(messages).where(eq(messages.id, item.id)).get();
+        if (exists) continue;
+        this.db.insert(messages).values({ id: item.id, conversationId: item.conversationId, parentId: item.parentId, branchId: item.branchId, isActiveBranch: item.isActiveBranch ? 1 : 0, role: item.role, contentCipher: encryptUtf8(item.content, this.masterKey), status: item.status, createdAt: toMs(item.createdAt), pinned: item.pinned ? 1 : 0 }).run();
+        imported += 1;
+      }
+      if (snapshot.appearance) this.setAppearance(snapshot.appearance);
+      if (snapshot.appPrefs) this.setAppPrefs(snapshot.appPrefs);
+      for (const item of snapshot.packets) {
+        if (item.projectId && !this.db.select().from(projects).where(eq(projects.id, item.projectId)).get()) continue;
+        if (this.db.select().from(contextPackets).where(eq(contextPackets.id, item.id)).get()) continue;
+        this.db.insert(contextPackets).values({ id: item.id, projectId: item.projectId, payloadCipher: encryptUtf8(item.payloadJson, this.masterKey), tokenEstimate: item.tokenEstimate, createdAt: toMs(item.createdAt), privacyMode: item.privacyMode, origin: JSON.stringify(item.origin), version: item.version }).run();
+        imported += 1;
+      }
+      for (const item of snapshot.skills) {
+        const local = this.db.select().from(skills).where(eq(skills.id, item.id)).get();
+        if (local && local.updatedAt > toMs(item.updatedAt)) { conflicts += 1; continue; }
+        if (item.factoryId && this.db.select().from(skills).where(eq(skills.factoryId, item.factoryId)).get() && !local) continue;
+        this.db.insert(skills).values({ id: item.id, folder: item.folder, titleCipher: encryptUtf8(item.title, this.masterKey), descriptionCipher: encryptUtf8(item.description, this.masterKey), definitionCipher: encryptUtf8(this.skillDefinitionJson(item), this.masterKey), preferredModel: item.preferredModel, factoryId: item.factoryId, createdAt: toMs(item.createdAt), updatedAt: toMs(item.updatedAt) }).onConflictDoUpdate({ target: skills.id, set: { folder: item.folder, titleCipher: encryptUtf8(item.title, this.masterKey), descriptionCipher: encryptUtf8(item.description, this.masterKey), definitionCipher: encryptUtf8(this.skillDefinitionJson(item), this.masterKey), preferredModel: item.preferredModel, updatedAt: toMs(item.updatedAt) } }).run();
+        imported += 1;
+      }
+    });
+    return { imported, conflicts };
+  }
+
+  listSyncConflicts(limit = 100): SyncConflictRecord[] {
+    return this.db.select().from(syncConflicts).all().sort((a, b) => b.createdAt - a.createdAt).slice(0, limit).map((row) => ({ id: row.id, entityKey: row.entityKey, localUpdatedAt: iso(row.localUpdatedAt), remoteUpdatedAt: iso(row.remoteUpdatedAt), resolution: row.resolution === "local" ? "local" : "remote", createdAt: iso(row.createdAt) }));
+  }
+
+  private recordSyncConflict(entityKey: string, localUpdatedAt: number, remoteUpdatedAt: number, resolution: "local" | "remote"): void {
+    this.db.insert(syncConflicts).values({ id: randomUUID(), entityKey, localUpdatedAt, remoteUpdatedAt, resolution, createdAt: Date.now() }).run();
   }
 
   setAppPrefs(patch: {
