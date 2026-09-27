@@ -294,8 +294,14 @@ function snapshotDecision(blocked: string | null, warnings: string[], allowOnce:
 export async function sendChat(input: PreparedChatSendInput, sender: WebContents): Promise<ChatSendResult> {
   const repos = getHubDatabase().repos;
   const prefs = repos.getAppPrefs();
+  const organization = repos.listOrganizations()[0];
+  if (organization?.policy.allowedModels.length && !organization.policy.allowedModels.includes(input.model)) {
+    throw new Error("enterprise:model_not_allowed");
+  }
   if (input.mode === "send" || input.mode === "edit") {
-    const firewall = applyContextFirewall(input.content, prefs.firewallPolicy);
+    const firewall = applyContextFirewall(input.content, organization?.policy.toolPolicy.blockPii
+      ? { ...prefs.firewallPolicy, email: "block", cpf: "block" }
+      : prefs.firewallPolicy);
     if (firewall.blocked.length > 0) {
       throw new Error(`firewall:blocked:${firewall.blocked.join(",")}`);
     }
