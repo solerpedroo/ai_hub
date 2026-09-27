@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -31,6 +31,9 @@ test("syncs a conversation between isolated device profiles without provider key
       return { projectId: project.id, conversationId: conversation.id };
     }, { phrase });
     await first.close();
+    const relayEnvelope = readFileSync(path.join(relay, "ai-hub-sync-v1.envelope"), "utf8");
+    expect(relayEnvelope).not.toContain("Message from device one");
+    expect(relayEnvelope).not.toContain("sync-source-only");
 
     const second = await launch(secondData, relay);
     const secondWindow = await second.firstWindow();
