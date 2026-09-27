@@ -111,6 +111,7 @@ import {
   marketplacePackDtoSchema,
   marketplacePackIdInputSchema,
   marketplacePackListSchema,
+  syncConfigDtoSchema, syncConfigureInputSchema, syncPickRelayResultSchema, syncRunResultSchema,
   providerListResultSchema,
   searchInputSchema,
   searchResultSchema,
@@ -316,6 +317,12 @@ const hub: HubApi = {
     list: () => invokeParsed(IpcChannel.marketplaceList, empty, emptyIpcPayloadSchema, marketplacePackListSchema),
     install: (input) => invokeParsed(IpcChannel.marketplaceInstall, input, marketplacePackIdInputSchema, marketplacePackDtoSchema),
     uninstall: (input) => invokeAckWith(IpcChannel.marketplaceUninstall, input, marketplacePackIdInputSchema),
+  },
+  sync: {
+    getConfig: () => invokeParsed(IpcChannel.syncGetConfig, empty, emptyIpcPayloadSchema, syncConfigDtoSchema),
+    configure: (input) => invokeParsed(IpcChannel.syncConfigure, input, syncConfigureInputSchema, syncConfigDtoSchema),
+    pickRelay: () => invokeParsed(IpcChannel.syncPickRelay, empty, emptyIpcPayloadSchema, syncPickRelayResultSchema),
+    run: () => invokeParsed(IpcChannel.syncRun, empty, emptyIpcPayloadSchema, syncRunResultSchema),
   },
   secrets: {
     list: () => invokeParsed(IpcChannel.secretsList, empty, emptyIpcPayloadSchema, providerKeyListResultSchema),
