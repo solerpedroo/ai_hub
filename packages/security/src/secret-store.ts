@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 
 export const KEYTAR_SERVICE = "ai-hub";
 export const DB_MASTER_KEY_ACCOUNT = "db-master-key";
+export const SYNC_KEY_ACCOUNT = "sync-envelope-key";
 
 export interface SecretStore {
   getPassword(account: string): Promise<string | null>;
