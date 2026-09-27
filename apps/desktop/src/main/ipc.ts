@@ -1,4 +1,5 @@
 import { clipboard, ipcMain } from "electron";
+import { auditLogDtoSchema, organizationCreateInputSchema, organizationDtoSchema, organizationIdInputSchema, projectOrganizationInputSchema } from "@ai-hub/shared";
 import { ZodError, z, type ZodType } from "zod";
 import {
   IpcChannel,
@@ -503,6 +504,10 @@ export function registerWorkspaceIpc(): void {
   registerHandler(IpcChannel.syncConfigure, syncConfigureInputSchema, syncConfigDtoSchema, (input) => configureSync(input));
   registerHandler(IpcChannel.syncPickRelay, emptyIpcPayloadSchema, syncPickRelayResultSchema, (_input, event) => pickSyncRelay(event.sender));
   registerHandler(IpcChannel.syncRun, emptyIpcPayloadSchema, syncRunResultSchema, () => runSync());
+  registerHandler(IpcChannel.organizationsList, emptyIpcPayloadSchema, z.array(organizationDtoSchema), () => getHubDatabase().repos.listOrganizations());
+  registerHandler(IpcChannel.organizationsCreate, organizationCreateInputSchema, organizationDtoSchema, (input) => getHubDatabase().repos.createOrganization(input.name));
+  registerHandler(IpcChannel.organizationsAuditList, organizationIdInputSchema, z.array(auditLogDtoSchema), (input) => getHubDatabase().repos.listAuditLogs(input.organizationId));
+  registerHandler(IpcChannel.organizationsAssignProject, projectOrganizationInputSchema, ipcAckResultSchema, (input) => { getHubDatabase().repos.assignProjectOrganization(input.projectId, input.organizationId); });
 
   registerHandler(IpcChannel.secretsList, emptyIpcPayloadSchema, providerKeyListResultSchema, async () => {
     const keys = await getHubDatabase().repos.listProviderKeys();
