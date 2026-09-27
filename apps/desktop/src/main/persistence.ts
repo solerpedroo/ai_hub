@@ -2,11 +2,12 @@ import { join } from "node:path";
 import { app } from "electron";
 import { openHubDatabase, type HubDatabase } from "@ai-hub/db";
 import { FACTORY_PROMPTS, FACTORY_SKILLS } from "@ai-hub/shared";
-import { loadOrCreateMasterKey, MemorySecretStore } from "@ai-hub/security";
+import { loadOrCreateMasterKey, MemorySecretStore, type SecretStore } from "@ai-hub/security";
 import { KeytarSecretStore } from "@ai-hub/security/keytar";
 import { isE2eMode } from "./e2e-mode";
 
 let hub: HubDatabase | null = null;
+let secretStore: SecretStore | null = null;
 
 async function seedE2eWorkspace(database: HubDatabase): Promise<void> {
   const project = database.repos.createProject("E2E");
@@ -37,6 +38,7 @@ export async function bootPersistence(): Promise<HubDatabase> {
     return hub;
   }
   const store = isE2eMode() ? new MemorySecretStore() : new KeytarSecretStore();
+  secretStore = store;
   const masterKey = await loadOrCreateMasterKey(store);
   const dbPath = join(app.getPath("userData"), "ai-hub.sqlite");
   hub = openHubDatabase({ path: dbPath, masterKey, secretStore: store });
@@ -55,4 +57,9 @@ export function getHubDatabase(): HubDatabase {
     throw new Error("Database is not ready");
   }
   return hub;
+}
+
+export function getHubSecretStore(): SecretStore {
+  if (!secretStore) throw new Error("Secret store is not ready");
+  return secretStore;
 }
