@@ -5,6 +5,7 @@ import type {
   AppPrefs,
   MonthlyCostsResult,
   MarketplacePackDto,
+  OrganizationDto,
   SyncConfigDto,
   ProviderDto,
   ProviderKeyDto,
@@ -55,6 +56,8 @@ export function SettingsView({
   const [marketplacePacks, setMarketplacePacks] = useState<MarketplacePackDto[]>([]);
   const [syncConfig, setSyncConfig] = useState<SyncConfigDto | null>(null);
   const [syncPhrase, setSyncPhrase] = useState("");
+  const [organizations, setOrganizations] = useState<OrganizationDto[]>([]);
+  const [organizationName, setOrganizationName] = useState("");
   const generalRef = useRef<HTMLHeadingElement>(null);
   const providerRef = useRef<HTMLSelectElement>(null);
   const capRef = useRef<HTMLInputElement>(null);
@@ -107,6 +110,7 @@ export function SettingsView({
       if (!cancelled) setError(t("workspace.error.generic"));
     });
     void window.hub.sync.getConfig().then((next) => { if (!cancelled) setSyncConfig(next); }).catch(() => undefined);
+    void window.hub.organizations.list().then((list) => { if (!cancelled) setOrganizations(list); }).catch(() => undefined);
     void window.hub.projects.list().then((list) => {
       if (!cancelled) {
         setProjects(list);
@@ -221,6 +225,12 @@ export function SettingsView({
             </div>
           </>
         ) : <p className="text-muted-foreground">{t("costTracker.loading")}</p>}
+      </section>
+      <section className="flex flex-col gap-2">
+        <h2 className="text-[12px] font-medium">{t("enterprise.title")}</h2>
+        <p className="text-muted-foreground">{t("enterprise.hint")}</p>
+        <div className="flex gap-2"><Input value={organizationName} placeholder={t("enterprise.name")} onChange={(event) => setOrganizationName(event.target.value)} /><Button type="button" disabled={!organizationName.trim()} onClick={() => { void window.hub.organizations.create({ name: organizationName }).then((item) => { setOrganizations((current) => [...current, item]); setOrganizationName(""); }).catch(() => setError(t("workspace.error.generic"))); }}>{t("enterprise.create")}</Button></div>
+        {organizations.map((organization) => <p key={organization.id} className="text-[11px] text-muted-foreground">{organization.name}</p>)}
       </section>
       <section className="flex flex-col gap-2">
         <h2 className="text-[12px] font-medium">{t("sync.title")}</h2>
