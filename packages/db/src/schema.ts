@@ -36,6 +36,7 @@ export const messages = sqliteTable("messages", {
   contentCipher: text("content_cipher").notNull(),
   status: text("status").notNull(),
   createdAt: integer("created_at", { mode: "number" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "number" }).notNull(),
   pinned: integer("pinned", { mode: "number" }).notNull().default(0),
 });
 
