@@ -410,6 +410,18 @@ CREATE TABLE installed_packs (
 );
 `;
 
+export const MIGRATION_0021_SQL = `
+CREATE TABLE sync_conflicts (
+  id TEXT PRIMARY KEY,
+  entity_key TEXT NOT NULL,
+  local_updated_at INTEGER NOT NULL,
+  remote_updated_at INTEGER NOT NULL,
+  resolution TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX sync_conflicts_created_idx ON sync_conflicts(created_at);
+`;
+
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
   { version: 2, sql: MIGRATION_0002_SQL },
@@ -431,4 +443,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 18, sql: MIGRATION_0018_SQL },
   { version: 19, sql: MIGRATION_0019_SQL },
   { version: 20, sql: MIGRATION_0020_SQL },
+  { version: 21, sql: MIGRATION_0021_SQL },
 ];
