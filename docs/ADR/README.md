@@ -34,6 +34,7 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 
 | ID | Onda | Título | Status |
 |---|---|---|---|
+| [ADR-W30-001](./ADR-W30-001-encrypted-folder-relay-sync.md) | W30 | Encrypted folder relay sync | accepted |
 | [ADR-W29-001](./ADR-W29-001-declarative-internal-marketplace.md) | W29 | Declarative internal marketplace | accepted |
 | [ADR-W00-001](./ADR-W00-001-electron-vite-monorepo.md) | W00 | Electron-vite + pnpm + Turborepo | accepted |
 | [ADR-W00-002](./ADR-W00-002-shadcn-tailwind-i18n.md) | W00 | shadcn, Tailwind v3, i18n, tema no renderer | accepted |
