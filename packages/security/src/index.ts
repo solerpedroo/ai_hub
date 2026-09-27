@@ -18,6 +18,7 @@ export {
 } from "./firewall";
 export {
   DB_MASTER_KEY_ACCOUNT,
+  SYNC_KEY_ACCOUNT,
   KEYTAR_SERVICE,
   MemorySecretStore,
   loadOrCreateMasterKey,
