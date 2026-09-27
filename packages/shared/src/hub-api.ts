@@ -132,6 +132,7 @@ import type {
   SecretsTestResult,
   WorkspaceSession,
 } from "./ipc-schemas";
+import type { SyncConfigDto, SyncConfigureInput, SyncPickRelayResult, SyncRunResult } from "./sync";
 
 export interface HubQuickAiApi {
   readClipboard: () => Promise<string>;
@@ -199,6 +200,13 @@ export interface HubMarketplaceApi {
   list: () => Promise<MarketplacePackDto[]>;
   install: (input: MarketplacePackIdInput) => Promise<MarketplacePackDto>;
   uninstall: (input: MarketplacePackIdInput) => Promise<void>;
+}
+
+export interface HubSyncApi {
+  getConfig: () => Promise<SyncConfigDto>;
+  configure: (input: SyncConfigureInput) => Promise<SyncConfigDto>;
+  pickRelay: () => Promise<SyncPickRelayResult>;
+  run: () => Promise<SyncRunResult>;
 }
 
 export interface HubSecretsApi {
@@ -365,6 +373,7 @@ export interface HubApi {
   updates: HubUpdatesApi;
   providers: HubProvidersApi;
   marketplace: HubMarketplaceApi;
+  sync: HubSyncApi;
   secrets: HubSecretsApi;
   search: HubSearchApi;
   spendCaps: HubSpendCapsApi;
