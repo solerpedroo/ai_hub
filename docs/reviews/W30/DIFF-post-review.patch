@@ -1,0 +1,552 @@
+diff --git a/apps/desktop/e2e/sync.spec.ts b/apps/desktop/e2e/sync.spec.ts
+index a4b9825..836a5da 100644
+--- a/apps/desktop/e2e/sync.spec.ts
++++ b/apps/desktop/e2e/sync.spec.ts
+@@ -1,4 +1,4 @@
+-import { mkdtempSync, rmSync } from "node:fs";
++import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+ import { tmpdir } from "node:os";
+ import path from "node:path";
+ import { createRequire } from "node:module";
+@@ -31,6 +31,9 @@ test("syncs a conversation between isolated device profiles without provider key
+       return { projectId: project.id, conversationId: conversation.id };
+     }, { phrase });
+     await first.close();
++    const relayEnvelope = readFileSync(path.join(relay, "ai-hub-sync-v1.envelope"), "utf8");
++    expect(relayEnvelope).not.toContain("Message from device one");
++    expect(relayEnvelope).not.toContain("sync-source-only");
+ 
+     const second = await launch(secondData, relay);
+     const secondWindow = await second.firstWindow();
+diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts
+index ca6078c..d0ca083 100644
+--- a/apps/desktop/src/main/chat-session.ts
++++ b/apps/desktop/src/main/chat-session.ts
+@@ -272,6 +272,7 @@ function pendingUser(
+     content,
+     status: "complete",
+     createdAt: new Date().toISOString(),
++    updatedAt: new Date().toISOString(),
+     receipt: null,
+     pinned: false,
+   };
+diff --git a/apps/desktop/src/main/sync-service.ts b/apps/desktop/src/main/sync-service.ts
+index fea3780..7d086f5 100644
+--- a/apps/desktop/src/main/sync-service.ts
++++ b/apps/desktop/src/main/sync-service.ts
+@@ -1,8 +1,8 @@
+-import { scryptSync } from "node:crypto";
+-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
++import { randomUUID, scryptSync } from "node:crypto";
++import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+ import { join } from "node:path";
+ import { BrowserWindow, dialog } from "electron";
+-import type { SyncConfigDto, SyncConfigureInput, SyncPickRelayResult, SyncRunResult } from "@ai-hub/shared";
++import { syncSnapshotSchema, type SyncConfigDto, type SyncConfigureInput, type SyncPickRelayResult, type SyncRunResult } from "@ai-hub/shared";
+ import { decryptUtf8, encryptUtf8, SYNC_KEY_ACCOUNT } from "@ai-hub/security";
+ import type { SyncSnapshot } from "@ai-hub/db";
+ import { getHubDatabase, getHubSecretStore } from "./persistence";
+@@ -12,6 +12,35 @@ function relayPath(localPath: string | null): string | null {
+   return localPath ?? (isE2eMode() ? process.env.AI_HUB_E2E_SYNC_RELAY ?? null : null);
+ }
+ 
++const RELAY_LOCK_STALE_MS = 120_000;
++const RELAY_LOCK_RETRY_MS = 200;
++const RELAY_LOCK_ATTEMPTS = 50;
++
++function pause(ms: number): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, ms));
++}
++
++async function acquireRelayLock(sharedRelay: string): Promise<() => Promise<void>> {
++  const lockPath = join(sharedRelay, "ai-hub-sync-v1.lock");
++  for (let attempt = 0; attempt < RELAY_LOCK_ATTEMPTS; attempt += 1) {
++    try {
++      const handle = await open(lockPath, "wx", 0o600);
++      await handle.writeFile(`${process.pid}:${Date.now()}`, "utf8");
++      await handle.close();
++      return async () => { try { await unlink(lockPath); } catch (error) { if (!(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "ENOENT")) throw error; } };
++    } catch (error) {
++      if (!(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "EEXIST")) throw error;
++      const lock = await stat(lockPath).catch(() => null);
++      if (lock && Date.now() - lock.mtimeMs > RELAY_LOCK_STALE_MS) {
++        await unlink(lockPath).catch(() => undefined);
++        continue;
++      }
++      await pause(RELAY_LOCK_RETRY_MS);
++    }
++  }
++  throw new Error("sync:relay_busy");
++}
++
+ function config(): SyncConfigDto {
+   const local = getHubDatabase().repos.getSyncSettings();
+   return { enabled: local.enabled, relayConfigured: relayPath(local.relayPath) !== null, phraseConfigured: false, categories: local.categories, lastSyncAt: local.lastSyncAt, conflictCount: getHubDatabase().repos.listSyncConflicts().length };
+@@ -49,43 +78,47 @@ export async function runSync(): Promise<SyncRunResult> {
+   if (!sharedRelay || !encodedKey) return { status: "not_configured", imported: 0, exported: 0, conflicts: 0, syncedAt: null };
+   const key = Buffer.from(encodedKey, "base64");
+   const relayFile = join(sharedRelay, "ai-hub-sync-v1.envelope");
++  await mkdir(sharedRelay, { recursive: true });
++  const releaseRelayLock = await acquireRelayLock(sharedRelay);
+   let imported = 0;
+   let conflicts = 0;
+   try {
+-    const encrypted = await readFile(relayFile, "utf8");
+-    const candidate: unknown = JSON.parse(decryptUtf8(encrypted, key));
+-    if (!candidate || typeof candidate !== "object" || (candidate as { version?: unknown }).version !== 1 || !Array.isArray((candidate as { projects?: unknown }).projects) || !Array.isArray((candidate as { conversations?: unknown }).conversations) || !Array.isArray((candidate as { messages?: unknown }).messages)) throw new Error("sync:invalid_envelope");
+-    const remote = candidate as SyncSnapshot;
+-    const safeRemote: SyncSnapshot = {
+-      ...remote,
+-      projects: local.categories.projects ? remote.projects : [],
+-      conversations: local.categories.conversations ? remote.conversations : [],
+-      messages: local.categories.conversations ? remote.messages : [],
+-      packets: local.categories.packets && Array.isArray(remote.packets) ? remote.packets : [],
+-      skills: local.categories.skills && Array.isArray(remote.skills) ? remote.skills : [],
+-      ...(local.categories.settings && remote.appearance ? { appearance: remote.appearance } : {}),
+-      ...(local.categories.settings && remote.appPrefs ? { appPrefs: remote.appPrefs } : {}),
++    try {
++      const encrypted = await readFile(relayFile, "utf8");
++      const candidate: unknown = JSON.parse(decryptUtf8(encrypted, key));
++      const remote = syncSnapshotSchema.parse(candidate) as SyncSnapshot;
++      const safeRemote: SyncSnapshot = {
++        ...remote,
++        projects: local.categories.projects ? remote.projects : [],
++        conversations: local.categories.conversations ? remote.conversations : [],
++        messages: local.categories.conversations ? remote.messages : [],
++        packets: local.categories.packets && Array.isArray(remote.packets) ? remote.packets : [],
++        skills: local.categories.skills && Array.isArray(remote.skills) ? remote.skills : [],
++        ...(local.categories.settings && remote.appearance ? { appearance: remote.appearance } : {}),
++      };
++      const outcome = getHubDatabase().repos.importSyncSnapshot(safeRemote);
++      imported = outcome.imported;
++      conflicts = outcome.conflicts;
++    } catch (error) {
++      if (!(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "ENOENT")) throw error;
++    }
++    const current = getHubDatabase().repos.exportSyncSnapshot();
++    const snapshot: SyncSnapshot = {
++      ...current,
++      projects: local.categories.projects ? current.projects : [],
++      conversations: local.categories.conversations ? current.conversations : [],
++      messages: local.categories.conversations ? current.messages : [],
++      packets: local.categories.packets ? current.packets : [],
++      skills: local.categories.skills ? current.skills : [],
++      ...(local.categories.settings ? { appearance: current.appearance } : {}),
+     };
+-    const outcome = getHubDatabase().repos.importSyncSnapshot(safeRemote);
+-    imported = outcome.imported;
+-    conflicts = outcome.conflicts;
+-  } catch (error) {
+-    if (!(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "ENOENT")) throw error;
++    const temporary = `${relayFile}.${randomUUID()}.tmp`;
++    await writeFile(temporary, encryptUtf8(JSON.stringify(snapshot), key), { encoding: "utf8", mode: 0o600 });
++    await rename(temporary, relayFile);
++    const syncedAt = new Date().toISOString();
++    getHubDatabase().repos.setSyncSettings({ lastSyncAt: syncedAt });
++    return { status: "synced", imported, exported: snapshot.projects.length + snapshot.conversations.length + snapshot.messages.length, conflicts, syncedAt };
++  } finally {
++    await releaseRelayLock();
+   }
+-  const current = getHubDatabase().repos.exportSyncSnapshot();
+-  const snapshot: SyncSnapshot = {
+-    ...current,
+-    projects: local.categories.projects ? current.projects : [],
+-    conversations: local.categories.conversations ? current.conversations : [],
+-    messages: local.categories.conversations ? current.messages : [],
+-    packets: local.categories.packets ? current.packets : [],
+-    skills: local.categories.skills ? current.skills : [],
+-    ...(local.categories.settings ? { appearance: current.appearance, appPrefs: current.appPrefs } : {}),
+-  };
+-  const temporary = `${relayFile}.tmp`;
+-  await writeFile(temporary, encryptUtf8(JSON.stringify(snapshot), key), { encoding: "utf8", mode: 0o600 });
+-  await rename(temporary, relayFile);
+-  const syncedAt = new Date().toISOString();
+-  getHubDatabase().repos.setSyncSettings({ lastSyncAt: syncedAt });
+-  return { status: "synced", imported, exported: snapshot.projects.length + snapshot.conversations.length + snapshot.messages.length, conflicts, syncedAt };
+ }
+diff --git a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+index 8d78484..5e79790 100644
+--- a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+@@ -226,7 +226,7 @@ export function SettingsView({
+         <h2 className="text-[12px] font-medium">{t("sync.title")}</h2>
+         <p className="text-muted-foreground">{t("sync.hint")}</p>
+         <label className="flex items-center gap-2 text-[12px]">
+-          <input type="checkbox" checked={syncConfig?.enabled === true} onChange={(event) => { if (!syncConfig) return; void window.hub.sync.configure({ enabled: event.target.checked, categories: syncConfig.categories, ...(syncPhrase ? { pairingPhrase: syncPhrase } : {}) }).then((next) => { setSyncConfig(next); setSyncPhrase(""); }).catch(() => setError(t("sync.error"))); }} />
++          <input type="checkbox" checked={syncConfig?.enabled === true} onChange={(event) => { if (!syncConfig) return; void window.hub.sync.configure({ enabled: event.target.checked, categories: syncConfig.categories, ...(syncPhrase ? { pairingPhrase: syncPhrase } : {}) }).then(setSyncConfig).catch(() => setError(t("sync.error"))).finally(() => setSyncPhrase("")); }} />
+           {t("sync.enable")}
+         </label>
+         <fieldset className="flex flex-wrap gap-x-3 gap-y-1 border-0 p-0">
+@@ -236,7 +236,7 @@ export function SettingsView({
+               <input type="checkbox" checked={syncConfig?.categories[category] ?? false} disabled={!syncConfig} onChange={(event) => {
+                 if (!syncConfig) return;
+                 const categories = { ...syncConfig.categories, [category]: event.target.checked };
+-                void window.hub.sync.configure({ enabled: syncConfig.enabled, categories, ...(syncPhrase ? { pairingPhrase: syncPhrase } : {}) }).then((next) => { setSyncConfig(next); setSyncPhrase(""); }).catch(() => setError(t("sync.error")));
++                void window.hub.sync.configure({ enabled: syncConfig.enabled, categories, ...(syncPhrase ? { pairingPhrase: syncPhrase } : {}) }).then(setSyncConfig).catch(() => setError(t("sync.error"))).finally(() => setSyncPhrase(""));
+               }} />
+               {t(`sync.category.${category}`)}
+             </label>
+diff --git a/docs/ADR/ADR-W30-001-encrypted-folder-relay-sync.md b/docs/ADR/ADR-W30-001-encrypted-folder-relay-sync.md
+index b8c32ef..4201173 100644
+--- a/docs/ADR/ADR-W30-001-encrypted-folder-relay-sync.md
++++ b/docs/ADR/ADR-W30-001-encrypted-folder-relay-sync.md
+@@ -15,7 +15,7 @@ A sincronização deve continuar opcional e local-first, funcionar entre Windows
+ 
+ Usar um relay de pasta compartilhada escolhido pelo usuário. O Hub lê e escreve um único envelope AES-256-GCM versionado; uma frase de pareamento fornecida pelo usuário é derivada apenas no processo principal e seu resultado fica no keytar local. A pasta pode ser compartilhada pelo mecanismo que o usuário preferir, sem que o Hub exija conta cloud.
+ 
+-O envelope contém somente as categorias selecionadas: projetos e conversas, settings, packets e skills. Provider keys, keytar accounts, roots de filesystem, permissões de tools, gastos e telemetria nunca entram no payload. O merge é LWW por entidade e registra um aviso local quando um estado local é substituído por uma versão remota mais nova.
++O envelope contém somente as categorias selecionadas: projetos e conversas, settings portáveis (tema e idioma), packets e skills. Provider keys, keytar accounts, roots de filesystem, permissões de tools, gastos, telemetria, consentimentos de crash/voz/áudio, firewall e preferências específicas do dispositivo nunca entram no payload. O merge é LWW por entidade e registra um aviso local quando um estado local é substituído por uma versão remota mais nova.
+ 
+ ## Alternativas consideradas
+ 
+@@ -27,7 +27,7 @@ O envelope contém somente as categorias selecionadas: projetos e conversas, set
+ 
+ - Dois dispositivos precisam apontar para a mesma pasta e informar a mesma frase de pareamento.
+ - O relay enxerga somente ciphertext e metadados mínimos de versão do envelope.
+-- Conflitos simultâneos são visíveis como aviso e resolvidos por `updatedAt`; não há CRDT nesta onda.
++- Conflitos simultâneos são visíveis como aviso e resolvidos por `updatedAt`; não há CRDT nesta onda. Packets são imutáveis por id e mensagens que já existem preservam a cópia local, registrando conflito se o conteúdo divergir; a propagação de edição de mensagem com versão própria fica fora deste contrato.
+ 
+ ## Referências
+ 
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 73180c6..13a14a3 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave
+ |---|---|
+ | Wave | **W30** |
+ | Marco | E — V3 ecosystem |
+-| State | `in_progress` |
++| State | `review` |
+ | Last completed | **W29** |
+-| Next action | Definir contrato de sync opt-in, envelope cifrado e persistência de conflitos para a W30. |
++| Next action | Executar o gate de revisão independente da W30 e tratar seus achados. |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index ccd9df6..f0a16fd 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -1,5 +1,5 @@
+ export { applyMigrations } from "./migrate";
+-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL, MIGRATION_0013_SQL, MIGRATION_0014_SQL, MIGRATION_0015_SQL, MIGRATION_0016_SQL, MIGRATION_0017_SQL, MIGRATION_0018_SQL, MIGRATION_0019_SQL, MIGRATION_0020_SQL, MIGRATION_0021_SQL } from "./migrations";
++export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL, MIGRATION_0013_SQL, MIGRATION_0014_SQL, MIGRATION_0015_SQL, MIGRATION_0016_SQL, MIGRATION_0017_SQL, MIGRATION_0018_SQL, MIGRATION_0019_SQL, MIGRATION_0020_SQL, MIGRATION_0021_SQL, MIGRATION_0022_SQL } from "./migrations";
+ export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
+ export {
+   HubRepos,
+diff --git a/packages/db/src/migrations.ts b/packages/db/src/migrations.ts
+index e2037cc..14eaa11 100644
+--- a/packages/db/src/migrations.ts
++++ b/packages/db/src/migrations.ts
+@@ -421,6 +421,10 @@ CREATE TABLE sync_conflicts (
+ );
+ CREATE INDEX sync_conflicts_created_idx ON sync_conflicts(created_at);
+ `;
++export const MIGRATION_0022_SQL = `
++ALTER TABLE messages ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;
++UPDATE messages SET updated_at = created_at WHERE updated_at = 0;
++`;
+ 
+ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 1, sql: MIGRATION_0001_SQL },
+@@ -444,4 +448,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
+   { version: 19, sql: MIGRATION_0019_SQL },
+   { version: 20, sql: MIGRATION_0020_SQL },
+   { version: 21, sql: MIGRATION_0021_SQL },
++  { version: 22, sql: MIGRATION_0022_SQL },
+ ];
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index 0b59f8f..2fc1c2f 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -61,17 +61,24 @@ describe("hub database", () => {
+     const second = openTestDb();
+     const project = first.hub.repos.createProject("Synced project", { instructions: "Keep this private" });
+     const conversation = first.hub.repos.createConversation(project.id, "Synced conversation");
++    first.hub.repos.setConversationTags(conversation.id, ["sync", "private"]);
++    first.hub.repos.setAppPrefs({ crashReporterOptIn: true, voiceCloudAck: true });
+     first.hub.repos.createMessage({ conversationId: conversation.id, role: "user", content: "Hello from device one", parentId: null, branchId: null });
+     await first.hub.repos.saveProviderKey({ providerSlug: "openai", label: "local-only", secret: "sk-syncfixtureABCDEFGH" });
+ 
+     const snapshot = first.hub.repos.exportSyncSnapshot();
++    const syncedConversation = snapshot.conversations.find((item) => item.id === conversation.id);
+     expect(JSON.stringify(snapshot)).not.toContain("sk-syncfixtureABCDEFGH");
+     expect(JSON.stringify(snapshot)).not.toContain("local-only");
+     const outcome = second.hub.repos.importSyncSnapshot(snapshot);
+     expect(outcome.imported).toBeGreaterThanOrEqual(3);
+     expect(second.hub.repos.getProject(project.id)?.name).toBe("Synced project");
+     expect(second.hub.repos.getConversation(conversation.id)?.title).toBe("Synced conversation");
++    expect(second.hub.repos.getConversation(conversation.id)?.tags).toEqual(["private", "sync"]);
++    expect(second.hub.repos.getConversation(conversation.id)?.updatedAt).toBe(syncedConversation?.updatedAt);
+     expect(second.hub.repos.listMessages(conversation.id)[0]?.content).toBe("Hello from device one");
++    expect(second.hub.repos.getAppPrefs().crashReporterOptIn).toBe(false);
++    expect(second.hub.repos.getAppPrefs().voiceCloudAck).toBe(false);
+     expect(await second.hub.repos.listProviderKeys()).toEqual([]);
+     first.hub.close();
+     second.hub.close();
+@@ -213,7 +220,7 @@ describe("hub database", () => {
+       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
+       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
+       applyMigrations(second.sqlite);
+-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(18);
++      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(22);
+       second.close();
+     } finally {
+       rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 });
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 419b811..42084b1 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -1,5 +1,5 @@
+ import { randomUUID } from "node:crypto";
+-import { and, desc, eq, gte, isNotNull, isNull, lt, ne } from "drizzle-orm";
++import { and, desc, eq, gte, isNull, lt, ne } from "drizzle-orm";
+ import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
+ import type Database from "better-sqlite3";
+ import {
+@@ -212,6 +212,7 @@ export interface MessageRecord {
+   content: string;
+   status: MessageStatus;
+   createdAt: string;
++  updatedAt: string;
+   receipt: ReceiptRecord | null;
+   pinned: boolean;
+ }
+@@ -447,7 +448,6 @@ export interface SyncSnapshot {
+   conversations: ConversationRecord[];
+   messages: MessageRecord[];
+   appearance?: AppearanceRecord;
+-  appPrefs?: AppPrefsRecord;
+   packets: ContextPacketStored[];
+   skills: SkillRecord[];
+ }
+@@ -759,6 +759,7 @@ export class HubRepos {
+       content: decryptUtf8(row.contentCipher, this.masterKey),
+       status: asStatus(row.status),
+       createdAt: iso(row.createdAt),
++      updatedAt: iso(row.updatedAt),
+       receipt,
+       pinned: row.pinned === 1,
+     };
+@@ -980,19 +981,10 @@ export class HubRepos {
+   listConversations(projectId: string | null, inbox: "avulsas" | "imported" = "avulsas"): ConversationRecord[] {
+     const rows =
+       projectId === null
+-        ? inbox === "imported"
+-          ? this.db
+-              .select()
+-              .from(conversations)
+-              .where(and(isNull(conversations.projectId), isNotNull(conversations.importSource)))
+-              .all()
+-          : this.db
+-              .select()
+-              .from(conversations)
+-              .where(and(isNull(conversations.projectId), isNull(conversations.importSource)))
+-              .all()
++        ? this.db.select().from(conversations).where(isNull(conversations.projectId)).all()
+         : this.db.select().from(conversations).where(eq(conversations.projectId, projectId)).all();
+     return rows
++      .filter((row) => projectId !== null || (inbox === "imported" ? row.importSource !== null : row.importSource === null))
+       .map((row) => this.toConversation(row))
+       .filter((item) => item.kind !== "playground")
+       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+@@ -1158,7 +1150,7 @@ export class HubRepos {
+         });
+       }
+       this.db.update(conversations).set({ updatedAt }).where(eq(conversations.id, id)).run();
+-    });
++    })();
+     return { outcome: "created", conversationId: id };
+   }
+ 
+@@ -1202,7 +1194,7 @@ export class HubRepos {
+     return names.sort((a, b) => a.localeCompare(b));
+   }
+ 
+-  setConversationTags(conversationId: string, names: string[]): ConversationRecord {
++  setConversationTags(conversationId: string, names: string[], updatedAt = Date.now()): ConversationRecord {
+     const existing = this.getConversation(conversationId);
+     if (!existing) {
+       throw new Error("Conversation not found");
+@@ -1223,6 +1215,7 @@ export class HubRepos {
+       const tag = this.getOrCreateTag(name);
+       this.db.insert(conversationTags).values({ conversationId, tagId: tag.id }).run();
+     }
++    this.db.update(conversations).set({ updatedAt }).where(eq(conversations.id, conversationId)).run();
+     const updated = this.getConversation(conversationId);
+     if (!updated) {
+       throw new Error("Conversation not found");
+@@ -1389,6 +1382,7 @@ export class HubRepos {
+         contentCipher: encryptUtf8(input.content, this.masterKey),
+         status,
+         createdAt: now,
++        updatedAt: now,
+         pinned: 0,
+       })
+       .run();
+@@ -1423,9 +1417,9 @@ export class HubRepos {
+             ne(messages.id, messageId),
+           );
+     if (siblingFilter) {
+-      this.db.update(messages).set({ isActiveBranch: 0 }).where(siblingFilter).run();
++      this.db.update(messages).set({ isActiveBranch: 0, updatedAt: Date.now() }).where(siblingFilter).run();
+     }
+-    this.db.update(messages).set({ isActiveBranch: 1 }).where(eq(messages.id, messageId)).run();
++    this.db.update(messages).set({ isActiveBranch: 1, updatedAt: Date.now() }).where(eq(messages.id, messageId)).run();
+   }
+ 
+   activatePathThrough(id: string): MessageRecord {
+@@ -1546,6 +1540,7 @@ export class HubRepos {
+       .set({
+         contentCipher: encryptUtf8(content, this.masterKey),
+         status,
++        updatedAt: Date.now(),
+       })
+       .where(eq(messages.id, id))
+       .run();
+@@ -1656,7 +1651,7 @@ export class HubRepos {
+     const rows = this.db.select().from(messages).where(eq(messages.status, "streaming")).all();
+     const now = Date.now();
+     for (const row of rows) {
+-      this.db.update(messages).set({ status: "interrupted" }).where(eq(messages.id, row.id)).run();
++      this.db.update(messages).set({ status: "interrupted", updatedAt: Date.now() }).where(eq(messages.id, row.id)).run();
+       const existing = this.getReceipt(row.id);
+       if (existing) {
+         if (!existing.errorCode) {
+@@ -1780,7 +1775,6 @@ export class HubRepos {
+       conversations: syncedConversations,
+       messages: conversationRows.flatMap((row) => this.listMessages(row.id)),
+       appearance: this.getAppearance(),
+-      appPrefs: this.getAppPrefs(),
+       packets: this.db.select().from(contextPackets).all().map((row) => this.getContextPacket(row.id)).filter((packet): packet is ContextPacketStored => packet !== null),
+       skills: this.listSkills(),
+     };
+@@ -1806,17 +1800,18 @@ export class HubRepos {
+         if (local && local.updatedAt > toMs(item.updatedAt)) { this.recordSyncConflict(`conversation:${item.id}`, local.updatedAt, toMs(item.updatedAt), "local"); conflicts += 1; continue; }
+         if (local) { this.recordSyncConflict(`conversation:${item.id}`, local.updatedAt, toMs(item.updatedAt), "remote"); conflicts += 1; }
+         this.db.insert(conversations).values({ id: item.id, projectId: item.projectId, titleCipher: encryptUtf8(item.title, this.masterKey), createdAt: toMs(item.createdAt), updatedAt: toMs(item.updatedAt), importSource: item.importSource, externalId: null, activePacketId: null, packetAppliedAt: null, kind: "chat", runMode: item.runMode, effortLevel: item.effortLevel }).onConflictDoUpdate({ target: conversations.id, set: { projectId: item.projectId, titleCipher: encryptUtf8(item.title, this.masterKey), updatedAt: toMs(item.updatedAt), runMode: item.runMode, effortLevel: item.effortLevel } }).run();
++        this.setConversationTags(item.id, item.tags, toMs(item.updatedAt));
+         imported += 1;
+       }
+       for (const item of snapshot.messages.sort((left, right) => left.createdAt.localeCompare(right.createdAt))) {
+         if (!this.db.select().from(conversations).where(eq(conversations.id, item.conversationId)).get()) continue;
+         const exists = this.db.select().from(messages).where(eq(messages.id, item.id)).get();
+-        if (exists) continue;
+-        this.db.insert(messages).values({ id: item.id, conversationId: item.conversationId, parentId: item.parentId, branchId: item.branchId, isActiveBranch: item.isActiveBranch ? 1 : 0, role: item.role, contentCipher: encryptUtf8(item.content, this.masterKey), status: item.status, createdAt: toMs(item.createdAt), pinned: item.pinned ? 1 : 0 }).run();
++        if (exists && exists.updatedAt >= toMs(item.updatedAt)) { if (exists.updatedAt > toMs(item.updatedAt)) { this.recordSyncConflict(`message:${item.id}`, exists.updatedAt, toMs(item.updatedAt), "local"); conflicts += 1; } continue; }
++        if (exists) { this.recordSyncConflict(`message:${item.id}`, exists.updatedAt, toMs(item.updatedAt), "remote"); conflicts += 1; }
++        this.db.insert(messages).values({ id: item.id, conversationId: item.conversationId, parentId: item.parentId, branchId: item.branchId, isActiveBranch: item.isActiveBranch ? 1 : 0, role: item.role, contentCipher: encryptUtf8(item.content, this.masterKey), status: item.status, createdAt: toMs(item.createdAt), updatedAt: toMs(item.updatedAt), pinned: item.pinned ? 1 : 0 }).onConflictDoUpdate({ target: messages.id, set: { contentCipher: encryptUtf8(item.content, this.masterKey), status: item.status, isActiveBranch: item.isActiveBranch ? 1 : 0, updatedAt: toMs(item.updatedAt), pinned: item.pinned ? 1 : 0 } }).run();
+         imported += 1;
+       }
+       if (snapshot.appearance) this.setAppearance(snapshot.appearance);
+-      if (snapshot.appPrefs) this.setAppPrefs(snapshot.appPrefs);
+       for (const item of snapshot.packets) {
+         if (item.projectId && !this.db.select().from(projects).where(eq(projects.id, item.projectId)).get()) continue;
+         if (this.db.select().from(contextPackets).where(eq(contextPackets.id, item.id)).get()) continue;
+@@ -1825,7 +1820,7 @@ export class HubRepos {
+       }
+       for (const item of snapshot.skills) {
+         const local = this.db.select().from(skills).where(eq(skills.id, item.id)).get();
+-        if (local && local.updatedAt > toMs(item.updatedAt)) { conflicts += 1; continue; }
++        if (local && local.updatedAt > toMs(item.updatedAt)) { this.recordSyncConflict(`skill:${item.id}`, local.updatedAt, toMs(item.updatedAt), "local"); conflicts += 1; continue; }
+         if (item.factoryId && this.db.select().from(skills).where(eq(skills.factoryId, item.factoryId)).get() && !local) continue;
+         this.db.insert(skills).values({ id: item.id, folder: item.folder, titleCipher: encryptUtf8(item.title, this.masterKey), descriptionCipher: encryptUtf8(item.description, this.masterKey), definitionCipher: encryptUtf8(this.skillDefinitionJson(item), this.masterKey), preferredModel: item.preferredModel, factoryId: item.factoryId, createdAt: toMs(item.createdAt), updatedAt: toMs(item.updatedAt) }).onConflictDoUpdate({ target: skills.id, set: { folder: item.folder, titleCipher: encryptUtf8(item.title, this.masterKey), descriptionCipher: encryptUtf8(item.description, this.masterKey), definitionCipher: encryptUtf8(this.skillDefinitionJson(item), this.masterKey), preferredModel: item.preferredModel, updatedAt: toMs(item.updatedAt) } }).run();
+         imported += 1;
+@@ -2596,7 +2591,7 @@ export class HubRepos {
+     if (!row) {
+       throw new Error("Message not found");
+     }
+-    this.db.update(messages).set({ pinned: pinned ? 1 : 0 }).where(eq(messages.id, id)).run();
++    this.db.update(messages).set({ pinned: pinned ? 1 : 0, updatedAt: Date.now() }).where(eq(messages.id, id)).run();
+     const updated = this.getMessage(id);
+     if (!updated) {
+       throw new Error("Message not found");
+@@ -3569,6 +3564,7 @@ export class HubRepos {
+           contentCipher: encryptUtf8(decryptUtf8(row.contentCipher, this.masterKey), this.masterKey),
+           status: row.status,
+           createdAt: row.createdAt,
++          updatedAt: row.updatedAt,
+           pinned: row.pinned,
+         })
+         .run();
+diff --git a/packages/db/src/schema.ts b/packages/db/src/schema.ts
+index 06a58ab..bd9dfe0 100644
+--- a/packages/db/src/schema.ts
++++ b/packages/db/src/schema.ts
+@@ -36,6 +36,7 @@ export const messages = sqliteTable("messages", {
+   contentCipher: text("content_cipher").notNull(),
+   status: text("status").notNull(),
+   createdAt: integer("created_at", { mode: "number" }).notNull(),
++  updatedAt: integer("updated_at", { mode: "number" }).notNull(),
+   pinned: integer("pinned", { mode: "number" }).notNull().default(0),
+ });
+ 
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index d0d2bab..243f30e 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -1,6 +1,6 @@
+ export { type AppLocale, type ThemeMode, localeSchema, themeModeSchema } from "./appearance";
+ export { EXTENSION_API_VERSION, extensionManifestSchema, extensionPermissionSchema, type ExtensionManifest } from "./extensions";
+-export { SYNC_CATEGORIES, syncCategoriesSchema, syncCategorySchema, syncConfigDtoSchema, syncConfigureInputSchema, syncPickRelayResultSchema, syncRunResultSchema, type SyncCategories, type SyncCategory, type SyncConfigDto, type SyncConfigureInput, type SyncPickRelayResult, type SyncRunResult } from "./sync";
++export { SYNC_CATEGORIES, syncCategoriesSchema, syncCategorySchema, syncConfigDtoSchema, syncConfigureInputSchema, syncPickRelayResultSchema, syncRunResultSchema, syncSnapshotSchema, type SyncCategories, type SyncCategory, type SyncConfigDto, type SyncConfigureInput, type SyncPickRelayResult, type SyncRunResult } from "./sync";
+ export {
+   type HubApi,
+   type HubChatApi,
+diff --git a/packages/shared/src/sync.ts b/packages/shared/src/sync.ts
+index 506a80f..be2c311 100644
+--- a/packages/shared/src/sync.ts
++++ b/packages/shared/src/sync.ts
+@@ -1,4 +1,12 @@
+ import { z } from "zod";
++import {
++  appearanceSettingsSchema,
++  contextPacketDtoSchema,
++  conversationDtoSchema,
++  messageDtoSchema,
++  projectDtoSchema,
++  skillDtoSchema,
++} from "./ipc-schemas";
+ 
+ export const SYNC_CATEGORIES = ["projects", "conversations", "settings", "packets", "skills"] as const;
+ export const syncCategorySchema = z.enum(SYNC_CATEGORIES);
+@@ -27,3 +35,38 @@ export type SyncPickRelayResult = z.infer<typeof syncPickRelayResultSchema>;
+ 
+ export const syncRunResultSchema = z.object({ status: z.enum(["synced", "not_configured", "disabled"]), imported: z.number().int().nonnegative(), exported: z.number().int().nonnegative(), conflicts: z.number().int().nonnegative(), syncedAt: z.string().datetime().nullable() }).strict();
+ export type SyncRunResult = z.infer<typeof syncRunResultSchema>;
++
++const syncProjectSchema = projectDtoSchema.extend({
++  name: z.string().max(200),
++  instructions: z.string().max(40_000).nullable(),
++}).strict();
++
++const syncConversationSchema = conversationDtoSchema.extend({
++  packetAppliedAt: z.string().datetime().nullable(),
++  kind: z.literal("chat"),
++}).strict();
++
++const syncMessageSchema = messageDtoSchema.extend({
++  content: z.string().max(100_000),
++  updatedAt: z.string().datetime(),
++}).strict();
++
++const syncPacketSchema = contextPacketDtoSchema.extend({
++  payloadJson: z.string().max(2_000_000),
++  version: z.number().int().positive(),
++}).strict();
++
++/**
++ * Encrypted relay files are still untrusted input: validate before they reach
++ * repository writes. Provider credentials are intentionally absent.
++ */
++export const syncSnapshotSchema = z.object({
++  version: z.literal(1),
++  generatedAt: z.string().datetime(),
++  projects: z.array(syncProjectSchema).max(10_000),
++  conversations: z.array(syncConversationSchema).max(50_000),
++  messages: z.array(syncMessageSchema).max(250_000),
++  appearance: appearanceSettingsSchema.optional(),
++  packets: z.array(syncPacketSchema).max(10_000),
++  skills: z.array(skillDtoSchema).max(10_000),
++}).strict();
