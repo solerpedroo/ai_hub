@@ -56,6 +56,27 @@ describe("hub database", () => {
     hub.close();
   });
 
+  it("replicates a project conversation and messages without provider keys", async () => {
+    const first = openTestDb();
+    const second = openTestDb();
+    const project = first.hub.repos.createProject("Synced project", { instructions: "Keep this private" });
+    const conversation = first.hub.repos.createConversation(project.id, "Synced conversation");
+    first.hub.repos.createMessage({ conversationId: conversation.id, role: "user", content: "Hello from device one", parentId: null, branchId: null });
+    await first.hub.repos.saveProviderKey({ providerSlug: "openai", label: "local-only", secret: "sk-syncfixtureABCDEFGH" });
+
+    const snapshot = first.hub.repos.exportSyncSnapshot();
+    expect(JSON.stringify(snapshot)).not.toContain("sk-syncfixtureABCDEFGH");
+    expect(JSON.stringify(snapshot)).not.toContain("local-only");
+    const outcome = second.hub.repos.importSyncSnapshot(snapshot);
+    expect(outcome.imported).toBeGreaterThanOrEqual(3);
+    expect(second.hub.repos.getProject(project.id)?.name).toBe("Synced project");
+    expect(second.hub.repos.getConversation(conversation.id)?.title).toBe("Synced conversation");
+    expect(second.hub.repos.listMessages(conversation.id)[0]?.content).toBe("Hello from device one");
+    expect(await second.hub.repos.listProviderKeys()).toEqual([]);
+    first.hub.close();
+    second.hub.close();
+  });
+
   it("persists project/provider caps independently", () => {
     const { hub } = openTestDb();
     const project = hub.repos.createProject("Scoped");
