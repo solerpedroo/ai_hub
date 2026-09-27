@@ -283,6 +283,15 @@ export const installedPacks = sqliteTable("installed_packs", {
   updatedAt: integer("updated_at", { mode: "number" }).notNull(),
 });
 
+export const syncConflicts = sqliteTable("sync_conflicts", {
+  id: text("id").primaryKey(),
+  entityKey: text("entity_key").notNull(),
+  localUpdatedAt: integer("local_updated_at", { mode: "number" }).notNull(),
+  remoteUpdatedAt: integer("remote_updated_at", { mode: "number" }).notNull(),
+  resolution: text("resolution").notNull(),
+  createdAt: integer("created_at", { mode: "number" }).notNull(),
+});
+
 export const agentRuns = sqliteTable("agent_runs", {
   id: text("id").primaryKey(),
   projectId: text("project_id").notNull(),
@@ -377,6 +386,7 @@ export const schema = {
   projectToolRoots,
   projectToolPermissions,
   installedPacks,
+  syncConflicts,
   agentRuns,
   agentSteps,
   agentHandoffs,
