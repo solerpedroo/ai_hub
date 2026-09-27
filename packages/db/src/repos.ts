@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, gte, isNotNull, isNull, lt, ne } from "drizzle-orm";
+import { and, desc, eq, gte, isNull, lt, ne } from "drizzle-orm";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import type Database from "better-sqlite3";
 import {
@@ -212,6 +212,7 @@ export interface MessageRecord {
   content: string;
   status: MessageStatus;
   createdAt: string;
+  updatedAt: string;
   receipt: ReceiptRecord | null;
   pinned: boolean;
 }
@@ -447,7 +448,6 @@ export interface SyncSnapshot {
   conversations: ConversationRecord[];
   messages: MessageRecord[];
   appearance?: AppearanceRecord;
-  appPrefs?: AppPrefsRecord;
   packets: ContextPacketStored[];
   skills: SkillRecord[];
 }
@@ -759,6 +759,7 @@ export class HubRepos {
       content: decryptUtf8(row.contentCipher, this.masterKey),
       status: asStatus(row.status),
       createdAt: iso(row.createdAt),
+      updatedAt: iso(row.updatedAt),
       receipt,
       pinned: row.pinned === 1,
     };
@@ -980,19 +981,10 @@ export class HubRepos {
   listConversations(projectId: string | null, inbox: "avulsas" | "imported" = "avulsas"): ConversationRecord[] {
     const rows =
       projectId === null
-        ? inbox === "imported"
-          ? this.db
-              .select()
-              .from(conversations)
-              .where(and(isNull(conversations.projectId), isNotNull(conversations.importSource)))
-              .all()
-          : this.db
-              .select()
-              .from(conversations)
-              .where(and(isNull(conversations.projectId), isNull(conversations.importSource)))
-              .all()
+        ? this.db.select().from(conversations).where(isNull(conversations.projectId)).all()
         : this.db.select().from(conversations).where(eq(conversations.projectId, projectId)).all();
     return rows
+      .filter((row) => projectId !== null || (inbox === "imported" ? row.importSource !== null : row.importSource === null))
       .map((row) => this.toConversation(row))
       .filter((item) => item.kind !== "playground")
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -1158,7 +1150,7 @@ export class HubRepos {
         });
       }
       this.db.update(conversations).set({ updatedAt }).where(eq(conversations.id, id)).run();
-    });
+    })();
     return { outcome: "created", conversationId: id };
   }
 
@@ -1202,7 +1194,7 @@ export class HubRepos {
     return names.sort((a, b) => a.localeCompare(b));
   }
 
-  setConversationTags(conversationId: string, names: string[]): ConversationRecord {
+  setConversationTags(conversationId: string, names: string[], updatedAt = Date.now()): ConversationRecord {
     const existing = this.getConversation(conversationId);
     if (!existing) {
       throw new Error("Conversation not found");
@@ -1223,6 +1215,7 @@ export class HubRepos {
       const tag = this.getOrCreateTag(name);
       this.db.insert(conversationTags).values({ conversationId, tagId: tag.id }).run();
     }
+    this.db.update(conversations).set({ updatedAt }).where(eq(conversations.id, conversationId)).run();
     const updated = this.getConversation(conversationId);
     if (!updated) {
       throw new Error("Conversation not found");
@@ -1389,6 +1382,7 @@ export class HubRepos {
         contentCipher: encryptUtf8(input.content, this.masterKey),
         status,
         createdAt: now,
+        updatedAt: now,
         pinned: 0,
       })
       .run();
@@ -1423,9 +1417,9 @@ export class HubRepos {
             ne(messages.id, messageId),
           );
     if (siblingFilter) {
-      this.db.update(messages).set({ isActiveBranch: 0 }).where(siblingFilter).run();
+      this.db.update(messages).set({ isActiveBranch: 0, updatedAt: Date.now() }).where(siblingFilter).run();
     }
-    this.db.update(messages).set({ isActiveBranch: 1 }).where(eq(messages.id, messageId)).run();
+    this.db.update(messages).set({ isActiveBranch: 1, updatedAt: Date.now() }).where(eq(messages.id, messageId)).run();
   }
 
   activatePathThrough(id: string): MessageRecord {
@@ -1546,6 +1540,7 @@ export class HubRepos {
       .set({
         contentCipher: encryptUtf8(content, this.masterKey),
         status,
+        updatedAt: Date.now(),
       })
       .where(eq(messages.id, id))
       .run();
@@ -1656,7 +1651,7 @@ export class HubRepos {
     const rows = this.db.select().from(messages).where(eq(messages.status, "streaming")).all();
     const now = Date.now();
     for (const row of rows) {
-      this.db.update(messages).set({ status: "interrupted" }).where(eq(messages.id, row.id)).run();
+      this.db.update(messages).set({ status: "interrupted", updatedAt: Date.now() }).where(eq(messages.id, row.id)).run();
       const existing = this.getReceipt(row.id);
       if (existing) {
         if (!existing.errorCode) {
@@ -1780,7 +1775,6 @@ export class HubRepos {
       conversations: syncedConversations,
       messages: conversationRows.flatMap((row) => this.listMessages(row.id)),
       appearance: this.getAppearance(),
-      appPrefs: this.getAppPrefs(),
       packets: this.db.select().from(contextPackets).all().map((row) => this.getContextPacket(row.id)).filter((packet): packet is ContextPacketStored => packet !== null),
       skills: this.listSkills(),
     };
@@ -1806,17 +1800,18 @@ export class HubRepos {
         if (local && local.updatedAt > toMs(item.updatedAt)) { this.recordSyncConflict(`conversation:${item.id}`, local.updatedAt, toMs(item.updatedAt), "local"); conflicts += 1; continue; }
         if (local) { this.recordSyncConflict(`conversation:${item.id}`, local.updatedAt, toMs(item.updatedAt), "remote"); conflicts += 1; }
         this.db.insert(conversations).values({ id: item.id, projectId: item.projectId, titleCipher: encryptUtf8(item.title, this.masterKey), createdAt: toMs(item.createdAt), updatedAt: toMs(item.updatedAt), importSource: item.importSource, externalId: null, activePacketId: null, packetAppliedAt: null, kind: "chat", runMode: item.runMode, effortLevel: item.effortLevel }).onConflictDoUpdate({ target: conversations.id, set: { projectId: item.projectId, titleCipher: encryptUtf8(item.title, this.masterKey), updatedAt: toMs(item.updatedAt), runMode: item.runMode, effortLevel: item.effortLevel } }).run();
+        this.setConversationTags(item.id, item.tags, toMs(item.updatedAt));
         imported += 1;
       }
       for (const item of snapshot.messages.sort((left, right) => left.createdAt.localeCompare(right.createdAt))) {
         if (!this.db.select().from(conversations).where(eq(conversations.id, item.conversationId)).get()) continue;
         const exists = this.db.select().from(messages).where(eq(messages.id, item.id)).get();
-        if (exists) continue;
-        this.db.insert(messages).values({ id: item.id, conversationId: item.conversationId, parentId: item.parentId, branchId: item.branchId, isActiveBranch: item.isActiveBranch ? 1 : 0, role: item.role, contentCipher: encryptUtf8(item.content, this.masterKey), status: item.status, createdAt: toMs(item.createdAt), pinned: item.pinned ? 1 : 0 }).run();
+        if (exists && exists.updatedAt >= toMs(item.updatedAt)) { if (exists.updatedAt > toMs(item.updatedAt)) { this.recordSyncConflict(`message:${item.id}`, exists.updatedAt, toMs(item.updatedAt), "local"); conflicts += 1; } continue; }
+        if (exists) { this.recordSyncConflict(`message:${item.id}`, exists.updatedAt, toMs(item.updatedAt), "remote"); conflicts += 1; }
+        this.db.insert(messages).values({ id: item.id, conversationId: item.conversationId, parentId: item.parentId, branchId: item.branchId, isActiveBranch: item.isActiveBranch ? 1 : 0, role: item.role, contentCipher: encryptUtf8(item.content, this.masterKey), status: item.status, createdAt: toMs(item.createdAt), updatedAt: toMs(item.updatedAt), pinned: item.pinned ? 1 : 0 }).onConflictDoUpdate({ target: messages.id, set: { contentCipher: encryptUtf8(item.content, this.masterKey), status: item.status, isActiveBranch: item.isActiveBranch ? 1 : 0, updatedAt: toMs(item.updatedAt), pinned: item.pinned ? 1 : 0 } }).run();
         imported += 1;
       }
       if (snapshot.appearance) this.setAppearance(snapshot.appearance);
-      if (snapshot.appPrefs) this.setAppPrefs(snapshot.appPrefs);
       for (const item of snapshot.packets) {
         if (item.projectId && !this.db.select().from(projects).where(eq(projects.id, item.projectId)).get()) continue;
         if (this.db.select().from(contextPackets).where(eq(contextPackets.id, item.id)).get()) continue;
@@ -1825,7 +1820,7 @@ export class HubRepos {
       }
       for (const item of snapshot.skills) {
         const local = this.db.select().from(skills).where(eq(skills.id, item.id)).get();
-        if (local && local.updatedAt > toMs(item.updatedAt)) { conflicts += 1; continue; }
+        if (local && local.updatedAt > toMs(item.updatedAt)) { this.recordSyncConflict(`skill:${item.id}`, local.updatedAt, toMs(item.updatedAt), "local"); conflicts += 1; continue; }
         if (item.factoryId && this.db.select().from(skills).where(eq(skills.factoryId, item.factoryId)).get() && !local) continue;
         this.db.insert(skills).values({ id: item.id, folder: item.folder, titleCipher: encryptUtf8(item.title, this.masterKey), descriptionCipher: encryptUtf8(item.description, this.masterKey), definitionCipher: encryptUtf8(this.skillDefinitionJson(item), this.masterKey), preferredModel: item.preferredModel, factoryId: item.factoryId, createdAt: toMs(item.createdAt), updatedAt: toMs(item.updatedAt) }).onConflictDoUpdate({ target: skills.id, set: { folder: item.folder, titleCipher: encryptUtf8(item.title, this.masterKey), descriptionCipher: encryptUtf8(item.description, this.masterKey), definitionCipher: encryptUtf8(this.skillDefinitionJson(item), this.masterKey), preferredModel: item.preferredModel, updatedAt: toMs(item.updatedAt) } }).run();
         imported += 1;
@@ -2596,7 +2591,7 @@ export class HubRepos {
     if (!row) {
       throw new Error("Message not found");
     }
-    this.db.update(messages).set({ pinned: pinned ? 1 : 0 }).where(eq(messages.id, id)).run();
+    this.db.update(messages).set({ pinned: pinned ? 1 : 0, updatedAt: Date.now() }).where(eq(messages.id, id)).run();
     const updated = this.getMessage(id);
     if (!updated) {
       throw new Error("Message not found");
@@ -3569,6 +3564,7 @@ export class HubRepos {
           contentCipher: encryptUtf8(decryptUtf8(row.contentCipher, this.masterKey), this.masterKey),
           status: row.status,
           createdAt: row.createdAt,
+          updatedAt: row.updatedAt,
           pinned: row.pinned,
         })
         .run();
