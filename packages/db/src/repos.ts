@@ -34,6 +34,10 @@ import {
   agentRuns,
   agentSteps,
   agentHandoffs,
+  auditLogs,
+  organizations,
+  projectOrganizations,
+  enterpriseAnalytics,
   messageReceipts,
   messages,
   projects,
@@ -461,6 +465,9 @@ export interface SyncConflictRecord {
   createdAt: string;
 }
 
+export interface OrganizationRecord { id: string; name: string; policy: { allowedModels: string[]; toolPolicy: { allowReadTools: boolean; allowWriteTools: boolean; blockPii: boolean }; teamMonthlyLimitUsd: string | null; analyticsOptIn: boolean }; createdAt: string; updatedAt: string; }
+export interface AuditLogRecord { id: string; organizationId: string; action: string; detail: string; createdAt: string; }
+
 const DEFAULT_APP_PREFS: AppPrefsRecord = {
   onboardingComplete: false,
   crashReporterOptIn: false,
@@ -687,6 +694,34 @@ export class HubRepos {
     private readonly masterKey: Buffer,
     private readonly secrets: SecretStore,
   ) {}
+
+  listOrganizations(): OrganizationRecord[] {
+    return this.db.select().from(organizations).all().map((row) => ({ id: row.id, name: decryptUtf8(row.nameCipher, this.masterKey), policy: JSON.parse(decryptUtf8(row.policyCipher, this.masterKey)) as OrganizationRecord["policy"], createdAt: iso(row.createdAt), updatedAt: iso(row.updatedAt) }));
+  }
+
+  createOrganization(name: string): OrganizationRecord {
+    const now = Date.now();
+    const id = randomUUID();
+    const safeName = redactSecrets(name).slice(0, 120);
+    const policy: OrganizationRecord["policy"] = { allowedModels: [], toolPolicy: { allowReadTools: true, allowWriteTools: false, blockPii: true }, teamMonthlyLimitUsd: null, analyticsOptIn: false };
+    this.db.insert(organizations).values({ id, nameCipher: encryptUtf8(safeName, this.masterKey), policyCipher: encryptUtf8(JSON.stringify(policy), this.masterKey), createdAt: now, updatedAt: now }).run();
+    this.db.insert(auditLogs).values({ id: randomUUID(), organizationId: id, action: "organization.created", detailCipher: encryptUtf8("Local organization created", this.masterKey), createdAt: now }).run();
+    return { id, name: safeName, policy, createdAt: iso(now), updatedAt: iso(now) };
+  }
+
+  listAuditLogs(organizationId: string): AuditLogRecord[] {
+    return this.db.select().from(auditLogs).where(eq(auditLogs.organizationId, organizationId)).all().map((row) => ({ id: row.id, organizationId: row.organizationId, action: row.action, detail: decryptUtf8(row.detailCipher, this.masterKey), createdAt: iso(row.createdAt) }));
+  }
+
+  assignProjectOrganization(projectId: string, organizationId: string): void {
+    if (!this.getProject(projectId) || !this.db.select().from(organizations).where(eq(organizations.id, organizationId)).get()) throw new Error("Project or organization not found");
+    this.db.insert(projectOrganizations).values({ projectId, organizationId, createdAt: Date.now() }).onConflictDoUpdate({ target: projectOrganizations.projectId, set: { organizationId } }).run();
+    this.db.insert(auditLogs).values({ id: randomUUID(), organizationId, action: "project.assigned", detailCipher: encryptUtf8(`Project ${projectId} assigned`, this.masterKey), createdAt: Date.now() }).run();
+  }
+
+  recordEnterpriseMetric(organizationId: string, metric: string): void {
+    this.db.insert(enterpriseAnalytics).values({ id: randomUUID(), organizationId, metric: metric.slice(0, 80), value: 1, createdAt: Date.now() }).run();
+  }
 
   private toReceipt(row: typeof messageReceipts.$inferSelect): ReceiptRecord {
     return {
