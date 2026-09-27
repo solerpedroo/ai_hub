@@ -1,5 +1,6 @@
 export { type AppLocale, type ThemeMode, localeSchema, themeModeSchema } from "./appearance";
 export { EXTENSION_API_VERSION, extensionManifestSchema, extensionPermissionSchema, type ExtensionManifest } from "./extensions";
+export { SYNC_CATEGORIES, syncCategoriesSchema, syncCategorySchema, syncConfigDtoSchema, syncConfigureInputSchema, syncPickRelayResultSchema, syncRunResultSchema, type SyncCategories, type SyncCategory, type SyncConfigDto, type SyncConfigureInput, type SyncPickRelayResult, type SyncRunResult } from "./sync";
 export {
   type HubApi,
   type HubChatApi,
@@ -8,6 +9,7 @@ export {
   type HubProjectsApi,
   type HubProvidersApi,
   type HubMarketplaceApi,
+  type HubSyncApi,
   type HubSearchApi,
   type HubSecretsApi,
   type HubSettingsApi,
