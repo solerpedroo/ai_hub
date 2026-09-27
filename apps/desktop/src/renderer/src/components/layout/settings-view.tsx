@@ -226,7 +226,7 @@ export function SettingsView({
         <h2 className="text-[12px] font-medium">{t("sync.title")}</h2>
         <p className="text-muted-foreground">{t("sync.hint")}</p>
         <label className="flex items-center gap-2 text-[12px]">
-          <input type="checkbox" checked={syncConfig?.enabled === true} onChange={(event) => { if (!syncConfig) return; void window.hub.sync.configure({ enabled: event.target.checked, categories: syncConfig.categories, ...(syncPhrase ? { pairingPhrase: syncPhrase } : {}) }).then((next) => { setSyncConfig(next); setSyncPhrase(""); }).catch(() => setError(t("sync.error"))); }} />
+          <input type="checkbox" checked={syncConfig?.enabled === true} onChange={(event) => { if (!syncConfig) return; void window.hub.sync.configure({ enabled: event.target.checked, categories: syncConfig.categories, ...(syncPhrase ? { pairingPhrase: syncPhrase } : {}) }).then(setSyncConfig).catch(() => setError(t("sync.error"))).finally(() => setSyncPhrase("")); }} />
           {t("sync.enable")}
         </label>
         <fieldset className="flex flex-wrap gap-x-3 gap-y-1 border-0 p-0">
@@ -236,7 +236,7 @@ export function SettingsView({
               <input type="checkbox" checked={syncConfig?.categories[category] ?? false} disabled={!syncConfig} onChange={(event) => {
                 if (!syncConfig) return;
                 const categories = { ...syncConfig.categories, [category]: event.target.checked };
-                void window.hub.sync.configure({ enabled: syncConfig.enabled, categories, ...(syncPhrase ? { pairingPhrase: syncPhrase } : {}) }).then((next) => { setSyncConfig(next); setSyncPhrase(""); }).catch(() => setError(t("sync.error")));
+                void window.hub.sync.configure({ enabled: syncConfig.enabled, categories, ...(syncPhrase ? { pairingPhrase: syncPhrase } : {}) }).then(setSyncConfig).catch(() => setError(t("sync.error"))).finally(() => setSyncPhrase(""));
               }} />
               {t(`sync.category.${category}`)}
             </label>
