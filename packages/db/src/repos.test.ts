@@ -61,17 +61,24 @@ describe("hub database", () => {
     const second = openTestDb();
     const project = first.hub.repos.createProject("Synced project", { instructions: "Keep this private" });
     const conversation = first.hub.repos.createConversation(project.id, "Synced conversation");
+    first.hub.repos.setConversationTags(conversation.id, ["sync", "private"]);
+    first.hub.repos.setAppPrefs({ crashReporterOptIn: true, voiceCloudAck: true });
     first.hub.repos.createMessage({ conversationId: conversation.id, role: "user", content: "Hello from device one", parentId: null, branchId: null });
     await first.hub.repos.saveProviderKey({ providerSlug: "openai", label: "local-only", secret: "sk-syncfixtureABCDEFGH" });
 
     const snapshot = first.hub.repos.exportSyncSnapshot();
+    const syncedConversation = snapshot.conversations.find((item) => item.id === conversation.id);
     expect(JSON.stringify(snapshot)).not.toContain("sk-syncfixtureABCDEFGH");
     expect(JSON.stringify(snapshot)).not.toContain("local-only");
     const outcome = second.hub.repos.importSyncSnapshot(snapshot);
     expect(outcome.imported).toBeGreaterThanOrEqual(3);
     expect(second.hub.repos.getProject(project.id)?.name).toBe("Synced project");
     expect(second.hub.repos.getConversation(conversation.id)?.title).toBe("Synced conversation");
+    expect(second.hub.repos.getConversation(conversation.id)?.tags).toEqual(["private", "sync"]);
+    expect(second.hub.repos.getConversation(conversation.id)?.updatedAt).toBe(syncedConversation?.updatedAt);
     expect(second.hub.repos.listMessages(conversation.id)[0]?.content).toBe("Hello from device one");
+    expect(second.hub.repos.getAppPrefs().crashReporterOptIn).toBe(false);
+    expect(second.hub.repos.getAppPrefs().voiceCloudAck).toBe(false);
     expect(await second.hub.repos.listProviderKeys()).toEqual([]);
     first.hub.close();
     second.hub.close();
@@ -213,7 +220,7 @@ describe("hub database", () => {
       expect(second.repos.listProjects().map((item) => item.name)).toEqual(["Persisted"]);
       expect(second.repos.listConversations(project.id).map((item) => item.title)).toEqual(["Kickoff"]);
       applyMigrations(second.sqlite);
-      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(18);
+      expect(Number(second.sqlite.pragma("user_version", { simple: true }))).toBe(22);
       second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 });
