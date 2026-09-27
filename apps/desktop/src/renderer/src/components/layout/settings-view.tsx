@@ -5,6 +5,7 @@ import type {
   AppPrefs,
   MonthlyCostsResult,
   MarketplacePackDto,
+  SyncConfigDto,
   ProviderDto,
   ProviderKeyDto,
   ProjectDto,
@@ -52,6 +53,8 @@ export function SettingsView({
   const [capSubject, setCapSubject] = useState("");
   const [scopedCapLimit, setScopedCapLimit] = useState("");
   const [marketplacePacks, setMarketplacePacks] = useState<MarketplacePackDto[]>([]);
+  const [syncConfig, setSyncConfig] = useState<SyncConfigDto | null>(null);
+  const [syncPhrase, setSyncPhrase] = useState("");
   const generalRef = useRef<HTMLHeadingElement>(null);
   const providerRef = useRef<HTMLSelectElement>(null);
   const capRef = useRef<HTMLInputElement>(null);
@@ -103,6 +106,7 @@ export function SettingsView({
     }).catch(() => {
       if (!cancelled) setError(t("workspace.error.generic"));
     });
+    void window.hub.sync.getConfig().then((next) => { if (!cancelled) setSyncConfig(next); }).catch(() => undefined);
     void window.hub.projects.list().then((list) => {
       if (!cancelled) {
         setProjects(list);
@@ -217,6 +221,34 @@ export function SettingsView({
             </div>
           </>
         ) : <p className="text-muted-foreground">{t("costTracker.loading")}</p>}
+      </section>
+      <section className="flex flex-col gap-2">
+        <h2 className="text-[12px] font-medium">{t("sync.title")}</h2>
+        <p className="text-muted-foreground">{t("sync.hint")}</p>
+        <label className="flex items-center gap-2 text-[12px]">
+          <input type="checkbox" checked={syncConfig?.enabled === true} onChange={(event) => { if (!syncConfig) return; void window.hub.sync.configure({ enabled: event.target.checked, categories: syncConfig.categories, ...(syncPhrase ? { pairingPhrase: syncPhrase } : {}) }).then((next) => { setSyncConfig(next); setSyncPhrase(""); }).catch(() => setError(t("sync.error"))); }} />
+          {t("sync.enable")}
+        </label>
+        <fieldset className="flex flex-wrap gap-x-3 gap-y-1 border-0 p-0">
+          <legend className="text-[11px] text-muted-foreground">{t("sync.categories")}</legend>
+          {(["projects", "conversations", "settings", "packets", "skills"] as const).map((category) => (
+            <label key={category} className="flex items-center gap-1 text-[11px]">
+              <input type="checkbox" checked={syncConfig?.categories[category] ?? false} disabled={!syncConfig} onChange={(event) => {
+                if (!syncConfig) return;
+                const categories = { ...syncConfig.categories, [category]: event.target.checked };
+                void window.hub.sync.configure({ enabled: syncConfig.enabled, categories, ...(syncPhrase ? { pairingPhrase: syncPhrase } : {}) }).then((next) => { setSyncConfig(next); setSyncPhrase(""); }).catch(() => setError(t("sync.error")));
+              }} />
+              {t(`sync.category.${category}`)}
+            </label>
+          ))}
+        </fieldset>
+        <Input type="password" value={syncPhrase} autoComplete="off" placeholder={t("sync.phrase")} onChange={(event) => setSyncPhrase(event.target.value)} />
+        <div className="flex gap-2">
+          <Button type="button" variant="outline" onClick={() => { void window.hub.sync.pickRelay().then(() => window.hub.sync.getConfig()).then(setSyncConfig).catch(() => setError(t("sync.error"))); }}>{t("sync.pickRelay")}</Button>
+          <Button type="button" disabled={!syncConfig?.enabled} onClick={() => { void window.hub.sync.run().then((next) => { if (next.status !== "synced") setError(t("sync.error")); return window.hub.sync.getConfig(); }).then(setSyncConfig).catch(() => setError(t("sync.error"))); }}>{t("sync.run")}</Button>
+        </div>
+        <p className="text-[11px] text-muted-foreground">{syncConfig?.relayConfigured ? t("sync.relayReady") : t("sync.relayMissing")}</p>
+        {syncConfig && syncConfig.conflictCount > 0 ? <p className="text-[11px] text-amber-700 dark:text-amber-400">{t("sync.conflicts", { count: syncConfig.conflictCount })}</p> : null}
       </section>
       <section className="flex flex-col gap-2">
         <p className="text-[12px] font-medium">{t("theme.label")}</p>
