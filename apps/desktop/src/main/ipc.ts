@@ -111,6 +111,7 @@ import {
   marketplacePackDtoSchema,
   marketplacePackIdInputSchema,
   marketplacePackListSchema,
+  syncConfigDtoSchema, syncConfigureInputSchema, syncPickRelayResultSchema, syncRunResultSchema,
   providerListResultSchema,
   searchInputSchema,
   searchResultSchema,
@@ -176,6 +177,7 @@ import { prepareResearch } from "./research-runner";
 import { developerDiff, developerReview, developerStatus, developerTerminal, developerTree } from "./developer-tools";
 import { getLocalProviderStatus, localProviderKey } from "./local-provider";
 import { installMarketplacePack, listMarketplacePacks, uninstallMarketplacePack } from "./marketplace-packs";
+import { configureSync, getSyncConfig, pickSyncRelay, runSync } from "./sync-service";
 
 function registerHandler<TIn, TOut>(
   channel: string,
@@ -497,6 +499,10 @@ export function registerWorkspaceIpc(): void {
   registerHandler(IpcChannel.marketplaceUninstall, marketplacePackIdInputSchema, ipcAckResultSchema, (input) => {
     uninstallMarketplacePack(input.packId);
   });
+  registerHandler(IpcChannel.syncGetConfig, emptyIpcPayloadSchema, syncConfigDtoSchema, () => getSyncConfig());
+  registerHandler(IpcChannel.syncConfigure, syncConfigureInputSchema, syncConfigDtoSchema, (input) => configureSync(input));
+  registerHandler(IpcChannel.syncPickRelay, emptyIpcPayloadSchema, syncPickRelayResultSchema, (_input, event) => pickSyncRelay(event.sender));
+  registerHandler(IpcChannel.syncRun, emptyIpcPayloadSchema, syncRunResultSchema, () => runSync());
 
   registerHandler(IpcChannel.secretsList, emptyIpcPayloadSchema, providerKeyListResultSchema, async () => {
     const keys = await getHubDatabase().repos.listProviderKeys();
