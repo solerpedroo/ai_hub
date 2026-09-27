@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave 
 |---|---|
 | Wave | **W30** |
 | Marco | E — V3 ecosystem |
-| State | `pending` |
+| State | `in_progress` |
 | Last completed | **W29** |
-| Next action | Iniciar Wave 30 (sync opcional) com skill `wave-start`. |
+| Next action | Definir contrato de sync opt-in, envelope cifrado e persistência de conflitos para a W30. |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
