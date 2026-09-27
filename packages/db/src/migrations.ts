@@ -421,6 +421,10 @@ CREATE TABLE sync_conflicts (
 );
 CREATE INDEX sync_conflicts_created_idx ON sync_conflicts(created_at);
 `;
+export const MIGRATION_0022_SQL = `
+ALTER TABLE messages ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;
+UPDATE messages SET updated_at = created_at WHERE updated_at = 0;
+`;
 
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
@@ -444,4 +448,5 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 19, sql: MIGRATION_0019_SQL },
   { version: 20, sql: MIGRATION_0020_SQL },
   { version: 21, sql: MIGRATION_0021_SQL },
+  { version: 22, sql: MIGRATION_0022_SQL },
 ];
