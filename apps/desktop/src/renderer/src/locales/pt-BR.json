@@ -679,5 +679,9 @@
     "sync.relayMissing": "Escolha uma pasta compartilhada antes de sincronizar.",
     "sync.error": "Não foi possível concluir a sincronização.",
     "sync.conflicts": "{{count}} conflito(s) de sincronização resolvido(s) pela alteração mais recente.",
-    "tools.error.packRequired": "Instale o pack Project Files no Marketplace interno antes de ler arquivos do projeto."
+    "tools.error.packRequired": "Instale o pack Project Files no Marketplace interno antes de ler arquivos do projeto.",
+    "enterprise.title": "Enterprise local",
+    "enterprise.hint": "Crie uma organização local para políticas de governança e auditoria.",
+    "enterprise.name": "Nome da organização",
+    "enterprise.create": "Criar organização"
 }
