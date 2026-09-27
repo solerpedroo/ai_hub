@@ -15,7 +15,7 @@ A sincronização deve continuar opcional e local-first, funcionar entre Windows
 
 Usar um relay de pasta compartilhada escolhido pelo usuário. O Hub lê e escreve um único envelope AES-256-GCM versionado; uma frase de pareamento fornecida pelo usuário é derivada apenas no processo principal e seu resultado fica no keytar local. A pasta pode ser compartilhada pelo mecanismo que o usuário preferir, sem que o Hub exija conta cloud.
 
-O envelope contém somente as categorias selecionadas: projetos e conversas, settings, packets e skills. Provider keys, keytar accounts, roots de filesystem, permissões de tools, gastos e telemetria nunca entram no payload. O merge é LWW por entidade e registra um aviso local quando um estado local é substituído por uma versão remota mais nova.
+O envelope contém somente as categorias selecionadas: projetos e conversas, settings portáveis (tema e idioma), packets e skills. Provider keys, keytar accounts, roots de filesystem, permissões de tools, gastos, telemetria, consentimentos de crash/voz/áudio, firewall e preferências específicas do dispositivo nunca entram no payload. O merge é LWW por entidade e registra um aviso local quando um estado local é substituído por uma versão remota mais nova.
 
 ## Alternativas consideradas
 
@@ -27,7 +27,7 @@ O envelope contém somente as categorias selecionadas: projetos e conversas, set
 
 - Dois dispositivos precisam apontar para a mesma pasta e informar a mesma frase de pareamento.
 - O relay enxerga somente ciphertext e metadados mínimos de versão do envelope.
-- Conflitos simultâneos são visíveis como aviso e resolvidos por `updatedAt`; não há CRDT nesta onda.
+- Conflitos simultâneos são visíveis como aviso e resolvidos por `updatedAt`; não há CRDT nesta onda. Packets são imutáveis por id e mensagens que já existem preservam a cópia local, registrando conflito se o conteúdo divergir; a propagação de edição de mensagem com versão própria fica fora deste contrato.
 
 ## Referências
 
