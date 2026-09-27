@@ -425,6 +425,16 @@ export const MIGRATION_0022_SQL = `
 ALTER TABLE messages ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;
 UPDATE messages SET updated_at = created_at WHERE updated_at = 0;
 `;
+export const MIGRATION_0023_SQL = `
+CREATE TABLE organizations (id TEXT PRIMARY KEY, name_cipher TEXT NOT NULL, policy_cipher TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE audit_logs (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, action TEXT NOT NULL, detail_cipher TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE INDEX audit_logs_org_created_idx ON audit_logs(organization_id, created_at);
+`;
+export const MIGRATION_0024_SQL = `
+CREATE TABLE project_organizations (project_id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE TABLE enterprise_analytics (id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, metric TEXT NOT NULL, value INTEGER NOT NULL, created_at INTEGER NOT NULL);
+CREATE INDEX enterprise_analytics_org_metric_idx ON enterprise_analytics(organization_id, metric);
+`;
 
 export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 1, sql: MIGRATION_0001_SQL },
@@ -449,4 +459,6 @@ export const MIGRATIONS: readonly { version: number; sql: string }[] = [
   { version: 20, sql: MIGRATION_0020_SQL },
   { version: 21, sql: MIGRATION_0021_SQL },
   { version: 22, sql: MIGRATION_0022_SQL },
+  { version: 23, sql: MIGRATION_0023_SQL },
+  { version: 24, sql: MIGRATION_0024_SQL },
 ];
