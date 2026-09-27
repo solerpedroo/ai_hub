@@ -34,6 +34,7 @@ Não escrever ADR de detalhe cosmética. Se mexe em segurança, custo, provider 
 
 | ID | Onda | Título | Status |
 |---|---|---|---|
+| [ADR-W31-001](./ADR-W31-001-local-enterprise-policy-profile.md) | W31 | Local enterprise policy profile | accepted |
 | [ADR-W30-001](./ADR-W30-001-encrypted-folder-relay-sync.md) | W30 | Encrypted folder relay sync | accepted |
 | [ADR-W29-001](./ADR-W29-001-declarative-internal-marketplace.md) | W29 | Declarative internal marketplace | accepted |
 | [ADR-W00-001](./ADR-W00-001-electron-vite-monorepo.md) | W00 | Electron-vite + pnpm + Turborepo | accepted |
