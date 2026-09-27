@@ -359,6 +359,25 @@ export const agentHandoffs = sqliteTable(
   (table) => [uniqueIndex("agent_handoffs_root_ordinal_idx").on(table.rootRunId, table.ordinal)],
 );
 
+export const organizations = sqliteTable("organizations", {
+  id: text("id").primaryKey(),
+  nameCipher: text("name_cipher").notNull(),
+  policyCipher: text("policy_cipher").notNull(),
+  createdAt: integer("created_at", { mode: "number" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "number" }).notNull(),
+});
+
+export const auditLogs = sqliteTable("audit_logs", {
+  id: text("id").primaryKey(),
+  organizationId: text("organization_id").notNull(),
+  action: text("action").notNull(),
+  detailCipher: text("detail_cipher").notNull(),
+  createdAt: integer("created_at", { mode: "number" }).notNull(),
+});
+
+export const projectOrganizations = sqliteTable("project_organizations", { projectId: text("project_id").primaryKey(), organizationId: text("organization_id").notNull(), createdAt: integer("created_at", { mode: "number" }).notNull() });
+export const enterpriseAnalytics = sqliteTable("enterprise_analytics", { id: text("id").primaryKey(), organizationId: text("organization_id").notNull(), metric: text("metric").notNull(), value: integer("value", { mode: "number" }).notNull(), createdAt: integer("created_at", { mode: "number" }).notNull() });
+
 export const schema = {
   projects,
   conversations,
@@ -391,4 +410,8 @@ export const schema = {
   agentRuns,
   agentSteps,
   agentHandoffs,
+  organizations,
+  auditLogs,
+  projectOrganizations,
+  enterpriseAnalytics,
 };
