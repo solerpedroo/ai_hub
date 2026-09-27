@@ -272,6 +272,7 @@ function pendingUser(
     content,
     status: "complete",
     createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
     receipt: null,
     pinned: false,
   };
