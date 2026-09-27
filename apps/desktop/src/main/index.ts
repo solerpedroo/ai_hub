@@ -26,7 +26,7 @@ protocol.registerSchemesAsPrivileged([
 ]);
 
 if (isE2eMode()) {
-  app.setPath("userData", mkdtempSync(join(tmpdir(), "ai-hub-e2e-")));
+  app.setPath("userData", process.env.AI_HUB_E2E_USER_DATA ?? mkdtempSync(join(tmpdir(), "ai-hub-e2e-")));
 }
 
 function applyContentSecurityPolicy(): void {
