@@ -679,5 +679,9 @@
     "sync.relayMissing": "Choose a shared folder before syncing.",
     "sync.error": "Sync could not be completed.",
     "sync.conflicts": "{{count}} sync conflict(s) resolved by latest change.",
-    "tools.error.packRequired": "Install the Project Files pack in the internal marketplace before reading project files."
+    "tools.error.packRequired": "Install the Project Files pack in the internal marketplace before reading project files.",
+    "enterprise.title": "Local Enterprise",
+    "enterprise.hint": "Create a local organization for governance and audit policies.",
+    "enterprise.name": "Organization name",
+    "enterprise.create": "Create organization"
 }
