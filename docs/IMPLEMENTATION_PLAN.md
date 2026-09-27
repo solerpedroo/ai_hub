@@ -968,11 +968,11 @@ Council **não** é orquestração de agentes: N modelos, um packet, sem tools. 
 
 **Sub-tasks:**
 
-- [ ] Sync seletivo: conversas / projetos / settings / packets / skills
-- [ ] **Nunca** sincronizar API keys
-- [ ] E2E encryption; conflito LWW por entidade + aviso
-- [ ] Windows ↔ macOS
-- [ ] Opt-in explícito; local-first permanece o default
+- [x] Sync seletivo: conversas / projetos / settings / packets / skills
+- [x] **Nunca** sincronizar API keys
+- [x] E2E encryption; conflito LWW por entidade + aviso
+- [x] Windows ↔ macOS (implementação portátil; prova física macOS pendente registrada)
+- [x] Opt-in explícito; local-first permanece o default
 
 **DoD:** dois dispositivos, mesmo projeto, conversa nova aparece; keys continuam só no OS de cada máquina.
 
