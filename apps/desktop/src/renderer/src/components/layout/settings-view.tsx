@@ -3,9 +3,12 @@ import { useTranslation } from "react-i18next";
 import type {
   AppLocale,
   AppPrefs,
+  AuditLogDto,
+  EnterpriseAnalyticsDto,
   MonthlyCostsResult,
   MarketplacePackDto,
   OrganizationDto,
+  EnterprisePolicy,
   SyncConfigDto,
   ProviderDto,
   ProviderKeyDto,
@@ -21,6 +24,26 @@ import { Input } from "@/components/ui/input";
 import { persistLocale } from "@/lib/i18n";
 import { useTheme } from "@/lib/theme";
 import type { SettingsSection } from "./types";
+
+function EnterprisePolicyEditor({ organization, projects, onSave, onAssign }: { organization: OrganizationDto; projects: readonly ProjectDto[]; onSave: (policy: EnterprisePolicy) => void; onAssign: (projectId: string) => void }): JSX.Element {
+  const { t } = useTranslation();
+  const [models, setModels] = useState(organization.policy.allowedModels.join(", "));
+  const [limit, setLimit] = useState(organization.policy.teamMonthlyLimitUsd ?? "");
+  const [policy, setPolicy] = useState(organization.policy);
+  const save = (): void => {
+    const teamMonthlyLimitUsd = limit.trim();
+    if (teamMonthlyLimitUsd && !/^\d+(\.\d{1,6})?$/.test(teamMonthlyLimitUsd)) return;
+    onSave({ ...policy, allowedModels: models.split(",").map((model) => model.trim()).filter(Boolean).slice(0, 128), teamMonthlyLimitUsd: teamMonthlyLimitUsd || null });
+  };
+  return <div className="flex flex-col gap-2 rounded-md border p-3 text-[12px]" data-testid="enterprise-policy">
+    <label className="flex flex-col gap-1">{t("enterprise.models")}<Input value={models} onChange={(event) => setModels(event.target.value)} placeholder={t("enterprise.modelsHint")} /></label>
+    <label className="flex flex-col gap-1">{t("enterprise.monthlyCap")}<Input value={limit} inputMode="decimal" placeholder={t("caps.unlimited")} onChange={(event) => setLimit(event.target.value)} /></label>
+    {(["allowReadTools", "allowWriteTools", "blockPii"] as const).map((key) => <label key={key} className="flex items-center gap-2"><input type="checkbox" checked={policy.toolPolicy[key]} onChange={(event) => setPolicy((current) => ({ ...current, toolPolicy: { ...current.toolPolicy, [key]: event.target.checked } }))} />{t(`enterprise.${key}`)}</label>)}
+    <label className="flex items-center gap-2"><input type="checkbox" checked={policy.analyticsOptIn} onChange={(event) => setPolicy((current) => ({ ...current, analyticsOptIn: event.target.checked }))} />{t("enterprise.analytics")}</label>
+    <Button type="button" size="sm" onClick={save}>{t("enterprise.savePolicy")}</Button>
+    <label className="flex flex-col gap-1">{t("enterprise.assignProject")}<select defaultValue="" onChange={(event) => { if (event.target.value) onAssign(event.target.value); }}><option value="" disabled>{t("enterprise.selectProject")}</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
+  </div>;
+}
 
 export function SettingsView({
   focusSection = "general",
@@ -58,6 +81,9 @@ export function SettingsView({
   const [syncPhrase, setSyncPhrase] = useState("");
   const [organizations, setOrganizations] = useState<OrganizationDto[]>([]);
   const [organizationName, setOrganizationName] = useState("");
+  const [selectedOrganizationId, setSelectedOrganizationId] = useState("");
+  const [organizationAudit, setOrganizationAudit] = useState<AuditLogDto[]>([]);
+  const [organizationAnalytics, setOrganizationAnalytics] = useState<EnterpriseAnalyticsDto | null>(null);
   const generalRef = useRef<HTMLHeadingElement>(null);
   const providerRef = useRef<HTMLSelectElement>(null);
   const capRef = useRef<HTMLInputElement>(null);
@@ -82,6 +108,16 @@ export function SettingsView({
       .then(setKeys)
       .catch(() => setError(t("workspace.error.generic")));
   };
+
+  useEffect(() => {
+    const organizationId = selectedOrganizationId || organizations[0]?.id;
+    if (!organizationId) { setOrganizationAudit([]); setOrganizationAnalytics(null); return; }
+    let cancelled = false;
+    void Promise.all([window.hub.organizations.listAudit({ organizationId }), window.hub.organizations.analytics({ organizationId })]).then(([audit, analytics]) => {
+      if (!cancelled) { setOrganizationAudit(audit); setOrganizationAnalytics(analytics); }
+    }).catch(() => { if (!cancelled) setError(t("workspace.error.generic")); });
+    return () => { cancelled = true; };
+  }, [organizations, selectedOrganizationId, t]);
 
   useEffect(() => {
     let cancelled = false;
@@ -229,8 +265,15 @@ export function SettingsView({
       <section className="flex flex-col gap-2">
         <h2 className="text-[12px] font-medium">{t("enterprise.title")}</h2>
         <p className="text-muted-foreground">{t("enterprise.hint")}</p>
-        <div className="flex gap-2"><Input value={organizationName} placeholder={t("enterprise.name")} onChange={(event) => setOrganizationName(event.target.value)} /><Button type="button" disabled={!organizationName.trim()} onClick={() => { void window.hub.organizations.create({ name: organizationName }).then((item) => { setOrganizations((current) => [...current, item]); setOrganizationName(""); }).catch(() => setError(t("workspace.error.generic"))); }}>{t("enterprise.create")}</Button></div>
-        {organizations.map((organization) => <p key={organization.id} className="text-[11px] text-muted-foreground">{organization.name}</p>)}
+        <div className="flex gap-2"><Input data-testid="enterprise-name" value={organizationName} placeholder={t("enterprise.name")} onChange={(event) => setOrganizationName(event.target.value)} /><Button data-testid="enterprise-create" type="button" disabled={!organizationName.trim()} onClick={() => { void window.hub.organizations.create({ name: organizationName }).then((item) => { setOrganizations((current) => [...current, item]); setSelectedOrganizationId(item.id); setOrganizationName(""); }).catch(() => setError(t("workspace.error.generic"))); }}>{t("enterprise.create")}</Button></div>
+        {organizations.length > 0 ? <select value={selectedOrganizationId || organizations[0]?.id || ""} onChange={(event) => setSelectedOrganizationId(event.target.value)} aria-label={t("enterprise.organization")}>
+          {organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}
+        </select> : null}
+        {organizations.map((organization) => organization.id === (selectedOrganizationId || organizations[0]?.id) ? <EnterprisePolicyEditor key={organization.id} organization={organization} projects={projects} onSave={(policy) => {
+          void window.hub.organizations.updatePolicy({ organizationId: organization.id, policy }).then((updated) => setOrganizations((current) => current.map((item) => item.id === updated.id ? updated : item))).catch(() => setError(t("workspace.error.generic")));
+        }} onAssign={(projectId) => { void window.hub.organizations.assignProject({ projectId, organizationId: organization.id }).catch(() => setError(t("workspace.error.generic"))); }} /> : null)}
+        {organizationAnalytics ? <p className="text-[11px] text-muted-foreground">{t("enterprise.analyticsSummary", { value: organizationAnalytics.metrics.reduce((sum, item) => sum + item.value, 0) })}</p> : null}
+        {organizationAudit.slice(0, 8).map((entry) => <p key={entry.id} className="text-[11px] text-muted-foreground">{entry.action} · {entry.createdAt}</p>)}
       </section>
       <section className="flex flex-col gap-2">
         <h2 className="text-[12px] font-medium">{t("sync.title")}</h2>
