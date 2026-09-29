@@ -21,7 +21,7 @@ export const DialogOverlay = forwardRef<
 >(({ className, ...props }, ref) => (
   <DialogPrimitive.Overlay
     ref={ref}
-    className={cn("fixed inset-0 z-50 bg-black/50", className)}
+    className={cn("fixed inset-0 z-50 bg-black/55 backdrop-blur-[3px]", className)}
     {...props}
   />
 ));
@@ -38,14 +38,14 @@ export const DialogContent = forwardRef<
       <DialogPrimitive.Content
         ref={ref}
         className={cn(
-          "fixed left-1/2 top-1/2 z-50 grid w-full max-w-md -translate-x-1/2 -translate-y-1/2 gap-3 rounded-lg border bg-background p-4 shadow-lg",
+          "fixed left-1/2 top-1/2 z-50 grid w-[calc(100%-2rem)] max-w-md -translate-x-1/2 -translate-y-1/2 gap-4 rounded-2xl border border-border/80 bg-card/95 p-5 text-card-foreground shadow-2xl shadow-black/25 backdrop-blur-xl",
           className,
         )}
         {...props}
       >
         {children}
         <DialogPrimitive.Close
-          className="absolute right-3 top-3 rounded-sm opacity-70 hover:opacity-100"
+          className="absolute right-3 top-3 rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           aria-label={t("dialog.close")}
         >
           <X className="h-4 w-4" />
@@ -71,3 +71,15 @@ export const DialogTitle = forwardRef<
   />
 ));
 DialogTitle.displayName = DialogPrimitive.Title.displayName;
+
+export const DialogDescription = forwardRef<
+  ElementRef<typeof DialogPrimitive.Description>,
+  ComponentPropsWithoutRef<typeof DialogPrimitive.Description>
+>(({ className, ...props }, ref) => (
+  <DialogPrimitive.Description
+    ref={ref}
+    className={cn("text-[13px] leading-relaxed text-muted-foreground", className)}
+    {...props}
+  />
+));
+DialogDescription.displayName = DialogPrimitive.Description.displayName;
