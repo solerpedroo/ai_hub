@@ -47,6 +47,7 @@ export async function runCouncil(input: CouncilRunInput, sender: WebContents): P
   if (cap.blocked) throw new SpendCapError(cap.blocked);
   // Persist the whole batch before dispatch so a concurrent chat sees this budget.
   const reservationIds = estimates.flatMap((estimate) => estimate.usd === null ? [] : [repos.reserveSpend({ projectId: estimate.projectId, providerSlug: estimate.providerSlug, amountUsd: estimate.usd, expiresAt: Date.now() + 15 * 60_000 })]);
+  try {
   const first = input.slots[0];
   if (!first) throw new Error("council:slots");
   // Freeze the compiler result before any provider request. Role instructions are a
@@ -74,6 +75,8 @@ export async function runCouncil(input: CouncilRunInput, sender: WebContents): P
   const synthesisPacket = packetV0Schema.parse({ ...prepared.packet, messages: [...prepared.packet.messages, { role: "user", content: synthesisContent }], tokenEstimate: prepared.packet.tokenEstimate + Math.ceil(synthesisContent.length / 4) });
   const synthesis = await sendChat({ mode: "send", conversationId: input.conversationId, providerKeyId: input.synthesis.providerKeyId, model: input.synthesis.model, content: synthesisContent, __preparedPacket: synthesisPacket, __skipCaps: true, ...(input.privacyMode ? { privacyMode: input.privacyMode } : {}) }, sender);
   await waitForChatRun(synthesis.runId);
-  for (const reservationId of reservationIds) repos.releaseSpendReservation(reservationId);
   return { slots, synthesis: { providerKeyId: input.synthesis.providerKeyId, model: input.synthesis.model, send: synthesis }, divergences: divergenceTerms(answers) };
+  } finally {
+    for (const reservationId of reservationIds) repos.releaseSpendReservation(reservationId);
+  }
 }
