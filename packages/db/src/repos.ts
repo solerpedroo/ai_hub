@@ -1110,6 +1110,23 @@ export class HubRepos {
     return updated;
   }
 
+  renameConversation(id: string, title: string): ConversationRecord {
+    const existing = this.getConversation(id);
+    if (!existing) {
+      throw new Error("Conversation not found");
+    }
+    this.db
+      .update(conversations)
+      .set({ titleCipher: encryptUtf8(title.trim().slice(0, 120), this.masterKey), updatedAt: Date.now() })
+      .where(eq(conversations.id, id))
+      .run();
+    const updated = this.getConversation(id);
+    if (!updated) {
+      throw new Error("Conversation not found");
+    }
+    return updated;
+  }
+
   removeConversation(id: string): void {
     this.db.delete(artifacts).where(eq(artifacts.conversationId, id)).run();
     this.db.delete(conversationTags).where(eq(conversationTags.conversationId, id)).run();
