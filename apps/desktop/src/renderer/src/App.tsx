@@ -132,9 +132,22 @@ function chatEventErrorText(t: TFunction, code: GatewayErrorCode): string {
   return t("workspace.error.chat", { code });
 }
 
+function titleFromFirstPrompt(content: string): string | null {
+  const normalized = content
+    .replace(/[`#*_>[\]{}]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (normalized.length < 3) {
+    return null;
+  }
+  const sentence = normalized.split(/(?<=[.!?])\s/)[0] ?? normalized;
+  return sentence.slice(0, 80).trim();
+}
+
 export function App(): JSX.Element {
   const { t } = useTranslation();
   const [view, setView] = useState<AppView>("home");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [projects, setProjects] = useState<ProjectDto[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [importedInbox, setImportedInbox] = useState(false);
@@ -308,6 +321,20 @@ export function App(): JSX.Element {
         if (showWizard) {
           wizardStartedAt.current = Date.now();
         }
+        if (!showWizard) {
+          const created = await window.hub.conversations.create({
+            projectId: null,
+            title: t("workspace.untitledChat"),
+          });
+          setSelectedProjectId(null);
+          setImportedInbox(false);
+          await loadConversations(null, false);
+          setSelectedConversationId(created.id);
+          setMessages([]);
+          setBranchLabels({});
+          setSessionReady(true);
+          return;
+        }
         if (session.projectId) {
           const project =
             projectList.find((item) => item.id === session.projectId) ?? null;
@@ -358,7 +385,7 @@ export function App(): JSX.Element {
         setSessionReady(true);
       }
     })();
-  }, [fail, loadConversations, loadKeys, loadMessages, loadProjects]);
+  }, [fail, loadConversations, loadKeys, loadMessages, loadProjects, t]);
 
   useEffect(() => {
     void loadHealth();
@@ -694,6 +721,19 @@ export function App(): JSX.Element {
       setFallback(null);
       setRun({ runId: result.runId, conversationId: selectedConversationId, tokensIn: null, tokensOut: null, tokensThinking: null, cacheReadTokens: null, cacheWriteTokens: null, costUsd: null, thinkingSupported: null });
       setMessages((current) => applySendResult(current, result));
+      const conversation = conversations.find((item) => item.id === selectedConversationId);
+      const generatedTitle =
+        input.mode === "send" && input.content ? titleFromFirstPrompt(input.content) : null;
+      if (conversation?.title === t("workspace.untitledChat") && generatedTitle) {
+        void window.hub.conversations
+          .rename({ conversationId: conversation.id, title: generatedTitle })
+          .then((updated) =>
+            setConversations((current) =>
+              current.map((item) => (item.id === updated.id ? updated : item)),
+            ),
+          )
+          .catch(() => undefined);
+      }
       return true;
     } catch (error) {
       const mapped = workspaceErrorText(t, error);
@@ -900,10 +940,12 @@ export function App(): JSX.Element {
   }
 
   return (
-    <div className="flex h-full flex-col overflow-hidden">
+    <div className="app-canvas flex h-full flex-col overflow-hidden">
       <TitleBar />
-      <div className="flex min-h-0 flex-1">
+      <div className="flex min-h-0 flex-1 overflow-hidden">
         <Sidebar
+          collapsed={sidebarCollapsed}
+          onToggleCollapsed={() => setSidebarCollapsed((collapsed) => !collapsed)}
           view={view}
           onChange={navigateToView}
           projects={projects}
@@ -946,7 +988,8 @@ export function App(): JSX.Element {
           searchInputRef={searchInputRef}
           onOpenSearchHit={openSearchHit}
         />
-        <main className="min-w-0 flex-1 bg-background">
+        <main className="min-w-0 flex-1 overflow-hidden">
+          <div key={view} className="view-transition h-full">
           {view === "home" ? (
             <HomeView
               project={selectedProject}
@@ -1153,16 +1196,37 @@ export function App(): JSX.Element {
                 }
               }}
               onExport={exportConversation}
-              onDuplicateConversation={async () => {
-                if (!selectedConversationId) {
-                  return;
-                }
+              onDuplicateConversation={async (conversationId) => {
                 try {
-                  const copy = await window.hub.conversations.duplicate({ id: selectedConversationId });
+                  const copy = await window.hub.conversations.duplicate({ id: conversationId });
                   setError(null);
                   await loadConversations(selectedProjectId, importedInbox);
                   setSelectedConversationId(copy.id);
                   await loadMessages(copy.id);
+                } catch {
+                  fail();
+                }
+              }}
+              onRemoveConversation={async (conversationId) => {
+                try {
+                  const deletingSelected = selectedConversationId === conversationId;
+                  if (deletingSelected) {
+                    abortIfLeaving(null);
+                  }
+                  await window.hub.conversations.remove({ id: conversationId });
+                  setError(null);
+                  const list = await loadConversations(selectedProjectId, importedInbox);
+                  if (!deletingSelected) {
+                    return;
+                  }
+                  const next = list[0] ?? null;
+                  setSelectedConversationId(next?.id ?? null);
+                  if (next) {
+                    await loadMessages(next.id);
+                  } else {
+                    setMessages([]);
+                    setBranchLabels({});
+                  }
                 } catch {
                   fail();
                 }
@@ -1502,6 +1566,7 @@ export function App(): JSX.Element {
           ) : (
             <SettingsView focusSection={settingsSection} />
           )}
+          </div>
         </main>
       </div>
       <StatusBar health={health} runHud={run} onOpenShortcuts={() => setShortcutsOpen(true)} />
