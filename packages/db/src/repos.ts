@@ -699,6 +699,15 @@ export class HubRepos {
     return this.db.select().from(organizations).all().map((row) => ({ id: row.id, name: decryptUtf8(row.nameCipher, this.masterKey), policy: JSON.parse(decryptUtf8(row.policyCipher, this.masterKey)) as OrganizationRecord["policy"], createdAt: iso(row.createdAt), updatedAt: iso(row.updatedAt) }));
   }
 
+  getOrganizationForProject(projectId: string | null): OrganizationRecord | null {
+    if (!projectId) return null;
+    const assignment = this.db.select().from(projectOrganizations).where(eq(projectOrganizations.projectId, projectId)).get();
+    if (!assignment) return null;
+    const row = this.db.select().from(organizations).where(eq(organizations.id, assignment.organizationId)).get();
+    if (!row) return null;
+    return { id: row.id, name: decryptUtf8(row.nameCipher, this.masterKey), policy: JSON.parse(decryptUtf8(row.policyCipher, this.masterKey)) as OrganizationRecord["policy"], createdAt: iso(row.createdAt), updatedAt: iso(row.updatedAt) };
+  }
+
   createOrganization(name: string): OrganizationRecord {
     const now = Date.now();
     const id = randomUUID();
@@ -709,8 +718,21 @@ export class HubRepos {
     return { id, name: safeName, policy, createdAt: iso(now), updatedAt: iso(now) };
   }
 
+  updateOrganizationPolicy(organizationId: string, policy: OrganizationRecord["policy"]): OrganizationRecord {
+    const row = this.db.select().from(organizations).where(eq(organizations.id, organizationId)).get();
+    if (!row) throw new Error("Organization not found");
+    const now = Date.now();
+    this.db.update(organizations).set({ policyCipher: encryptUtf8(JSON.stringify(policy), this.masterKey), updatedAt: now }).where(eq(organizations.id, organizationId)).run();
+    this.db.insert(auditLogs).values({ id: randomUUID(), organizationId, action: "policy.updated", detailCipher: encryptUtf8("Local governance policy updated", this.masterKey), createdAt: now }).run();
+    return { id: row.id, name: decryptUtf8(row.nameCipher, this.masterKey), policy, createdAt: iso(row.createdAt), updatedAt: iso(now) };
+  }
+
   listAuditLogs(organizationId: string): AuditLogRecord[] {
     return this.db.select().from(auditLogs).where(eq(auditLogs.organizationId, organizationId)).all().map((row) => ({ id: row.id, organizationId: row.organizationId, action: row.action, detail: decryptUtf8(row.detailCipher, this.masterKey), createdAt: iso(row.createdAt) }));
+  }
+
+  recordOrganizationAudit(organizationId: string, action: string, detail: string): void {
+    this.db.insert(auditLogs).values({ id: randomUUID(), organizationId, action: action.slice(0, 120), detailCipher: encryptUtf8(redactSecrets(detail).slice(0, 2_000), this.masterKey), createdAt: Date.now() }).run();
   }
 
   assignProjectOrganization(projectId: string, organizationId: string): void {
@@ -720,7 +742,20 @@ export class HubRepos {
   }
 
   recordEnterpriseMetric(organizationId: string, metric: string): void {
+    const row = this.db.select().from(organizations).where(eq(organizations.id, organizationId)).get();
+    if (!row) return;
+    const policy = JSON.parse(decryptUtf8(row.policyCipher, this.masterKey)) as OrganizationRecord["policy"];
+    if (!policy.analyticsOptIn) return;
     this.db.insert(enterpriseAnalytics).values({ id: randomUUID(), organizationId, metric: metric.slice(0, 80), value: 1, createdAt: Date.now() }).run();
+  }
+
+  getEnterpriseAnalytics(organizationId: string): { organizationId: string; metrics: Array<{ metric: string; value: number }> } {
+    const row = this.db.select().from(organizations).where(eq(organizations.id, organizationId)).get();
+    if (!row) throw new Error("Organization not found");
+    const policy = JSON.parse(decryptUtf8(row.policyCipher, this.masterKey)) as OrganizationRecord["policy"];
+    if (!policy.analyticsOptIn) return { organizationId, metrics: [] };
+    const rows = this.sqlite.prepare("SELECT metric, SUM(value) AS value FROM enterprise_analytics WHERE organization_id = ? GROUP BY metric ORDER BY metric").all(organizationId) as Array<{ metric: string; value: number }>;
+    return { organizationId, metrics: rows.map((item) => ({ metric: item.metric, value: item.value })) };
   }
 
   private toReceipt(row: typeof messageReceipts.$inferSelect): ReceiptRecord {
@@ -2187,6 +2222,15 @@ export class HubRepos {
     return microsToUsdText(micros);
   }
 
+  sumOrganizationReceiptCostUsd(organizationId: string, sinceMs: number): string {
+    const rows = this.sqlite.prepare(`SELECT mr.cost_usd AS costUsd FROM message_receipts mr
+      INNER JOIN messages m ON m.id = mr.message_id
+      INNER JOIN conversations c ON c.id = m.conversation_id
+      INNER JOIN project_organizations po ON po.project_id = c.project_id
+      WHERE po.organization_id = ? AND mr.created_at >= ?`).all(organizationId, sinceMs) as Array<{ costUsd: string | null }>;
+    return microsToUsdText(rows.reduce((sum, row) => sum + parseUsdMicros(row.costUsd), 0));
+  }
+
   reserveSpend(input: { projectId: string | null; providerSlug: string; amountUsd: string; expiresAt: number }): string {
     const id = randomUUID();
     this.sqlite.prepare("DELETE FROM spend_reservations WHERE expires_at <= ?").run(Date.now());
@@ -2208,6 +2252,14 @@ export class HubRepos {
     let micros = 0;
     for (const row of rows) micros += parseUsdMicros(row.amountUsd);
     return microsToUsdText(micros);
+  }
+
+  sumOrganizationReservedSpendUsd(organizationId: string, sinceMs: number): string {
+    this.sqlite.prepare("DELETE FROM spend_reservations WHERE expires_at <= ?").run(Date.now());
+    const rows = this.sqlite.prepare(`SELECT sr.amount_usd AS amountUsd FROM spend_reservations sr
+      INNER JOIN project_organizations po ON po.project_id = sr.project_id
+      WHERE po.organization_id = ? AND sr.created_at >= ? AND sr.expires_at > ?`).all(organizationId, sinceMs, Date.now()) as Array<{ amountUsd: string }>;
+    return microsToUsdText(rows.reduce((sum, row) => sum + parseUsdMicros(row.amountUsd), 0));
   }
 
   summarizeReceipts(fromMs: number, toMs: number): {
