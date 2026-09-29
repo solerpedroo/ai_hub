@@ -294,21 +294,6 @@ function snapshotDecision(blocked: string | null, warnings: string[], allowOnce:
 export async function sendChat(input: PreparedChatSendInput, sender: WebContents): Promise<ChatSendResult> {
   const repos = getHubDatabase().repos;
   const prefs = repos.getAppPrefs();
-  const organization = repos.listOrganizations()[0];
-  if (organization?.policy.allowedModels.length && !organization.policy.allowedModels.includes(input.model)) {
-    throw new Error("enterprise:model_not_allowed");
-  }
-  if (input.mode === "send" || input.mode === "edit") {
-    const firewall = applyContextFirewall(input.content, organization?.policy.toolPolicy.blockPii
-      ? { ...prefs.firewallPolicy, email: "block", cpf: "block" }
-      : prefs.firewallPolicy);
-    if (firewall.blocked.length > 0) {
-      throw new Error(`firewall:blocked:${firewall.blocked.join(",")}`);
-    }
-    if (firewall.maskedText !== input.content) {
-      input = { ...input, content: firewall.maskedText };
-    }
-  }
   input = { ...input, privacyMode: prefs.privacyMode };
   const activeConversationRuns = runByConversation.get(input.conversationId);
   const isSameOrchestration = input.__orchestrationRootId !== undefined
@@ -319,6 +304,18 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
   }
 
   const conversation = repos.getConversation(input.conversationId);
+  const organization = repos.getOrganizationForProject(conversation?.projectId ?? null);
+  const effectiveFirewallPolicy = organization?.policy.toolPolicy.blockPii
+    ? { ...prefs.firewallPolicy, email: "block" as const, cpf: "block" as const }
+    : prefs.firewallPolicy;
+  if (organization?.policy.allowedModels.length && !organization.policy.allowedModels.includes(input.model)) {
+    throw new Error("enterprise:model_not_allowed");
+  }
+  if (input.mode === "send" || input.mode === "edit") {
+    const firewall = applyContextFirewall(input.content, effectiveFirewallPolicy);
+    if (firewall.blocked.length > 0) throw new Error(`firewall:blocked:${firewall.blocked.join(",")}`);
+    if (firewall.maskedText !== input.content) input = { ...input, content: firewall.maskedText };
+  }
   if (!conversation) {
     throw new Error("Conversation not found");
   }
@@ -469,9 +466,9 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
   const compiledPacket = enforcePacketFirewall(appendMentionsToPacket(withFiles.packet, [
     ...resolvedMentions.mentions,
     ...autoContext,
-  ]).packet, prefs.firewallPolicy);
+  ]).packet, effectiveFirewallPolicy);
   const packet = input.__preparedPacket
-    ? input.__preparedPacket
+    ? enforcePacketFirewall(input.__preparedPacket, effectiveFirewallPolicy)
     : compiledPacket;
   if (packet.messages.length === 0) {
     throw new Error("Add a user message before sending");
@@ -490,6 +487,25 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
     packet.tokenEstimate,
     input.maxTokens ?? (input.effortLevel ? effortParams(input.effortLevel).maxTokens : null),
   );
+  if (organization?.policy.teamMonthlyLimitUsd && !input.__skipCaps) {
+    const monthStart = new Date();
+    monthStart.setDate(1);
+    monthStart.setHours(0, 0, 0, 0);
+    const teamSpent = addUsd(
+      repos.sumOrganizationReceiptCostUsd(organization.id, monthStart.getTime()),
+      repos.sumOrganizationReservedSpendUsd(organization.id, monthStart.getTime()),
+    );
+    const teamCap = evaluateScopedOutgoingCaps({
+      providerSlug: key.providerSlug,
+      estimatedRequestUsd: estimatedCostUsd,
+      spentUsd: teamSpent,
+      limitUsd: organization.policy.teamMonthlyLimitUsd,
+      scope: "project",
+    });
+    if (estimatedCostUsd === null || teamCap.blocked) {
+      throw new Error("enterprise:team_monthly_cap");
+    }
+  }
   const limits = spendCapLimitsFromRows(repos.listSpendCaps());
   const daySpentUsd = addUsd(repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() }), repos.sumReservedSpendUsd({ sinceMs: localDayStartMs() }));
   const globalSpentUsd = addUsd(repos.sumReceiptCostUsd({}), repos.sumReservedSpendUsd({}));
@@ -556,6 +572,10 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
       model: input.model,
       provider: key.providerSlug,
     });
+  }
+  if (organization) {
+    repos.recordEnterpriseMetric(organization.id, "chat.requested");
+    repos.recordOrganizationAudit(organization.id, "chat.requested", `model=${input.model}; provider=${key.providerSlug}`);
   }
   const reservationId = !input.__skipCaps && estimatedCostUsd !== null
     ? repos.reserveSpend({ projectId: conversation.projectId, providerSlug: key.providerSlug, amountUsd: estimatedCostUsd, expiresAt: Date.now() + 15 * 60_000 })
