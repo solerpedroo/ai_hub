@@ -1,5 +1,5 @@
 import { type JSX, type ReactNode, useState, type RefObject } from "react";
-import { Activity, Home, Inbox, Library, Plus, Settings, Upload, Workflow } from "lucide-react";
+import { Activity, Home, Inbox, Library, PanelLeftClose, PanelLeftOpen, Plus, Search, Settings, Upload, Workflow } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { ProjectDto, SearchHit } from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
@@ -8,6 +8,8 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import type { AppView } from "./types";
 
 export function Sidebar({
+  collapsed,
+  onToggleCollapsed,
   view,
   onChange,
   projects,
@@ -23,6 +25,8 @@ export function Sidebar({
   onOpenSearchHit,
   searchInputRef,
 }: {
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
   view: AppView;
   onChange: (view: AppView) => void;
   projects: ProjectDto[];
@@ -50,8 +54,18 @@ export function Sidebar({
   };
 
   return (
-    <aside className="flex w-52 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground">
-      <ScrollArea className="flex-1 p-2">
+    <aside className={`app-sidebar flex shrink-0 flex-col border-r text-sidebar-foreground transition-[width] duration-200 ${collapsed ? "w-12" : "w-52"}`}>
+      <div className="flex h-10 items-center justify-end px-2"><Button type="button" size="icon" variant="ghost" className="shadow-none" onClick={onToggleCollapsed} aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}>{collapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}</Button></div>
+      {collapsed ? (
+        <nav className="flex flex-col gap-1 px-2">
+          <NavButton active={view === "home"} icon={<Home className="h-4 w-4" />} label="" onClick={() => onChange("home")} />
+          <NavButton active={view === "prompts"} icon={<Library className="h-4 w-4" />} label="" onClick={() => onChange("prompts")} />
+          <NavButton active={view === "skills"} icon={<Workflow className="h-4 w-4" />} label="" onClick={() => onChange("skills")} />
+          <NavButton active={view === "settings"} icon={<Settings className="h-4 w-4" />} label="" onClick={() => onChange("settings")} />
+        </nav>
+      ) : <>
+      <ScrollArea className="scrollbar-subtle flex-1 p-2.5">
+        <div className="mb-3 px-2 pt-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">Workspace</div>
         <nav className="flex flex-col gap-0.5">
           <NavButton
             active={view === "home"}
@@ -96,8 +110,10 @@ export function Sidebar({
             testId="nav-import"
           />
         </nav>
-        <div className="mt-3 px-1">
+        <div className="relative mt-4 px-1">
+          <Search className="pointer-events-none absolute left-3 top-2 h-3.5 w-3.5 text-muted-foreground" />
           <Input
+            className="h-8 bg-background/70 pl-7 text-[12px] shadow-sm"
             ref={searchInputRef}
             value={searchQuery}
             onChange={(event) => onSearchQuery(event.target.value)}
@@ -132,7 +148,7 @@ export function Sidebar({
             </ul>
           ) : null}
         </div>
-        <p className="mt-4 px-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+        <p className="mt-5 px-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
           {t("workspace.projects")}
         </p>
         <div className="mt-1 flex flex-col gap-0.5">
@@ -143,7 +159,7 @@ export function Sidebar({
                 ? "secondary"
                 : "ghost"
             }
-            className="h-8 w-full justify-start gap-2 truncate"
+            className="nav-rail h-8 w-full justify-start gap-2 truncate shadow-none"
             data-testid="inbox-avulsas"
             aria-current={
               view === "home" && selectedProjectId === null && !importedInbox
@@ -190,7 +206,7 @@ export function Sidebar({
               key={project.id}
               type="button"
               variant={selectedProjectId === project.id ? "secondary" : "ghost"}
-              className="h-8 w-full justify-start gap-2 truncate"
+              className="nav-rail h-8 w-full justify-start gap-2 truncate shadow-none"
               data-testid="project-item"
               aria-current={
                 view === "home" && selectedProjectId === project.id ? "page" : undefined
@@ -211,7 +227,7 @@ export function Sidebar({
         </div>
       </ScrollArea>
       <form
-        className="flex flex-col gap-1 border-t p-2"
+        className="flex flex-col gap-1.5 border-t bg-background/35 p-2.5"
         onSubmit={(event) => {
           event.preventDefault();
           submit();
@@ -228,13 +244,13 @@ export function Sidebar({
         <Button
           type="submit"
           size="sm"
-          className="h-7 gap-1"
+          className="h-8 gap-1"
           data-testid="workspace-new-project"
         >
           <Plus className="h-3 w-3" />
           {t("workspace.newProject")}
         </Button>
-      </form>
+      </form></>}
     </aside>
   );
 }
@@ -256,7 +272,7 @@ function NavButton({
     <Button
       type="button"
       variant={active ? "secondary" : "ghost"}
-      className="h-8 w-full justify-start gap-2"
+      className="nav-rail h-8 w-full justify-start gap-2 shadow-none"
       onClick={onClick}
       data-testid={testId}
     >
