@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   appPrefsSchema,
   appPrefsPatchSchema,
+  conversationRenameInputSchema,
   conversationExportDocumentSchema,
   debugSnapshotSchema,
   emptyIpcPayloadSchema,
@@ -50,6 +51,24 @@ import {
   marketplacePackDtoSchema,
   marketplacePackIdInputSchema,
 } from "./ipc-schemas";
+
+describe("conversationRenameInputSchema", () => {
+  it("accepts a bounded title and rejects untrusted extra fields", () => {
+    expect(
+      conversationRenameInputSchema.parse({
+        conversationId: "11111111-1111-4111-8111-111111111111",
+        title: "Contextual title",
+      }),
+    ).toMatchObject({ title: "Contextual title" });
+    expect(() =>
+      conversationRenameInputSchema.parse({
+        conversationId: "11111111-1111-4111-8111-111111111111",
+        title: "Contextual title",
+        providerKey: "sk-testfixtureABCDEFGH",
+      }),
+    ).toThrow();
+  });
+});
 
 describe("wave 29 marketplace contracts", () => {
   it("accepts only strict internal pack metadata", () => {
