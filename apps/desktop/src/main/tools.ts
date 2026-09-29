@@ -45,6 +45,17 @@ function projectState(projectId: string): ToolProjectState {
   };
 }
 
+function assertOrganizationToolPolicy(projectId: string, operation: "read" | "execute"): void {
+  const repos = getHubDatabase().repos;
+  const organization = repos.getOrganizationForProject(projectId);
+  const policy = organization?.policy.toolPolicy;
+  if ((operation === "read" && policy && !policy.allowReadTools) || (operation === "execute" && policy && !policy.allowWriteTools)) {
+    if (organization) repos.recordOrganizationAudit(organization.id, "tool.blocked", `operation=${operation}`);
+    throw new Error("enterprise:tool_not_allowed");
+  }
+  if (organization) repos.recordOrganizationAudit(organization.id, "tool.requested", `operation=${operation}`);
+}
+
 function isPermission(value: ToolExecutionResult | ToolPermissionRequest): value is ToolPermissionRequest {
   return "requiresDestructiveConfirmation" in value;
 }
@@ -88,6 +99,7 @@ export function settleDeveloperActivity(status: "completed" | "failed", resultSu
  */
 export async function requestDeveloperPermission(projectId: string, sender: WebContents, toolId: typeof TOOL_ID_DEVELOPER_EXPLORER | typeof TOOL_ID_DEVELOPER_GIT | typeof TOOL_ID_DEVELOPER_TERMINAL | "developer.git.review", operation: "read" | "execute", detail: string): Promise<void> {
   if (!getHubDatabase().repos.getProject(projectId)) throw new Error("tools:project_not_found");
+  assertOrganizationToolPolicy(projectId, operation);
   if (operation === "read" && getHubDatabase().repos.hasProjectToolPermission(projectId, toolId, operation)) {
     latestActivity = { id: crypto.randomUUID(), projectId, toolId, operation, effect: "read", status: "completed", argsSummary: detail.slice(0, 200), resultSummary: "Project permission", createdAt: new Date().toISOString() };
     return;
@@ -114,6 +126,7 @@ export async function requestDeveloperPermission(projectId: string, sender: WebC
 
 export async function requestToolRead(input: ToolReadRequestInput, sender: WebContents): Promise<ToolReadRequestResult> {
   if (!projectFilesPackInstalled()) throw new Error("marketplace:pack_not_installed");
+  assertOrganizationToolPolicy(input.projectId, "read");
   const result = await router.request({ projectId: input.projectId, toolId: TOOL_ID_PROJECT_FILESYSTEM_READ, relativePath: input.relativePath }, sender.id);
   if (!isPermission(result)) { record(result); return completed(result); }
   const parent = BrowserWindow.fromWebContents(sender);
