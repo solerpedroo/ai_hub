@@ -683,5 +683,17 @@
     "enterprise.title": "Enterprise local",
     "enterprise.hint": "Crie uma organização local para políticas de governança e auditoria.",
     "enterprise.name": "Nome da organização",
-    "enterprise.create": "Criar organização"
+    "enterprise.create": "Criar organização",
+    "enterprise.organization": "Organização",
+    "enterprise.models": "Modelos permitidos",
+    "enterprise.modelsHint": "gpt-4o-mini, claude-… (vazio = todos)",
+    "enterprise.monthlyCap": "Teto mensal do time (USD)",
+    "enterprise.allowReadTools": "Permitir ferramentas de leitura",
+    "enterprise.allowWriteTools": "Permitir ferramentas de escrita",
+    "enterprise.blockPii": "Bloquear PII",
+    "enterprise.analytics": "Permitir analytics agregados (somente local)",
+    "enterprise.savePolicy": "Salvar política de governança",
+    "enterprise.assignProject": "Associar um projeto",
+    "enterprise.selectProject": "Escolha um projeto",
+    "enterprise.analyticsSummary": "Eventos agregados locais: {{value}}"
 }
