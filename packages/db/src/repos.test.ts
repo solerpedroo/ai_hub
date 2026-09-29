@@ -66,6 +66,40 @@ describe("hub database", () => {
     hub.close();
   });
 
+  it("applies a local organization policy only to its assigned project", () => {
+    const { hub } = openTestDb();
+    const project = hub.repos.createProject("Governed");
+    const other = hub.repos.createProject("Personal");
+    const organization = hub.repos.createOrganization("Acme");
+    hub.repos.assignProjectOrganization(project.id, organization.id);
+    const policy = { ...organization.policy, allowedModels: ["gpt-4o-mini"], teamMonthlyLimitUsd: "10.000000" };
+    hub.repos.updateOrganizationPolicy(organization.id, policy);
+    expect(hub.repos.getOrganizationForProject(project.id)?.policy).toEqual(policy);
+    expect(hub.repos.getOrganizationForProject(other.id)).toBeNull();
+    expect(hub.repos.listAuditLogs(organization.id).map((item) => item.action)).toContain("policy.updated");
+    hub.close();
+  });
+
+  it("keeps enterprise analytics empty until the organization opts in", () => {
+    const { hub } = openTestDb();
+    const organization = hub.repos.createOrganization("Metrics");
+    hub.repos.recordEnterpriseMetric(organization.id, "chat.requested");
+    expect(hub.repos.getEnterpriseAnalytics(organization.id).metrics).toEqual([]);
+    hub.repos.updateOrganizationPolicy(organization.id, { ...organization.policy, analyticsOptIn: true });
+    hub.repos.recordEnterpriseMetric(organization.id, "chat.requested");
+    expect(hub.repos.getEnterpriseAnalytics(organization.id).metrics).toEqual([{ metric: "chat.requested", value: 1 }]);
+    hub.close();
+  });
+
+  it("encrypts and redacts audit detail at rest", () => {
+    const { hub } = openTestDb();
+    const organization = hub.repos.createOrganization("Audit");
+    hub.repos.recordOrganizationAudit(organization.id, "tool.requested", "token sk-enterpriseauditABCDEFGH");
+    expect(hub.repos.listAuditLogs(organization.id).at(-1)?.detail).not.toContain("sk-enterpriseauditABCDEFGH");
+    expect(dumpAllText(hub.sqlite)).not.toContain("sk-enterpriseauditABCDEFGH");
+    hub.close();
+  });
+
   it("replicates a project conversation and messages without provider keys", async () => {
     const first = openTestDb();
     const second = openTestDb();
