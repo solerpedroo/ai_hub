@@ -9,6 +9,7 @@ import type {
   ChatEvent,
   ChatSendResult,
   ConversationCreateInput,
+  ConversationRenameInput,
   ConversationDto,
   ConversationExportInput,
   ConversationTagsSetInput,
@@ -157,6 +158,7 @@ export interface HubProjectsApi {
 export interface HubConversationsApi {
   list: (input: ConversationListInput) => Promise<ConversationDto[]>;
   create: (input: ConversationCreateInput) => Promise<ConversationDto>;
+  rename: (input: ConversationRenameInput) => Promise<ConversationDto>;
   remove: (input: IdInput) => Promise<void>;
   export: (input: ConversationExportInput) => Promise<ConversationExportResult>;
   getBranchLabels: (input: BranchLabelsGetInput) => Promise<BranchLabels>;
