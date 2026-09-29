@@ -1,0 +1,694 @@
+diff --git a/apps/desktop/src/main/chat-session.ts b/apps/desktop/src/main/chat-session.ts
+index c79f538..b18ccac 100644
+--- a/apps/desktop/src/main/chat-session.ts
++++ b/apps/desktop/src/main/chat-session.ts
+@@ -294,21 +294,6 @@ function snapshotDecision(blocked: string | null, warnings: string[], allowOnce:
+ export async function sendChat(input: PreparedChatSendInput, sender: WebContents): Promise<ChatSendResult> {
+   const repos = getHubDatabase().repos;
+   const prefs = repos.getAppPrefs();
+-  const organization = repos.listOrganizations()[0];
+-  if (organization?.policy.allowedModels.length && !organization.policy.allowedModels.includes(input.model)) {
+-    throw new Error("enterprise:model_not_allowed");
+-  }
+-  if (input.mode === "send" || input.mode === "edit") {
+-    const firewall = applyContextFirewall(input.content, organization?.policy.toolPolicy.blockPii
+-      ? { ...prefs.firewallPolicy, email: "block", cpf: "block" }
+-      : prefs.firewallPolicy);
+-    if (firewall.blocked.length > 0) {
+-      throw new Error(`firewall:blocked:${firewall.blocked.join(",")}`);
+-    }
+-    if (firewall.maskedText !== input.content) {
+-      input = { ...input, content: firewall.maskedText };
+-    }
+-  }
+   input = { ...input, privacyMode: prefs.privacyMode };
+   const activeConversationRuns = runByConversation.get(input.conversationId);
+   const isSameOrchestration = input.__orchestrationRootId !== undefined
+@@ -319,6 +304,18 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
+   }
+ 
+   const conversation = repos.getConversation(input.conversationId);
++  const organization = repos.getOrganizationForProject(conversation?.projectId ?? null);
++  const effectiveFirewallPolicy = organization?.policy.toolPolicy.blockPii
++    ? { ...prefs.firewallPolicy, email: "block" as const, cpf: "block" as const }
++    : prefs.firewallPolicy;
++  if (organization?.policy.allowedModels.length && !organization.policy.allowedModels.includes(input.model)) {
++    throw new Error("enterprise:model_not_allowed");
++  }
++  if (input.mode === "send" || input.mode === "edit") {
++    const firewall = applyContextFirewall(input.content, effectiveFirewallPolicy);
++    if (firewall.blocked.length > 0) throw new Error(`firewall:blocked:${firewall.blocked.join(",")}`);
++    if (firewall.maskedText !== input.content) input = { ...input, content: firewall.maskedText };
++  }
+   if (!conversation) {
+     throw new Error("Conversation not found");
+   }
+@@ -469,9 +466,9 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
+   const compiledPacket = enforcePacketFirewall(appendMentionsToPacket(withFiles.packet, [
+     ...resolvedMentions.mentions,
+     ...autoContext,
+-  ]).packet, prefs.firewallPolicy);
++  ]).packet, effectiveFirewallPolicy);
+   const packet = input.__preparedPacket
+-    ? input.__preparedPacket
++    ? enforcePacketFirewall(input.__preparedPacket, effectiveFirewallPolicy)
+     : compiledPacket;
+   if (packet.messages.length === 0) {
+     throw new Error("Add a user message before sending");
+@@ -490,6 +487,25 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
+     packet.tokenEstimate,
+     input.maxTokens ?? (input.effortLevel ? effortParams(input.effortLevel).maxTokens : null),
+   );
++  if (organization?.policy.teamMonthlyLimitUsd && !input.__skipCaps) {
++    const monthStart = new Date();
++    monthStart.setDate(1);
++    monthStart.setHours(0, 0, 0, 0);
++    const teamSpent = addUsd(
++      repos.sumOrganizationReceiptCostUsd(organization.id, monthStart.getTime()),
++      repos.sumOrganizationReservedSpendUsd(organization.id, monthStart.getTime()),
++    );
++    const teamCap = evaluateScopedOutgoingCaps({
++      providerSlug: key.providerSlug,
++      estimatedRequestUsd: estimatedCostUsd,
++      spentUsd: teamSpent,
++      limitUsd: organization.policy.teamMonthlyLimitUsd,
++      scope: "project",
++    });
++    if (estimatedCostUsd === null || teamCap.blocked) {
++      throw new Error("enterprise:team_monthly_cap");
++    }
++  }
+   const limits = spendCapLimitsFromRows(repos.listSpendCaps());
+   const daySpentUsd = addUsd(repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() }), repos.sumReservedSpendUsd({ sinceMs: localDayStartMs() }));
+   const globalSpentUsd = addUsd(repos.sumReceiptCostUsd({}), repos.sumReservedSpendUsd({}));
+@@ -557,6 +573,10 @@ export async function sendChat(input: PreparedChatSendInput, sender: WebContents
+       provider: key.providerSlug,
+     });
+   }
++  if (organization) {
++    repos.recordEnterpriseMetric(organization.id, "chat.requested");
++    repos.recordOrganizationAudit(organization.id, "chat.requested", `model=${input.model}; provider=${key.providerSlug}`);
++  }
+   const reservationId = !input.__skipCaps && estimatedCostUsd !== null
+     ? repos.reserveSpend({ projectId: conversation.projectId, providerSlug: key.providerSlug, amountUsd: estimatedCostUsd, expiresAt: Date.now() + 15 * 60_000 })
+     : null;
+diff --git a/apps/desktop/src/main/council.ts b/apps/desktop/src/main/council.ts
+index 9603464..987d7bd 100644
+--- a/apps/desktop/src/main/council.ts
++++ b/apps/desktop/src/main/council.ts
+@@ -47,6 +47,7 @@ export async function runCouncil(input: CouncilRunInput, sender: WebContents): P
+   if (cap.blocked) throw new SpendCapError(cap.blocked);
+   // Persist the whole batch before dispatch so a concurrent chat sees this budget.
+   const reservationIds = estimates.flatMap((estimate) => estimate.usd === null ? [] : [repos.reserveSpend({ projectId: estimate.projectId, providerSlug: estimate.providerSlug, amountUsd: estimate.usd, expiresAt: Date.now() + 15 * 60_000 })]);
++  try {
+   const first = input.slots[0];
+   if (!first) throw new Error("council:slots");
+   // Freeze the compiler result before any provider request. Role instructions are a
+@@ -74,6 +75,8 @@ export async function runCouncil(input: CouncilRunInput, sender: WebContents): P
+   const synthesisPacket = packetV0Schema.parse({ ...prepared.packet, messages: [...prepared.packet.messages, { role: "user", content: synthesisContent }], tokenEstimate: prepared.packet.tokenEstimate + Math.ceil(synthesisContent.length / 4) });
+   const synthesis = await sendChat({ mode: "send", conversationId: input.conversationId, providerKeyId: input.synthesis.providerKeyId, model: input.synthesis.model, content: synthesisContent, __preparedPacket: synthesisPacket, __skipCaps: true, ...(input.privacyMode ? { privacyMode: input.privacyMode } : {}) }, sender);
+   await waitForChatRun(synthesis.runId);
+-  for (const reservationId of reservationIds) repos.releaseSpendReservation(reservationId);
+   return { slots, synthesis: { providerKeyId: input.synthesis.providerKeyId, model: input.synthesis.model, send: synthesis }, divergences: divergenceTerms(answers) };
++  } finally {
++    for (const reservationId of reservationIds) repos.releaseSpendReservation(reservationId);
++  }
+ }
+diff --git a/apps/desktop/src/main/ipc.ts b/apps/desktop/src/main/ipc.ts
+index 6f5e849..2a58043 100644
+--- a/apps/desktop/src/main/ipc.ts
++++ b/apps/desktop/src/main/ipc.ts
+@@ -1,5 +1,5 @@
+ import { clipboard, ipcMain } from "electron";
+-import { auditLogDtoSchema, organizationCreateInputSchema, organizationDtoSchema, organizationIdInputSchema, projectOrganizationInputSchema } from "@ai-hub/shared";
++import { auditLogDtoSchema, enterpriseAnalyticsDtoSchema, organizationCreateInputSchema, organizationDtoSchema, organizationIdInputSchema, organizationPolicyUpdateInputSchema, projectOrganizationInputSchema } from "@ai-hub/shared";
+ import { ZodError, z, type ZodType } from "zod";
+ import {
+   IpcChannel,
+@@ -506,7 +506,9 @@ export function registerWorkspaceIpc(): void {
+   registerHandler(IpcChannel.syncRun, emptyIpcPayloadSchema, syncRunResultSchema, () => runSync());
+   registerHandler(IpcChannel.organizationsList, emptyIpcPayloadSchema, z.array(organizationDtoSchema), () => getHubDatabase().repos.listOrganizations());
+   registerHandler(IpcChannel.organizationsCreate, organizationCreateInputSchema, organizationDtoSchema, (input) => getHubDatabase().repos.createOrganization(input.name));
++  registerHandler(IpcChannel.organizationsUpdatePolicy, organizationPolicyUpdateInputSchema, organizationDtoSchema, (input) => getHubDatabase().repos.updateOrganizationPolicy(input.organizationId, input.policy));
+   registerHandler(IpcChannel.organizationsAuditList, organizationIdInputSchema, z.array(auditLogDtoSchema), (input) => getHubDatabase().repos.listAuditLogs(input.organizationId));
++  registerHandler(IpcChannel.organizationsAnalytics, organizationIdInputSchema, enterpriseAnalyticsDtoSchema, (input) => getHubDatabase().repos.getEnterpriseAnalytics(input.organizationId));
+   registerHandler(IpcChannel.organizationsAssignProject, projectOrganizationInputSchema, ipcAckResultSchema, (input) => { getHubDatabase().repos.assignProjectOrganization(input.projectId, input.organizationId); });
+ 
+   registerHandler(IpcChannel.secretsList, emptyIpcPayloadSchema, providerKeyListResultSchema, async () => {
+diff --git a/apps/desktop/src/main/playground.ts b/apps/desktop/src/main/playground.ts
+index 1c21208..654030e 100644
+--- a/apps/desktop/src/main/playground.ts
++++ b/apps/desktop/src/main/playground.ts
+@@ -1,11 +1,11 @@
+-import { SpendCapError, evaluatePlaygroundCaps, FACTORY_PROMPTS } from "@ai-hub/shared";
++import { SpendCapError, FACTORY_PROMPTS } from "@ai-hub/shared";
+ import type { PlaygroundRunInput, PlaygroundRunResult } from "@ai-hub/shared";
+ import type { WebContents } from "electron";
+ import { sendChat, waitForChatRun } from "./chat-session";
+ import { previewPacket } from "./packet-preview";
+ import { getHubDatabase } from "./persistence";
+ import { interpolateStoredPrompt } from "./prompt-vars";
+-import { localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
++import { evaluateBatchScopedCaps } from "./spend-guard";
+ 
+ let playgroundBusy = false;
+ 
+@@ -66,6 +66,7 @@ export async function runPlayground(
+     throw error;
+   }
+   const conversations: Array<(typeof prepared)[number] & { conversation: { id: string } }> = [];
++  let reservationIds: string[] = [];
+   try {
+     for (const item of prepared) {
+       const conversation = repos.createConversation(
+@@ -76,7 +77,7 @@ export async function runPlayground(
+       conversations.push({ ...item, conversation });
+     }
+ 
+-    const estimates: Array<string | null> = [];
++    const estimates: Array<{ usd: string | null; projectId: string | null; providerSlug: string }> = [];
+     for (const item of conversations) {
+       const preview = previewPacket({
+         conversationId: item.conversation.id,
+@@ -90,19 +91,15 @@ export async function runPlayground(
+       if (preview.overflow) {
+         throw new Error("gateway:context_overflow");
+       }
+-      estimates.push(preview.estimatedCostUsd);
++      estimates.push({ usd: preview.estimatedCostUsd, projectId: input.projectId, providerSlug: item.key.providerSlug });
+     }
+ 
+-    const cap = evaluatePlaygroundCaps({
+-      estimates,
+-      daySpentUsd: repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() }),
+-      globalSpentUsd: repos.sumReceiptCostUsd({}),
+-      limits: spendCapLimitsFromRows(repos.listSpendCaps()),
+-    });
++    const cap = evaluateBatchScopedCaps({ estimates, repos });
+     if (cap.blocked) {
+       throw new SpendCapError(cap.blocked);
+     }
+ 
++    reservationIds = estimates.flatMap((estimate) => estimate.usd === null ? [] : [repos.reserveSpend({ projectId: estimate.projectId, providerSlug: estimate.providerSlug, amountUsd: estimate.usd, expiresAt: Date.now() + 15 * 60_000 })]);
+     const sends = await Promise.all(
+       conversations.map((item) =>
+         sendChat(
+@@ -116,12 +113,14 @@ export async function runPlayground(
+             ...(input.extraSystem !== undefined ? { extraSystem: input.extraSystem } : {}),
+             ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
+             ...(input.maxTokens !== undefined ? { maxTokens: input.maxTokens } : {}),
++            __skipCaps: true,
+           },
+           sender,
+         ),
+       ),
+     );
+     void Promise.all(sends.map((send) => waitForChatRun(send.runId))).finally(() => {
++      for (const reservationId of reservationIds) repos.releaseSpendReservation(reservationId);
+       playgroundBusy = false;
+     });
+     return {
+@@ -139,6 +138,7 @@ export async function runPlayground(
+       }),
+     };
+   } catch (error) {
++    for (const reservationId of reservationIds) repos.releaseSpendReservation(reservationId);
+     for (const item of conversations) {
+       const streaming = repos.listMessages(item.conversation.id).some((message) => message.status === "streaming");
+       if (!streaming) {
+diff --git a/apps/desktop/src/main/spend-guard.ts b/apps/desktop/src/main/spend-guard.ts
+index 7d4507b..debff4a 100644
+--- a/apps/desktop/src/main/spend-guard.ts
++++ b/apps/desktop/src/main/spend-guard.ts
+@@ -17,6 +17,13 @@ export function localDayStartMs(now = Date.now()): number {
+   return date.getTime();
+ }
+ 
++function localMonthStartMs(now = Date.now()): number {
++  const date = new Date(now);
++  date.setDate(1);
++  date.setHours(0, 0, 0, 0);
++  return date.getTime();
++}
++
+ export function spendCapLimitsFromRows(rows: readonly SpendCapRecord[]): SpendCapLimits {
+   const limits: SpendCapLimits = {};
+   for (const row of rows) {
+@@ -100,5 +107,14 @@ export function evaluateBatchScopedCaps(input: {
+     const usd = providerEstimates.reduce<string>((sum, item) => item === null ? sum : addUsd(sum, item), "0.000000");
+     if (evaluateScopedOutgoingCaps({ estimatedRequestUsd: usd, spentUsd: addUsd(input.repos.sumReceiptCostUsd({ providerSlug }), input.repos.sumReservedSpendUsd({ providerSlug })), limitUsd: limit, scope: "provider" }).blocked) return { blocked: "provider" };
+   }
++  for (const organizationId of new Set(input.estimates.map((item) => item.projectId ? input.repos.getOrganizationForProject(item.projectId)?.id : undefined).filter((id): id is string => Boolean(id)))) {
++    const organization = input.repos.listOrganizations().find((item) => item.id === organizationId);
++    if (!organization?.policy.teamMonthlyLimitUsd) continue;
++    const estimates = input.estimates.filter((item) => item.projectId && input.repos.getOrganizationForProject(item.projectId)?.id === organizationId).map((item) => item.usd);
++    if (estimates.some((item) => item === null)) return { blocked: "project" };
++    const estimatedUsd = estimates.reduce<string>((sum, item) => addUsd(sum, item ?? "0.000000"), "0.000000");
++    const spentUsd = addUsd(input.repos.sumOrganizationReceiptCostUsd(organizationId, localMonthStartMs()), input.repos.sumOrganizationReservedSpendUsd(organizationId, localMonthStartMs()));
++    if (evaluateScopedOutgoingCaps({ estimatedRequestUsd: estimatedUsd, spentUsd, limitUsd: organization.policy.teamMonthlyLimitUsd, scope: "project" }).blocked) return { blocked: "project" };
++  }
+   return { blocked: null };
+ }
+diff --git a/apps/desktop/src/main/tools.ts b/apps/desktop/src/main/tools.ts
+index f149a16..32e68c9 100644
+--- a/apps/desktop/src/main/tools.ts
++++ b/apps/desktop/src/main/tools.ts
+@@ -45,6 +45,17 @@ function projectState(projectId: string): ToolProjectState {
+   };
+ }
+ 
++function assertOrganizationToolPolicy(projectId: string, operation: "read" | "execute"): void {
++  const repos = getHubDatabase().repos;
++  const organization = repos.getOrganizationForProject(projectId);
++  const policy = organization?.policy.toolPolicy;
++  if ((operation === "read" && policy && !policy.allowReadTools) || (operation === "execute" && policy && !policy.allowWriteTools)) {
++    if (organization) repos.recordOrganizationAudit(organization.id, "tool.blocked", `operation=${operation}`);
++    throw new Error("enterprise:tool_not_allowed");
++  }
++  if (organization) repos.recordOrganizationAudit(organization.id, "tool.requested", `operation=${operation}`);
++}
++
+ function isPermission(value: ToolExecutionResult | ToolPermissionRequest): value is ToolPermissionRequest {
+   return "requiresDestructiveConfirmation" in value;
+ }
+@@ -88,6 +99,7 @@ export function settleDeveloperActivity(status: "completed" | "failed", resultSu
+  */
+ export async function requestDeveloperPermission(projectId: string, sender: WebContents, toolId: typeof TOOL_ID_DEVELOPER_EXPLORER | typeof TOOL_ID_DEVELOPER_GIT | typeof TOOL_ID_DEVELOPER_TERMINAL | "developer.git.review", operation: "read" | "execute", detail: string): Promise<void> {
+   if (!getHubDatabase().repos.getProject(projectId)) throw new Error("tools:project_not_found");
++  assertOrganizationToolPolicy(projectId, operation);
+   if (operation === "read" && getHubDatabase().repos.hasProjectToolPermission(projectId, toolId, operation)) {
+     latestActivity = { id: crypto.randomUUID(), projectId, toolId, operation, effect: "read", status: "completed", argsSummary: detail.slice(0, 200), resultSummary: "Project permission", createdAt: new Date().toISOString() };
+     return;
+@@ -114,6 +126,7 @@ export async function requestDeveloperPermission(projectId: string, sender: WebC
+ 
+ export async function requestToolRead(input: ToolReadRequestInput, sender: WebContents): Promise<ToolReadRequestResult> {
+   if (!projectFilesPackInstalled()) throw new Error("marketplace:pack_not_installed");
++  assertOrganizationToolPolicy(input.projectId, "read");
+   const result = await router.request({ projectId: input.projectId, toolId: TOOL_ID_PROJECT_FILESYSTEM_READ, relativePath: input.relativePath }, sender.id);
+   if (!isPermission(result)) { record(result); return completed(result); }
+   const parent = BrowserWindow.fromWebContents(sender);
+diff --git a/apps/desktop/src/preload/index.ts b/apps/desktop/src/preload/index.ts
+index 532b76a..7e5790f 100644
+--- a/apps/desktop/src/preload/index.ts
++++ b/apps/desktop/src/preload/index.ts
+@@ -1,5 +1,5 @@
+ import { contextBridge, ipcRenderer, webUtils } from "electron";
+-import { auditLogDtoSchema, organizationCreateInputSchema, organizationDtoSchema, organizationIdInputSchema, projectOrganizationInputSchema } from "@ai-hub/shared";
++import { auditLogDtoSchema, enterpriseAnalyticsDtoSchema, organizationCreateInputSchema, organizationDtoSchema, organizationIdInputSchema, organizationPolicyUpdateInputSchema, projectOrganizationInputSchema } from "@ai-hub/shared";
+ import { ZodError, z, type ZodType } from "zod";
+ import {
+   IpcChannel,
+@@ -328,7 +328,9 @@ const hub: HubApi = {
+   organizations: {
+     list: () => invokeParsed(IpcChannel.organizationsList, empty, emptyIpcPayloadSchema, z.array(organizationDtoSchema)),
+     create: (input) => invokeParsed(IpcChannel.organizationsCreate, input, organizationCreateInputSchema, organizationDtoSchema),
++    updatePolicy: (input) => invokeParsed(IpcChannel.organizationsUpdatePolicy, input, organizationPolicyUpdateInputSchema, organizationDtoSchema),
+     listAudit: (input) => invokeParsed(IpcChannel.organizationsAuditList, input, organizationIdInputSchema, z.array(auditLogDtoSchema)),
++    analytics: (input) => invokeParsed(IpcChannel.organizationsAnalytics, input, organizationIdInputSchema, enterpriseAnalyticsDtoSchema),
+     assignProject: (input) => invokeAckWith(IpcChannel.organizationsAssignProject, input, projectOrganizationInputSchema),
+   },
+   secrets: {
+diff --git a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+index 584d689..89fe11d 100644
+--- a/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
++++ b/apps/desktop/src/renderer/src/components/layout/settings-view.tsx
+@@ -3,9 +3,12 @@ import { useTranslation } from "react-i18next";
+ import type {
+   AppLocale,
+   AppPrefs,
++  AuditLogDto,
++  EnterpriseAnalyticsDto,
+   MonthlyCostsResult,
+   MarketplacePackDto,
+   OrganizationDto,
++  EnterprisePolicy,
+   SyncConfigDto,
+   ProviderDto,
+   ProviderKeyDto,
+@@ -22,6 +25,26 @@ import { persistLocale } from "@/lib/i18n";
+ import { useTheme } from "@/lib/theme";
+ import type { SettingsSection } from "./types";
+ 
++function EnterprisePolicyEditor({ organization, projects, onSave, onAssign }: { organization: OrganizationDto; projects: readonly ProjectDto[]; onSave: (policy: EnterprisePolicy) => void; onAssign: (projectId: string) => void }): JSX.Element {
++  const { t } = useTranslation();
++  const [models, setModels] = useState(organization.policy.allowedModels.join(", "));
++  const [limit, setLimit] = useState(organization.policy.teamMonthlyLimitUsd ?? "");
++  const [policy, setPolicy] = useState(organization.policy);
++  const save = (): void => {
++    const teamMonthlyLimitUsd = limit.trim();
++    if (teamMonthlyLimitUsd && !/^\d+(\.\d{1,6})?$/.test(teamMonthlyLimitUsd)) return;
++    onSave({ ...policy, allowedModels: models.split(",").map((model) => model.trim()).filter(Boolean).slice(0, 128), teamMonthlyLimitUsd: teamMonthlyLimitUsd || null });
++  };
++  return <div className="flex flex-col gap-2 rounded-md border p-3 text-[12px]" data-testid="enterprise-policy">
++    <label className="flex flex-col gap-1">{t("enterprise.models")}<Input value={models} onChange={(event) => setModels(event.target.value)} placeholder={t("enterprise.modelsHint")} /></label>
++    <label className="flex flex-col gap-1">{t("enterprise.monthlyCap")}<Input value={limit} inputMode="decimal" placeholder={t("caps.unlimited")} onChange={(event) => setLimit(event.target.value)} /></label>
++    {(["allowReadTools", "allowWriteTools", "blockPii"] as const).map((key) => <label key={key} className="flex items-center gap-2"><input type="checkbox" checked={policy.toolPolicy[key]} onChange={(event) => setPolicy((current) => ({ ...current, toolPolicy: { ...current.toolPolicy, [key]: event.target.checked } }))} />{t(`enterprise.${key}`)}</label>)}
++    <label className="flex items-center gap-2"><input type="checkbox" checked={policy.analyticsOptIn} onChange={(event) => setPolicy((current) => ({ ...current, analyticsOptIn: event.target.checked }))} />{t("enterprise.analytics")}</label>
++    <Button type="button" size="sm" onClick={save}>{t("enterprise.savePolicy")}</Button>
++    <label className="flex flex-col gap-1">{t("enterprise.assignProject")}<select defaultValue="" onChange={(event) => { if (event.target.value) onAssign(event.target.value); }}><option value="" disabled>{t("enterprise.selectProject")}</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
++  </div>;
++}
++
+ export function SettingsView({
+   focusSection = "general",
+ }: {
+@@ -58,6 +81,9 @@ export function SettingsView({
+   const [syncPhrase, setSyncPhrase] = useState("");
+   const [organizations, setOrganizations] = useState<OrganizationDto[]>([]);
+   const [organizationName, setOrganizationName] = useState("");
++  const [selectedOrganizationId, setSelectedOrganizationId] = useState("");
++  const [organizationAudit, setOrganizationAudit] = useState<AuditLogDto[]>([]);
++  const [organizationAnalytics, setOrganizationAnalytics] = useState<EnterpriseAnalyticsDto | null>(null);
+   const generalRef = useRef<HTMLHeadingElement>(null);
+   const providerRef = useRef<HTMLSelectElement>(null);
+   const capRef = useRef<HTMLInputElement>(null);
+@@ -83,6 +109,16 @@ export function SettingsView({
+       .catch(() => setError(t("workspace.error.generic")));
+   };
+ 
++  useEffect(() => {
++    const organizationId = selectedOrganizationId || organizations[0]?.id;
++    if (!organizationId) { setOrganizationAudit([]); setOrganizationAnalytics(null); return; }
++    let cancelled = false;
++    void Promise.all([window.hub.organizations.listAudit({ organizationId }), window.hub.organizations.analytics({ organizationId })]).then(([audit, analytics]) => {
++      if (!cancelled) { setOrganizationAudit(audit); setOrganizationAnalytics(analytics); }
++    }).catch(() => { if (!cancelled) setError(t("workspace.error.generic")); });
++    return () => { cancelled = true; };
++  }, [organizations, selectedOrganizationId, t]);
++
+   useEffect(() => {
+     let cancelled = false;
+     void window.hub.providers
+@@ -229,8 +265,15 @@ export function SettingsView({
+       <section className="flex flex-col gap-2">
+         <h2 className="text-[12px] font-medium">{t("enterprise.title")}</h2>
+         <p className="text-muted-foreground">{t("enterprise.hint")}</p>
+-        <div className="flex gap-2"><Input value={organizationName} placeholder={t("enterprise.name")} onChange={(event) => setOrganizationName(event.target.value)} /><Button type="button" disabled={!organizationName.trim()} onClick={() => { void window.hub.organizations.create({ name: organizationName }).then((item) => { setOrganizations((current) => [...current, item]); setOrganizationName(""); }).catch(() => setError(t("workspace.error.generic"))); }}>{t("enterprise.create")}</Button></div>
+-        {organizations.map((organization) => <p key={organization.id} className="text-[11px] text-muted-foreground">{organization.name}</p>)}
++        <div className="flex gap-2"><Input data-testid="enterprise-name" value={organizationName} placeholder={t("enterprise.name")} onChange={(event) => setOrganizationName(event.target.value)} /><Button data-testid="enterprise-create" type="button" disabled={!organizationName.trim()} onClick={() => { void window.hub.organizations.create({ name: organizationName }).then((item) => { setOrganizations((current) => [...current, item]); setSelectedOrganizationId(item.id); setOrganizationName(""); }).catch(() => setError(t("workspace.error.generic"))); }}>{t("enterprise.create")}</Button></div>
++        {organizations.length > 0 ? <select value={selectedOrganizationId || organizations[0]?.id || ""} onChange={(event) => setSelectedOrganizationId(event.target.value)} aria-label={t("enterprise.organization")}>
++          {organizations.map((organization) => <option key={organization.id} value={organization.id}>{organization.name}</option>)}
++        </select> : null}
++        {organizations.map((organization) => organization.id === (selectedOrganizationId || organizations[0]?.id) ? <EnterprisePolicyEditor key={organization.id} organization={organization} projects={projects} onSave={(policy) => {
++          void window.hub.organizations.updatePolicy({ organizationId: organization.id, policy }).then((updated) => setOrganizations((current) => current.map((item) => item.id === updated.id ? updated : item))).catch(() => setError(t("workspace.error.generic")));
++        }} onAssign={(projectId) => { void window.hub.organizations.assignProject({ projectId, organizationId: organization.id }).catch(() => setError(t("workspace.error.generic"))); }} /> : null)}
++        {organizationAnalytics ? <p className="text-[11px] text-muted-foreground">{t("enterprise.analyticsSummary", { value: organizationAnalytics.metrics.reduce((sum, item) => sum + item.value, 0) })}</p> : null}
++        {organizationAudit.slice(0, 8).map((entry) => <p key={entry.id} className="text-[11px] text-muted-foreground">{entry.action} · {entry.createdAt}</p>)}
+       </section>
+       <section className="flex flex-col gap-2">
+         <h2 className="text-[12px] font-medium">{t("sync.title")}</h2>
+diff --git a/apps/desktop/src/renderer/src/locales/en.json b/apps/desktop/src/renderer/src/locales/en.json
+index 41ed202..acbf505 100644
+--- a/apps/desktop/src/renderer/src/locales/en.json
++++ b/apps/desktop/src/renderer/src/locales/en.json
+@@ -683,5 +683,17 @@
+     "enterprise.title": "Local Enterprise",
+     "enterprise.hint": "Create a local organization for governance and audit policies.",
+     "enterprise.name": "Organization name",
+-    "enterprise.create": "Create organization"
++    "enterprise.create": "Create organization",
++    "enterprise.organization": "Organization",
++    "enterprise.models": "Allowed models",
++    "enterprise.modelsHint": "gpt-4o-mini, claude-… (empty = all)",
++    "enterprise.monthlyCap": "Team monthly cap (USD)",
++    "enterprise.allowReadTools": "Allow read tools",
++    "enterprise.allowWriteTools": "Allow write tools",
++    "enterprise.blockPii": "Block PII",
++    "enterprise.analytics": "Allow aggregate analytics (local only)",
++    "enterprise.savePolicy": "Save governance policy",
++    "enterprise.assignProject": "Assign a project",
++    "enterprise.selectProject": "Choose a project",
++    "enterprise.analyticsSummary": "Local aggregate events: {{value}}"
+ }
+diff --git a/apps/desktop/src/renderer/src/locales/pt-BR.json b/apps/desktop/src/renderer/src/locales/pt-BR.json
+index 30807f8..8d1e7e7 100644
+--- a/apps/desktop/src/renderer/src/locales/pt-BR.json
++++ b/apps/desktop/src/renderer/src/locales/pt-BR.json
+@@ -683,5 +683,17 @@
+     "enterprise.title": "Enterprise local",
+     "enterprise.hint": "Crie uma organização local para políticas de governança e auditoria.",
+     "enterprise.name": "Nome da organização",
+-    "enterprise.create": "Criar organização"
++    "enterprise.create": "Criar organização",
++    "enterprise.organization": "Organização",
++    "enterprise.models": "Modelos permitidos",
++    "enterprise.modelsHint": "gpt-4o-mini, claude-… (vazio = todos)",
++    "enterprise.monthlyCap": "Teto mensal do time (USD)",
++    "enterprise.allowReadTools": "Permitir ferramentas de leitura",
++    "enterprise.allowWriteTools": "Permitir ferramentas de escrita",
++    "enterprise.blockPii": "Bloquear PII",
++    "enterprise.analytics": "Permitir analytics agregados (somente local)",
++    "enterprise.savePolicy": "Salvar política de governança",
++    "enterprise.assignProject": "Associar um projeto",
++    "enterprise.selectProject": "Escolha um projeto",
++    "enterprise.analyticsSummary": "Eventos agregados locais: {{value}}"
+ }
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 019c6c0..1dc5f38 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave
+ |---|---|
+ | Wave | **W31** |
+ | Marco | E — V3 ecosystem |
+-| State | `in_progress` |
+-| Last completed | **W30** |
+-| Next action | Implementar o perfil Enterprise local: organização, políticas, auditoria e limites sem backend remoto. |
++| State | `complete` |
++| Last completed | **W31** |
++| Next action | Não há onda posterior planejada; definir o próximo incremento antes de retomar implementação. |
+ 
+ `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
+ 
+@@ -57,5 +57,5 @@ None.
+ 
+ | Kind | Path |
+ |---|---|
+-| Review | `docs/reviews/W30/REVIEW.md` |
+-| Latest ADR | `docs/ADR/ADR-W29-001-declarative-internal-marketplace.md` |
++| Review | `docs/reviews/W31/REVIEW.md` |
++| Latest ADR | `docs/ADR/ADR-W31-001-local-enterprise-policy-profile.md` |
+diff --git a/packages/db/src/index.ts b/packages/db/src/index.ts
+index 6eac25d..c41fcd7 100644
+--- a/packages/db/src/index.ts
++++ b/packages/db/src/index.ts
+@@ -1,5 +1,5 @@
+ export { applyMigrations } from "./migrate";
+-export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL, MIGRATION_0013_SQL, MIGRATION_0014_SQL, MIGRATION_0015_SQL, MIGRATION_0016_SQL, MIGRATION_0017_SQL, MIGRATION_0018_SQL, MIGRATION_0019_SQL, MIGRATION_0020_SQL, MIGRATION_0021_SQL, MIGRATION_0022_SQL, MIGRATION_0023_SQL } from "./migrations";
++export { MIGRATIONS, MIGRATION_0001_SQL, MIGRATION_0002_SQL, MIGRATION_0003_SQL, MIGRATION_0004_SQL, MIGRATION_0005_SQL, MIGRATION_0006_SQL, MIGRATION_0007_SQL, MIGRATION_0008_SQL, MIGRATION_0009_SQL, MIGRATION_0010_SQL, MIGRATION_0011_SQL, MIGRATION_0012_SQL, MIGRATION_0013_SQL, MIGRATION_0014_SQL, MIGRATION_0015_SQL, MIGRATION_0016_SQL, MIGRATION_0017_SQL, MIGRATION_0018_SQL, MIGRATION_0019_SQL, MIGRATION_0020_SQL, MIGRATION_0021_SQL, MIGRATION_0022_SQL, MIGRATION_0023_SQL, MIGRATION_0024_SQL } from "./migrations";
+ export { openHubDatabase, type HubDatabase, type OpenHubDatabaseOptions } from "./open";
+ export {
+   HubRepos,
+diff --git a/packages/db/src/repos.test.ts b/packages/db/src/repos.test.ts
+index f8d1af8..7fd1759 100644
+--- a/packages/db/src/repos.test.ts
++++ b/packages/db/src/repos.test.ts
+@@ -66,6 +66,40 @@ describe("hub database", () => {
+     hub.close();
+   });
+ 
++  it("applies a local organization policy only to its assigned project", () => {
++    const { hub } = openTestDb();
++    const project = hub.repos.createProject("Governed");
++    const other = hub.repos.createProject("Personal");
++    const organization = hub.repos.createOrganization("Acme");
++    hub.repos.assignProjectOrganization(project.id, organization.id);
++    const policy = { ...organization.policy, allowedModels: ["gpt-4o-mini"], teamMonthlyLimitUsd: "10.000000" };
++    hub.repos.updateOrganizationPolicy(organization.id, policy);
++    expect(hub.repos.getOrganizationForProject(project.id)?.policy).toEqual(policy);
++    expect(hub.repos.getOrganizationForProject(other.id)).toBeNull();
++    expect(hub.repos.listAuditLogs(organization.id).map((item) => item.action)).toContain("policy.updated");
++    hub.close();
++  });
++
++  it("keeps enterprise analytics empty until the organization opts in", () => {
++    const { hub } = openTestDb();
++    const organization = hub.repos.createOrganization("Metrics");
++    hub.repos.recordEnterpriseMetric(organization.id, "chat.requested");
++    expect(hub.repos.getEnterpriseAnalytics(organization.id).metrics).toEqual([]);
++    hub.repos.updateOrganizationPolicy(organization.id, { ...organization.policy, analyticsOptIn: true });
++    hub.repos.recordEnterpriseMetric(organization.id, "chat.requested");
++    expect(hub.repos.getEnterpriseAnalytics(organization.id).metrics).toEqual([{ metric: "chat.requested", value: 1 }]);
++    hub.close();
++  });
++
++  it("encrypts and redacts audit detail at rest", () => {
++    const { hub } = openTestDb();
++    const organization = hub.repos.createOrganization("Audit");
++    hub.repos.recordOrganizationAudit(organization.id, "tool.requested", "token sk-enterpriseauditABCDEFGH");
++    expect(hub.repos.listAuditLogs(organization.id).at(-1)?.detail).not.toContain("sk-enterpriseauditABCDEFGH");
++    expect(dumpAllText(hub.sqlite)).not.toContain("sk-enterpriseauditABCDEFGH");
++    hub.close();
++  });
++
+   it("replicates a project conversation and messages without provider keys", async () => {
+     const first = openTestDb();
+     const second = openTestDb();
+diff --git a/packages/db/src/repos.ts b/packages/db/src/repos.ts
+index 5abb6f4..41fce02 100644
+--- a/packages/db/src/repos.ts
++++ b/packages/db/src/repos.ts
+@@ -699,6 +699,15 @@ export class HubRepos {
+     return this.db.select().from(organizations).all().map((row) => ({ id: row.id, name: decryptUtf8(row.nameCipher, this.masterKey), policy: JSON.parse(decryptUtf8(row.policyCipher, this.masterKey)) as OrganizationRecord["policy"], createdAt: iso(row.createdAt), updatedAt: iso(row.updatedAt) }));
+   }
+ 
++  getOrganizationForProject(projectId: string | null): OrganizationRecord | null {
++    if (!projectId) return null;
++    const assignment = this.db.select().from(projectOrganizations).where(eq(projectOrganizations.projectId, projectId)).get();
++    if (!assignment) return null;
++    const row = this.db.select().from(organizations).where(eq(organizations.id, assignment.organizationId)).get();
++    if (!row) return null;
++    return { id: row.id, name: decryptUtf8(row.nameCipher, this.masterKey), policy: JSON.parse(decryptUtf8(row.policyCipher, this.masterKey)) as OrganizationRecord["policy"], createdAt: iso(row.createdAt), updatedAt: iso(row.updatedAt) };
++  }
++
+   createOrganization(name: string): OrganizationRecord {
+     const now = Date.now();
+     const id = randomUUID();
+@@ -709,10 +718,23 @@ export class HubRepos {
+     return { id, name: safeName, policy, createdAt: iso(now), updatedAt: iso(now) };
+   }
+ 
++  updateOrganizationPolicy(organizationId: string, policy: OrganizationRecord["policy"]): OrganizationRecord {
++    const row = this.db.select().from(organizations).where(eq(organizations.id, organizationId)).get();
++    if (!row) throw new Error("Organization not found");
++    const now = Date.now();
++    this.db.update(organizations).set({ policyCipher: encryptUtf8(JSON.stringify(policy), this.masterKey), updatedAt: now }).where(eq(organizations.id, organizationId)).run();
++    this.db.insert(auditLogs).values({ id: randomUUID(), organizationId, action: "policy.updated", detailCipher: encryptUtf8("Local governance policy updated", this.masterKey), createdAt: now }).run();
++    return { id: row.id, name: decryptUtf8(row.nameCipher, this.masterKey), policy, createdAt: iso(row.createdAt), updatedAt: iso(now) };
++  }
++
+   listAuditLogs(organizationId: string): AuditLogRecord[] {
+     return this.db.select().from(auditLogs).where(eq(auditLogs.organizationId, organizationId)).all().map((row) => ({ id: row.id, organizationId: row.organizationId, action: row.action, detail: decryptUtf8(row.detailCipher, this.masterKey), createdAt: iso(row.createdAt) }));
+   }
+ 
++  recordOrganizationAudit(organizationId: string, action: string, detail: string): void {
++    this.db.insert(auditLogs).values({ id: randomUUID(), organizationId, action: action.slice(0, 120), detailCipher: encryptUtf8(redactSecrets(detail).slice(0, 2_000), this.masterKey), createdAt: Date.now() }).run();
++  }
++
+   assignProjectOrganization(projectId: string, organizationId: string): void {
+     if (!this.getProject(projectId) || !this.db.select().from(organizations).where(eq(organizations.id, organizationId)).get()) throw new Error("Project or organization not found");
+     this.db.insert(projectOrganizations).values({ projectId, organizationId, createdAt: Date.now() }).onConflictDoUpdate({ target: projectOrganizations.projectId, set: { organizationId } }).run();
+@@ -720,9 +742,22 @@ export class HubRepos {
+   }
+ 
+   recordEnterpriseMetric(organizationId: string, metric: string): void {
++    const row = this.db.select().from(organizations).where(eq(organizations.id, organizationId)).get();
++    if (!row) return;
++    const policy = JSON.parse(decryptUtf8(row.policyCipher, this.masterKey)) as OrganizationRecord["policy"];
++    if (!policy.analyticsOptIn) return;
+     this.db.insert(enterpriseAnalytics).values({ id: randomUUID(), organizationId, metric: metric.slice(0, 80), value: 1, createdAt: Date.now() }).run();
+   }
+ 
++  getEnterpriseAnalytics(organizationId: string): { organizationId: string; metrics: Array<{ metric: string; value: number }> } {
++    const row = this.db.select().from(organizations).where(eq(organizations.id, organizationId)).get();
++    if (!row) throw new Error("Organization not found");
++    const policy = JSON.parse(decryptUtf8(row.policyCipher, this.masterKey)) as OrganizationRecord["policy"];
++    if (!policy.analyticsOptIn) return { organizationId, metrics: [] };
++    const rows = this.sqlite.prepare("SELECT metric, SUM(value) AS value FROM enterprise_analytics WHERE organization_id = ? GROUP BY metric ORDER BY metric").all(organizationId) as Array<{ metric: string; value: number }>;
++    return { organizationId, metrics: rows.map((item) => ({ metric: item.metric, value: item.value })) };
++  }
++
+   private toReceipt(row: typeof messageReceipts.$inferSelect): ReceiptRecord {
+     return {
+       id: row.id,
+@@ -2187,6 +2222,15 @@ export class HubRepos {
+     return microsToUsdText(micros);
+   }
+ 
++  sumOrganizationReceiptCostUsd(organizationId: string, sinceMs: number): string {
++    const rows = this.sqlite.prepare(`SELECT mr.cost_usd AS costUsd FROM message_receipts mr
++      INNER JOIN messages m ON m.id = mr.message_id
++      INNER JOIN conversations c ON c.id = m.conversation_id
++      INNER JOIN project_organizations po ON po.project_id = c.project_id
++      WHERE po.organization_id = ? AND mr.created_at >= ?`).all(organizationId, sinceMs) as Array<{ costUsd: string | null }>;
++    return microsToUsdText(rows.reduce((sum, row) => sum + parseUsdMicros(row.costUsd), 0));
++  }
++
+   reserveSpend(input: { projectId: string | null; providerSlug: string; amountUsd: string; expiresAt: number }): string {
+     const id = randomUUID();
+     this.sqlite.prepare("DELETE FROM spend_reservations WHERE expires_at <= ?").run(Date.now());
+@@ -2210,6 +2254,14 @@ export class HubRepos {
+     return microsToUsdText(micros);
+   }
+ 
++  sumOrganizationReservedSpendUsd(organizationId: string, sinceMs: number): string {
++    this.sqlite.prepare("DELETE FROM spend_reservations WHERE expires_at <= ?").run(Date.now());
++    const rows = this.sqlite.prepare(`SELECT sr.amount_usd AS amountUsd FROM spend_reservations sr
++      INNER JOIN project_organizations po ON po.project_id = sr.project_id
++      WHERE po.organization_id = ? AND sr.created_at >= ? AND sr.expires_at > ?`).all(organizationId, sinceMs, Date.now()) as Array<{ amountUsd: string }>;
++    return microsToUsdText(rows.reduce((sum, row) => sum + parseUsdMicros(row.amountUsd), 0));
++  }
++
+   summarizeReceipts(fromMs: number, toMs: number): {
+     tokens: number;
+     requests: number;
+diff --git a/packages/shared/src/enterprise.ts b/packages/shared/src/enterprise.ts
+index e60026d..7e303b3 100644
+--- a/packages/shared/src/enterprise.ts
++++ b/packages/shared/src/enterprise.ts
+@@ -26,8 +26,19 @@ export type OrganizationDto = z.infer<typeof organizationDtoSchema>;
+ export const organizationCreateInputSchema = z.object({ name: z.string().trim().min(1).max(120) }).strict();
+ export type OrganizationCreateInput = z.infer<typeof organizationCreateInputSchema>;
+ 
++export const organizationPolicyUpdateInputSchema = z.object({
++  organizationId: z.string().uuid(),
++  policy: enterprisePolicySchema,
++}).strict();
++export type OrganizationPolicyUpdateInput = z.infer<typeof organizationPolicyUpdateInputSchema>;
++
+ export const auditLogDtoSchema = z.object({ id: z.string().uuid(), organizationId: z.string().uuid(), action: z.string().min(1).max(120), detail: z.string().max(2_000), createdAt: z.string().datetime() }).strict();
+ export type AuditLogDto = z.infer<typeof auditLogDtoSchema>;
++export const enterpriseAnalyticsDtoSchema = z.object({
++  organizationId: z.string().uuid(),
++  metrics: z.array(z.object({ metric: z.string().min(1).max(80), value: z.number().int().nonnegative() }).strict()).max(100),
++}).strict();
++export type EnterpriseAnalyticsDto = z.infer<typeof enterpriseAnalyticsDtoSchema>;
+ export const organizationIdInputSchema = z.object({ organizationId: z.string().uuid() }).strict();
+ export type OrganizationIdInput = z.infer<typeof organizationIdInputSchema>;
+ 
+diff --git a/packages/shared/src/hub-api.ts b/packages/shared/src/hub-api.ts
+index 5bc978a..06f13cb 100644
+--- a/packages/shared/src/hub-api.ts
++++ b/packages/shared/src/hub-api.ts
+@@ -1,5 +1,5 @@
+ import type { AppLocale, ThemeMode } from "./appearance";
+-import type { AuditLogDto, OrganizationCreateInput, OrganizationDto, OrganizationIdInput, ProjectOrganizationInput } from "./enterprise";
++import type { AuditLogDto, EnterpriseAnalyticsDto, OrganizationCreateInput, OrganizationDto, OrganizationIdInput, OrganizationPolicyUpdateInput, ProjectOrganizationInput } from "./enterprise";
+ import type { ChatAbortInput, ChatSendInput } from "./gateway";
+ import type {
+   AppearanceSettings,
+@@ -213,7 +213,9 @@ export interface HubSyncApi {
+ export interface HubOrganizationsApi {
+   list: () => Promise<OrganizationDto[]>;
+   create: (input: OrganizationCreateInput) => Promise<OrganizationDto>;
++  updatePolicy: (input: OrganizationPolicyUpdateInput) => Promise<OrganizationDto>;
+   listAudit: (input: OrganizationIdInput) => Promise<AuditLogDto[]>;
++  analytics: (input: OrganizationIdInput) => Promise<EnterpriseAnalyticsDto>;
+   assignProject: (input: ProjectOrganizationInput) => Promise<void>;
+ }
+ 
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 2a17481..b0fb974 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -1,5 +1,5 @@
+ export { type AppLocale, type ThemeMode, localeSchema, themeModeSchema } from "./appearance";
+-export { auditLogDtoSchema, enterprisePolicySchema, enterpriseToolPolicySchema, organizationCreateInputSchema, organizationDtoSchema, organizationIdInputSchema, projectOrganizationInputSchema, type AuditLogDto, type EnterprisePolicy, type OrganizationCreateInput, type OrganizationDto, type OrganizationIdInput, type ProjectOrganizationInput } from "./enterprise";
++export { auditLogDtoSchema, enterpriseAnalyticsDtoSchema, enterprisePolicySchema, enterpriseToolPolicySchema, organizationCreateInputSchema, organizationDtoSchema, organizationIdInputSchema, organizationPolicyUpdateInputSchema, projectOrganizationInputSchema, type AuditLogDto, type EnterpriseAnalyticsDto, type EnterprisePolicy, type OrganizationCreateInput, type OrganizationDto, type OrganizationIdInput, type OrganizationPolicyUpdateInput, type ProjectOrganizationInput } from "./enterprise";
+ export { EXTENSION_API_VERSION, extensionManifestSchema, extensionPermissionSchema, type ExtensionManifest } from "./extensions";
+ export { SYNC_CATEGORIES, syncCategoriesSchema, syncCategorySchema, syncConfigDtoSchema, syncConfigureInputSchema, syncPickRelayResultSchema, syncRunResultSchema, syncSnapshotSchema, type SyncCategories, type SyncCategory, type SyncConfigDto, type SyncConfigureInput, type SyncPickRelayResult, type SyncRunResult } from "./sync";
+ export {
+diff --git a/packages/shared/src/ipc-channels.ts b/packages/shared/src/ipc-channels.ts
+index 130f96a..e642a16 100644
+--- a/packages/shared/src/ipc-channels.ts
++++ b/packages/shared/src/ipc-channels.ts
+@@ -53,7 +53,9 @@ export const IpcChannel = {
+   syncRun: "sync:run",
+   organizationsList: "organizations:list",
+   organizationsCreate: "organizations:create",
++  organizationsUpdatePolicy: "organizations:updatePolicy",
+   organizationsAuditList: "organizations:auditList",
++  organizationsAnalytics: "organizations:analytics",
+   organizationsAssignProject: "organizations:assignProject",
+   secretsList: "secrets:list",
+   secretsSave: "secrets:save",
