@@ -8,9 +8,9 @@ Living session file. Agents **read this first** and **update it** when the wave 
 |---|---|
 | Wave | **W31** |
 | Marco | E — V3 ecosystem |
-| State | `in_progress` |
-| Last completed | **W30** |
-| Next action | Implementar o perfil Enterprise local: organização, políticas, auditoria e limites sem backend remoto. |
+| State | `complete` |
+| Last completed | **W31** |
+| Next action | Não há onda posterior planejada; definir o próximo incremento antes de retomar implementação. |
 
 `State` is one of: `pending` | `in_progress` | `review` | `blocked` | `complete`.
 
@@ -57,5 +57,5 @@ None.
 
 | Kind | Path |
 |---|---|
-| Review | `docs/reviews/W30/REVIEW.md` |
-| Latest ADR | `docs/ADR/ADR-W29-001-declarative-internal-marketplace.md` |
+| Review | `docs/reviews/W31/REVIEW.md` |
+| Latest ADR | `docs/ADR/ADR-W31-001-local-enterprise-policy-profile.md` |
