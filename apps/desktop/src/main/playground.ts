@@ -1,11 +1,11 @@
-import { SpendCapError, evaluatePlaygroundCaps, FACTORY_PROMPTS } from "@ai-hub/shared";
+import { SpendCapError, FACTORY_PROMPTS } from "@ai-hub/shared";
 import type { PlaygroundRunInput, PlaygroundRunResult } from "@ai-hub/shared";
 import type { WebContents } from "electron";
 import { sendChat, waitForChatRun } from "./chat-session";
 import { previewPacket } from "./packet-preview";
 import { getHubDatabase } from "./persistence";
 import { interpolateStoredPrompt } from "./prompt-vars";
-import { localDayStartMs, spendCapLimitsFromRows } from "./spend-guard";
+import { evaluateBatchScopedCaps } from "./spend-guard";
 
 let playgroundBusy = false;
 
@@ -66,6 +66,7 @@ export async function runPlayground(
     throw error;
   }
   const conversations: Array<(typeof prepared)[number] & { conversation: { id: string } }> = [];
+  let reservationIds: string[] = [];
   try {
     for (const item of prepared) {
       const conversation = repos.createConversation(
@@ -76,7 +77,7 @@ export async function runPlayground(
       conversations.push({ ...item, conversation });
     }
 
-    const estimates: Array<string | null> = [];
+    const estimates: Array<{ usd: string | null; projectId: string | null; providerSlug: string }> = [];
     for (const item of conversations) {
       const preview = previewPacket({
         conversationId: item.conversation.id,
@@ -90,19 +91,15 @@ export async function runPlayground(
       if (preview.overflow) {
         throw new Error("gateway:context_overflow");
       }
-      estimates.push(preview.estimatedCostUsd);
+      estimates.push({ usd: preview.estimatedCostUsd, projectId: input.projectId, providerSlug: item.key.providerSlug });
     }
 
-    const cap = evaluatePlaygroundCaps({
-      estimates,
-      daySpentUsd: repos.sumReceiptCostUsd({ sinceMs: localDayStartMs() }),
-      globalSpentUsd: repos.sumReceiptCostUsd({}),
-      limits: spendCapLimitsFromRows(repos.listSpendCaps()),
-    });
+    const cap = evaluateBatchScopedCaps({ estimates, repos });
     if (cap.blocked) {
       throw new SpendCapError(cap.blocked);
     }
 
+    reservationIds = estimates.flatMap((estimate) => estimate.usd === null ? [] : [repos.reserveSpend({ projectId: estimate.projectId, providerSlug: estimate.providerSlug, amountUsd: estimate.usd, expiresAt: Date.now() + 15 * 60_000 })]);
     const sends = await Promise.all(
       conversations.map((item) =>
         sendChat(
@@ -116,12 +113,14 @@ export async function runPlayground(
             ...(input.extraSystem !== undefined ? { extraSystem: input.extraSystem } : {}),
             ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
             ...(input.maxTokens !== undefined ? { maxTokens: input.maxTokens } : {}),
+            __skipCaps: true,
           },
           sender,
         ),
       ),
     );
     void Promise.all(sends.map((send) => waitForChatRun(send.runId))).finally(() => {
+      for (const reservationId of reservationIds) repos.releaseSpendReservation(reservationId);
       playgroundBusy = false;
     });
     return {
@@ -139,6 +138,7 @@ export async function runPlayground(
       }),
     };
   } catch (error) {
+    for (const reservationId of reservationIds) repos.releaseSpendReservation(reservationId);
     for (const item of conversations) {
       const streaming = repos.listMessages(item.conversation.id).some((message) => message.status === "streaming");
       if (!streaming) {
