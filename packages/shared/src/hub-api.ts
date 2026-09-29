@@ -1,5 +1,5 @@
 import type { AppLocale, ThemeMode } from "./appearance";
-import type { AuditLogDto, OrganizationCreateInput, OrganizationDto, OrganizationIdInput, ProjectOrganizationInput } from "./enterprise";
+import type { AuditLogDto, EnterpriseAnalyticsDto, OrganizationCreateInput, OrganizationDto, OrganizationIdInput, OrganizationPolicyUpdateInput, ProjectOrganizationInput } from "./enterprise";
 import type { ChatAbortInput, ChatSendInput } from "./gateway";
 import type {
   AppearanceSettings,
@@ -213,7 +213,9 @@ export interface HubSyncApi {
 export interface HubOrganizationsApi {
   list: () => Promise<OrganizationDto[]>;
   create: (input: OrganizationCreateInput) => Promise<OrganizationDto>;
+  updatePolicy: (input: OrganizationPolicyUpdateInput) => Promise<OrganizationDto>;
   listAudit: (input: OrganizationIdInput) => Promise<AuditLogDto[]>;
+  analytics: (input: OrganizationIdInput) => Promise<EnterpriseAnalyticsDto>;
   assignProject: (input: ProjectOrganizationInput) => Promise<void>;
 }
 
