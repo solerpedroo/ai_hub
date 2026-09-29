@@ -11,6 +11,7 @@ import {
   chatSendInputSchema,
   chatSendResultSchema,
   conversationCreateInputSchema,
+  conversationRenameInputSchema,
   conversationDtoSchema,
   conversationExportInputSchema,
   conversationExportResultSchema,
@@ -289,6 +290,12 @@ export function registerWorkspaceIpc(): void {
     conversationCreateInputSchema,
     conversationDtoSchema,
     (input) => conversationDtoSchema.parse(getHubDatabase().repos.createConversation(input.projectId, input.title)),
+  );
+  registerHandler(
+    IpcChannel.conversationsRename,
+    conversationRenameInputSchema,
+    conversationDtoSchema,
+    (input) => conversationDtoSchema.parse(getHubDatabase().repos.renameConversation(input.conversationId, input.title)),
   );
 
   registerHandler(IpcChannel.conversationsRemove, idInputSchema, ipcAckResultSchema, (input) => {
