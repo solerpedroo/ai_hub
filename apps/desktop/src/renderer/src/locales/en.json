@@ -683,5 +683,17 @@
     "enterprise.title": "Local Enterprise",
     "enterprise.hint": "Create a local organization for governance and audit policies.",
     "enterprise.name": "Organization name",
-    "enterprise.create": "Create organization"
+    "enterprise.create": "Create organization",
+    "enterprise.organization": "Organization",
+    "enterprise.models": "Allowed models",
+    "enterprise.modelsHint": "gpt-4o-mini, claude-… (empty = all)",
+    "enterprise.monthlyCap": "Team monthly cap (USD)",
+    "enterprise.allowReadTools": "Allow read tools",
+    "enterprise.allowWriteTools": "Allow write tools",
+    "enterprise.blockPii": "Block PII",
+    "enterprise.analytics": "Allow aggregate analytics (local only)",
+    "enterprise.savePolicy": "Save governance policy",
+    "enterprise.assignProject": "Assign a project",
+    "enterprise.selectProject": "Choose a project",
+    "enterprise.analyticsSummary": "Local aggregate events: {{value}}"
 }
