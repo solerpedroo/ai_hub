@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { Paperclip, SendHorizontal, SlidersHorizontal } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
   looksLikePastedSecret,
@@ -55,6 +56,11 @@ export function ChatComposer({
   streaming,
   sending,
   disabled,
+  onAttachFile,
+  onAttachFolder,
+  extraSystem,
+  onExtraSystemChange,
+  voicePanel,
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -71,6 +77,11 @@ export function ChatComposer({
   streaming: boolean;
   sending: boolean;
   disabled: boolean;
+  onAttachFile: () => void;
+  onAttachFolder: () => void;
+  extraSystem: string;
+  onExtraSystemChange: (value: string) => void;
+  voicePanel: (open: boolean, onOpenChange: (open: boolean) => void) => JSX.Element | null;
 }): JSX.Element {
   const { t } = useTranslation();
   const areaRef = useRef<HTMLTextAreaElement>(null);
@@ -79,6 +90,7 @@ export function ChatComposer({
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
   const [mentionDismissed, setMentionDismissed] = useState(false);
   const [caret, setCaret] = useState(0);
+  const [activePopover, setActivePopover] = useState<"attachments" | "instructions" | "voice" | null>(null);
   const busy = streaming || sending;
   const secretWarning = looksLikePastedSecret(value);
   const slashQuery =
@@ -139,7 +151,7 @@ export function ChatComposer({
 
   return (
     <form
-      className="flex flex-col gap-1.5 border-t p-2"
+      className="mx-3 mb-3 flex flex-col gap-2 rounded-xl border bg-card p-2.5 shadow-[0_8px_24px_hsl(224_30%_15%_/_0.06)]"
       onSubmit={(event: FormEvent) => {
         event.preventDefault();
         submit();
@@ -156,7 +168,7 @@ export function ChatComposer({
         value={value}
         disabled={disabled || sending}
         rows={3}
-        className="min-h-[4.5rem] w-full resize-none rounded-md border border-input bg-background px-2.5 py-2 text-[13px] shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+        className="min-h-[5rem] w-full resize-none rounded-lg border border-input bg-background/60 px-3 py-2.5 text-[13px] shadow-inner placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
         placeholder={t("workspace.composer.placeholder")}
         aria-autocomplete="list"
         aria-controls={
@@ -348,6 +360,32 @@ export function ChatComposer({
             {t("workspace.composer.hint")}
           </p>
         )}
+        <div className="relative flex items-center gap-1">
+        <div className="relative">
+          <Button type="button" size="icon" variant={activePopover === "instructions" ? "secondary" : "ghost"} aria-label={t("workspace.extraSystem")} aria-pressed={activePopover === "instructions"} onClick={() => setActivePopover((value) => value === "instructions" ? null : "instructions")}>
+            <SlidersHorizontal className="h-4 w-4" />
+          </Button>
+          {activePopover === "instructions" ? (
+            <div className="surface-raised absolute bottom-10 right-0 z-40 w-[min(22rem,calc(100vw-2rem))] rounded-xl p-3 shadow-xl">
+              <label htmlFor="extra-system-instructions" className="mb-2 block text-xs font-medium">{t("workspace.extraSystem")}</label>
+              <textarea id="extra-system-instructions" rows={4} value={extraSystem} onChange={(event) => onExtraSystemChange(event.target.value)} className="w-full resize-y rounded-lg border border-input bg-background px-3 py-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" />
+            </div>
+          ) : null}
+        </div>
+        {voicePanel(activePopover === "voice", (open) => setActivePopover(open ? "voice" : null))}
+        {!streaming ? (
+          <div className="relative">
+            <Button type="button" size="icon" variant={activePopover === "attachments" ? "secondary" : "ghost"} disabled={disabled || sending} aria-label={t("files.attach")} onClick={() => setActivePopover((open) => open === "attachments" ? null : "attachments")}>
+              <Paperclip className="h-4 w-4" />
+            </Button>
+            {activePopover === "attachments" ? (
+              <div className="surface-raised absolute bottom-10 right-0 z-40 w-40 rounded-lg p-1 shadow-xl">
+                <button type="button" className="w-full rounded px-2 py-1.5 text-left text-[12px] hover:bg-accent" onClick={() => { setActivePopover(null); onAttachFile(); }}>{t("files.attach")}</button>
+                <button type="button" className="w-full rounded px-2 py-1.5 text-left text-[12px] hover:bg-accent" onClick={() => { setActivePopover(null); onAttachFolder(); }}>{t("files.attachFolder")}</button>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
         {streaming ? (
           <Button
             type="button"
@@ -362,12 +400,15 @@ export function ChatComposer({
         ) : (
           <Button
             type="submit"
+            size="icon"
             data-testid="chat-send"
             disabled={disabled || sending || !canSubmit}
+            aria-label={t("workspace.composer.send")}
           >
-            {t("workspace.composer.send")}
+            <SendHorizontal className="h-4 w-4" />
           </Button>
         )}
+        </div>
       </div>
     </form>
   );
