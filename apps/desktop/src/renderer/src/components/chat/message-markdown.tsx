@@ -1,4 +1,4 @@
-import { type JSX, type MouseEvent, useState } from "react";
+import { type JSX, type MouseEvent, useEffect, useRef, useState } from "react";
 import type { Components } from "react-markdown";
 import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
@@ -109,16 +109,51 @@ const markdownComponents: Components = {
   ),
 };
 
-export function MessageMarkdown({ content }: { content: string }): JSX.Element {
+export function MessageMarkdown({
+  content,
+  streaming = false,
+}: {
+  content: string;
+  streaming?: boolean;
+}): JSX.Element {
+  const [visibleContent, setVisibleContent] = useState(content);
+  const visibleRef = useRef(content);
+
+  useEffect(() => {
+    if (!streaming) {
+      visibleRef.current = content;
+      setVisibleContent(content);
+      return;
+    }
+
+    const tick = (): void => {
+      const current = visibleRef.current;
+      if (current.length >= content.length || !content.startsWith(current)) {
+        visibleRef.current = content;
+        setVisibleContent(content);
+        return;
+      }
+      const next = content.slice(0, Math.min(content.length, current.length + 3));
+      visibleRef.current = next;
+      setVisibleContent(next);
+    };
+    const timer = window.setInterval(tick, 12);
+    return () => window.clearInterval(timer);
+  }, [content, streaming]);
+
   return (
-    <div className="chat-md max-w-none text-[13px] leading-5 [&_p]:mb-2 [&_p:last-child]:mb-0 [&_ul]:mb-2 [&_ol]:mb-2 [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_pre_code]:bg-transparent [&_pre_code]:p-0">
+    <div
+      className="chat-md max-w-none text-[13px] leading-5 [&_p]:mb-2 [&_p:last-child]:mb-0 [&_ul]:mb-2 [&_ol]:mb-2 [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_pre_code]:bg-transparent [&_pre_code]:p-0"
+      aria-live={streaming ? "polite" : undefined}
+    >
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[[rehypeSanitize, markdownSchema], rehypeHighlight]}
         components={markdownComponents}
       >
-        {content}
+        {visibleContent}
       </ReactMarkdown>
+      {streaming ? <span className="streaming-caret" aria-hidden /> : null}
     </div>
   );
 }
