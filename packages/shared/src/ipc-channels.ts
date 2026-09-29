@@ -11,6 +11,7 @@ export const IpcChannel = {
   projectsRemove: "projects:remove",
   conversationsList: "conversations:list",
   conversationsCreate: "conversations:create",
+  conversationsRename: "conversations:rename",
   conversationsRemove: "conversations:remove",
   conversationsExport: "conversations:export",
   conversationsGetBranchLabels: "conversations:getBranchLabels",
