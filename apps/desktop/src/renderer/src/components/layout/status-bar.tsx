@@ -27,7 +27,7 @@ export function StatusBar({
   const modifier = window.hub.platform === "darwin" ? "⌘" : "Ctrl";
 
   return (
-    <footer className="flex h-6 shrink-0 items-center justify-between gap-3 border-t bg-background px-3 text-[11px] text-muted-foreground">
+    <footer className="flex h-7 shrink-0 items-center justify-between gap-3 border-t bg-background/80 px-3 text-[11px] text-muted-foreground backdrop-blur-sm">
       <span className="truncate" data-testid="status-health">
         {health.length === 0
           ? t("status.health.empty")
@@ -51,7 +51,7 @@ export function StatusBar({
               })
               .join(" · ")}
       </span>
-      <span className="truncate" data-testid="status-usage">
+      <span className="tabular-nums truncate" data-testid="status-usage">
         {runHud ? `tokens ${runHud.tokensIn ?? "—"}/${runHud.tokensOut ?? "—"} · thinking ${runHud.tokensThinking ?? "—"} · cache ${runHud.cacheReadTokens ?? "—"}/${runHud.cacheWriteTokens ?? "—"} · $${runHud.costUsd ?? "—"}` : ""}
       </span>
       <span className="flex shrink-0 items-center gap-3">
