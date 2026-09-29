@@ -1,4 +1,5 @@
 import { type JSX, useEffect, useRef, useState } from "react";
+import { Mic, MicOff } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { AppPrefs, MessageDto } from "@ai-hub/shared";
 import { Button } from "@/components/ui/button";
@@ -27,6 +28,8 @@ export function VoicePanel({
   onSendTranscript,
   onAbortChat,
   onPrefsChange,
+  open,
+  onOpenChange,
 }: {
   enabled: boolean;
   conversationId: string | null;
@@ -40,9 +43,10 @@ export function VoicePanel({
   onSendTranscript: (text: string) => Promise<boolean>;
   onAbortChat: () => void;
   onPrefsChange: (patch: Partial<AppPrefs>) => Promise<void>;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
 }): JSX.Element | null {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
   const [phase, setPhase] = useState<VoicePhase>("idle");
   const [interim, setInterim] = useState("");
   const [lastTranscript, setLastTranscript] = useState("");
@@ -215,36 +219,35 @@ export function VoicePanel({
   }
 
   return (
-    <section className="border-t px-2 py-2" data-testid="voice-panel">
-      <div className="flex flex-wrap items-center gap-2">
-        <p className="text-[12px] font-medium">{t("voice.title")}</p>
+    <div className="relative" data-testid="voice-panel">
         <Button
           type="button"
-          size="sm"
+          size="icon"
           variant={open ? "default" : "outline"}
           aria-pressed={open}
+          aria-label={open ? t("voice.hide") : t("voice.show")}
           data-testid="voice-toggle"
           onClick={() => {
-            setOpen((value) => {
-              const next = !value;
-              if (next) {
-                markExistingAssistantSpoken();
-              } else {
-                listeningDesiredRef.current = false;
-                awaitingVoiceReplyRef.current = false;
-                recognitionRef.current?.abort();
-                recognitionRef.current = null;
-                stopSpeaking();
-                setPhase("idle");
-              }
-              return next;
-            });
+            const next = !open;
+            if (next) {
+              markExistingAssistantSpoken();
+            } else {
+              listeningDesiredRef.current = false;
+              awaitingVoiceReplyRef.current = false;
+              recognitionRef.current?.abort();
+              recognitionRef.current = null;
+              stopSpeaking();
+              setPhase("idle");
+            }
+            onOpenChange(next);
           }}
         >
-          {open ? t("voice.hide") : t("voice.show")}
+          {phase === "listening" ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
         </Button>
         {open ? (
-          <>
+          <div className="surface-raised absolute bottom-10 right-0 z-40 max-h-[min(70vh,32rem)] w-[min(22rem,calc(100vw-2rem))] overflow-auto rounded-xl p-3 shadow-xl">
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <p className="text-xs font-medium">{t("voice.title")}</p>
             <Button
               type="button"
               size="sm"
@@ -263,11 +266,8 @@ export function VoicePanel({
             <Button type="button" size="sm" variant="ghost" data-testid="voice-interrupt" onClick={interrupt}>
               {t("voice.interrupt")}
             </Button>
-          </>
-        ) : null}
-      </div>
-      {open ? (
-        <div className="mt-2 flex flex-col gap-2">
+            </div>
+          <div className="flex flex-col gap-2">
           {!cloudAck ? (
             <div className="rounded border border-amber-600/40 bg-amber-500/10 p-2 text-[11px]" role="status">
               <p>{t("voice.cloudWarning")}</p>
@@ -337,8 +337,9 @@ export function VoicePanel({
               {error}
             </p>
           ) : null}
-        </div>
-      ) : null}
-    </section>
+          </div>
+          </div>
+        ) : null}
+    </div>
   );
 }
