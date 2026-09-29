@@ -1,4 +1,5 @@
 import { type JSX, useEffect, useRef, useState } from "react";
+import { PanelLeftClose, PanelLeftOpen, SlidersHorizontal } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
   activePath,
@@ -47,7 +48,10 @@ import { PacketPanel } from "@/components/chat/packet-panel";
 import { ConversationWorkspacePanel } from "@/components/workspace/conversation-workspace-panel";
 import { MemoryPanel } from "@/components/workspace/memory-panel";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
 import { ScrollArea } from "@/components/ui/scroll-area";
 
 const PROJECT_COLORS = [
@@ -139,6 +143,7 @@ export function HomeView({
   onDropFiles,
   onMentionsChange,
   onDuplicateConversation,
+  onRemoveConversation,
   onPromoteConversation,
   composerInsert,
   onComposerInsertConsumed,
@@ -184,7 +189,8 @@ export function HomeView({
   onRenameBranch: (branchId: string, label: string) => Promise<void>;
   onExport: (mode: "active" | "tree") => Promise<void>;
   onMoveConversation: (projectId: string | null) => Promise<void>;
-  onDuplicateConversation: () => Promise<void>;
+  onDuplicateConversation: (conversationId: string) => Promise<void>;
+  onRemoveConversation: (conversationId: string) => Promise<void>;
   onPromoteConversation: () => Promise<void>;
   onSaveProject: (input: Omit<ProjectUpdateInput, "id">) => Promise<void>;
   onRemoveProject: () => Promise<void>;
@@ -223,7 +229,6 @@ export function HomeView({
 }): JSX.Element {
   const { t, i18n } = useTranslation();
   const modifier = window.hub.platform === "darwin" ? "⌘" : "Ctrl";
-  const [title, setTitle] = useState("");
   const [draft, setDraft] = useState("");
   const [runMode, setRunMode] = useState<"plan" | "assist" | "agent" | "orchestrate" | "research">("assist");
   const [effortLevel, setEffortLevel] = useState<"low" | "medium" | "high" | "max">("medium");
@@ -235,6 +240,12 @@ export function HomeView({
   const mentionQueryRef = useRef<string | null>(null);
   const [editing, setEditing] = useState(false);
   const [treeOpen, setTreeOpen] = useState(false);
+  const [contextConversationId, setContextConversationId] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<
+    { kind: "conversation"; id: string } | { kind: "project" } | null
+  >(null);
+  const [conversationPaneCollapsed, setConversationPaneCollapsed] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [packetOpen, setPacketOpen] = useState(false);
   const [memoryOpen, setMemoryOpen] = useState(false);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
@@ -819,10 +830,11 @@ export function HomeView({
   };
 
   return (
-    <div className="flex h-full min-h-0">
-      <section className="flex w-64 shrink-0 flex-col border-r">
-        <div className="border-b p-3">
-          <h1 className="truncate text-sm font-semibold">
+    <div className="flex h-full min-h-0 overflow-hidden">
+      <section className={`flex shrink-0 flex-col border-r bg-card/45 transition-[width] duration-200 ${conversationPaneCollapsed ? "w-0 overflow-hidden border-r-0" : "w-56"}`}>
+        <div className="border-b bg-card/55 px-4 py-3">
+          <p className="mb-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">{t("workspace.conversations")}</p>
+          <h1 className="truncate text-sm font-semibold tracking-tight">
             {project
               ? project.name
               : importedInbox
@@ -837,7 +849,7 @@ export function HomeView({
                 : t("workspace.inboxHint")}
           </p>
         </div>
-        <ScrollArea className="flex-1 p-2">
+        <ScrollArea className="scrollbar-subtle flex-1 p-2">
           {conversations.length === 0 ? (
             <p className="px-2 text-muted-foreground">
               {project
@@ -849,27 +861,65 @@ export function HomeView({
           ) : (
             <div className="flex flex-col gap-0.5">
               {conversations.map((conversation) => (
-                <Button
-                  key={conversation.id}
-                  type="button"
-                  variant={
-                    selectedConversationId === conversation.id ? "secondary" : "ghost"
-                  }
-                  className="h-8 w-full justify-start truncate"
-                  data-testid="conversation-item"
-                  aria-current={
-                    selectedConversationId === conversation.id ? "true" : undefined
-                  }
-                  onClick={() => onSelectConversation(conversation.id)}
-                >
-                  {conversation.title}
-                </Button>
+                <div key={conversation.id} className="relative">
+                  <Button
+                    type="button"
+                    variant={selectedConversationId === conversation.id ? "secondary" : "ghost"}
+                    className="nav-rail h-8 w-full justify-start truncate shadow-none"
+                    data-testid="conversation-item"
+                    aria-current={selectedConversationId === conversation.id ? "true" : undefined}
+                    onClick={() => {
+                      setContextConversationId(null);
+                      onSelectConversation(conversation.id);
+                    }}
+                    onContextMenu={(event) => {
+                      event.preventDefault();
+                      setContextConversationId(conversation.id);
+                    }}
+                  >
+                    {conversation.title}
+                  </Button>
+                  {contextConversationId === conversation.id ? (
+                    <div
+                      className="surface-raised absolute left-2 right-2 top-9 z-30 overflow-hidden rounded-lg p-1"
+                      role="menu"
+                      data-testid="conversation-context-menu"
+                    >
+                      <button
+                        type="button"
+                        className="flex w-full rounded-md px-2 py-1.5 text-left text-[12px] hover:bg-accent"
+                        role="menuitem"
+                        onClick={() => {
+                          setContextConversationId(null);
+                          void onDuplicateConversation(conversation.id);
+                        }}
+                      >
+                        {t("workspace.duplicate")}
+                      </button>
+                      <button
+                        type="button"
+                        className="flex w-full rounded-md px-2 py-1.5 text-left text-[12px] text-destructive hover:bg-destructive/10"
+                        role="menuitem"
+                        onClick={() => {
+                          setContextConversationId(null);
+                          setPendingDelete({ kind: "conversation", id: conversation.id });
+                        }}
+                      >
+                        {t("workspace.deleteConversation")}
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
               ))}
             </div>
           )}
           {selectedConversation ? (
+            <details className="mt-3 border-t pt-2">
+              <summary className="cursor-pointer px-1 text-[11px] text-muted-foreground marker:text-muted-foreground">
+                {t("workspace.tags")}
+              </summary>
             <form
-              className="mt-3 flex flex-col gap-1 border-t pt-2"
+              className="mt-2 flex flex-col gap-1"
               onSubmit={(event) => {
                 event.preventDefault();
                 const next = tagDraft.trim();
@@ -882,9 +932,6 @@ export function HomeView({
                 void onSetTags(names).then(() => setTagDraft(""));
               }}
             >
-              <p className="px-1 text-[11px] text-muted-foreground">
-                {t("workspace.tags")}
-              </p>
               <div className="flex flex-wrap gap-1 px-1">
                 {selectedConversation.tags.map((tag) => (
                   <Button
@@ -920,6 +967,7 @@ export function HomeView({
                 {t("workspace.tagAdd")}
               </Button>
             </form>
+            </details>
           ) : null}
           {project ? (
             <form
@@ -977,8 +1025,7 @@ export function HomeView({
               </label>
               <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
                 {t("workspace.preferredProvider")}
-                <select
-                  className="h-8 rounded-md border bg-background px-2 text-sm text-foreground"
+                <Select
                   value={preferredProvider}
                   onChange={(event) => setPreferredProvider(event.target.value)}
                   aria-label={t("workspace.preferredProvider")}
@@ -989,13 +1036,12 @@ export function HomeView({
                       {slug}
                     </option>
                   ))}
-                </select>
+                </Select>
               </label>
               <label className="flex flex-col gap-1 text-[11px] text-muted-foreground">
                 {t("workspace.preferredModel")}
                 {preferredModels.length > 0 ? (
-                  <select
-                    className="h-8 rounded-md border bg-background px-2 text-sm text-foreground"
+                  <Select
                     value={preferredModel}
                     onChange={(event) => setPreferredModel(event.target.value)}
                     aria-label={t("workspace.preferredModel")}
@@ -1006,7 +1052,7 @@ export function HomeView({
                         {model.label}
                       </option>
                     ))}
-                  </select>
+                  </Select>
                 ) : (
                   <Input
                     value={preferredModel}
@@ -1024,15 +1070,7 @@ export function HomeView({
                 variant="outline"
                 className="h-7"
                 data-testid="project-delete"
-                onClick={() => {
-                  if (
-                    window.confirm(
-                      t("workspace.deleteProjectConfirm", { name: project.name }),
-                    )
-                  ) {
-                    void onRemoveProject();
-                  }
-                }}
+                onClick={() => setPendingDelete({ kind: "project" })}
               >
                 {t("workspace.deleteProject")}
               </Button>
@@ -1040,48 +1078,67 @@ export function HomeView({
           ) : null}
         </ScrollArea>
         {importedInbox ? null : (
-          <form
-            className="flex flex-col gap-1 border-t p-2"
-            onSubmit={(event) => {
-              event.preventDefault();
-              const next = title.trim();
-              if (!next) {
-                return;
-              }
-              void onCreateConversation(next).then(() => setTitle(""));
-            }}
-          >
-            <Input
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-              placeholder={t("workspace.conversationPlaceholder")}
-              aria-label={t("workspace.conversationPlaceholder")}
-              data-testid="workspace-new-conversation-title"
-            />
+          <div className="border-t bg-background/40 p-2">
             <Button
-              type="submit"
-              size="sm"
-              className="h-7"
+              type="button"
+              className="h-8 w-full"
               data-testid="workspace-new-conversation"
+              onClick={() => {
+                void onCreateConversation(t("workspace.untitledChat"));
+              }}
             >
               {t("workspace.newConversation")}
             </Button>
-          </form>
+          </div>
         )}
       </section>
-      <section className="flex min-w-0 flex-1 flex-col">
+      <section className="flex min-w-0 flex-1 flex-col bg-background/35">
         {selectedConversationId ? (
           <>
-            <header className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
-              <span className="rounded border px-2 py-1 text-[11px]" role="status" data-testid="offline-status">{localReady ? t(providerSlug === "ollama" ? "offline.localMode" : "offline.cloudMode") : t(localStatus?.available ? "offline.noModels" : "offline.localUnavailable")}</span>
+            <header className="flex flex-wrap items-center gap-2 border-b bg-card/60 px-4 py-2.5 backdrop-blur-sm">
+              <Button type="button" size="icon" variant="ghost" className="h-8 w-8 shadow-none" aria-label={t("workspace.conversations")} onClick={() => setConversationPaneCollapsed((collapsed) => !collapsed)}>
+                {conversationPaneCollapsed ? <PanelLeftOpen className="h-4 w-4" /> : <PanelLeftClose className="h-4 w-4" />}
+              </Button>
+              <div className="flex min-w-0 flex-1 items-center gap-2">
+                <span className="truncate text-[12px] font-medium">
+                  {selectedConversation?.title ?? t("workspace.conversations")}
+                </span>
+                <span className="hidden truncate text-[11px] text-muted-foreground sm:inline">
+                  {selectedKey?.providerSlug ?? "—"} · {selectedModel}
+                </span>
+              </div>
+              {packetPreview ? (
+                <span className="hidden rounded-full bg-muted px-2 py-1 text-[10px] text-muted-foreground sm:inline" data-testid="packet-badge">
+                  {t("workspace.packet.badge", { n: packetPreview.tokenEstimate })}
+                </span>
+              ) : null}
+              <Button
+                type="button"
+                size="sm"
+                variant={advancedOpen ? "secondary" : "ghost"}
+                className="h-8 px-2 shadow-none"
+                aria-expanded={advancedOpen}
+                aria-label={t("command.settings")}
+                onClick={() => setAdvancedOpen((open) => !open)}
+              >
+                <SlidersHorizontal className="h-3.5 w-3.5" />
+              </Button>
+              <Dialog open={advancedOpen} onOpenChange={setAdvancedOpen}>
+                <DialogContent className="max-h-[85vh] max-w-4xl overflow-hidden p-0">
+                  <DialogHeader className="border-b px-5 py-4 pr-12">
+                    <DialogTitle>{t("command.settings")}</DialogTitle>
+                  </DialogHeader>
+                  <div className="max-h-[calc(85vh-4rem)] space-y-3 overflow-y-auto p-5">
+              <div className="flex flex-wrap items-center gap-2 rounded-xl border bg-muted/20 p-3">
+              <span className="rounded-full border border-primary/15 bg-primary/[0.06] px-2 py-1 text-[10px] font-medium text-primary" role="status" data-testid="offline-status">{localReady ? t(providerSlug === "ollama" ? "offline.localMode" : "offline.cloudMode") : t(localStatus?.available ? "offline.noModels" : "offline.localUnavailable")}</span>
               {providerKeys.length === 0 ? (
                 <p className="text-muted-foreground">{t("workspace.noKey")}</p>
               ) : (
                 <>
-                  <label className="flex items-center gap-1">
+                  <label className="flex items-center gap-2 text-xs">
                     <span className="text-muted-foreground">{t("workspace.key")}</span>
-                    <select
-                      className="h-8 rounded-md border bg-background px-2 text-sm"
+                    <Select
+                      className="max-w-[min(24rem,55vw)]"
                       value={selectedKeyId ?? providerKeys[0]?.id}
                       onChange={(event) => onSelectKey(event.target.value)}
                       aria-label={t("workspace.key")}
@@ -1092,11 +1149,11 @@ export function HomeView({
                           {key.providerSlug} · {key.label} ({key.maskedKey})
                         </option>
                       ))}
-                    </select>
+                    </Select>
                   </label>
-                  <label className="flex items-center gap-1 text-[11px]"><span>{t("runMode.label")}</span><select className="h-8 rounded border bg-background px-1" value={runMode} onChange={(event) => void saveRunSettings(event.target.value as typeof runMode, effortLevel)}><option value="assist">Assist</option><option value="plan">Plan</option><option value="agent">{t("agents.mode")}</option><option value="orchestrate">{t("orchestration.mode")}</option><option value="research">{t("research.mode")}</option></select></label>
-                  <label className="flex items-center gap-1 text-[11px"><span>{t("effort.label")}</span><select className="h-8 rounded border bg-background px-1" value={effortLevel} onChange={(event) => void saveRunSettings(runMode, event.target.value as typeof effortLevel)}>{["low", "medium", "high", "max"].map((level) => <option key={level} value={level}>{level}</option>)}</select></label>
-                  <label className="flex items-center gap-1">
+                  <label className="flex items-center gap-2 text-xs"><span>{t("runMode.label")}</span><Select value={runMode} onChange={(event) => void saveRunSettings(event.target.value as typeof runMode, effortLevel)}><option value="assist">Assist</option><option value="plan">Plan</option><option value="agent">{t("agents.mode")}</option><option value="orchestrate">{t("orchestration.mode")}</option><option value="research">{t("research.mode")}</option></Select></label>
+                  <label className="flex items-center gap-2 text-xs"><span>{t("effort.label")}</span><Select value={effortLevel} onChange={(event) => void saveRunSettings(runMode, event.target.value as typeof effortLevel)}>{["low", "medium", "high", "max"].map((level) => <option key={level} value={level}>{level}</option>)}</Select></label>
+                  <label className="flex items-center gap-2 text-xs">
                     <span className="text-muted-foreground">{t("workspace.model")}</span>
                     {providerSlug === "custom" ? (
                       <Input
@@ -1108,9 +1165,9 @@ export function HomeView({
                         data-testid="workspace-custom-model"
                       />
                     ) : (
-                      <select
+                      <Select
                         ref={modelSelectRef}
-                        className="h-8 max-w-72 rounded-md border bg-background px-2 text-sm"
+                        className="max-w-72"
                         value={selectedModel}
                         onChange={(event) => onSelectModel(event.target.value)}
                         aria-label={t("workspace.model")}
@@ -1124,7 +1181,7 @@ export function HomeView({
                             {` · ${model.contextWindow / 1000}k`}
                           </option>
                         ))}
-                      </select>
+                      </Select>
                     )}
                   </label>
                   <label className="flex items-center gap-1 text-[11px]">
@@ -1185,7 +1242,8 @@ export function HomeView({
                   </label>
                 </>
               )}
-              <div className="ml-auto flex flex-wrap items-center gap-1">
+              </div>
+              <div className="flex flex-wrap items-center gap-1 rounded-xl border bg-background/70 p-3">
                 {conversationCost ? (
                   <span
                     className="text-[11px] text-muted-foreground"
@@ -1238,6 +1296,11 @@ export function HomeView({
                     {t("workspace.estimate.none")}
                   </span>
                 ) : null}
+                <details className="w-full rounded-lg border bg-background/60 px-3 py-2">
+                  <summary className="cursor-pointer text-xs font-medium text-muted-foreground hover:text-foreground">
+                    {t("workspace.moreConversationActions")}
+                  </summary>
+                  <div className="mt-2 flex flex-wrap items-center gap-1.5">
                 <Button
                   type="button"
                   size="sm"
@@ -1286,7 +1349,9 @@ export function HomeView({
                   data-testid="conversation-duplicate"
                   disabled={!selectedConversationId || busy}
                   onClick={() => {
-                    void onDuplicateConversation();
+                    if (selectedConversationId) {
+                      void onDuplicateConversation(selectedConversationId);
+                    }
                   }}
                 >
                   {t("workspace.duplicate")}
@@ -1338,8 +1403,8 @@ export function HomeView({
                 {selectedConversation?.importSource ? (
                   <label className="flex items-center gap-1">
                     <span className="text-muted-foreground">{t("workspace.moveTo")}</span>
-                    <select
-                      className="h-8 max-w-48 rounded-md border bg-background px-2 text-sm"
+                    <Select
+                      className="max-w-48"
                       value={selectedConversation.projectId ?? ""}
                       data-testid="import-move"
                       aria-label={t("workspace.moveTo")}
@@ -1354,10 +1419,15 @@ export function HomeView({
                           {item.name}
                         </option>
                       ))}
-                    </select>
+                    </Select>
                   </label>
                 ) : null}
+                  </div>
+                </details>
               </div>
+                  </div>
+                </DialogContent>
+              </Dialog>
             </header>
             {modelSwitchNotice ? (
               <p
@@ -1428,11 +1498,35 @@ export function HomeView({
             ) : null}
             <div className="flex min-h-0 flex-1">
               <div className="flex min-w-0 flex-1 flex-col">
-                <ScrollArea className="flex-1 p-4">
+                <ScrollArea className="scrollbar-subtle flex-1 p-5">
                   {path.length === 0 ? (
-                    <p className="text-muted-foreground">{t("workspace.noMessages")}</p>
+                    <div className="mx-auto flex min-h-full w-full max-w-2xl flex-col items-center justify-center pb-20 text-center">
+                      <div className="mb-4 flex h-11 w-11 items-center justify-center rounded-2xl bg-primary text-lg font-semibold text-primary-foreground shadow-sm">
+                        ✦
+                      </div>
+                      <h2 className="text-xl font-semibold tracking-tight">{t("workspace.greeting")}</h2>
+                      <p className="mt-2 max-w-md text-[13px] text-muted-foreground">
+                        {t("workspace.greetingHint")}
+                      </p>
+                      <div className="mt-6 flex flex-wrap justify-center gap-2">
+                        {["workspace.greeting.prompt1", "workspace.greeting.prompt2", "workspace.greeting.prompt3"].map((key) => (
+                          <button
+                            key={key}
+                            type="button"
+                            className="rounded-full border bg-card px-3 py-1.5 text-[12px] text-foreground shadow-sm hover:border-primary/30 hover:bg-accent"
+                            onClick={() => {
+                              const next = t(key);
+                              setDraft(next);
+                              onComposerDraft(next);
+                            }}
+                          >
+                            {t(key)}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
                   ) : (
-                    <ol className="flex flex-col gap-2" aria-live="polite">
+                    <ol className="mx-auto flex w-full max-w-4xl flex-col gap-3" aria-live="polite">
                       {path.map((message, index) => (
                         <MessageBubble
                           key={message.id}
@@ -1501,44 +1595,7 @@ export function HomeView({
                     </ol>
                   )}
                 </ScrollArea>
-                <label className="flex flex-col gap-1 border-t px-3 py-2 text-[12px]">
-                  <span className="text-muted-foreground">
-                    {t("workspace.extraSystem")}
-                  </span>
-                  <textarea
-                    className="min-h-[2.5rem] resize-y rounded-md border bg-background px-2 py-1 text-[13px]"
-                    value={extraSystem}
-                    onChange={(event) => onSelectExtraSystem(event.target.value)}
-                    aria-label={t("workspace.extraSystem")}
-                  />
-                </label>
-                <div className="flex flex-col gap-1.5">
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      data-testid="files-attach"
-                      disabled={busy || editing}
-                      onClick={() => {
-                        void onAttachFile();
-                      }}
-                    >
-                      {t("files.attach")}
-                    </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      data-testid="files-attach-folder"
-                      disabled={busy || editing}
-                      onClick={() => {
-                        void onAttachFolder();
-                      }}
-                    >
-                      {t("files.attachFolder")}
-                    </Button>
-                  </div>
+                <div className="flex flex-col gap-1.5 px-3 pt-1">
                   {attachedFiles.length > 0 ? (
                     <ul className="flex flex-col gap-1" data-testid="files-attached">
                       {attachedFiles.map((file) => (
@@ -1700,13 +1757,16 @@ export function HomeView({
                     </ol>
                   </div>
                 ) : null}
-                <div className="flex flex-wrap gap-2 border-t px-2 py-1 text-[11px] text-muted-foreground" data-testid="run-hud">
-                  <span>{t("hud.mode")}: {runMode}</span><span>{t("hud.effort")}: {effortLevel}</span>
-                  <span>{t("hud.context")}: {packetPreview?.tokenEstimate ?? "—"}/{packetPreview?.contextWindow ?? "—"}</span>
-                  <span>{t("hud.tokens")}: {runHud?.tokensIn ?? "—"}/{runHud?.tokensOut ?? "—"}</span><span>{t("hud.turnCost")}: {runHud?.costUsd ?? conversationCost ?? "—"}</span>
-                  <span>{t("hud.thinking")}: {runHud?.tokensThinking ?? "—"}</span><span>{t("hud.cache")}: {runHud?.cacheReadTokens ?? "—"}/{runHud?.cacheWriteTokens ?? "—"}</span>
-                  {runHud?.thinkingSupported === false ? <span>{t("hud.thinkingUnavailable")}</span> : null}
-                  {toolActivity ? <span data-testid="tool-activity">{t("tools.activity")}: {toolActivity.toolId} · {toolActivity.argsSummary} · {toolActivity.resultSummary ?? t(`tools.status.${toolActivity.status}`)}</span> : null}
+                <div className="order-last mx-3 mb-2 flex flex-wrap items-center gap-1.5 rounded-xl border bg-card/55 px-2.5 py-1.5 text-[10px] text-muted-foreground shadow-sm" data-testid="run-hud">
+                  <span className="rounded-md bg-muted/70 px-2 py-1">{t("hud.mode")}: {runMode}</span>
+                  <span className="rounded-md bg-muted/70 px-2 py-1">{t("hud.effort")}: {effortLevel}</span>
+                  <span className="rounded-md bg-muted/70 px-2 py-1">{t("hud.context")}: {packetPreview?.tokenEstimate ?? "—"}/{packetPreview?.contextWindow ?? "—"}</span>
+                  <span className="rounded-md bg-muted/70 px-2 py-1 tabular-nums">{t("hud.tokens")}: {runHud?.tokensIn ?? "—"}/{runHud?.tokensOut ?? "—"}</span>
+                  <span className="rounded-md bg-muted/70 px-2 py-1 tabular-nums">{t("hud.turnCost")}: {runHud?.costUsd ?? conversationCost ?? "—"}</span>
+                  <span className="rounded-md bg-muted/70 px-2 py-1 tabular-nums">{t("hud.thinking")}: {runHud?.tokensThinking ?? "—"}</span>
+                  <span className="rounded-md bg-muted/70 px-2 py-1 tabular-nums">{t("hud.cache")}: {runHud?.cacheReadTokens ?? "—"}/{runHud?.cacheWriteTokens ?? "—"}</span>
+                  {runHud?.thinkingSupported === false ? <span className="rounded-md bg-muted/70 px-2 py-1">{t("hud.thinkingUnavailable")}</span> : null}
+                  {toolActivity ? <span className="max-w-full truncate rounded-md bg-muted/70 px-2 py-1" data-testid="tool-activity">{t("tools.activity")}: {toolActivity.toolId} · {toolActivity.argsSummary} · {toolActivity.resultSummary ?? t(`tools.status.${toolActivity.status}`)}</span> : null}
                 </div>
                 {runMode === "agent" || agentRun ? (
                   <section className="border-t px-2 py-2" data-testid="agent-run">
@@ -1780,30 +1840,6 @@ export function HomeView({
                     {developerOutput ? <pre className="mt-2 max-h-40 overflow-auto rounded bg-muted p-2 text-[11px]" data-testid="developer-output">{developerOutput}</pre> : <p className="mt-1 text-[11px] text-muted-foreground">{t("developer.hint")}</p>}
                   </section>
                 ) : null}
-                <VoicePanel
-                  enabled={Boolean(selectedConversationId)}
-                  conversationId={selectedConversationId}
-                  prefs={appPrefs}
-                  messages={messages}
-                  streaming={streaming}
-                  sending={sending}
-                  hasKey={hasKey}
-                  hasConversation={Boolean(selectedConversationId)}
-                  locale={i18n.language}
-                  onSendTranscript={async (text) => {
-                    const voiceMode = runMode === "plan" || runMode === "assist" ? runMode : "assist";
-                    return onSend(text, [], {
-                      keyId: selectedKeyId ?? "",
-                      model: selectedModel,
-                      runMode: voiceMode,
-                      effortLevel,
-                    });
-                  }}
-                  onAbortChat={() => {
-                    void onAbort();
-                  }}
-                  onPrefsChange={onAppPrefsPatch}
-                />
                 <ChatComposer
                   key={selectedConversationId}
                   value={draft}
@@ -2019,6 +2055,35 @@ export function HomeView({
                   onFilesDrop={(files) => {
                     void onDropFiles(files);
                   }}
+                  onAttachFile={() => {
+                    void onAttachFile();
+                  }}
+                  onAttachFolder={() => {
+                    void onAttachFolder();
+                  }}
+                  extraSystem={extraSystem}
+                  onExtraSystemChange={onSelectExtraSystem}
+                  voicePanel={(open, onOpenChange) => (
+                    <VoicePanel
+                      enabled={Boolean(selectedConversationId)}
+                      conversationId={selectedConversationId}
+                      prefs={appPrefs}
+                      messages={messages}
+                      streaming={streaming}
+                      sending={sending}
+                      hasKey={hasKey}
+                      hasConversation={Boolean(selectedConversationId)}
+                      locale={i18n.language}
+                      onSendTranscript={async (text) => {
+                        const voiceMode = runMode === "plan" || runMode === "assist" ? runMode : "assist";
+                        return onSend(text, [], { keyId: selectedKeyId ?? "", model: selectedModel, runMode: voiceMode, effortLevel });
+                      }}
+                      onAbortChat={() => { void onAbort(); }}
+                      onPrefsChange={onAppPrefsPatch}
+                      open={open}
+                      onOpenChange={onOpenChange}
+                    />
+                  )}
                 />
                 {autoRouter && routedModel ? <div className="flex items-center gap-2 border-t px-2 py-1 text-[11px] text-muted-foreground" data-testid="chat-router"><span>{t(`council.router.${routerRecommendation.reason}`)} · {routedModel.key.label} · {routedModel.model.label}</span><span>{t("council.router.cost", { usd: (routedModel.cost / 1_000_000 * (Math.ceil(draft.length / 4) + 1024)).toFixed(6) })} · {routedModel.latency === Number.MAX_SAFE_INTEGER ? t(`council.router.speed.${routerRecommendation.tier}`) : t("council.router.latency", { ms: routedModel.latency })}</span><Button type="button" size="sm" variant={autoRouteConfirmed ? "secondary" : "outline"} onClick={() => setAutoRouteConfirmed(true)}>{autoRouteConfirmed ? t("council.router.confirmed") : t("council.router.confirm")}</Button></div> : null}
               </div>
@@ -2221,6 +2286,23 @@ export function HomeView({
             {canvasError}
           </p>
         ) : null}
+        <ConfirmDialog
+          open={pendingDelete !== null}
+          onOpenChange={(open) => {
+            if (!open) setPendingDelete(null);
+          }}
+          title={t(pendingDelete?.kind === "project" ? "workspace.deleteProject" : "workspace.deleteConversation")}
+          description={pendingDelete?.kind === "project"
+            ? t("workspace.deleteProjectConfirm", { name: project?.name ?? "" })
+            : t("workspace.deleteConversationConfirm")}
+          confirmLabel={t(pendingDelete?.kind === "project" ? "workspace.deleteProject" : "workspace.deleteConversation")}
+          onConfirm={() => {
+            const action = pendingDelete;
+            setPendingDelete(null);
+            if (action?.kind === "project") void onRemoveProject();
+            if (action?.kind === "conversation") void onRemoveConversation(action.id);
+          }}
+        />
       </section>
     </div>
   );
