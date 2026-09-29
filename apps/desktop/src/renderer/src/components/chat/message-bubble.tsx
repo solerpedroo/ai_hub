@@ -57,12 +57,12 @@ export function MessageBubble({
 
   return (
     <li
-      className="rounded-md border bg-card p-2"
+      className={message.role === "assistant" ? "surface-raised rounded-xl p-3" : "ml-auto max-w-[88%] rounded-xl border border-primary/15 bg-primary/[0.07] p-3"}
       data-testid={message.role === "assistant" ? "message-assistant" : "message-user"}
       data-status={message.status}
     >
-      <div className="mb-1 flex items-center justify-between gap-2">
-        <p className="text-[11px] uppercase text-muted-foreground">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground">
           {t(`workspace.role.${message.role}`)}
           {statusLabel ? ` · ${statusLabel}` : ""}
         </p>
@@ -204,7 +204,10 @@ export function MessageBubble({
           </div>
         </form>
       ) : message.role === "assistant" ? (
-        <MessageMarkdown content={message.content.length > 0 ? message.content : t("workspace.placeholder")} />
+        <MessageMarkdown
+          content={message.content.length > 0 ? message.content : t("workspace.placeholder")}
+          streaming={message.status === "streaming"}
+        />
       ) : (
         <p className="whitespace-pre-wrap">{message.content}</p>
       )}
