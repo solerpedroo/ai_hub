@@ -13,6 +13,7 @@ import {
   chatSendInputSchema,
   chatSendResultSchema,
   conversationCreateInputSchema,
+  conversationRenameInputSchema,
   conversationListInputSchema,
   conversationListResultSchema,
   conversationMoveInputSchema,
@@ -242,6 +243,8 @@ const hub: HubApi = {
       ),
     create: (input) =>
       invokeParsed(IpcChannel.conversationsCreate, input, conversationCreateInputSchema, conversationDtoSchema),
+    rename: (input) =>
+      invokeParsed(IpcChannel.conversationsRename, input, conversationRenameInputSchema, conversationDtoSchema),
     remove: (input) => invokeAckWith(IpcChannel.conversationsRemove, input, idInputSchema),
     export: (input) =>
       invokeParsed(
