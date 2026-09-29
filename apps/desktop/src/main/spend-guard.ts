@@ -17,6 +17,13 @@ export function localDayStartMs(now = Date.now()): number {
   return date.getTime();
 }
 
+function localMonthStartMs(now = Date.now()): number {
+  const date = new Date(now);
+  date.setDate(1);
+  date.setHours(0, 0, 0, 0);
+  return date.getTime();
+}
+
 export function spendCapLimitsFromRows(rows: readonly SpendCapRecord[]): SpendCapLimits {
   const limits: SpendCapLimits = {};
   for (const row of rows) {
@@ -99,6 +106,15 @@ export function evaluateBatchScopedCaps(input: {
     if (limit !== null && providerEstimates.some((item) => item === null)) return { blocked: "provider" };
     const usd = providerEstimates.reduce<string>((sum, item) => item === null ? sum : addUsd(sum, item), "0.000000");
     if (evaluateScopedOutgoingCaps({ estimatedRequestUsd: usd, spentUsd: addUsd(input.repos.sumReceiptCostUsd({ providerSlug }), input.repos.sumReservedSpendUsd({ providerSlug })), limitUsd: limit, scope: "provider" }).blocked) return { blocked: "provider" };
+  }
+  for (const organizationId of new Set(input.estimates.map((item) => item.projectId ? input.repos.getOrganizationForProject(item.projectId)?.id : undefined).filter((id): id is string => Boolean(id)))) {
+    const organization = input.repos.listOrganizations().find((item) => item.id === organizationId);
+    if (!organization?.policy.teamMonthlyLimitUsd) continue;
+    const estimates = input.estimates.filter((item) => item.projectId && input.repos.getOrganizationForProject(item.projectId)?.id === organizationId).map((item) => item.usd);
+    if (estimates.some((item) => item === null)) return { blocked: "project" };
+    const estimatedUsd = estimates.reduce<string>((sum, item) => addUsd(sum, item ?? "0.000000"), "0.000000");
+    const spentUsd = addUsd(input.repos.sumOrganizationReceiptCostUsd(organizationId, localMonthStartMs()), input.repos.sumOrganizationReservedSpendUsd(organizationId, localMonthStartMs()));
+    if (evaluateScopedOutgoingCaps({ estimatedRequestUsd: estimatedUsd, spentUsd, limitUsd: organization.policy.teamMonthlyLimitUsd, scope: "project" }).blocked) return { blocked: "project" };
   }
   return { blocked: null };
 }
