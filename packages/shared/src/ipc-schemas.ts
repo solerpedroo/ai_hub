@@ -353,6 +353,15 @@ export const conversationCreateInputSchema = z
 
 export type ConversationCreateInput = z.infer<typeof conversationCreateInputSchema>;
 
+export const conversationRenameInputSchema = z
+  .object({
+    conversationId: z.string().uuid(),
+    title: z.string().trim().min(1).max(120),
+  })
+  .strict();
+
+export type ConversationRenameInput = z.infer<typeof conversationRenameInputSchema>;
+
 export const conversationTagsSetInputSchema = z
   .object({
     conversationId: z.string().uuid(),
